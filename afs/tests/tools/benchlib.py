@@ -38,6 +38,8 @@ OVERRIDE_KEYS = {
 # Settings the product range-checks on every Node but uses only while the native read cache runs
 # (dfs_read_cache_bytes non-zero): accepted without it, but recorded as inert instead of effective.
 READ_CACHE_ONLY = ("dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms")
+# Product default of dfs_source_cache_max_ms (config/dfs.rs resolve_read_budget) when a role leaves it unset.
+SOURCE_CACHE_MAX_MS_DEFAULT = 5000
 # The serveable read cache and the private peer cache are exclusive on one Node (the product refuses both).
 EXCLUSIVE_OVERRIDES = ("dfs_read_cache_bytes", "dfs_peer_cache.")
 LOCAL_COPY = ("required", "preferred", "none")
@@ -136,10 +138,19 @@ def parameters(config):
 
 
 def inert_keys(merged):
-    """Read-cache-only keys of one role's merged settings while its read cache is off (absent or 0)."""
-    if merged.get("dfs_read_cache_bytes", 0):
-        return []
-    return sorted(k for k in merged if k in READ_CACHE_ONLY)
+    """Declared settings one role's Node ignores at run time, judged on its merged ("*" + role) settings.
+
+    With the read cache off (dfs_read_cache_bytes absent or 0) every READ_CACHE_ONLY key is inert. With it
+    on, the single-source TTL is still inert while the ordinary source TTL is 0: the Node then caches no
+    source metadata at all (sources.rs source_deadline yields no deadline, so source_expiry none). An
+    explicit single TTL of 0 under a non-zero ordinary TTL keeps the ordinary deadline and is not inert.
+    """
+    if not merged.get("dfs_read_cache_bytes", 0):
+        return sorted(k for k in merged if k in READ_CACHE_ONLY)
+    if "dfs_source_single_ttl_ms" in merged and not merged.get("dfs_source_cache_max_ms",
+                                                               SOURCE_CACHE_MAX_MS_DEFAULT):
+        return ["dfs_source_single_ttl_ms"]
+    return []
 
 
 def effective_settings(merged):

@@ -195,6 +195,62 @@ class SummaryAttributionTests(unittest.TestCase):
                 c.write_configs()
 
 
+class SingleTtlAttributionTests(unittest.TestCase):
+    """The single-source TTL only acts while the read cache runs and the ordinary source TTL is non-zero."""
+
+    QUEUE, TTL = SummaryAttributionTests.QUEUE, SummaryAttributionTests.TTL
+    CACHE, NORMAL = "dfs_read_cache_bytes", "dfs_source_cache_max_ms"
+    summary = SummaryAttributionTests.summary
+
+    def test_zero_ordinary_ttl_makes_any_single_ttl_inert(self):
+        rows = [self.summary("MABC", variant="VR", node_overrides={
+            "*": {self.NORMAL: 0}, "B": {self.CACHE: 64 * MIB, self.TTL: ttl}}) for ttl in (100, 250)]
+        self.assertEqual(rows[0]["node_overrides"], rows[1]["node_overrides"])
+        self.assertNotIn(self.TTL, rows[0]["node_overrides"]["B"])
+        p = benchlib.parameters(bench(variant="VR", node_overrides={
+            "*": {self.NORMAL: 0}, "B": {self.CACHE: 64 * MIB, self.TTL: 100}}))
+        self.assertEqual(p.inert_overrides("B"), [self.TTL])
+
+    def test_wildcard_and_role_settings_are_merged_before_judging(self):
+        overrides = {"*": {self.NORMAL: 0, self.TTL: 100, self.QUEUE: 64 * MIB},
+                     "B": {self.CACHE: 64 * MIB}, "C": {self.CACHE: 64 * MIB, self.NORMAL: 1000}}
+        p = benchlib.parameters(bench(variant="VR", node_overrides=overrides))
+        self.assertEqual(p.inert_overrides("B"), [self.TTL])
+        self.assertEqual(p.inert_overrides("C"), [])
+        self.assertEqual(p.inert_overrides("A"), [self.QUEUE, self.TTL])
+        row = self.summary("MABC", variant="VR", node_overrides=overrides)
+        self.assertEqual(row["node_overrides"], {
+            "A": {self.NORMAL: 0},
+            "B": {self.NORMAL: 0, self.QUEUE: 64 * MIB, self.CACHE: 64 * MIB},
+            "C": {self.NORMAL: 1000, self.TTL: 100, self.QUEUE: 64 * MIB, self.CACHE: 64 * MIB}})
+        self.assertTrue(row["variant_applied"])
+
+    def test_explicit_zero_single_ttl_keeps_the_ordinary_deadline_and_counts(self):
+        # Ordinary TTL left at its product default (non-zero): single TTL 0 means "use the ordinary deadline".
+        row = self.summary("MAB", variant="VR", node_overrides={"B": {self.CACHE: 64 * MIB, self.TTL: 0}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.TTL: 0}})
+
+    def test_only_an_inert_single_ttl_besides_the_variant_settings(self):
+        # B's remaining settings still form a variant even though its single TTL is dropped.
+        row = self.summary("MAB", variant="VR", node_overrides={
+            "B": {self.CACHE: 64 * MIB, self.NORMAL: 0, self.TTL: 100}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.NORMAL: 0}})
+        self.assertTrue(row["variant_applied"])
+
+    def test_node_evidence_lists_the_single_ttl_as_inert_and_still_checks_it(self):
+        declared = {self.CACHE: 64 * MIB, self.NORMAL: 0, self.TTL: 100}
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, dict(declared), variant="VR", node_overrides={"B": declared})
+            c.write_configs()
+            record = {e["check"]: e["value"] for e in c.evidence}["bench.node_overrides.B"]
+            self.assertEqual(record, {"declared": declared, "mismatches": [], "inert": [self.TTL]})
+        with tempfile.TemporaryDirectory() as d:
+            effective = {self.CACHE: 64 * MIB, self.NORMAL: 0}
+            c = ClusterRenderingTests().cluster(d, effective, variant="VR", node_overrides={"B": declared})
+            with self.assertRaises(AssertionError):
+                c.write_configs()
+
+
 class AbsentRoleTests(unittest.TestCase):
     @staticmethod
     def topology(roles, **extra):
