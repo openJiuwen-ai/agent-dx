@@ -214,18 +214,20 @@ deletion receipt. It is historical progress, not a guarantee that the user has
 kept the Environment running afterward. A successful migrate response still
 requires the expected target execution state.
 
-In drain mode, if capacity runs out after Pause and the original source still
-owns the Environment, `Deferring` fences further transfer. Retry that same
+If capacity runs out after Pause and the original source still owns the
+Environment, `Deferring` fences further transfer. Retry that same
 operation if source recovery is pending. Once a task-paused Environment has
 published Running on the original owner, or an existing user Pause is
 confirmed unchanged, the operation records `Deferred`. The migrate response
 is HTTP 200 with `outcome:"deferred"`, `completed:false`, and the source
-`environment_id`, `node_id` and `generation`. Leave the Environment on that
-node and continue draining in the same task. Pod deletion still requires strict
-emptiness. If ownership already moved, continue settling the original transfer.
-For a `prepare-node` source, post-Pause capacity loss instead returns 429 and
-keeps the accepted migration pending for replay when capacity returns or for
-explicit Abort.
+`environment_id`, `node_id` and `generation`. Drain leaves the Environment on
+that node to finish naturally. For a `prepare-node` source, send
+`defer_on_capacity:true` when the Coordinator advertises `migrate_deferral:true`
+and the source supports `guarded_resume`. Once the attempt is `Deferred`, recheck
+capacity and use a new operation ID and the current source generation/revision
+within the same task. Replaying the old ID returns its historical receipt.
+Clients that do not opt in retain the 429 and replay contract. Pod deletion still
+requires strict emptiness. If ownership already moved, settle the original transfer.
 
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause

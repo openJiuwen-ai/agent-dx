@@ -17,6 +17,18 @@ async fn pinned_migration_does_not_change_target_when_capacity_is_taken_during_c
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn evacuation_defers_when_automatic_reselection_finds_no_target() {
+    evacuation_capacity_loss(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn evacuation_defers_when_a_pinned_claim_cannot_dispatch() {
+    evacuation_capacity_loss(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn migration_acceptance_rejects_source_version_changed_by_resume() {
     let rig = Rig::new(Duration::from_secs(4)).await;
     let paused = rig.session.get("sleep").await.unwrap();
@@ -288,6 +300,135 @@ async fn take_target_capacity(rig: &Rig) {
     assert_eq!(load.assignment.unwrap().node_id, "b");
 }
 
+async fn evacuation_capacity_loss(automatic: bool) {
+    let mut rig = Rig::new(Duration::from_secs(4)).await;
+    let running = rig.resume(false).await.unwrap().record.unwrap();
+    let original: adx_core::Assignment = running.assignment.clone().unwrap().try_into().unwrap();
+    let stale_route = running.runtime.as_ref().unwrap().id.clone();
+    let (address, server, mut migrate) = prepare_migration(&rig, running).await;
+    migrate["defer_on_capacity"] = json!(true);
+    if automatic {
+        migrate.as_object_mut().unwrap().remove("target_node_id");
+    }
+    let gate = Arc::new(Notify::new());
+    *rig.source.backend.checkpoint_gate.lock().unwrap() = Some(gate.clone());
+    let body = migrate.to_string();
+    let transfer =
+        tokio::spawn(async move { upgrade_response(address, "POST", MIGRATE_PATH, body).await });
+    timeout(
+        Duration::from_secs(3),
+        rig.source.backend.checkpoint_entered.notified(),
+    )
+    .await
+    .unwrap();
+    take_target_capacity(&rig).await;
+    *rig.source.backend.checkpoint_gate.lock().unwrap() = None;
+    gate.notify_one();
+    let (status, deferred) = timeout(Duration::from_secs(6), transfer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 200, "{deferred}");
+    assert_eq!(deferred["outcome"], "deferred");
+    assert_eq!(deferred["node_id"], "a");
+    assert_eq!(deferred["generation"], original.generation);
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, migrate.clone()).await,
+        deferred
+    );
+    let restored = rig.session.get("sleep").await.unwrap();
+    assert_eq!(restored.assignment, original);
+    let restored = restored.result.unwrap();
+    assert_eq!(restored.state, adx_core::EnvironmentState::Running);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    let task = rig.session.upgrade_task().await.unwrap().unwrap();
+    assert_eq!(task.phase, "Active");
+    assert_eq!(task.nodes["a"].phase, "evacuating");
+    assert_eq!(task.operations["migrate"].phase, "Deferred");
+    assert!(!rig.source.manager.accepting_allocations());
+    // A retry carrying the old runtime ID can resolve the restored execution
+    // without trying to start a Paused Sandbox on the evacuating source.
+    let replacement_route = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::Ingress).await,
+    )
+    .ensure_running(pb::EnsureRunningRequest {
+        expected_runtime_id: stale_route.clone(),
+        environment_id: "sleep".into(),
+        caller: caller(),
+        timeout_seconds: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .record
+    .unwrap();
+    let route_owner: adx_core::Assignment =
+        replacement_route.assignment.unwrap().try_into().unwrap();
+    assert_eq!(route_owner, original);
+    assert_ne!(replacement_route.runtime.unwrap().id, stale_route);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
+
+    let previous = migrate.clone();
+    migrate["operation_id"] = json!("migrate-retry");
+    migrate["expected_source_revision"] = json!(restored.revision);
+    let (status, _) = upgrade_response(address, "POST", MIGRATE_PATH, migrate.to_string()).await;
+    assert_eq!(status, 429);
+    assert!(!rig
+        .session
+        .upgrade_task()
+        .await
+        .unwrap()
+        .unwrap()
+        .operations
+        .contains_key("migrate-retry"));
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
+
+    let period = Duration::from_secs(60);
+    let capacity = Resources {
+        cpu_millis: 200,
+        memory_bytes: 256,
+        disk_bytes: 0,
+    };
+    rig.target
+        .manager
+        .update_capacity(capacity, period)
+        .unwrap();
+    rig.target.report.capacity = Some(capacity.into());
+    report(&mut rig.target, &rig.address, period).await.unwrap();
+    let body = migrate.to_string();
+    let transfer =
+        tokio::spawn(async move { upgrade_response(address, "POST", MIGRATE_PATH, body).await });
+    // Wait for committed assignment before waking the two workers' reconciliation.
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if rig.session.get("sleep").await.unwrap().assignment.node_id == "b" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    report(&mut rig.source, &rig.address, period).await.unwrap();
+    report(&mut rig.target, &rig.address, period).await.unwrap();
+    let (status, completed) = timeout(Duration::from_secs(6), transfer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 200, "{completed}");
+    assert_eq!(completed["outcome"], "completed");
+    assert_eq!(completed["node_id"], "b");
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, previous).await,
+        deferred
+    );
+    server.abort();
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn drain_defers_and_resumes_source_when_reselection_finds_no_target() {
@@ -502,10 +643,29 @@ async fn drain_capacity_loss(fault: DrainCapacityLoss) {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn drain_defers_an_accepted_migration_without_resuming_a_user_paused_source() {
+    deferral_preserves_user_pause(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn evacuation_defers_an_accepted_migration_without_resuming_a_user_paused_source() {
+    deferral_preserves_user_pause(false).await;
+}
+
+async fn deferral_preserves_user_pause(drain: bool) {
     let rig = Rig::new(Duration::from_secs(4)).await;
     let before = rig.session.get("sleep").await.unwrap();
     let checkpoint = before.result.as_ref().unwrap();
-    let (address, server, source_session, target_session) = prepare_review_drain(&rig).await;
+    let (address, server) = if drain {
+        let (address, server, _, _) = prepare_review_drain(&rig).await;
+        (address, server)
+    } else {
+        let (address, server, _) =
+            prepare_migration(&rig, checkpoint.clone().try_into().unwrap()).await;
+        (address, server)
+    };
+    let source_session = &rig.source.report.session_id;
+    let target_session = &rig.target.report.session_id;
     let mut task = rig.session.upgrade_task().await.unwrap().unwrap();
     let revision = task.revision;
     task.operations.insert(
@@ -519,7 +679,7 @@ async fn drain_defers_an_accepted_migration_without_resuming_a_user_paused_sourc
             source_revision: checkpoint.revision,
             source_stopped_revision: None,
             source_session_id: source_session.clone(),
-            target_session_id: target_session,
+            target_session_id: target_session.clone(),
             was_running: false,
             phase: "Prepared".into(),
         },
@@ -535,7 +695,7 @@ async fn drain_defers_an_accepted_migration_without_resuming_a_user_paused_sourc
         json!({
             "task_id":"planned-migration", "epoch":1, "operation_id":"migrate",
             "node_id":"a", "node_session_id":source_session, "pod_uid":"source-pod",
-            "environment_id":"sleep"
+            "environment_id":"sleep", "defer_on_capacity": !drain
         }),
     )
     .await;
@@ -544,10 +704,12 @@ async fn drain_defers_an_accepted_migration_without_resuming_a_user_paused_sourc
     assert_eq!(rig.session.get("sleep").await.unwrap(), before);
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
     assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        rig.resume(false).await.unwrap().record.unwrap().state,
-        pb::EnvironmentState::Running as i32
-    );
+    if drain {
+        assert_eq!(
+            rig.resume(false).await.unwrap().record.unwrap().state,
+            pb::EnvironmentState::Running as i32
+        );
+    }
     server.abort();
 }
 

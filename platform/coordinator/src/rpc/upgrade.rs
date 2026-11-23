@@ -27,6 +27,7 @@ struct Action {
     expected_source_revision: Option<u64>,
     expected_target_control_revision: Option<u64>,
     target_node_id: String,
+    defer_on_capacity: bool,
     permit_id: String,
     delete_intent: bool,
     rollback: bool,
@@ -300,7 +301,8 @@ impl CoordinatorRpc {
             if method == hyper::Method::GET && suffix == "capabilities" {
                 return Ok(
                     json!({"version":2,"node_protocol_version":3,"planned_migration":true,"paused_transfer":true,
-                "quiesce":true,"drain":true,"guarded_resume":true,"session_isolation":true,"recovery_compatibility":true,"runtime_rootfs_identity":true}),
+                "quiesce":true,"drain":true,"guarded_resume":true,"migrate_deferral":true,
+                "session_isolation":true,"recovery_compatibility":true,"runtime_rootfs_identity":true}),
                 );
             }
             if method == hyper::Method::GET {
@@ -418,11 +420,8 @@ impl CoordinatorRpc {
                         .map(|e| pb::NodeUpgradeGrant {
                             environment_id: e.spec.id.clone(),
                             assignment_generation: e.assignment.generation,
-                            actions: if drain {
-                                vec!["pause".into(), "route".into(), "resume".into()]
-                            } else {
-                                vec!["pause".into(), "route".into()]
-                            },
+                            // Evacuating still rejects non-task Resume.
+                            actions: vec!["pause".into(), "route".into(), "resume".into()],
                         })
                         .collect();
                     self.control(&mut task, &request.node_id, phase, grants)
@@ -578,7 +577,7 @@ impl CoordinatorRpc {
                         .map(|(id, op)| (id.clone(), op.clone()))
                         .collect();
                     for (id, op) in deferring {
-                        self.finish_drain_deferral(&mut task, &id, &op).await?;
+                        self.finish_migration_deferral(&mut task, &id, &op).await?;
                     }
                     self.cancel_prepared_operations(&mut task).await?;
                 }
@@ -1355,6 +1354,27 @@ impl CoordinatorRpc {
         Ok(())
     }
 
+    async fn require_evacuation_deferral(
+        &self,
+        source: &StoredNode,
+        assignment: &adx_core::Assignment,
+    ) -> Result<()> {
+        let view = self.node_view(source, "").await?;
+        if !view.guarded_resume
+            || view.phase != "evacuating"
+            || !view.grants.iter().any(|grant| {
+                grant.environment_id == assignment.environment_id
+                    && grant.assignment_generation == assignment.generation
+                    && grant.actions.iter().any(|action| action == "resume")
+            })
+        {
+            return Err(Error::Invalid(
+                "migration deferral requires guarded Resume on a prepared source".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn migration_handoff_source(
         &self,
         op: &UpgradeOperation,
@@ -1383,14 +1403,14 @@ impl CoordinatorRpc {
 
     // Deferring already fences transfer in Redis. Retire its queued claim
     // without releasing an original execution that was already restored.
-    async fn finish_drain_deferral(
+    async fn finish_migration_deferral(
         &self,
         task: &mut UpgradeTask,
         id: &str,
         op: &UpgradeOperation,
     ) -> Result<Value> {
         let binding = task.nodes.get(&op.source_node_id).ok_or(Error::Conflict)?;
-        if binding.phase != "draining"
+        if !matches!(binding.phase.as_str(), "draining" | "evacuating")
             || binding.pod_uid != binding.original_pod_uid
             || binding.node_session_id != op.source_session_id
             || binding.delete_resource_version.is_some()
@@ -1430,7 +1450,7 @@ impl CoordinatorRpc {
         let (mut client, view) = self.checked_node(&node, &op.environment_id).await?;
         if view.unknown
             || !view.guarded_resume
-            || view.phase != "draining"
+            || view.phase != binding.phase
             || view.task_id != task.task_id
             || view.epoch != task.epoch
             || view.revision != binding.control_revision
@@ -1596,6 +1616,10 @@ impl CoordinatorRpc {
                 {
                     return Err(Error::Conflict);
                 }
+                if r.defer_on_capacity && task.nodes[&r.node_id].phase == "evacuating" {
+                    self.require_evacuation_deferral(&source_node, &stored.assignment)
+                        .await?;
+                }
                 let requested_target =
                     (!r.target_node_id.is_empty()).then_some(r.target_node_id.as_str());
                 let target = self
@@ -1652,7 +1676,7 @@ impl CoordinatorRpc {
             }
             if op.phase == "Deferring" {
                 return self
-                    .finish_drain_deferral(&mut task, &r.operation_id, &op)
+                    .finish_migration_deferral(&mut task, &r.operation_id, &op)
                     .await;
             }
             if stored.assignment.node_id == op.source_node_id {
@@ -1664,6 +1688,11 @@ impl CoordinatorRpc {
                 if draining && replaying {
                     self.require_guarded_drain(&source_node).await?;
                 }
+                if !draining && r.defer_on_capacity && replaying {
+                    self.require_evacuation_deferral(&source_node, &stored.assignment)
+                        .await?;
+                }
+                let defer_on_capacity = draining || r.defer_on_capacity;
                 if !op.automatic_target {
                     if binding.phase == "draining"
                         && !task.drain_target_eligible(&op.target_node_id, &op.target_session_id)
@@ -1741,7 +1770,7 @@ impl CoordinatorRpc {
                                 .await?;
                             Some((target, node.session.ok_or(Error::Conflict)?.id))
                         }
-                        Err(Error::NoCapacity) if draining => {
+                        Err(Error::NoCapacity) if defer_on_capacity => {
                             no_capacity = true;
                             None
                         }
@@ -1808,7 +1837,7 @@ impl CoordinatorRpc {
                     stored = session.get(&r.environment_id).await?;
                 }
                 if stored.assignment.node_id == op.source_node_id {
-                    if !draining {
+                    if !defer_on_capacity {
                         return Err(Error::NoCapacity);
                     }
                     task.operations
@@ -1820,7 +1849,7 @@ impl CoordinatorRpc {
                         .await?;
                     drop(state);
                     return self
-                        .finish_drain_deferral(&mut task, &r.operation_id, &op)
+                        .finish_migration_deferral(&mut task, &r.operation_id, &op)
                         .await;
                 }
             }

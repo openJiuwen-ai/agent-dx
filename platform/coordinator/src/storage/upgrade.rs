@@ -174,20 +174,40 @@ impl UpgradeTask {
             })
     }
 
-    pub(crate) fn blocks_resume(&self, stored: &StoredEnvironment) -> bool {
+    pub(crate) fn allows_deferred_route(&self, stored: &StoredEnvironment) -> bool {
         self.active()
-            && (self.operations.values().any(|operation| {
-                operation.environment_id == stored.spec.id && !operation.settled()
-            }) || self
+            && self
                 .nodes
                 .get(&stored.assignment.node_id)
-                .is_some_and(|node| {
-                    matches!(node.phase.as_str(), "evacuating" | "quiescing")
+                .is_some_and(|node| node.phase == "evacuating")
+            && !self.has_unsettled_migration(&stored.spec.id)
+            && self.operations.values().any(|op| {
+                op.phase == "Deferred"
+                    && op.environment_id == stored.spec.id
+                    && op.source_node_id == stored.assignment.node_id
+                    && op.source_generation == stored.assignment.generation
+            })
+    }
+
+    fn has_unsettled_migration(&self, id: &str) -> bool {
+        self.operations
+            .values()
+            .any(|op| op.environment_id == id && !op.settled())
+    }
+
+    pub(crate) fn blocks_resume(&self, stored: &StoredEnvironment) -> bool {
+        self.active()
+            && (self.has_unsettled_migration(&stored.spec.id)
+                || self
+                    .nodes
+                    .get(&stored.assignment.node_id)
+                    .is_some_and(|node| {
+                        matches!(node.phase.as_str(), "evacuating" | "quiescing")
                         // Freeze new demand while the existing intents settle before evacuation.
                         || (node.phase == "draining"
                             && self.phase == "Aborting"
                             && stored.resume.is_none())
-                }))
+                    }))
     }
     pub fn validate(&self) -> Result<()> {
         if self.task_id.trim().is_empty()
