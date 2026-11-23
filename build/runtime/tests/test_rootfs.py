@@ -98,8 +98,10 @@ class RuntimeRootfsTests(unittest.TestCase):
                         guest_bin = Path(command[-2].split('=', 1)[1]) / 'usr/local/bin'
                         guest_bin.mkdir(parents=True)
                         for name, contents in guest.items():
+                            mode = guest_modes.get(name)
+                            self.assertIsNotNone(mode, f'missing test permissions for {name}')
                             (guest_bin / name).write_bytes(contents)
-                            (guest_bin / name).chmod(guest_modes[name])
+                            (guest_bin / name).chmod(mode)
                 elif command[0] == str(root / 'curl'):
                     self.assertEqual(kwargs.get('timeout'), 120)
                     if candidate_timeout:
