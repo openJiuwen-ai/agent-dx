@@ -631,8 +631,13 @@ DFS远端读前后Meta与每个Node的`/metrics`差值（`evidence.metrics.<角�
 写者持有唯一副本且送出计数完整时核对两件事：读者收到的`durable`字节等于写者送出，`peer_received`等于其余Node送出，结果记为`ok`；
 任一读者的来源计数缺失或重置、缺写者窗口、或有`object`字节（整对象路径不区分由谁供数，记`unattributed`）时只记录不判定（`ok=null`），不使该轮失败。
 fan-out每段另记`result.reader_timing.completion`：elbencho `--svcelapsed`给出的各读者完成时间（毫秒，`by_reader`）及首末、中位与首末差（`spread_ms`）；
-控制台缺这一行或服务对不上时记`status: unavailable`，不使该轮失败。`evidence.kernel_groups`列出按内核（boot id）分组的角色，不记录boot id本身，
-用来区分读者之间的流量是否跨机；角色落在哪台机器由环境文件的host项决定。
+控制台缺这一行或服务对不上时记`status: unavailable`，不使该轮失败。`evidence.kernel_groups`列出按内核（boot id）分组的角色，不记录boot id本身；角色落在哪台机器由环境文件的host项决定。
+`evidence.peer_locality`只在拓扑能唯一推断时判定读者之间的流量是否跨机：所有读者同在一个内核为`same_kernel`，
+每个内核至多一个读者为`cross_kernel`，只有一个读者为`no_peer`；其余分组（如B/C共用一个内核、D/E共用另一个）记`undetermined`，
+即无法判定跨机——此时"B↔C、D↔E"与"B↔D、C↔E"给出相同的分组、逐节点送出与逐读者来源字节，`supply.ok`只说明字节守恒，
+不说明流量走向。产品没有按发送者、接收者配对的字节计数，框架也不推算；需要时随2b/2c的产品计数补。
+开启`progress_interval_ms`时，进度CSV读不到（文件缺失、读取失败）或格式不对（缺列、短行或多字段、数值非法）都记
+`result.reader_timing.progress.status: unavailable`及原因，不使该轮失败。
 每轮（从写入前到远端读结束）统计各Node日志（`<角色>.log`）中含各事件的行数（`evidence.log_events`），日志被截断时从头计并标`rotated`。
 
 每轮写入`checks.json`的`bench.round`，含工具自身报告的字节数与耗时（fio、elbencho的JSON），

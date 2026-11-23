@@ -439,18 +439,23 @@ NON_PEER_SOURCES = ("local", "durable", "object")
 def labelled_counter_window(before, after, family, label):
     """One counter family between two scrapes, kept per value of `label` (same verdicts as counter_window).
 
-    Every sample of the family must carry the label; a different sample set is `missing`, never zero.
+    Every sample of the family must carry the label: a sample without it, or a different sample set,
+    makes the window `missing`, never zero.
     """
     wanted = re.compile(r'^%s\{(?:.*,)?%s="([^"]*)"' % (re.escape(family), re.escape(label)))
+    member = re.compile(r'^%s(?:\{|$)' % re.escape(family))
 
     def pick(text):
         selected = {}
         for name, value in _samples(text).items():
-            if wanted.match(name):
+            if member.match(name):
                 selected[name] = value
         return selected
 
     first, second = pick(before), pick(after)
+    unlabelled = sorted(n for n in set(first) | set(second) if not wanted.match(n))
+    if unlabelled:
+        return {"status": "missing", "samples": unlabelled}
     if not first or not second or set(first) != set(second):
         return {"status": "missing", "samples": sorted(set(first) ^ set(second)) or [family]}
     reset = sorted(n for n in second if second[n] < first[n])
@@ -500,6 +505,24 @@ def source_supply(windows, sent, *, writer, file_bytes, applies):
     if judged and "unattributed" not in supply:
         supply["ok"] = by_role.get("durable", 0) == writer_sent and peer_received == readers_sent
     return supply
+
+
+def reader_peer_locality(groups, readers):
+    """Whether reader-to-reader traffic crosses kernels, as far as the kernel groups alone determine it.
+
+    `same_kernel` when every reader shares one kernel, `cross_kernel` when no two readers share one,
+    `no_peer` for a single reader. Any other grouping is `undetermined`: per-role sent and received bytes
+    cannot tell which reader served which (no sender/receiver pair counter exists in the product).
+    """
+    readers = set(readers)
+    counts = [len(readers.intersection(group)) for group in groups]
+    if len(readers) < 2:
+        return "no_peer"
+    if max(counts) == len(readers):
+        return "same_kernel"
+    if max(counts) == 1:
+        return "cross_kernel"
+    return "undetermined"
 
 
 def kernel_groups(kernels):
@@ -725,12 +748,21 @@ def elbencho_progress(text, services, file_bytes, phase="READ"):
     and the slowest reader at one sample, when it happened and its fraction of the file, and the spread
     of the first-progress times. Resolution is the sampling interval.
     """
-    rows = list(csv.DictReader(io.StringIO(text)))
+    reader = csv.DictReader(io.StringIO(text))
+    missing = sorted({"Phase", "RuntimeMS", "DoneBytes", "Service"} - set(reader.fieldnames or ()))
+    if missing:
+        raise ValueError("elbencho live report lacks columns: %r" % missing)
     samples = {}
-    for row in rows:
+    for row in reader:
+        # csv fills a short row's missing fields with None and keeps a long row's extra fields under None.
+        if None in row or None in row.values():
+            raise ValueError("elbencho live report has a malformed row: %r" % row)
         if row.get("Phase") != phase or row.get("Service") not in services:
             continue
-        runtime, done = int(row["RuntimeMS"]), int(row["DoneBytes"])
+        try:
+            runtime, done = int(row["RuntimeMS"]), int(row["DoneBytes"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("elbencho live report has a malformed row: %r" % row) from error
         samples.setdefault(runtime, {})[services[row["Service"]]] = done
     seen = set()
     for values in samples.values():

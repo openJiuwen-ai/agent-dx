@@ -496,12 +496,14 @@ def reader_timing(c, params, console, services, live):
     except ValueError as error:
         timing["completion"] = {"status": "unavailable", "error": str(error)}
     if live:
+        read = c.python("A", "print(open(sys.argv[1]).read())", live, check=False)
         try:
-            text = c.python("A", "print(open(sys.argv[1]).read())", live)["stdout"]
-            timing["progress"] = dict(benchlib.elbencho_progress(text, services, params.file_bytes),
-                                      interval_ms=params.progress_interval_ms)
+            if read["returncode"] != 0:
+                raise ValueError("elbencho live report unreadable: %s" % (read["stderr"] or "")[-300:])
+            progress = benchlib.elbencho_progress(read["stdout"], services, params.file_bytes)
         except ValueError as error:
-            timing["progress"] = {"status": "unavailable", "error": str(error)}
+            progress = {"status": "unavailable", "error": str(error)}
+        timing["progress"] = dict(progress, interval_ms=params.progress_interval_ms)
     return timing
 
 
@@ -577,7 +579,9 @@ def fanout_rounds(c, params, readers, link, elbencho, env):
                         # Each phase is labelled from its own window (seed and followers read differently).
                         check, local, supply = read_window(params, scrapes[-2], scrapes[-1], group,
                                                            result["bytes"])
-                        evidence = {"same_kernel": same_kernel, "kernel_groups": kernels, "backend": backend,
+                        evidence = {"same_kernel": same_kernel, "kernel_groups": kernels,
+                                    "peer_locality": benchlib.reader_peer_locality(kernels, group),
+                                    "backend": backend,
                                     "readers": list(group), "phase_send": check, "local_read": local,
                                     "phase_supply": supply}
                         phase_layer = layer

@@ -45,6 +45,18 @@ class LabelledWindowTests(unittest.TestCase):
                                                   SOURCE, "role")
         self.assertEqual(window["status"], "missing")
 
+    def test_a_sample_of_the_family_without_the_label_makes_the_window_missing(self):
+        for unlabelled in ("%s 0\n", '%s{stage="x"} 0\n'):
+            with self.subTest(unlabelled=unlabelled):
+                before = scrape(durable=0) + unlabelled % SOURCE
+                after = scrape(durable=8) + unlabelled.replace(" 0", " 8") % SOURCE
+                window = benchlib.labelled_counter_window(before, after, SOURCE, "role")
+                self.assertEqual(window["status"], "missing")
+        # Other families sharing the prefix are not part of this family.
+        other = SOURCE + "_extra 5\n"
+        window = benchlib.labelled_counter_window(scrape(durable=0) + other, scrape(durable=8) + other, SOURCE, "role")
+        self.assertEqual(window, {"status": "complete", "by": {"durable": 8}})
+
     def test_a_decreased_sample_is_a_reset(self):
         window = benchlib.labelled_counter_window(scrape(durable=9), scrape(durable=2), SOURCE, "role")
         self.assertEqual(window, {"status": "reset", "samples": ['%s{role="durable"}' % SOURCE]})
@@ -174,6 +186,13 @@ class ProgressTests(unittest.TestCase):
         progress = benchlib.elbencho_progress(text, services, 8 * MIB)
         self.assertEqual((progress["max_lead_bytes"], progress["max_lead_at_ms"]), (MIB, 200))
 
+    def test_missing_column_or_short_row_is_a_format_error(self):
+        good = self.HEADER + self.row(100, 0, MIB, "h1:1") + self.row(100, 1, MIB, "h2:1")
+        for bad in (good.replace("DoneBytes", "Bytes"), good + "2026-11-23T10:00:00.000+0800,,READ,200\n",
+                    good.replace("h2:1,", "h2:1,extra,")):
+            with self.subTest(bad=bad[-40:]), self.assertRaises(ValueError):
+                benchlib.elbencho_progress(bad, self.SERVICES, MIB)
+
     def test_report_without_every_reader_is_rejected(self):
         with self.assertRaises(ValueError):
             benchlib.elbencho_progress(self.HEADER + self.row(100, 0, MIB, "h1:1"), self.SERVICES, 8 * MIB)
@@ -211,6 +230,24 @@ class KernelGroupTests(unittest.TestCase):
         self.assertEqual(benchlib.kernel_groups({"A": "k", "B": "k"}), [["A", "B"]])
 
 
+class PeerLocalityTests(unittest.TestCase):
+    """Reader-to-reader traffic locality is reported only when the kernel groups determine it."""
+
+    def test_all_readers_on_one_kernel_is_same_kernel(self):
+        self.assertEqual(benchlib.reader_peer_locality([["A"], ["B", "C", "D", "E"]], "BCDE"), "same_kernel")
+
+    def test_one_reader_per_kernel_is_cross_kernel(self):
+        self.assertEqual(benchlib.reader_peer_locality([["A", "B"], ["C"], ["D"]], "BCD"), "cross_kernel")
+
+    def test_mixed_groups_are_undetermined(self):
+        # B<->C, D<->E and B<->D, C<->E give the same groups and the same per-role bytes.
+        self.assertEqual(benchlib.reader_peer_locality([["A"], ["B", "C"], ["D", "E"]], "BCDE"), "undetermined")
+        self.assertEqual(benchlib.reader_peer_locality([["A", "B", "C"], ["D"]], "BCD"), "undetermined")
+
+    def test_a_single_reader_has_no_peer_traffic(self):
+        self.assertEqual(benchlib.reader_peer_locality([["A"], ["B"]], "B"), "no_peer")
+
+
 class MetricWhitelistTests(unittest.TestCase):
     def test_reader_source_and_read_cache_counters_are_in_the_node_window(self):
         import re  # noqa: PLC0415
@@ -243,7 +280,7 @@ class FanoutEvidenceTests(unittest.TestCase):
     """Drive fanout_rounds with fakes: B and C read together, A sends S and B serves C the other S."""
 
     @staticmethod
-    def run_rounds(**extra):
+    def run_rounds(live="ok", **extra):
         suite = load_suite()
         cfg = bench(backend="memory", memory_backend_bytes=256 * MIB, **extra)
         params = benchlib.parameters(cfg)
@@ -308,13 +345,22 @@ class FanoutEvidenceTests(unittest.TestCase):
             @staticmethod
             def python(role, code, *args, **kw):
                 if "open(sys.argv[1]).read()" in code and args[0].endswith("-live.csv"):
+                    if live == "missing":
+                        value = {"stdout": "", "stderr": "FileNotFoundError", "returncode": 1}
+                        if kw.get("check", True):
+                            raise AssertionError("A: command failed: %r" % value)  # as Cluster.python does
+                        return value
                     rows = ProgressTests.HEADER + "".join(
                         "t,,READ,%d,%d,,0,%d,,,0,,,,1,5,%s,\n" % (ms, rank, done, host)
                         for ms, rank, done, host in ((100, 0, size // 2, "10.0.0.B:26611"),
                                                      (100, 1, size // 4, "10.0.0.C:26611"),
                                                      (200, 0, size, "10.0.0.B:26611"),
                                                      (200, 1, size, "10.0.0.C:26611")))
-                    return {"stdout": rows}
+                    if live == "no_column":
+                        rows = rows.replace("DoneBytes", "Bytes")
+                    if live == "short_row":
+                        rows += "t,,READ,300,0\n"
+                    return {"stdout": rows, "stderr": "", "returncode": 0}
                 if "open(sys.argv[1]).read()" in code:
                     phase = {"phase_type": "READ", "config": {"version": "3.3", "hosts": 2},
                              "last_done": {"bytes": size * 2, "elapsed_time_ms": 1100}}
@@ -334,6 +380,7 @@ class FanoutEvidenceTests(unittest.TestCase):
             suite.fanout_rounds(Cluster(), params, ("B", "C"), "/tmp/l", "/opt/bench/elbencho", {})
         reads = [v for n, v in recorded if n == "bench.round" and v["op"] == "read"]
         runs = [argv for argv in commands if "--hosts" in argv and "--quit" not in argv]
+        assert any(n == "bench.summary" for n, _ in recorded)
         return reads, runs, size
 
     def test_round_records_supply_completion_and_kernel_groups(self):
@@ -358,6 +405,22 @@ class FanoutEvidenceTests(unittest.TestCase):
         self.assertEqual(progress["max_lead_bytes"], size // 4)
         self.assertEqual(progress["by_reader"]["C"]["done_ms"], 200)
         self.assertTrue(all(argv[argv.index("--liveint") + 1] == "100" for argv in runs))
+
+    def test_unreadable_progress_is_unavailable_and_every_round_completes(self):
+        for live in ("missing", "no_column", "short_row"):
+            with self.subTest(live=live):
+                reads, _, size = self.run_rounds(live=live, progress_interval_ms=100)
+                self.assertEqual(len(reads), 3)
+                for read in reads:
+                    progress = read["result"]["reader_timing"]["progress"]
+                    self.assertEqual(progress["status"], "unavailable")
+                    self.assertEqual(progress["interval_ms"], 100)
+                    self.assertTrue(progress["error"])
+                    self.assertEqual(read["result"]["bytes"], 2 * size)
+
+    def test_round_records_reader_peer_locality(self):
+        reads, _, _ = self.run_rounds()
+        self.assertEqual(reads[0]["evidence"]["peer_locality"], "same_kernel")
 
 
 if __name__ == "__main__":
