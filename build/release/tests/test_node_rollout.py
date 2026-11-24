@@ -1,5 +1,6 @@
 """Source-only regression tests; all Kubernetes and HTTP I/O is injected."""
 import copy
+from functools import partial
 import importlib.util
 import io
 from pathlib import Path
@@ -64,7 +65,7 @@ class PlanTests(unittest.TestCase):
         self.args = rollout.parser().parse_args([
             "plan-pod", "--context", "test-cluster", "--origin", "http://coordinator:9090", "--namespace", "ns",
             "--daemonset", "workers", "--container", "adxlet", "--config", "/etc/adx/deployment.yaml", "--target-image",
-            "registry/worker@sha256:" + "b" * 64, "--task-id", "release-1",
+            f"registry/worker@sha256:{'b' * 64}", "--task-id", "release-1",
             "--epoch", "1", "--node", "workers-a=adx-node"])
         self.calls = []
 
@@ -145,7 +146,7 @@ class PlanTests(unittest.TestCase):
         self.args = rollout.parser().parse_args([
             "plan-pod", "--context", "test-cluster", "--origin", "http://coordinator:9090", "--namespace", "ns",
             "--statefulset", "workers", "--container", "adxlet", "--config", "/etc/adx/deployment.yaml",
-            "--target-image", "registry/worker@sha256:" + "b" * 64, "--task-id", "release-1",
+            "--target-image", f"registry/worker@sha256:{'b' * 64}", "--task-id", "release-1",
             "--epoch", "1", "--node", "workers-0=adx-node"])
 
     def test_statefulset_daemonset_mutually_exclusive(self):
@@ -540,7 +541,7 @@ class PlanTests(unittest.TestCase):
             with self.subTest(change=change):
                 counts = {"kube": 0, "inspect": 0}
 
-                def kube(args, counters=counts, changing=change):
+                def kube(args, changing=change, *, counters):
                     counters["kube"] += 1
                     value = self.kube(args)
                     if counters["kube"] > 2:
@@ -549,8 +550,9 @@ class PlanTests(unittest.TestCase):
                         if changing == "ds" and "daemonset" in args:
                             value["metadata"]["uid"] = "new-ds"
                     return value
+                kube = partial(kube, counters=counts)
 
-                def get(path, counters=counts, changing=change):
+                def get(path, changing=change, *, counters):
                     value = self.get(path)
                     if path.endswith("inspect"):
                         counters["inspect"] += 1
@@ -561,6 +563,7 @@ class PlanTests(unittest.TestCase):
                         if changing == "rootfs" and counters["inspect"] > 1:
                             value["runtime_rootfs_sha256"] = "c" * 64
                     return value
+                get = partial(get, counters=counts)
 
                 with self.assertRaises(rollout.Refusal):
                     rollout.plan_pod(self.args, kube, get, self.local)
@@ -622,8 +625,8 @@ class PlanTests(unittest.TestCase):
         manager = MagicMock()
         manager.__enter__.return_value = process
         arguments = ["--context", "test-cluster", "get", "--raw", "/api/v1/namespaces/ns/pods"]
-        with patch.object(rollout.shutil, "which", return_value="kubectl"), \
-                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen, \
+        with patch.object(rollout.shutil, "which", return_value="kubectl"),\
+                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen,\
                 patch.object(rollout.threading, "Timer"):
             self.assertEqual(rollout.kubectl_get(arguments)["kind"], "PodList")
         self.assertEqual(popen.call_args.args[0][1:], ["--request-timeout=10s", *arguments])
@@ -762,8 +765,8 @@ class ApplyTests(PlanTests):
                     self.assertTrue(body["template_restored"])
                     self.assertTrue(all(n["phase"] in ("pending", "RestoredOriginal", "verified")
                                         and n["delete_resource_version"] is None for n in self.task["nodes"].values()))
-                    self.assertTrue(all(o["phase"] in ("Completed", "Cancelled")
-                                        for o in self.task["operations"].values()))
+                    self.assertTrue(all(entry["phase"] in ("Completed", "Cancelled")
+                                        for entry in self.task["operations"].values()))
                     self.task["phase"] = "Aborted"
                 else:
                     self.fail("unknown abort stage")
@@ -857,7 +860,7 @@ class ApplyTests(PlanTests):
                                            self.post, self.mutate, sleep=lambda _: None, local=self.local)
             if result["status"] == "completed":
                 return rollout.read_json_file(path)
-        self.fail("normal path did not finish")
+        return self.fail("normal path did not finish")
 
     def test_single_empty_worker_completes_without_migration(self):
         self.assertEqual(len(self.snapshot["pods"]), 1)
@@ -1012,7 +1015,7 @@ class ApplyTests(PlanTests):
         for action in ("prepare-node", "quiesce", "verify-node", "complete", "patch", "delete"):
             with self.subTest(action=action):
                 self.setUp()
-                key = action if action in ("patch", "delete") else "/v1/node-upgrades/tasks/release-1/" + action
+                key = action if action in ("patch", "delete") else f'/v1/node-upgrades/tasks/release-1/{action}'
                 self.lost.add(key)
                 with tempfile.TemporaryDirectory() as directory:
                     self.drive(Path(directory) / "journal.json")
@@ -1075,7 +1078,7 @@ class ApplyTests(PlanTests):
                 result["node"].update(scheduling_paused=True, accepting_allocations=False)
             return result
 
-        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"), \
+        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"),\
                 patch.object(self, "post", post), patch.object(self, "get_live", get):
             path = Path(directory) / "journal.json"
             outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, get, post,
@@ -1098,7 +1101,7 @@ class ApplyTests(PlanTests):
                     fault = {"body": None, "observation": None, "replayed": False}
 
                     def post(path, body, node_applied=applied, on_replacement=replacement,
-                             progress=fault, send=original_post, read=original_get):
+                             send=original_post, read=original_get, *, progress):
                         matches = (path.endswith("/quiesce") and not body.get("delete_intent")
                                    and (body["pod_uid"] == "new-uid") == on_replacement)
                         if matches and progress["body"] is None:
@@ -1115,13 +1118,15 @@ class ApplyTests(PlanTests):
                             progress["replayed"] = True
                             progress["observation"] = None
                         return send(path, body)
+                    post = partial(post, progress=fault)
 
-                    def get(path, progress=fault, read=original_get):
+                    def get(path, read=original_get, *, progress):
                         if path.endswith("/inspect") and progress["observation"] is not None:
                             return copy.deepcopy(progress["observation"])
                         return read(path)
+                    get = partial(get, progress=fault)
 
-                    with patch.object(self, "post", post), patch.object(self, "get_live", get), \
+                    with patch.object(self, "post", post), patch.object(self, "get_live", get),\
                             tempfile.TemporaryDirectory() as directory:
                         journal = self.drive(Path(directory) / "journal.json")
                     self.assertTrue(fault["replayed"])
@@ -1295,7 +1300,7 @@ class ApplyTests(PlanTests):
                                             self.post, self.mutate, sleep=lambda _: None, mode=mode, local=self.local)
             if outcome["status"] != "pending":
                 return outcome
-        self.fail("cleanup did not converge: " + str(outcome))
+        return self.fail("cleanup did not converge: " + str(outcome))
 
     def test_local_stop_and_abort_never_begin(self):
         for mode, expected in (("stop", "stopped"), ("abort", "aborted")):
@@ -1382,10 +1387,10 @@ class ApplyTests(PlanTests):
         original = self.mutate
 
         def mutate(args, body):
-            result = original(args, body)
+            original(args, body)
             if args[:2] == ["patch", "pod"]:
                 self.pods["items"][0]["metadata"]["deletionTimestamp"] = "2026-11-11T00:00:00Z"
-            return result
+            return None
 
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
             path = Path(directory) / "journal.json"
@@ -1456,7 +1461,7 @@ class ApplyTests(PlanTests):
 
     def test_unsettled_foreign_template_and_extra_owned_refuse_finalize(self):
         for fault in ("operation", "template", "extra", "same-name-new-uid"):
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory, \
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory,\
                     patch.object(rollout.sys, "platform", "linux"):
                 self.setUp()
                 path = Path(directory) / "journal.json"
@@ -1652,8 +1657,8 @@ class ApplyTests(PlanTests):
         body = dict(apiVersion="v1", kind="DeleteOptions", preconditions=dict(uid="pod-uid", resourceVersion="20"))
         arguments = ["--context", "test-cluster", "delete", "--raw",
                      "/api/v1/namespaces/ns/pods/workers-a", "-f", "-"]
-        with patch.object(rollout.shutil, "which", return_value="kubectl"), \
-                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen, \
+        with patch.object(rollout.shutil, "which", return_value="kubectl"),\
+                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen,\
                 patch.object(rollout.threading, "Timer"):
             rollout.kubectl_json(arguments, body)
         self.assertEqual(popen.call_args.args[0][1:], ["--request-timeout=10s", *arguments])
@@ -1680,7 +1685,7 @@ class HttpJsonTests(unittest.TestCase):
         connection = self.response(400, rollout.canonical({"error": {
             "code": "InvalidArgument", "message": "node recovery capabilities are unavailable or unverified",
         }}).encode("utf-8"))
-        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
                 self.assertRaises(rollout.Refusal) as rejected:
             rollout.http_json("http://coordinator:9090", "/v1/node-upgrades/tasks/task/verify-node", {})
         self.assertEqual(str(rejected.exception), "management request returned HTTP 400: InvalidArgument: "
@@ -1698,7 +1703,7 @@ class HttpJsonTests(unittest.TestCase):
                 ("application/json", b'{"error":' + b"[" * 10000 + b"0" + b"]" * 10000 + b"}")):
             with self.subTest(content_type=content_type, size=len(body)):
                 connection = self.response(400, body, content_type)
-                with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
+                with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
                         self.assertRaises(rollout.Refusal) as rejected:
                     rollout.http_json("http://coordinator:9090", "/query")
                 self.assertEqual(str(rejected.exception), "management request returned HTTP 400")
@@ -1716,9 +1721,9 @@ class HttpJsonTests(unittest.TestCase):
                 with self.subTest(status=status, error_type=error_type):
                     connection = self.response(status, b"{}")
                     expected = rollout.Refusal if status == 400 else error_type
-                    with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
+                    with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
                             patch.object(connection.getresponse.return_value, "read1",
-                                         side_effect=error_type("response read failed")), \
+                                         side_effect=error_type("response read failed")),\
                             self.assertRaises(expected) as rejected:
                         rollout.http_json("http://coordinator:9090", "/query")
                     detail = "management request returned HTTP 400" if status == 400 else "response read failed"
@@ -1727,8 +1732,8 @@ class HttpJsonTests(unittest.TestCase):
 
     def test_http_error_body_obeys_response_size_limit(self):
         connection = self.response(400, b'{"error":{"code":"InvalidArgument","message":"' + b"x" * 100 + b'"}}')
-        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
-                patch.object(rollout, "LIMIT", 64), \
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
+                patch.object(rollout, "LIMIT", 64),\
                 self.assertRaisesRegex(rollout.Refusal, "management response exceeds size limit"):
             rollout.http_json("http://coordinator:9090", "/query")
         connection.close.assert_called_once()
@@ -1736,9 +1741,9 @@ class HttpJsonTests(unittest.TestCase):
     def test_http_error_body_obeys_original_deadline(self):
         connection = self.response(400, b'{"error":{"code":"InvalidArgument","message":"unavailable"}}')
         response = connection.getresponse.return_value
-        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
-                patch.object(rollout.time, "monotonic", side_effect=[0, rollout.TIMEOUT + 1]), \
-                patch.object(response, "read1", wraps=response.read1) as read, \
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
+                patch.object(rollout.time, "monotonic", side_effect=[0, rollout.TIMEOUT + 1]),\
+                patch.object(response, "read1", wraps=response.read1) as read,\
                 self.assertRaisesRegex(rollout.Refusal, "management request deadline exceeded"):
             rollout.http_json("http://coordinator:9090", "/query")
         read.assert_not_called()

@@ -1,5 +1,6 @@
 """Source-only process planner regressions; all external I/O is injected."""
 import copy
+from functools import partial
 import importlib.util
 import io
 import json
@@ -552,7 +553,10 @@ class ProcessPlanTests(unittest.TestCase):
         with patch.object(rollout.shutil, "which", return_value="kubectl"):
             with patch.object(rollout.subprocess, "Popen", return_value=process) as popen:
                 with patch.object(rollout, "plan_process") as planner:
-                    planner.side_effect = lambda selected, kube, local: local("pod-a")
+                    def observe_node(selected, kube, local):
+                        return local("pod-a")
+
+                    planner.side_effect = observe_node
                     with patch("sys.stdout", new_callable=io.StringIO):
                         argv = ["plan-process", "--context", args.context, "--namespace", args.namespace,
                                 "--container", args.container, "--config", args.config, "--role", args.role,
@@ -1671,7 +1675,7 @@ class ProcessApplyTests(unittest.TestCase):
                 fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
                 original_post = fixture.post.side_effect
 
-                def post(path, body, original_post=original_post, fixture=fixture, field=field, value=value):
+                def post(path, body, original_post=original_post, field=field, *, fixture, value):
                     receipt = original_post(path, body)
                     if body.get("action") == "prepare":
                         if field == "released":
@@ -1680,6 +1684,7 @@ class ProcessApplyTests(unittest.TestCase):
                         else:
                             fixture.marker[field] = value
                     return receipt
+                post = partial(post, fixture=fixture, value=value)
 
                 fixture.post.side_effect = post
                 self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
@@ -1694,7 +1699,7 @@ class ProcessApplyTests(unittest.TestCase):
                 fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
                 original_post = fixture.post.side_effect
 
-                def post(path, body, original_post=original_post, field=field, value=value):
+                def post(path, body, original_post=original_post, field=field, *, value):
                     receipt = original_post(path, body)
                     if body.get("action") == "prepare":
                         if value is KeyError:
@@ -1702,6 +1707,7 @@ class ProcessApplyTests(unittest.TestCase):
                         else:
                             receipt[field] = value
                     return receipt
+                post = partial(post, value=value)
 
                 fixture.post.side_effect = post
                 self.assertEqual(self.run_adxlet(fixture)["status"], "pending")

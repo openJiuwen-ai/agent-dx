@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import http.client
+from functools import partial
 from itertools import chain
 import json
 import os
@@ -177,7 +178,7 @@ def workload_resource(workload):
 def workload_owns(workload, pod):
     """True when the Pod has exactly one controller owner that is this workload."""
     kind = workload_kind(workload)
-    owners = [o for o in pod["metadata"].get("ownerReferences", []) if o.get("controller") is True]
+    owners = [entry for entry in pod["metadata"].get("ownerReferences", []) if entry.get("controller") is True]
     return (len(owners) == 1 and owners[0].get("uid") == workload["uid"]
             and owners[0].get("kind") == kind and owners[0].get("apiVersion") == "apps/v1"
             and owners[0].get("name") == workload["name"])
@@ -208,9 +209,9 @@ def pod_replacement(plan, pod, candidates):
             continue
         if kind == "StatefulSet" and candidate["metadata"].get("name") != pod["name"]:
             continue
-        owners = [o for o in candidate["metadata"].get("ownerReferences", [])
-                  if o.get("controller") is True]
-        if not any(o.get("uid") == workload["uid"] for o in owners):
+        owners = [entry for entry in candidate["metadata"].get("ownerReferences", [])
+                  if entry.get("controller") is True]
+        if not any(entry.get("uid") == workload["uid"] for entry in owners):
             continue
         require(workload_owns(workload, candidate), "replacement owner differs")
         matches.append(candidate)
@@ -294,9 +295,9 @@ def plan_pod(args, kube, get, local):
         workload["target_template_hash"] = template_hash(template)
         owned = []
         for pod in pod_inventory(args.namespace, kube):
-            owners = [o for o in pod["metadata"].get("ownerReferences", [])
-                      if o.get("controller") is True]
-            if not any(o.get("uid") == workload["uid"] for o in owners):
+            owners = [entry for entry in pod["metadata"].get("ownerReferences", [])
+                      if entry.get("controller") is True]
+            if not any(entry.get("uid") == workload["uid"] for entry in owners):
                 continue
             require(workload_owns(workload, pod), "invalid controller owner")
             require(pod["apiVersion"] == "v1", "unexpected Pod API version")
@@ -320,7 +321,7 @@ def plan_pod(args, kube, get, local):
         pods = []
         for pod, record in owned:
             record["actual"] = pod_actual(pod, args.namespace, args.container,
-                                          mappings[record["name"]], local(record["name"]))
+                                          mappings.get(record["name"]), local(record["name"]))
             if source:
                 path = declaration_mount(pod, args.container, source["name"], source["key"])
                 record["declaration_path"] = path
@@ -344,7 +345,7 @@ def plan_pod(args, kube, get, local):
                 and field.get("apiVersion", "v1") == "v1", "ADX_POD_UID must use Downward metadata.uid")
 
     def inspect(node, uid):
-        view = get("/v1/node-upgrades/nodes/" + quote(node, safe="") + "/inspect")
+        view = get(f"/v1/node-upgrades/nodes/{quote(node, safe='')}/inspect")
         require(view.get("node_id") == node and text(view.get("node_session_id"))
                 and type(view.get("protocol_version")) is int and view["protocol_version"] == 3
                 and view.get("unknown") is False, "unknown or incompatible node identity/session")
@@ -781,7 +782,7 @@ def plan_process(args, kube, local):
 
 
 def read_json_file(path, raw=False):
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, mode=0o600)
     with os.fdopen(descriptor, "rb") as stream:
         require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "JSON input must be a regular file")
         data = stream.read(LIMIT + 1)
@@ -804,7 +805,7 @@ def write_journal(path, journal):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY, mode=0o700)
         try:
             os.fsync(directory)
         finally:
@@ -1055,13 +1056,13 @@ def process_upgrade_status(post, owner):
     fields = {"absent": {"status", "owner"},
               "active": {"status", "owner", "origin_session", "current_session", "yielded"},
               "released": {"status", "owner", "node_session"}}
-    require(isinstance(status, str) and status in fields and set(result) == fields[status],
+    require(isinstance(status, str) and status in fields and set(result) == fields.get(status),
             "invalid maintenance query status or fields")
     sessions = ("origin_session", "current_session") if status == "active" else (
         ("node_session",) if status == "released" else ())
     require(all(text(result.get(key)) and len(result[key].encode("utf-8")) <= 128 for key in sessions),
             "invalid maintenance query session")
-    require(status != "active" or type(result["yielded"]) is bool, "invalid maintenance yield state")
+    require(status != "active" or isinstance(result.get("yielded"), bool), "invalid maintenance yield state")
     return result
 
 
@@ -1333,11 +1334,11 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
                     # Commit ambiguity uses only same-A Receipt, even after expiry.
                     if execution.get("stage") == "target_commit_unknown":
                         return "pending"
-                    if execution.get("stage") == "start_unknown" and task.get("phase") in ("unknown", "failed") and (
-                            stage == "start_unknown" or not budget_open(execution)):
-                        begin_rollback(task)
-                    else:
+                    if execution.get("stage") != "start_unknown" or task.get("phase") not in ("unknown", "failed"):
                         return "pending"
+                    if stage != "start_unknown" and budget_open(execution):
+                        return "pending"
+                    begin_rollback(task)
     if state["stage"] in ("rollback_intent", "original_start_intent"):
         task = query_task()
         # B can already be terminal when the accepted local rollback returns.
@@ -1472,16 +1473,16 @@ def declaration_patch(source, resource_version, before, after, data_present=True
     body = [dict(op="test", path="/metadata/uid", value=source["uid"]),
             dict(op="test", path="/metadata/resourceVersion", value=resource_version)]
     if before is not None:
-        body.append(dict(op="test", path="/data/" + key, value=before))
+        body.append(dict(op="test", path=f'/data/{key}', value=before))
     if before == after:
         pass
     elif after is None:
-        body.append(dict(op="remove", path="/data/" + key))
+        body.append(dict(op="remove", path=f'/data/{key}'))
     elif before is None:
-        body.append(dict(op="add", path="/data/" + key if data_present else "/data",
+        body.append(dict(op="add", path=f'/data/{key}' if data_present else "/data",
                          value=after if data_present else {source["key"]: after}))
     else:
-        body.append(dict(op="replace", path="/data/" + key, value=after))
+        body.append(dict(op="replace", path=f'/data/{key}', value=after))
     if fence is not None:
         body.append(dict(op="add", path="/metadata/annotations", value=fence))
     return body
@@ -1504,7 +1505,7 @@ def declaration_write(plan, journal, save, kube, mutate, restore=False):
         if intent is None:
             continue
         require(isinstance(intent, dict) and set(intent) == {"rv", "data_present", "fence", "body", "before"}
-                and text(intent["rv"]) and type(intent["data_present"]) is bool, "invalid CM intent")
+                and text(intent["rv"]) and isinstance(intent.get("data_present"), bool), "invalid CM intent")
         reverse = name == "declaration_restore"
         before = intent["before"]
         require(before in (source["original_text"], source["candidate_text"])
@@ -1928,7 +1929,7 @@ def validate_pod_plan(plan):
 
 def pod_task(plan, get, cleanup=False):
     begin = plan["begin"]
-    task = get("/v1/node-upgrades/tasks/" + quote(begin["task_id"], safe=""))
+    task = get(f"/v1/node-upgrades/tasks/{quote(begin['task_id'], safe='')}")
     require(task.get("protocol_version") == 3 and task.get("kind") == "pod", "incompatible Pod task")
     require(all(task.get(k) == begin[k] for k in
                 ("task_id", "epoch", "namespace", "daemonset_uid", "target_image")), "task owner differs")
@@ -1945,8 +1946,8 @@ def pod_task(plan, get, cleanup=False):
 def pod_instances(node_id, get):
     records, stamp, page = {}, None, 1
     while True:
-        value = get("/instance-manager/query-tenant-instances?node_id=" + quote(node_id, safe="")
-                    + "&page=" + str(page) + "&page_size=1000")
+        value = get(f"/instance-manager/query-tenant-instances?node_id={quote(node_id, safe='')}"
+                    f"&page={page}&page_size=1000")
         current = (value["epoch"], value["revision"], value["count"])
         require(all(type(n) is int and n >= 0 for n in current), "invalid inventory counters")
         require(stamp is None or stamp == current, "inventory changed; reread from page one")
@@ -1962,7 +1963,7 @@ def pod_instances(node_id, get):
             require(text(key) and key not in records and item["node_id"] == node_id, "invalid inventory binding")
             require(all(type(item[k]) is int and 0 <= item[k] <= 2**64 - 1 for k in ("generation", "revision")),
                     "invalid Environment revision")
-            require(item["status"] in ("running", "paused") and type(item["resources_held"]) is bool
+            require(item["status"] in ("running", "paused") and isinstance(item.get("resources_held"), bool)
                     and all(item.get(k) is False for k in
                             ("invalidated", "restart_pending", "resume_pending", "recovery_pending")),
                     "Environment not ready for planned migration")
@@ -1973,7 +1974,7 @@ def pod_instances(node_id, get):
 
 
 def pod_inventory(namespace, kube):
-    listing = kube(["get", "--raw", "/api/v1/namespaces/" + quote(namespace, safe="") + "/pods"])
+    listing = kube(["get", "--raw", f"/api/v1/namespaces/{quote(namespace, safe='')}/pods"])
     require(listing["kind"] == "PodList" and listing["apiVersion"] == "v1"
             and text(listing.get("metadata", {}).get("resourceVersion"))
             and not listing.get("metadata", {}).get("continue"), "incomplete authoritative Pod list")
@@ -1995,7 +1996,7 @@ def pod_inventory(namespace, kube):
 
 
 def pod_inspection(plan, pod, uid, session, get, phase=None, permit=None, revision=None):
-    view = get("/v1/node-upgrades/nodes/" + quote(pod["node_id"], safe="") + "/inspect")
+    view = get(f"/v1/node-upgrades/nodes/{quote(pod['node_id'], safe='')}/inspect")
     require(view.get("protocol_version") == 3 and view.get("node_id") == pod["node_id"]
             and view.get("observed_pod_uid") == uid and view.get("node_session_id") == session
             and view.get("unknown") is False, "live Pod identity/session unknown or changed")
@@ -2017,7 +2018,7 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
     begin, workload = plan["begin"], plan["workload"]
     kind = workload_kind(workload)
     resource = workload_resource(workload)
-    base = "/v1/node-upgrades/tasks/" + quote(begin["task_id"], safe="")
+    base = f"/v1/node-upgrades/tasks/{quote(begin['task_id'], safe='')}"
     stage = journal["stage"]
     if stage == "new":
         current_workload = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
@@ -2056,7 +2057,7 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                 and task["nodes"][prior]["phase"] == "verified", "prior batch is not verified")
     if task["phase"] == "Completed":
         require(all(n["phase"] == "verified" for n in task["nodes"].values())
-                and all(o["phase"] == "Completed" for o in task["operations"].values()), "invalid completion")
+                and all(entry["phase"] == "Completed" for entry in task["operations"].values()), "invalid completion")
         journal["stage"] = "completed"
         save()
         return True
@@ -2075,7 +2076,7 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
         containers = current_workload["spec"]["template"]["spec"]["containers"]
         indexes = [i for i, c in enumerate(containers) if c["name"] == plan["container"]]
         require(len(indexes) == 1, "selected template container changed")
-        pointer = "/spec/template/spec/containers/" + str(indexes[0]) + "/image"
+        pointer = f'/spec/template/spec/containers/{str(indexes[0])}/image'
         patch = [{"op": "test", "path": "/metadata/uid", "value": workload["uid"]},
                  {"op": "test", "path": "/metadata/resourceVersion", "value": evidence["resource_version"]},
                  {"op": "test", "path": pointer, "value": workload["original_image"]},
@@ -2110,7 +2111,7 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
         original_session = pod["inspection"]["node_session_id"]
         binding = dict(node_id=node_id, pod_uid=pod["uid"], node_session_id=original_session)
 
-        def action(name, extra=None, binding=binding, node_id=node_id, state=state, *, intent_key="intent"):
+        def action(name, extra=None, node_id=node_id, *, intent_key='intent', binding, state):
             body = dict(task_id=begin["task_id"], epoch=begin["epoch"], **binding)
             if cleanup:
                 body["rollback"] = True
@@ -2120,7 +2121,8 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                 state[intent_key] = dict(action=name, body=body)
                 save()
             require(state[intent_key] == dict(action=name, body=body), "action intent differs")
-            return post(base + "/" + name, body)
+            return post(f'{base}/{name}', body)
+        action = partial(action, binding=binding, state=state)
 
         if local_stage == "verified":
             require(node["phase"] == "verified" and node["pod_uid"] == state["replacement_uid"]
@@ -2144,8 +2146,8 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
             save()
             return False
         if local_stage == "evacuate":
-            def migrate(item, *, intent_key="intent"):
-                return action("migrate", dict(environment_id=item["instanceID"],
+            def migrate(item, *, intent_key="intent", send=action):
+                return send("migrate", dict(environment_id=item["instanceID"],
                                               expected_source_generation=item["generation"],
                                               expected_source_revision=item["revision"]),
                               intent_key=intent_key)
@@ -2164,8 +2166,8 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                         state.pop(intent_key)
                         save()
                         return False
-                    if (intent_key == "intent" and operation["phase"] == "Prepared"
-                            and operation.get("was_running") and operation.get("source_stopped_revision") is None):
+                    waiting_for_idle = operation.get("was_running") and operation.get("source_stopped_revision") is None
+                    if intent_key == "intent" and operation["phase"] == "Prepared" and waiting_for_idle:
                         # A separate paused Environment can transfer while the
                         # original operation waits for an idle window. Preserve
                         # both bodies until their authoritative receipts settle.
@@ -2178,15 +2180,15 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                         if original and original["status"] == "running":
                             pending = {op["environment_id"] for op in task["operations"].values()
                                        if op["phase"] != "Completed"}
-                            paused = next((instances[key] for key in sorted(instances)
-                                           if key not in pending and instances[key]["status"] == "paused"), None)
+                            paused = next((instance for key, instance in sorted(instances.items())
+                                           if key not in pending and instance["status"] == "paused"), None)
                             if paused is not None:
                                 migrate(paused, intent_key="paused_intent")
                                 return False
-                post(base + "/migrate", body)
+                post(f'{base}/migrate', body)
                 return False
-            require(all(o["phase"] == "Completed" for o in task["operations"].values()
-                        if node_id in (o["source_node_id"], o["target_node_id"])), "unresolved migration")
+            require(all(entry["phase"] == "Completed" for entry in task["operations"].values()
+                        if node_id in (entry["source_node_id"], entry["target_node_id"])), "unresolved migration")
             instances = pod_instances(node_id, get)
             if instances:
                 item = min(instances.values(), key=lambda item: (item["status"] != "paused", item["instanceID"]))
@@ -2205,9 +2207,9 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                     binding.update(pod_uid=uid, node_session_id=session)
                     action("quiesce")
                     return False
-                if (node["pod_uid"] == uid and node["node_session_id"] == session
-                        and node["phase"] == "quiescing" and node.get("permit_id") is None
-                        and node.get("delete_resource_version") is None):
+                same_incarnation = node["pod_uid"] == uid and node["node_session_id"] == session
+                no_delete_permit = node.get("permit_id") is None and node.get("delete_resource_version") is None
+                if same_incarnation and node["phase"] == "quiescing" and no_delete_permit:
                     view = pod_inspection(plan, pod, uid, session, get)
                     require(view.get("task_id") == begin["task_id"] and view.get("epoch") == begin["epoch"],
                             "partial quiesce observation owner differs")
@@ -2292,8 +2294,8 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                 gate_node = dict(kube={"name": pod["name"]}, declaration_path=pod["declaration_path"])
                 declaration_gate(plan, gate_node, kube, local, sleep, override=True)
             save()
-            mutate(["delete", "--raw", "/api/v1/namespaces/" + quote(begin["namespace"], safe="")
-                    + "/pods/" + quote(pod["name"], safe=""), "-f", "-"], body)
+            url = f"/api/v1/namespaces/{quote(begin['namespace'], safe='')}/pods/{quote(pod['name'], safe='')}"
+            mutate(["delete", "--raw", url, "-f", "-"], body)
             return False
         if local_stage == "replacement":
             inventory = pod_inventory(begin["namespace"], kube)
@@ -2305,7 +2307,7 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
             field = entries[0].get("valueFrom", {}).get("fieldRef", {})
             require(field.get("fieldPath") == "metadata.uid" and field.get("apiVersion", "v1") == "v1",
                     "replacement Downward UID differs")
-            view = get("/v1/node-upgrades/nodes/" + quote(node_id, safe="") + "/inspect")
+            view = get(f"/v1/node-upgrades/nodes/{quote(node_id, safe='')}/inspect")
             session = view.get("node_session_id")
             require(text(session) and session != original_session, "replacement session unavailable")
             pod_inspection(plan, pod, evidence["uid"], session, get, "isolated")
@@ -2358,11 +2360,11 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
         raise Refusal("invalid Pod node stage")
     if not cleanup and batch_index == len(plan["batches"]) - 1:
         require(all(n["phase"] == "verified" for n in task["nodes"].values())
-                and all(o["phase"] == "Completed" for o in task["operations"].values()), "task not complete")
+                and all(entry["phase"] == "Completed" for entry in task["operations"].values()), "task not complete")
         journal["stage"] = "complete_intent"
         save()
         operation_id = hashlib.sha256(canonical([begin, "complete"]).encode("utf-8")).hexdigest()
-        post(base + "/complete", dict(task_id=begin["task_id"], epoch=begin["epoch"], operation_id=operation_id))
+        post(f'{base}/complete', dict(task_id=begin["task_id"], epoch=begin["epoch"], operation_id=operation_id))
         return False
     return True
 
@@ -2372,8 +2374,8 @@ def cleanup_inventory(plan, task, get, kube, local):
     inventory = pod_inventory(plan["begin"]["namespace"], kube)
     workload, begin = plan["workload"], plan["begin"]
     kind = workload_kind(workload)
-    owned = [p for p in inventory if any(o.get("controller") is True and o.get("uid") == workload["uid"]
-                                       for o in p["metadata"].get("ownerReferences", []))]
+    owned = [p for p in inventory if any(entry.get("controller") is True and entry.get("uid") == workload["uid"]
+                                       for entry in p["metadata"].get("ownerReferences", []))]
     require(len(owned) == len(plan["pods"]), "extra or missing owned Pods; cleanup inventory unknown")
     result = {}
     for pod in plan["pods"]:
@@ -2419,7 +2421,7 @@ def cleanup_inventory(plan, task, get, kube, local):
         except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
                 subprocess.SubprocessError, http.client.HTTPException):
             pass
-    require(all(o["phase"] in ("Completed", "Cancelled") for o in task["operations"].values()),
+    require(all(entry["phase"] in ("Completed", "Cancelled") for entry in task["operations"].values()),
             "cleanup migration unresolved")
     return result
 
@@ -2428,7 +2430,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
     begin, workload = plan["begin"], plan["workload"]
     kind = workload_kind(workload)
     resource = workload_resource(workload)
-    base = "/v1/node-upgrades/tasks/" + quote(begin["task_id"], safe="")
+    base = f"/v1/node-upgrades/tasks/{quote(begin['task_id'], safe='')}"
     cleanup = journal.setdefault("cleanup", {"nodes": {}})
 
     def action(name, extra):
@@ -2436,7 +2438,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
         body["operation_id"] = template_hash([begin, name, extra])
         cleanup["intent"] = dict(action=name, body=body)
         save()
-        return post(base + "/" + name, body)
+        return post(f'{base}/{name}', body)
 
     if journal["stage"] == "new":
         if not stop and "declaration_write" in journal:
@@ -2481,7 +2483,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
         return dict(status="stopped", task_phase="Aborting")
     if "declaration_write" in journal:
         declaration_write(plan, journal, save, kube, mutate, restore=True)
-    if any(o["phase"] not in ("Completed", "Cancelled") for o in task["operations"].values()):
+    if any(entry["phase"] not in ("Completed", "Cancelled") for entry in task["operations"].values()):
         action("abort", dict(stage="freeze"))
         raise Refusal("migration outcomes unresolved; keep maintenance and retry cleanup")
 
@@ -2544,8 +2546,8 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
                 require(view.get("task_id") == begin["task_id"] and view.get("epoch") == begin["epoch"]
                         and view.get("phase") == "released" and view.get("revision") == node["control_revision"],
                         "restored original control unknown")
-                page = get("/instance-manager/query-tenant-instances?node_id=" + quote(node_id, safe="")
-                           + "&page=1&page_size=1000")
+                page = get(f"/instance-manager/query-tenant-instances?node_id={quote(node_id, safe='')}"
+                           "&page=1&page_size=1000")
                 require(page["node"]["node_id"] == node_id, "original admission node differs")
                 state["admission"] = page["node"]
                 save()
@@ -2578,7 +2580,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
                     require(body["node_id"] == node_id and body["pod_uid"] == node["pod_uid"]
                             and body["node_session_id"] == node["node_session_id"], "verify intent binding differs")
                     save()
-                    response = post(base + "/verify-node", body)
+                    response = post(f'{base}/verify-node', body)
                 else:
                     response = action("verify-node", dict(node_id=node_id, pod_uid=node["pod_uid"],
                                                           node_session_id=node["node_session_id"], rollback=True,
@@ -2626,7 +2628,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
         containers = current_workload["spec"]["template"]["spec"]["containers"]
         indexes = [i for i, c in enumerate(containers) if c["name"] == plan["container"]]
         require(len(indexes) == 1, "template container changed")
-        pointer = "/spec/template/spec/containers/" + str(indexes[0]) + "/image"
+        pointer = f'/spec/template/spec/containers/{str(indexes[0])}/image'
         patch.extend([dict(op="test", path=pointer, value=begin["target_image"]),
                       dict(op="replace", path=pointer, value=workload["original_image"])])
     else:
