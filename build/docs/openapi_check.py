@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -117,18 +118,23 @@ def create_fields():
     return result
 
 
+def documented_operations(doc):
+    for path, entry in doc['paths'].items():
+        for method, operation in entry.items():
+            if method in METHODS:
+                yield method.upper(), path, operation
+
+
 def audit(control, data, *, routes=None, actions=None):
     errors = []
     for label, doc in [('environment', control), ('data-plane', data)]:
         ids = []
-        for path, entry in doc['paths'].items():
-            for method, operation in entry.items():
-                if method in METHODS:
-                    ids.append(operation['operationId'])
-                    for parameter in operation.get('parameters', []):
-                        parameter = resolve(doc, parameter['$ref']) if '$ref' in parameter else parameter
-                        if parameter['in'] == 'path' and f"{{{parameter['name']}}}" not in path:
-                            errors.append(f'{label}: unmatched path parameter {parameter["name"]}: {path}')
+        for _, path, operation in documented_operations(doc):
+            ids.append(operation['operationId'])
+            for parameter in operation.get('parameters', []):
+                parameter = resolve(doc, parameter['$ref']) if '$ref' in parameter else parameter
+                if parameter['in'] == 'path' and f"{{{parameter['name']}}}" not in path:
+                    errors.append(f'{label}: unmatched path parameter {parameter["name"]}: {path}')
         if len(ids) != len(set(ids)):
             errors.append(f'{label}: duplicate operationId')
         valid_refs = True
@@ -147,9 +153,7 @@ def audit(control, data, *, routes=None, actions=None):
                 errors.append(f'{label}: invalid schema {name}: {error.message}')
         if valid_refs:
             errors.extend(f'{label}: {error}' for error in example_errors(doc))
-    documented = {
-        (method.upper(), path) for path, entry in control['paths'].items() for method in entry if method in METHODS
-    }
+    documented = {(method, path) for method, path, _ in documented_operations(control)}
     for method, path in sorted((control_routes() if routes is None else routes) - documented):
         errors.append(f'missing control operation: {method} {path}')
     control_schemas = control['components']['schemas']
@@ -192,15 +196,17 @@ def main():
     args = parser.parse_args()
     control, data = load('environment.yaml'), load('data-plane.yaml')
     result = {
-        'control_operations': sum(method in METHODS for entry in control['paths'].values() for method in entry),
+        'control_operations': sum(1 for _ in documented_operations(control)),
         'runtime_actions': len(runtime_actions()),
         'errors': audit(control, data),
     }
-    output = json.dumps(result, indent=2) + '\n'
+    output = json.dumps(result, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(output)
-    sys.stdout.write(output)
+        args.output.write_text(output + '\n')
+    output_logger = logging.Logger(__name__, level=logging.INFO)
+    output_logger.addHandler(logging.StreamHandler(sys.stdout))
+    output_logger.info('%s', output)
     return bool(result['errors'])
 
 
