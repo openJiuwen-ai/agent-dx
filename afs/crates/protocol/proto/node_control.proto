@@ -28,6 +28,8 @@ service OwnerControl {
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceReply);
   // Read a workspace root's owner and mode on its Home without peer admission.
   rpc WorkspaceAttributes(WorkspaceAttributesRequest) returns (WorkspaceAttributesReply);
+  // Report the layout of the given roots that this Home session can serve.
+  rpc WorkspaceOutletLayouts(WorkspaceOutletLayoutsRequest) returns (WorkspaceOutletLayoutsReply);
   // Home owns advisory lock authority; no file payload travels here.
   rpc OwnerGetLock(OwnerGetLockRequest) returns (OwnerGetLockReply);
   rpc OwnerSetLock(OwnerSetLockRequest) returns (OwnerSetLockReply);
@@ -79,7 +81,25 @@ message DeleteWorkspaceRequest { string root_id = 1; uint64 expected_epoch = 2; 
 message DeleteWorkspaceReply {}
 
 message WorkspaceAttributesRequest { string root_id = 1; uint64 epoch = 2; }
-message WorkspaceAttributesReply { uint32 uid = 1; uint32 gid = 2; uint32 mode = 3; }
+message WorkspaceAttributesReply {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  uint32 mode = 3;
+  bool legacy_layout = 4;
+}
+
+message WorkspaceOutletLayoutsRequest {
+  string home_session_id = 1;
+  repeated WorkspaceAttributesRequest roots = 2;
+}
+
+message WorkspaceOutletLayout {
+  string root_id = 1;
+  uint64 epoch = 2;
+  bool legacy_layout = 3;
+}
+
+message WorkspaceOutletLayoutsReply { repeated WorkspaceOutletLayout roots = 1; }
 
 message NegotiateDataRequest {
   bytes client_info = 1;

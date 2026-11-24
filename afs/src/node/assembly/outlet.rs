@@ -6,11 +6,12 @@
 use super::ownerfs::OwnerFsAssembly;
 use crate::{
     config::Config,
+    node::fuse::FuseMountOptions,
     node::outlet::{
-        live::{self, ImportExecutor, MirrorConfig},
+        live::{self, ImportExecutor, MirrorConfig, OutletLayouts},
         mount::{self, KernelMounter},
     },
-    node::vfs::ownerfs::root::RootMeta,
+    node::vfs::ownerfs::{OwnerFs, root::RootMeta},
     runtime::{BoxError, Services, cancelled},
 };
 use std::sync::Arc;
@@ -60,6 +61,8 @@ pub(super) fn start_mirror(
             ),
         )));
     }
+    mount::recover_legacy_outlet_mount(&outlet.import_root)?;
+    live::withdraw_direct_legacy_links(&outlet.public_root, &outlet.import_root)?;
     afs_logging::info!(
         "outlet.import.enabled";
         "users_root" => outlet.users_root.display().to_string(),
@@ -71,6 +74,15 @@ pub(super) fn start_mirror(
         outlet.mount_options.clone(),
         cfg.id.clone(),
         Arc::new(KernelMounter),
+    )
+    .with_layouts(
+        OutletLayouts {
+            meta: control.meta.clone(),
+            peers: control.peers.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        },
+        control.owner.clone(),
+        FuseMountOptions::from(cfg).exec,
     );
     afs_logging::info!(
         "outlet.mirror.starting";
@@ -84,7 +96,7 @@ pub(super) fn start_mirror(
     services.spawn(async move {
         let shutdown = cancelled(stop);
         tokio::pin!(shutdown);
-        live::run(mirror_config, meta, shutdown, import_executor).await;
+        live::run(mirror_config, meta, shutdown, import_executor).await?;
         Ok(())
     });
     // Read-only topology diagnosis. A separate task so a slow mount scan can
@@ -103,4 +115,6 @@ pub(super) fn start_mirror(
 /// site because `OwnerFs` itself does not expose it.
 pub(super) struct OutletControl {
     pub(super) meta: Arc<crate::node::rpc::meta::GrpcRootMeta>,
+    pub(super) peers: Arc<crate::node::rpc::peer::PeerConnectionPool>,
+    pub(super) owner: Arc<OwnerFs>,
 }

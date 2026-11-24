@@ -198,11 +198,8 @@ pub(super) async fn assemble(
                     "error" => error.to_string()),
             }
         }
-        outlet_control = Some(super::outlet::OutletControl {
-            meta: root_meta.clone(),
-        });
         if cfg.experimental_ownerfs_workspace_bind {
-            workspace_bind_root_control = Some((root_meta, roots.clone()));
+            workspace_bind_root_control = Some((root_meta.clone(), roots.clone()));
         }
         let roots_for_startup = roots.clone();
         let owner = if cfg.experimental_ownerfs_workspace_bind {
@@ -220,6 +217,11 @@ pub(super) async fn assemble(
             vfs::ownerfs::OwnerFs::new_local_with_remote(roots, disk, remote_factory)
         };
         let owner = Arc::new(owner.with_workspace_defaults(cfg.workspace_default_identity()?));
+        outlet_control = Some(super::outlet::OutletControl {
+            meta: root_meta,
+            peers: peer_connections.clone(),
+            owner: owner.clone(),
+        });
         if let Some(mm) = owner.mount_manager() {
             mm.attach_owner(&owner);
             // Startup egress reconciliation (D4 §4.4): detach residual bind

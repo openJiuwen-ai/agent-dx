@@ -70,8 +70,9 @@ def scenarios(component, checks):
     with run.case(component.check_name, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
         inputs = Path(temp)
         baseline, registry, old = download_baseline(inputs)
-        if old['target'] != component.package['target'] or old['commit'] == component.package['commit']:
-            raise ValueError('upgrade requires two different AFS commits of the same target')
+        same_commit = old['commit'] == component.package['commit']
+        if old['target'] != component.package['target'] or (mixed and same_commit):
+            raise ValueError('version switch requires the same target and mixed protocols require distinct commits')
         image = registry['references']['node']
         pod = {
             'apiVersion': 'v1', 'kind': 'Pod',
@@ -134,7 +135,7 @@ def scenarios(component, checks):
                     admission=admission, admission_versions=versions,
                 )
             else:
-                selection = runner.selected_cases(os.getenv(UPGRADE_CASE_ENV))
+                selection = runner.selected_cases(os.getenv(UPGRADE_CASE_ENV), same_commit=same_commit)
                 expected = len(selection)
                 entries, cleanup_errors = runner.exercise(
                     component.config, old_inputs, new_inputs, output, selection=selection,
