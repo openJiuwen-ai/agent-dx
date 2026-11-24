@@ -143,9 +143,7 @@ impl SlotChecksum {
     pub(crate) fn digest(self, bytes: &[u8]) -> Vec<u8> {
         match self {
             Self::Blake3 => blake3::hash(bytes).as_bytes().to_vec(),
-            Self::Crc32c => super::checksum::checksum(bytes)
-                .to_le_bytes()
-                .to_vec(),
+            Self::Crc32c => super::checksum::checksum(bytes).to_le_bytes().to_vec(),
         }
     }
 }
