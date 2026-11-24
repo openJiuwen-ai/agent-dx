@@ -252,6 +252,65 @@ class SingleTtlAttributionTests(unittest.TestCase):
                 c.write_configs()
 
 
+class ConcurrentShareKeyTests(unittest.TestCase):
+    """H2 step 2b keys. Product: sharing runs only with dfs_read_share_concurrent true and a non-zero
+    dfs_read_cache_bytes (assembly/dfs.rs read_sharing); dfs_holder_ttl_ms is used only while it runs."""
+
+    SHARE, HOLDER, CACHE = "dfs_read_share_concurrent", "dfs_holder_ttl_ms", "dfs_read_cache_bytes"
+    summary = SummaryAttributionTests.summary
+
+    def test_values_follow_the_product_limits(self):
+        for good in ({self.SHARE: True}, {self.SHARE: False}, {self.HOLDER: 50}, {self.HOLDER: 5000}):
+            with self.subTest(good=good):
+                benchlib.parameters(bench(variant="VS", node_overrides={"B": dict(good, **{self.CACHE: 64 * MIB})}))
+        for bad in ({self.SHARE: 1}, {self.SHARE: 0}, {self.SHARE: "true"}, {self.HOLDER: 49}, {self.HOLDER: 5001},
+                    {self.HOLDER: True}, {self.HOLDER: 250.0}):
+            with self.subTest(bad=bad):
+                blocked(self, variant="Vx", node_overrides={"B": dict(bad, **{self.CACHE: 64 * MIB})})
+
+    def test_booleans_render_as_toml_booleans(self):
+        toml = benchlib.node_overrides_toml({self.SHARE: True, self.HOLDER: 100, self.CACHE: 64 * MIB}, "/unused")
+        self.assertIn("dfs_read_share_concurrent = true", toml.splitlines())
+        self.assertIn("dfs_holder_ttl_ms = 100", toml.splitlines())
+
+    def test_share_without_the_read_cache_is_inert(self):
+        p = benchlib.parameters(bench(node_overrides={"*": {self.SHARE: True, self.HOLDER: 100}}))
+        self.assertEqual(p.variant, "V0")  # nothing takes effect, so the baseline label is allowed
+        self.assertEqual(p.inert_overrides("B"), [self.HOLDER, self.SHARE])
+
+    def test_holder_ttl_is_inert_unless_sharing_runs(self):
+        for share in ({}, {self.SHARE: False}):
+            with self.subTest(share=share):
+                p = benchlib.parameters(bench(variant="VR", node_overrides={
+                    "B": dict(share, **{self.CACHE: 64 * MIB, self.HOLDER: 100})}))
+                self.assertEqual(p.inert_overrides("B"), [self.HOLDER])
+        p = benchlib.parameters(bench(variant="VS", node_overrides={
+            "B": {self.CACHE: 64 * MIB, self.SHARE: True, self.HOLDER: 100}}))
+        self.assertEqual(p.inert_overrides("B"), [])
+
+    def test_wildcard_merge_and_summary(self):
+        row = self.summary("MABC", variant="VS", node_overrides={
+            "*": {self.SHARE: True, self.HOLDER: 100}, "B": {self.CACHE: 64 * MIB}, "C": {self.SHARE: False}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.SHARE: True, self.HOLDER: 100}})
+        self.assertTrue(row["variant_applied"])
+        row = self.summary("MABC", variant="Vx", node_overrides={"*": {self.SHARE: True, self.HOLDER: 100}})
+        self.assertEqual((row["node_overrides"], row["variant_applied"]), ({}, False))
+
+    def test_node_evidence_keeps_declared_inert_keys_and_checks_them(self):
+        declared = {self.SHARE: True, self.HOLDER: 100}
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, dict(declared, **{self.CACHE: 0}), node_overrides={"B": declared})
+            c.write_configs()
+            self.assertIn("dfs_read_share_concurrent = true", (Path(d) / "config-B.toml").read_text())
+            record = {e["check"]: e["value"] for e in c.evidence}["bench.node_overrides.B"]
+            self.assertEqual(record, {"declared": declared, "mismatches": [], "inert": [self.HOLDER, self.SHARE]})
+        with tempfile.TemporaryDirectory() as d:
+            # A binary without the 2b fields cannot prove them and is refused.
+            c = ClusterRenderingTests().cluster(d, {self.CACHE: 0}, node_overrides={"B": declared})
+            with self.assertRaises(AssertionError):
+                c.write_configs()
+
+
 class AbsentRoleTests(unittest.TestCase):
     @staticmethod
     def topology(roles, **extra):
