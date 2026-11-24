@@ -1,7 +1,7 @@
 # sandboxd protocol
 
 - Repository: https://github.com/inclusionAI/sandboxd
-- Pinned head: `03ea0a4db807c1d5dac4b11d02f2ec238083a8ae`
+- Pinned head: `8d8a9253689a798461568ce44cf04621d650d40b`
 - ADX builds this revision without downstream source patches. Rootfs defaults,
   bootstrap mounts and managed-file paths are adapted by the control plane to
   the published sandboxd protocol.

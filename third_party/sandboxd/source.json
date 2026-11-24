@@ -1,11 +1,11 @@
 {
   "repository": "https://github.com/inclusionAI/sandboxd.git",
-  "revision": "03ea0a4db807c1d5dac4b11d02f2ec238083a8ae",
+  "revision": "8d8a9253689a798461568ce44cf04621d650d40b",
   "files": [
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
+      "sha256": "68095599d99a2838183db67f2a33f1b36d31c6d49d4d21df7f56a33af06d3ec7"
     },
     {
       "source": "LICENSE",
