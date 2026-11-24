@@ -701,12 +701,16 @@ write-permission checks and mode semantics. An interrupted upload may leave part
 content and concurrent writers require application coordination.
 
 Each file download reads metadata and bytes from one opened descriptor. Full
-responses use chunked framing without a fixed Content-Length, so an in-place
-truncation can return fewer bytes with a valid ending chunk. A transfer interrupted
-before that chunk remains an error, allowing the SDK to retry or resume. Reads are
-bounded by the initial file size during concurrent appends. Range downloads retain their
-fixed-length resume contract and require a stable file; they do not provide a
-snapshot of a concurrently modified file. Downloads accept regular files only.
+responses use chunked framing without a fixed Content-Length. The server can
+emit a valid ending chunk after an in-place truncation. For a direct regular-file
+`files.copy_to_local()`, the SDK checks the received length against the size from
+the initial `file.stat`, even when the response uses chunked framing. A length
+mismatch raises `EnvironmentError` and preserves any existing destination.
+A transfer interrupted before the ending chunk remains eligible for Range
+resume. Copy and resume require the source length to stay stable from the
+metadata lookup through the transfer. Size checks cannot detect changes that
+preserve the file length. The stat size of a symbolic link describes the link
+itself, so a copy through a link uses the response's length information.
 
 For a direct ordinary-file copy, `ADX_DIRECT_DOWNLOAD_IDLE_TIMEOUT` defaults
 to 30 seconds of HTTP read inactivity. `ADX_DIRECT_DOWNLOAD_TIMEOUT` defaults

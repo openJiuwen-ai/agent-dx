@@ -88,6 +88,23 @@ def test_file_download_uses_independent_processing_and_read_timeouts(
     assert target.read_bytes() == b"finished"
 
 
+def _file_stat(size, *, entry_type="file"):
+    return httpx.Response(200, json={
+        "name": "out.bin",
+        "path": "/tmp/out.bin",
+        "type": entry_type,
+        "size": size,
+        "permissions": "",
+        "modified_time": 0,
+    })
+
+
+def _chunked_file(body, clock):
+    return httpx.Response(
+        200, headers={"Transfer-Encoding": "chunked"}, stream=TimedStream(clock, [(0, body)]),
+    )
+
+
 def test_copy_to_local_uses_file_budget_instead_of_the_upload_budget(client_for, clock, monkeypatch, tmp_path):
     monkeypatch.setenv("ADX_DIRECT_UPLOAD_TIMEOUT", "123")
     monkeypatch.setenv("ADX_DIRECT_DOWNLOAD_TIMEOUT", "40")
@@ -95,10 +112,7 @@ def test_copy_to_local_uses_file_budget_instead_of_the_upload_budget(client_for,
 
     def handler(request):
         if request.url.path.endswith("/invoke"):
-            return httpx.Response(200, json={
-                "name": "out.bin", "path": "/tmp/out.bin", "type": "file", "size": 8,
-                "permissions": "", "modified_time": 0,
-            })
+            return _file_stat(8)
         seen.append((request.headers["x-adx-processing-timeout-ms"], request.extensions["timeout"]["read"]))
         return httpx.Response(200, content=b"finished")
 
@@ -296,3 +310,75 @@ def test_full_empty_response_replaces_partial_file_when_range_is_ignored(client_
 
     assert target.read_bytes() == b""
     assert not part.exists()
+
+
+def test_copy_to_local_preserves_existing_file_after_clean_short_response(client_for, clock, tmp_path):
+    def handler(request):
+        if request.url.path.endswith("/invoke"):
+            return _file_stat(8)
+        return _chunked_file(b"abcd", clock)
+
+    target = tmp_path / "out.bin"
+    target.write_bytes(b"previous")
+
+    with pytest.raises(_transport.EnvironmentError) as error:
+        Filesystem(client_for(handler), "environment").copy_to_local("/tmp/out.bin", str(target))
+
+    assert error.value.code == "INVALID_DOWNLOAD_RESPONSE"
+    assert target.read_bytes() == b"previous"
+
+
+@pytest.mark.parametrize("body", [b"abcdefgh", b""], ids=["matching-size", "empty-file"])
+def test_copy_to_local_publishes_chunked_response_with_matching_size(client_for, clock, tmp_path, body):
+    def handler(request):
+        if request.url.path.endswith("/invoke"):
+            return _file_stat(len(body))
+        return _chunked_file(body, clock)
+
+    target = tmp_path / "out.bin"
+    Filesystem(client_for(handler), "environment").copy_to_local("/tmp/out.bin", str(target))
+
+    assert target.read_bytes() == body
+    assert not target.with_suffix(".bin.part").exists()
+
+
+def test_copy_to_local_rejects_resume_if_remote_total_differs_from_stat(client_for, tmp_path):
+    def handler(request):
+        if request.url.path.endswith("/invoke"):
+            return _file_stat(9)
+        assert request.headers["range"] == "bytes=4-"
+        return httpx.Response(206, headers={"Content-Range": "bytes 4-7/8"}, content=b"efgh")
+
+    target = tmp_path / "out.bin"
+    part = target.with_suffix(".bin.part")
+    part.write_bytes(b"abcd")
+
+    with pytest.raises(_transport.EnvironmentError) as error:
+        Filesystem(client_for(handler), "environment").copy_to_local("/tmp/out.bin", str(target))
+
+    assert error.value.code == "INVALID_DOWNLOAD_RESPONSE"
+    assert not target.exists()
+    assert part.read_bytes() == b"abcd"
+
+
+def test_chunked_symlink_copy_uses_target_bytes_instead_of_link_size(client_for, clock, tmp_path):
+    def handler(request):
+        if request.url.path.endswith("/invoke"):
+            return _file_stat(17, entry_type="symlink")
+        return _chunked_file(b"target-file", clock)
+
+    target = tmp_path / "out.bin"
+    Filesystem(client_for(handler), "environment").copy_to_local("/tmp/out.bin", str(target))
+
+    assert target.read_bytes() == b"target-file"
+
+
+def test_transport_download_without_expected_size_accepts_complete_chunked_response(client_for, clock, tmp_path):
+    def handler(_request):
+        return _chunked_file(b"abcd", clock)
+
+    target = tmp_path / "out.bin"
+    client_for(handler).download_file_direct("environment", "/tmp/out.bin", str(target))
+
+    assert target.read_bytes() == b"abcd"
+    assert not target.with_suffix(".bin.part").exists()

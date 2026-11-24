@@ -1444,10 +1444,13 @@ class EnvironmentClient:
         rpc_timeout: Optional[float] = None,
         *,
         download_type: str = "file",
+        expected_size: Optional[int] = None,
     ) -> None:
         """Download a file/tar over the required /direct binary data path."""
         if download_type == "file":
-            self._download_file_resumable(environment_id, remote_path, local_path, rpc_timeout)
+            self._download_file_resumable(
+                environment_id, remote_path, local_path, rpc_timeout, expected_size=expected_size,
+            )
             return
         url = f"{self._direct_base}/{self._safe_id(environment_id)}/download"
         try:
@@ -1465,7 +1468,11 @@ class EnvironmentClient:
         remote_path: str,
         local_path: str,
         rpc_timeout: Optional[float] = None,
+        *,
+        expected_size: Optional[int],
     ) -> None:
+        if expected_size is not None and (type(expected_size) is not int or expected_size < 0):
+            raise ValueError("expected file size must be a non-negative integer")
         total_timeout = rpc_timeout
         if total_timeout is None:
             total_timeout = float(os.environ.get("ADX_DIRECT_DOWNLOAD_TIMEOUT", "300"))
@@ -1483,7 +1490,7 @@ class EnvironmentClient:
         if parent:
             os.makedirs(parent, exist_ok=True)
         attempts = 0
-        total_size = None
+        total_size = expected_size
         while True:
             offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
             headers = {"Accept-Encoding": "identity"}
@@ -1495,7 +1502,13 @@ class EnvironmentClient:
                     params={"path": remote_path, "type": "file"},
                     headers=headers,
                 ) as resp:
-                    total_size = self._download_response_size(resp, offset, total_size)
+                    response_size = self._download_response_size(resp, offset, total_size)
+                    if expected_size is not None and response_size is not None and response_size != expected_size:
+                        raise EnvironmentError(
+                            f"file download expected {expected_size} bytes but response declares {response_size}",
+                            code="INVALID_DOWNLOAD_RESPONSE",
+                        )
+                    total_size = response_size if expected_size is None else expected_size
                     append = resp.status_code == 206
                     expected = None if total_size is None else total_size - (offset if append else 0)
                     self._write_stream_to_file(resp, part_path, append=append, expected=expected, deadline=deadline)
@@ -1562,14 +1575,16 @@ class EnvironmentClient:
                 if expected is not None and received > expected:
                     f.truncate(start)
                     raise EnvironmentError(
-                        "download response exceeded its declared length", code="INVALID_DOWNLOAD_RESPONSE",
+                        f"download response exceeded its expected length of {expected} bytes",
+                        code="INVALID_DOWNLOAD_RESPONSE",
                     )
                 if chunk:
                     f.write(chunk)
             if expected is not None and received != expected:
                 f.truncate(start)
                 raise EnvironmentError(
-                    "download response ended before its declared length", code="INVALID_DOWNLOAD_RESPONSE",
+                    f"download response ended at {received} bytes, expected {expected}",
+                    code="INVALID_DOWNLOAD_RESPONSE",
                 )
 
     def download_bytes_direct(
