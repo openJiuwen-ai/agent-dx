@@ -6,6 +6,8 @@ import io
 import json
 import logging
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -661,8 +663,8 @@ class AdxletPublisherFixture:
             if self.receipt is not None:
                 response = dict(status="released", **copy.deepcopy(self.receipt))
             elif self.marker is not None:
-                response = dict(status="active", **{key: copy.deepcopy(self.marker[key]) for key in
-                                ("owner", "origin_session", "current_session", "yielded")})
+                fields = ("owner", "origin_session", "current_session", "yielded")
+                response = dict(status="active", **{key: copy.deepcopy(self.marker[key]) for key in fields})
             else:
                 response = dict(status="absent", owner=copy.deepcopy(self.owner))
             self.events.append("http.query." + response["status"])
@@ -1468,9 +1470,27 @@ class ProcessApplyTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), rollout.canonical(dict(status="completed")) + "\n")
         self.assertEqual(errors.getvalue(), "")
         self.assertNotIn("handoff", apply.call_args.kwargs)
-        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
-            rollout.parser().parse_args(["apply-process", "--plan", "plan", "--journal", "journal",
+        selected_parser = rollout.parser()
+        with patch.object(rollout.argparse.ArgumentParser, "error", side_effect=ValueError) as error, \
+                self.assertRaises(ValueError):
+            selected_parser.parse_args(["apply-process", "--plan", "plan", "--journal", "journal",
                                         "--batch-index", "0", "--handoff-config", "/removed"])
+
+        error.assert_called_once()
+
+    def test_invalid_cli_arguments_exit_before_opening_plan(self):
+        for command in ("apply-process", "apply-pod"):
+            base = [command, "--plan", "/missing-plan", "--journal", "/missing-journal"]
+            choices = ([], ["--prune"], ["--promote-ready", "--batch-index", "0"],
+                       ["--batch-index", "0", "--handoff-config", "/removed"])
+            for flags in choices:
+                with self.subTest(command=command, flags=flags):
+                    result = subprocess.run([sys.executable, str(SPEC.origin), *base, *flags],
+                                            capture_output=True, text=True, check=False, timeout=10)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("error:", result.stderr)
+                    self.assertNotIn("PlanRefused", result.stderr)
+                    self.assertEqual(result.stdout, "")
 
     def test_cli_output_ignores_global_logging_disable(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))

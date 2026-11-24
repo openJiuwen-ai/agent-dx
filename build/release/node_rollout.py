@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import http.client
+from collections import namedtuple
 from functools import partial
 from itertools import chain
 import json
@@ -19,6 +20,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 LIMIT = 8 * 1024 * 1024
 TIMEOUT = 15
+PodClients = namedtuple("PodClients", ("kube", "get", "post", "mutate"))
 CAPABILITIES = ("planned_migration", "paused_transfer", "quiesce",
                 "session_isolation", "recovery_compatibility", "runtime_rootfs_identity")
 
@@ -265,8 +267,8 @@ def plan_pod(args, kube, get, local):
     require(type(args.batch_size) is int and args.batch_size > 0, "batch size must be positive")
     require(text(args.task_id) and "/" not in args.task_id and "%" not in args.task_id
             and len(args.task_id.encode("utf-8")) <= 128, "invalid task ID")
-    require(all(text(v) and not v.startswith("-") for v in
-                (args.namespace, workload_name, args.container, args.task_id)), "invalid identity")
+    fields = (args.namespace, workload_name, args.container, args.task_id)
+    require(all(text(v) and not v.startswith("-") for v in fields), "invalid identity")
     require(type(args.epoch) is int and 0 < args.epoch <= 2**64 - 1, "epoch must be positive u64")
     require(re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", args.target_image),
             "target image must be fixed by SHA-256 digest")
@@ -295,8 +297,7 @@ def plan_pod(args, kube, get, local):
         workload["target_template_hash"] = template_hash(template)
         owned = []
         for pod in pod_inventory(args.namespace, kube):
-            owners = [entry for entry in pod["metadata"].get("ownerReferences", [])
-                      if entry.get("controller") is True]
+            owners = [entry for entry in pod["metadata"].get("ownerReferences", []) if entry.get("controller") is True]
             if not any(entry.get("uid") == workload["uid"] for entry in owners):
                 continue
             require(workload_owns(workload, pod), "invalid controller owner")
@@ -365,8 +366,8 @@ def plan_pod(args, kube, get, local):
     require((workload, pods) == inventory(), "Kubernetes objects changed during planning")
     for node, view in views.items():
         current = inspect(node, view["observed_pod_uid"])
-        require(all(current.get(k) == view.get(k) for k in
-                    ("node_session_id", "runtime_rootfs_sha256", "runtime_rootfs_path", "observed_pod_uid")),
+        fields = ("node_session_id", "runtime_rootfs_sha256", "runtime_rootfs_path", "observed_pod_uid")
+        require(all(current.get(k) == view.get(k) for k in fields),
                 "node session or runtime changed during planning")
     bindings = []
     for pod in pods:
@@ -499,8 +500,9 @@ def process_component(response, role, node, pod_uid, eligible=True, complete=Tru
             "runtime Pod UID or boot nonce differs from node-info")
     pid = runtime["pid"]
     require(isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid <= 2**32 - 1, "invalid runtime PID")
-    require(all(text(runtime[key]) and len(runtime[key].encode("utf-8")) <= 128 for key in
-                ("pod_uid", "node_session", "relay_session")), "missing runtime identity/session")
+    fields = ("pod_uid", "node_session", "relay_session")
+    require(all(text(runtime[key]) and len(runtime[key].encode("utf-8")) <= 128 for key in fields),
+            "missing runtime identity/session")
     digest = runtime["executable_sha256"]
     require(isinstance(runtime["configuration_sha256"], str)
             and re.fullmatch(r"[0-9a-f]{64}", runtime["configuration_sha256"]), "invalid configuration SHA-256")
@@ -584,8 +586,8 @@ def declaration_candidate(value, raw_text=None):
             remote_archive(dict(url=artifact["url"], archive_sha256=artifact["sha256"]))
             component_config(component["config"])
         if value["mode"] == "embedded":
-            require(all(group["adxlet"][key] == group["relay"][key]
-                        for key in ("version", "release_id", "artifact")), "embedded requires same package")
+            require(all(group["adxlet"][key] == group["relay"][key] for key in ("version", "release_id", "artifact")),
+                    "embedded requires same package")
     normalized = dict(value, upgrade_components=roles)
     require(len(canonical(normalized).encode("utf-8")) <= 64 * 1024, "desired declaration exceeds 64 KiB")
     return normalized
@@ -654,9 +656,10 @@ def plan_process(args, kube, local):
     require((candidate_path is None) == (args.configmap is None), "candidate and ConfigMap must be paired")
     require(candidate_path is not None or args.declaration_key == "target.yaml", "key requires candidate")
     if candidate_path is not None:
-        require(all(getattr(args, field) is None for field in (
+        fields = (
             "role", "commit", "sha256", "archive_url", "archive_sha256",
-            "component_config_path", "component_config_sha256")), "candidate conflicts with manual target")
+            "component_config_path", "component_config_sha256")
+        require(all(getattr(args, field) is None for field in fields), "candidate conflicts with manual target")
         candidate_text = read_json_file(candidate_path, raw=True)
         desired = declaration_candidate(decode(candidate_text.encode("utf-8")), candidate_text)
         require(desired["mode"] == "standalone" and len(desired.get("upgrade_components", [])) == 1,
@@ -671,8 +674,8 @@ def plan_process(args, kube, local):
             "component configuration flags must be paired")
     configuration = None if args.component_config_path is None else component_config(
         dict(mount_path=args.component_config_path, sha256=args.component_config_sha256))
-    require(all(text(value) and not value.startswith("-") for value in
-                (args.context, args.namespace, args.container)), "invalid Kubernetes selection")
+    require(all(text(value) and not value.startswith("-") for value in (args.context, args.namespace, args.container)),
+            "invalid Kubernetes selection")
     require(text(args.config) and PurePosixPath(args.config).is_absolute(),
             "config must be an absolute container path")
     require(PurePosixPath(args.config).suffix in (".yaml", ".yml"), "config must use .yaml or .yml")
@@ -839,8 +842,8 @@ def validate_process_plan(plan):
         target = desired["components"][plan["role"]]
         require(plan["commit"] == target["version"], "candidate version differs")
     require(plan["role"] in ("adxlet", "relay"), "invalid role")
-    require(all(text(plan[key]) and not plan[key].startswith("-") for key in
-                ("context", "namespace", "container")), "invalid Kubernetes selection")
+    require(all(text(plan[key]) and not plan[key].startswith("-") for key in ("context", "namespace", "container")),
+            "invalid Kubernetes selection")
     config = plan["config"]
     require(text(config) and PurePosixPath(config).is_absolute(), "config must be absolute")
     require(PurePosixPath(config).suffix in (".yaml", ".yml"), "config must be YAML")
@@ -878,8 +881,9 @@ def validate_process_plan(plan):
         require(text(node_id) and len(node_id.encode("utf-8")) <= 128, "invalid node ID")
         require(evidence["namespace"] == plan["namespace"] and evidence["container"] == plan["container"],
                 "Kubernetes selection differs from plan")
-        require(all(text(evidence[key]) for key in ("name", "uid", "kubernetes_node_name", "container_id",
-                                                  "resource_version", "rechecked_resource_version")),
+        fields = ("name", "uid", "kubernetes_node_name", "container_id",
+                  "resource_version", "rechecked_resource_version")
+        require(all(text(evidence[key]) for key in fields),
                 "missing evidence")
         require(not evidence["name"].startswith("-"), "invalid Pod name")
         restarts = evidence["restart_count"]
@@ -1121,8 +1125,9 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
             return None
         require(type(execution.get("old_pid")) is int and execution["old_pid"] == expected["pid"],
                 "exited old PID differs")
-        require(all(text(execution.get(key)) and len(execution[key].encode("utf-8")) <= 128
-                    for key in ("attempt", "node_session")), "exited identity unavailable")
+        fields = ("attempt", "node_session")
+        require(all(text(execution.get(key)) and len(execution[key].encode("utf-8")) <= 128 for key in fields),
+                "exited identity unavailable")
         require(execution["node_session"] != expected["node_session"], "new session equals old")
         require(type(execution.get("deadline_unix_ms")) is int and execution["deadline_unix_ms"] > 0,
                 "local execution deadline unavailable")
@@ -1184,9 +1189,12 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
         if not isinstance(execution, dict) or execution.get("rollback_from") is None:
             return False
         require(execution["rollback_from"] == state["rollback_from"], "rollback B names a different A")
-        require(all(text(execution.get(key)) and len(execution[key].encode("utf-8")) <= 128
-                    and execution[key] != state["rollback_from"][key] for key in ("attempt", "node_session")),
-                "rollback B identity unavailable or reuses A")
+        fields = ("attempt", "node_session")
+        for key in fields:
+            require(text(execution.get(key))
+                        and len(execution[key].encode("utf-8")) <= 128
+                        and execution[key] != state["rollback_from"][key],
+                    "rollback B identity unavailable or reuses A")
         require(execution["node_session"] != expected["node_session"], "rollback B reuses origin session")
         require(execution.get("stage") in ("rollback_ready", "original_start_intent", "original_start_unknown",
                                            "original_commit_unknown", "original_selected"),
@@ -1625,8 +1633,7 @@ def completed_scope(plan, node, state, kube, local):
                 "process container or parent changed")
     else:
         namespace = plan["begin"]["namespace"]
-        matches = [pod for pod in pod_inventory(namespace, kube)
-                   if pod["metadata"]["uid"] == state["replacement_uid"]]
+        matches = [pod for pod in pod_inventory(namespace, kube) if pod["metadata"]["uid"] == state["replacement_uid"]]
         require(len(matches) == 1, "replacement UID changed")
         pod = matches[0]
         response = local(pod["metadata"]["name"])
@@ -1667,8 +1674,8 @@ def promote_ready(plan, journal, save, kube, local, mutate, sleep, cli=None, pos
             "promotion ownership unknown or superseded")
     require(not confirmed or intent is not None, "promoted marker without durable intent")
     if plan["mode"] == "process":
-        require(all(journal["nodes"].get(node["node_id"], {}).get("stage") == "completed"
-                    for node in plan["nodes"]), "all process batches must complete before promotion")
+        require(all(journal["nodes"].get(node["node_id"], {}).get("stage") == "completed" for node in plan["nodes"]),
+                "all process batches must complete before promotion")
         nodes = plan["nodes"]
     else:
         require(journal["stage"] == "completed", "all Pod batches must complete before promotion")
@@ -1931,8 +1938,8 @@ def pod_task(plan, get, cleanup=False):
     begin = plan["begin"]
     task = get(f"/v1/node-upgrades/tasks/{quote(begin['task_id'], safe='')}")
     require(task.get("protocol_version") == 3 and task.get("kind") == "pod", "incompatible Pod task")
-    require(all(task.get(k) == begin[k] for k in
-                ("task_id", "epoch", "namespace", "daemonset_uid", "target_image")), "task owner differs")
+    require(all(task.get(k) == begin[k] for k in ("task_id", "epoch", "namespace", "daemonset_uid", "target_image")),
+            "task owner differs")
     require(set(task["nodes"]) == {n["node_id"] for n in begin["nodes"]}, "task node set differs")
     for binding in begin["nodes"]:
         node = task["nodes"][binding["node_id"]]
@@ -1963,9 +1970,9 @@ def pod_instances(node_id, get):
             require(text(key) and key not in records and item["node_id"] == node_id, "invalid inventory binding")
             require(all(type(item[k]) is int and 0 <= item[k] <= 2**64 - 1 for k in ("generation", "revision")),
                     "invalid Environment revision")
+            fields = ("invalidated", "restart_pending", "resume_pending", "recovery_pending")
             require(item["status"] in ("running", "paused") and isinstance(item.get("resources_held"), bool)
-                    and all(item.get(k) is False for k in
-                            ("invalidated", "restart_pending", "resume_pending", "recovery_pending")),
+                    and all(item.get(k) is False for k in fields),
                     "Environment not ready for planned migration")
             records[key] = item
         if len(records) == stamp[2]:
@@ -2001,20 +2008,21 @@ def pod_inspection(plan, pod, uid, session, get, phase=None, permit=None, revisi
             and view.get("observed_pod_uid") == uid and view.get("node_session_id") == session
             and view.get("unknown") is False, "live Pod identity/session unknown or changed")
     if phase is not None:
+        fields = ("controllers", "holds", "backends", "authority_tasks")
         require(view.get("task_id") == plan["begin"]["task_id"] and view.get("epoch") == plan["begin"]["epoch"]
                 and view.get("phase") == phase
                 and (phase == "isolated" or view.get("strict_empty") is True)
-                and all(type(view.get(k)) is int and view[k] == 0 for k in
-                        ("controllers", "holds", "backends", "authority_tasks")), "strict empty proof unavailable")
+                and all(type(view.get(k)) is int and view[k] == 0 for k in fields), "strict empty proof unavailable")
         if permit is not None:
             require(view.get("permit_id") == permit and view.get("revision") == revision,
                     "permit evidence differs")
     return view
 
 
-def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, cleanup=False, cleanup_node=None,
+def advance_pod(plan, journal, save, batch_index, clients, cleanup=False, cleanup_node=None,
                 local=None, sleep=time.sleep):
     """Advance with durable intent recorded before each external mutation."""
+    kube, get, post, mutate = clients
     begin, workload = plan["begin"], plan["workload"]
     kind = workload_kind(workload)
     resource = workload_resource(workload)
@@ -2157,10 +2165,12 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                 body = state[intent_key]["body"]
                 operation = task["operations"].get(body["operation_id"])
                 if operation is not None:
-                    require(all(operation.get(k) == v for k, v in {
+                    expected_operation = {
                         "environment_id": body["environment_id"], "source_node_id": node_id,
                         "source_session_id": original_session, "source_generation": body["expected_source_generation"],
-                        "source_revision": body["expected_source_revision"]}.items()), "migration operation differs")
+                        "source_revision": body["expected_source_revision"]}
+                    require(all(operation.get(k) == v for k, v in expected_operation.items()),
+                            "migration operation differs")
                     require(operation["phase"] in ("Prepared", "Assigned", "Completed"), "migration not successful")
                     if operation["phase"] == "Completed":
                         state.pop(intent_key)
@@ -2345,8 +2355,8 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
                 pod_inspection(plan, pod, binding["pod_uid"], binding["node_session_id"], get,
                                "Quiescing", state["permit_id"], state["control_revision"])
             response = action("verify-node", dict(permit_id=state["permit_id"]))
-            require(all(response[k] == begin[k] for k in
-                        ("task_id", "epoch", "namespace", "daemonset_uid", "target_image"))
+            fields = ("task_id", "epoch", "namespace", "daemonset_uid", "target_image")
+            require(all(response[k] == begin[k] for k in fields)
                     and response["protocol_version"] == 3 and response["kind"] == "pod"
                     and response["phase"] == ("Aborting" if cleanup else "Active"), "verify task receipt differs")
             verified = response["nodes"][node_id]
@@ -2374,8 +2384,11 @@ def cleanup_inventory(plan, task, get, kube, local):
     inventory = pod_inventory(plan["begin"]["namespace"], kube)
     workload, begin = plan["workload"], plan["begin"]
     kind = workload_kind(workload)
-    owned = [p for p in inventory if any(entry.get("controller") is True and entry.get("uid") == workload["uid"]
-                                       for entry in p["metadata"].get("ownerReferences", []))]
+    owned = []
+    for item in inventory:
+        owners = item["metadata"].get("ownerReferences", [])
+        if any(entry.get("controller") is True and entry.get("uid") == workload["uid"] for entry in owners):
+            owned.append(item)
     require(len(owned) == len(plan["pods"]), "extra or missing owned Pods; cleanup inventory unknown")
     result = {}
     for pod in plan["pods"]:
@@ -2471,8 +2484,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
                     current_images={key: value["image"] for key, value in current.items()})
     if not cleanup.get("frozen"):
         response = action("abort", dict(stage="freeze"))
-        require(all(response[k] == begin[k] for k in
-                    ("task_id", "epoch", "namespace", "daemonset_uid", "target_image"))
+        require(all(response[k] == begin[k] for k in ("task_id", "epoch", "namespace", "daemonset_uid", "target_image"))
                 and response["phase"] == "Aborting" and response["protocol_version"] == 3
                 and response["kind"] == "pod" and set(response["nodes"]) == set(task["nodes"])
                 and isinstance(response["operations"], dict), "freeze success receipt differs")
@@ -2611,7 +2623,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
             require(body.get("node_id") == selected_node and path.rsplit("/", 1)[-1] in ("quiesce", "verify-node"),
                     "abort cleanup cannot start source work")
             return post(path, body)
-        advance_pod(plan, journal, save, batch, kube, get, replacement_post, mutate,
+        advance_pod(plan, journal, save, batch, PodClients(kube, get, replacement_post, mutate),
                     cleanup=True, cleanup_node=node_id, local=local)
         return None
 
@@ -2654,8 +2666,9 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
     return None
 
 
-def apply_pod(plan, journal_path, batch_index, kube, get, post, mutate, sleep=time.sleep, mode="apply", local=None,
+def apply_pod(plan, journal_path, batch_index, clients, sleep=time.sleep, mode="apply", local=None,
               promote=False):
+    kube, get, post, mutate = clients
     require(sys.platform == "linux", "apply-pod requires a Linux publisher")
     import fcntl
 
@@ -2710,7 +2723,7 @@ def apply_pod(plan, journal_path, batch_index, kube, get, post, mutate, sleep=ti
                         return outcome
                     sleep(2)
                     continue
-                if advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, local=local, sleep=sleep):
+                if advance_pod(plan, journal, save, batch_index, clients, local=local, sleep=sleep):
                     return dict(status="completed", batch_index=batch_index)
                 sleep(2)
             return dict(status="pending", batch_index=batch_index, detail="publisher observation budget expired")
@@ -2801,9 +2814,9 @@ def main(argv=None):
                 observation = ["--declaration-path", declaration_path] if declaration_path is not None else []
                 return pod_cli(pod, ["node-info", *observation])
 
-            outcome = apply_pod(snapshot, args.journal, getattr(args, "batch_index", 0), pod_kube,
+            outcome = apply_pod(snapshot, args.journal, getattr(args, "batch_index", 0), PodClients(pod_kube,
                                 lambda path: http_json(snapshot["origin"], path),
-                                lambda path, body: http_json(snapshot["origin"], path, body), pod_mutate,
+                                lambda path, body: http_json(snapshot["origin"], path, body), pod_mutate),
                                 mode={"apply-pod": "apply", "stop-pod": "stop", "abort-pod": "abort"}[args.command],
                                 local=pod_local, promote=getattr(args, "promote_ready", False))
             emit_cli(canonical(outcome))

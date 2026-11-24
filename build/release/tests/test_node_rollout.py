@@ -28,8 +28,13 @@ class PlanTests(unittest.TestCase):
             self.assertTrue(rollout.parser().parse_args([*base, "--promote-ready"]).promote_ready)
             self.assertEqual(rollout.parser().parse_args([*base, "--batch-index", "0"]).batch_index, 0)
             for choices in ([], ["--prune"], ["--promote-ready", "--batch-index", "0"]):
-                with self.subTest(command=command, choices=choices), self.assertRaises(SystemExit):
-                    rollout.parser().parse_args([*base, *choices])
+                selected_parser = rollout.parser()
+                with self.subTest(command=command, choices=choices), \
+                        patch.object(rollout.argparse.ArgumentParser, "error", side_effect=ValueError) as error, \
+                        self.assertRaises(ValueError):
+                    selected_parser.parse_args([*base, *choices])
+
+                error.assert_called_once()
 
     def setUp(self):
         self.ds = {
@@ -55,8 +60,7 @@ class PlanTests(unittest.TestCase):
         self.pods["items"][0]["status"] = {"containerStatuses": [{
             "name": "adxlet", "containerID": "container-original", "restartCount": 0,
             "imageID": "opaque-runtime-content-id", "state": {"running": {"startedAt": "now"}}}]}
-        self.cap = dict(version=2, node_protocol_version=3, **{
-            key: True for key in rollout.CAPABILITIES})
+        self.cap = dict(version=2, node_protocol_version=3, **{ key: True for key in rollout.CAPABILITIES})
         self.inspect = {"node_id": "adx-node", "node_session_id": "session-1",
                         "observed_pod_uid": "pod-uid",
                         "protocol_version": 3, "unknown": False,
@@ -158,8 +162,12 @@ class PlanTests(unittest.TestCase):
         sts = rollout.parser().parse_args([*base, "--statefulset", "workers"])
         self.assertEqual((sts.statefulset, sts.daemonset), ("workers", None))
         for choices in ([], ["--daemonset", "a", "--statefulset", "b"]):
-            with self.assertRaises(SystemExit):
-                rollout.parser().parse_args([*base, *choices])
+            selected_parser = rollout.parser()
+            with patch.object(rollout.argparse.ArgumentParser, "error", side_effect=ValueError) as error, \
+                    self.assertRaises(ValueError):
+                selected_parser.parse_args([*base, *choices])
+
+            error.assert_called_once()
 
     def test_statefulset_plan_does_not_select_update_strategy(self):
         self.sts()
@@ -268,8 +276,7 @@ class PlanTests(unittest.TestCase):
             self.assertTrue(saved)
             staged = copy.deepcopy(cm)
             for change in body:
-                parts = [part.replace("~1", "/").replace("~0", "~")
-                         for part in change["path"].strip("/").split("/")]
+                parts = [part.replace("~1", "/").replace("~0", "~") for part in change["path"].strip("/").split("/")]
                 parent = staged
                 for part in parts[:-1]:
                     parent = parent[part]
@@ -625,8 +632,8 @@ class PlanTests(unittest.TestCase):
         manager = MagicMock()
         manager.__enter__.return_value = process
         arguments = ["--context", "test-cluster", "get", "--raw", "/api/v1/namespaces/ns/pods"]
-        with patch.object(rollout.shutil, "which", return_value="kubectl"),\
-                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen,\
+        with patch.object(rollout.shutil, "which", return_value="kubectl"), \
+                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen, \
                 patch.object(rollout.threading, "Timer"):
             self.assertEqual(rollout.kubectl_get(arguments)["kind"], "PodList")
         self.assertEqual(popen.call_args.args[0][1:], ["--request-timeout=10s", *arguments])
@@ -827,8 +834,7 @@ class ApplyTests(PlanTests):
             self.assertEqual(changes[1]["path"], "/metadata/resourceVersion")
             staged = copy.deepcopy(target)
             for change in changes:
-                parts = [p.replace("~1", "/").replace("~0", "~")
-                         for p in change["path"].strip("/").split("/")]
+                parts = [p.replace("~1", "/").replace("~0", "~") for p in change["path"].strip("/").split("/")]
                 value = staged
                 for part in parts[:-1]:
                     value = value[int(part)] if isinstance(value, list) else value[part]
@@ -856,8 +862,8 @@ class ApplyTests(PlanTests):
     def drive(self, path):
         for _ in range(60):
             with patch.object(rollout.sys, "platform", "linux"):
-                result = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                           self.post, self.mutate, sleep=lambda _: None, local=self.local)
+                result = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                           self.post, self.mutate), sleep=lambda _: None, local=self.local)
             if result["status"] == "completed":
                 return rollout.read_json_file(path)
         return self.fail("normal path did not finish")
@@ -887,8 +893,8 @@ class ApplyTests(PlanTests):
             path = Path(directory) / "rollout.json"
             for _ in range(2):
                 with patch.object(rollout.sys, "platform", "linux"):
-                    result = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                               no_target, self.mutate, sleep=lambda _: None, local=self.local)
+                    result = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                               no_target, self.mutate), sleep=lambda _: None, local=self.local)
                 self.assertEqual(result["status"], "pending")
                 self.assertIn("capacity unavailable", result["detail"])
                 self.assertEqual(rollout.read_json_file(path)["nodes"]["adx-node"]["stage"], "evacuate")
@@ -957,8 +963,8 @@ class ApplyTests(PlanTests):
 
             def apply():
                 with patch.object(rollout.sys, "platform", "linux"):
-                    return rollout.apply_pod(self.snapshot, path, 0, self.kube, get_live, post,
-                                             self.mutate, sleep=lambda _: None, local=self.local)
+                    return rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, get_live, post,
+                                             self.mutate), sleep=lambda _: None, local=self.local)
 
             self.assertEqual(apply()["status"], "pending")
             instances[paused] = instance(paused, "paused")
@@ -998,7 +1004,7 @@ class ApplyTests(PlanTests):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(rollout.sys, "platform", "linux"):
                 result = rollout.apply_pod(self.snapshot, Path(directory) / "rollout.json", 0,
-                                           self.kube, self.get_live, self.post, self.mutate,
+                                           rollout.PodClients(self.kube, self.get_live, self.post, self.mutate),
                                            sleep=lambda _: None, local=self.local)
             self.assertEqual(result["status"], "pending")
         self.assertFalse(any(isinstance(p, list) and "delete" in p for p, _ in self.writes))
@@ -1078,11 +1084,11 @@ class ApplyTests(PlanTests):
                 result["node"].update(scheduling_paused=True, accepting_allocations=False)
             return result
 
-        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"),\
+        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"), \
                 patch.object(self, "post", post), patch.object(self, "get_live", get):
             path = Path(directory) / "journal.json"
-            outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, get, post,
-                                        self.mutate, sleep=lambda _: None, local=self.local)
+            outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, get, post,
+                                        self.mutate), sleep=lambda _: None, local=self.local)
             self.assertEqual(outcome["status"], "pending")
             journal = rollout.read_json_file(path)
             self.assertEqual(journal["nodes"]["adx-node"]["stage"], "verify")
@@ -1126,7 +1132,7 @@ class ApplyTests(PlanTests):
                         return read(path)
                     get = partial(get, progress=fault)
 
-                    with patch.object(self, "post", post), patch.object(self, "get_live", get),\
+                    with patch.object(self, "post", post), patch.object(self, "get_live", get), \
                             tempfile.TemporaryDirectory() as directory:
                         journal = self.drive(Path(directory) / "journal.json")
                     self.assertTrue(fault["replayed"])
@@ -1172,10 +1178,10 @@ class ApplyTests(PlanTests):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
             path = Path(directory) / "journal.json"
-            rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                              self.post, mutate, sleep=lambda _: None, local=self.local)
-            outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                        self.post, mutate, sleep=lambda _: None, local=self.local)
+            rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                              self.post, mutate), sleep=lambda _: None, local=self.local)
+            outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                        self.post, mutate), sleep=lambda _: None, local=self.local)
             self.assertEqual(outcome["status"], "pending")
             self.assertIn("terminating", outcome["detail"])
             self.assertNotIn("revoke", outcome["detail"])
@@ -1186,8 +1192,8 @@ class ApplyTests(PlanTests):
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
             path = Path(directory) / "journal.json"
             for _ in range(2):
-                outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                            self.post, self.mutate, sleep=lambda _: None, local=self.local)
+                outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                            self.post, self.mutate), sleep=lambda _: None, local=self.local)
                 self.assertEqual(outcome["status"], "pending")
             self.assertEqual(rollout.read_json_file(path)["nodes"]["adx-node"]["delete_rv"], "20")
         deletes = [body["preconditions"] for args, body in self.writes
@@ -1219,8 +1225,8 @@ class ApplyTests(PlanTests):
                 try:
                     path = Path(directory) / "journal.json"
                     with patch.object(rollout.sys, "platform", "linux"):
-                        pending = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                                    self.post, self.mutate, sleep=lambda _: None, local=self.local)
+                        pending = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                                    self.post, self.mutate), sleep=lambda _: None, local=self.local)
                     self.assertEqual(pending["status"], "pending")
                     self.retain_original = self.change_rv = False
                     self.action_losses.add("revoke-delete")
@@ -1252,12 +1258,12 @@ class ApplyTests(PlanTests):
             path = Path(directory) / "journal.json"
             rollout.write_journal(path, dict(schema_version=1, plan_hash=rollout.template_hash(self.snapshot),
                                             stage="template", nodes={}))
-            outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                        self.post, self.mutate, sleep=lambda _: None, mode="stop", local=self.local)
+            outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                        self.post, self.mutate), sleep=lambda _: None, mode="stop", local=self.local)
             self.assertEqual(outcome["status"], "stopped")
             with self.assertRaises(rollout.Refusal):
-                rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                  self.post, self.mutate, local=self.local)
+                rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                  self.post, self.mutate), local=self.local)
 
     def test_abort_untouched_original_finalizes_without_migration(self):
         self.post("/v1/node-upgrades/tasks", self.snapshot["begin"])
@@ -1266,7 +1272,7 @@ class ApplyTests(PlanTests):
             rollout.write_journal(path, dict(schema_version=1, plan_hash=rollout.template_hash(self.snapshot),
                                             stage="template", nodes={}))
             outcome = rollout.apply_pod(self.snapshot, path, 0,
-                                        self.kube, self.get_live, self.post, self.mutate,
+                                        rollout.PodClients(self.kube, self.get_live, self.post, self.mutate),
                                         sleep=lambda _: None, mode="abort", local=self.local)
         self.assertEqual(outcome["task_phase"], "Aborted")
         self.assertEqual(outcome["nodes"]["adx-node"]["outcome"], "original")
@@ -1296,8 +1302,8 @@ class ApplyTests(PlanTests):
         outcome = None
         for _ in range(12):
             with patch.object(rollout.sys, "platform", "linux"):
-                outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                            self.post, self.mutate, sleep=lambda _: None, mode=mode, local=self.local)
+                outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                            self.post, self.mutate), sleep=lambda _: None, mode=mode, local=self.local)
             if outcome["status"] != "pending":
                 return outcome
         return self.fail("cleanup did not converge: " + str(outcome))
@@ -1330,16 +1336,18 @@ class ApplyTests(PlanTests):
                 self.action_losses.add(loss)
                 if loss == "revoke-delete":
                     with patch.object(rollout.sys, "platform", "linux"):
-                        pending = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                                    self.post, self.mutate, sleep=lambda _: None,
+                        pending = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                                    self.post, self.mutate), sleep=lambda _: None,
                                                     mode="abort", local=self.local)
                     self.assertEqual(pending["status"], "pending")
                     self.assertIsNone(self.task["nodes"]["adx-node"]["delete_resource_version"])
                     self.pods["items"][0]["metadata"]["resourceVersion"] = "30"
                 outcome = self.cleanup_drive(path)
                 self.assertEqual(outcome["task_phase"], "Aborted")
-                attempts = [b for p, b in self.writes if isinstance(p, str)
-                            and b.get("stage", p.rsplit("/", 1)[-1]) == loss]
+                attempts = []
+                for request_path, body in self.writes:
+                    if isinstance(request_path, str) and body.get("stage", request_path.rsplit("/", 1)[-1]) == loss:
+                        attempts.append(body)
                 if loss != "finalize":
                     self.assertGreaterEqual(len(attempts), 2)
                     self.assertEqual(attempts[0], attempts[1])
@@ -1363,8 +1371,8 @@ class ApplyTests(PlanTests):
             path = Path(directory) / "journal.json"
             self.cleanup_seed(path)
             self.action_losses.add("freeze")
-            outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                        self.post, self.mutate, sleep=lambda _: None, mode="stop", local=self.local)
+            outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                        self.post, self.mutate), sleep=lambda _: None, mode="stop", local=self.local)
             self.assertEqual(outcome["status"], "pending")
             self.assertEqual(self.task["phase"], "Aborting")
             self.assertFalse(rollout.read_json_file(path)["cleanup"].get("frozen", False))
@@ -1395,8 +1403,8 @@ class ApplyTests(PlanTests):
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
             path = Path(directory) / "journal.json"
             self.cleanup_seed(path, delete=True)
-            outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                        self.post, mutate, sleep=lambda _: None, mode="abort", local=self.local)
+            outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                        self.post, mutate), sleep=lambda _: None, mode="abort", local=self.local)
             self.assertEqual(outcome["status"], "pending")
             self.assertIn("terminating", outcome["detail"])
             self.assertFalse(any(isinstance(p, str) and p.endswith("/revoke-delete") for p, _ in self.writes))
@@ -1461,7 +1469,7 @@ class ApplyTests(PlanTests):
 
     def test_unsettled_foreign_template_and_extra_owned_refuse_finalize(self):
         for fault in ("operation", "template", "extra", "same-name-new-uid"):
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory,\
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory, \
                     patch.object(rollout.sys, "platform", "linux"):
                 self.setUp()
                 path = Path(directory) / "journal.json"
@@ -1476,8 +1484,8 @@ class ApplyTests(PlanTests):
                     self.pods["items"].append(extra)
                 else:
                     self.pods["items"][0]["metadata"]["uid"] = "imposter"
-                outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                            self.post, self.mutate, sleep=lambda _: None,
+                outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                            self.post, self.mutate), sleep=lambda _: None,
                                             mode="abort", local=self.local)
                 self.assertEqual(outcome["status"], "pending")
                 self.assertFalse(any(b.get("stage") == "finalize" for p, b in self.writes if isinstance(p, str)))
@@ -1506,8 +1514,8 @@ class ApplyTests(PlanTests):
                 self.assertEqual(len(self.writes), before)
                 self.pods["items"][0]["metadata"]["uid"] = "unknown-now"
                 with patch.object(rollout.sys, "platform", "linux"):
-                    outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
-                                                self.post, self.mutate, sleep=lambda _: None,
+                    outcome = rollout.apply_pod(self.snapshot, path, 0, rollout.PodClients(self.kube, self.get_live,
+                                                self.post, self.mutate), sleep=lambda _: None,
                                                 mode="abort", local=self.local)
                 self.assertEqual(outcome["status"], "pending")
 
@@ -1570,8 +1578,9 @@ class ApplyTests(PlanTests):
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
             path = Path(directory) / "rollout.json"
             for _ in range(40):
-                result = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live, self.post,
-                                           self.mutate, sleep=lambda _: None, local=self.local)
+                result = rollout.apply_pod(self.snapshot, path, 0,
+                                           rollout.PodClients(self.kube, self.get_live, self.post,
+                                           self.mutate), sleep=lambda _: None, local=self.local)
             self.assertEqual(result["status"], "pending")
             self.assertTrue(self.deleted)
             self.assertNotIn("replacement_uid", rollout.read_json_file(path)["nodes"]["adx-node"])
@@ -1615,7 +1624,7 @@ class ApplyTests(PlanTests):
 
                 with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
                     outcome = rollout.apply_pod(self.snapshot, Path(directory) / "journal.json", 0,
-                                                self.kube, read, self.post, write,
+                                                rollout.PodClients(self.kube, read, self.post, write),
                                                 sleep=lambda _: None, local=self.local)
                 self.assertEqual(outcome["status"], "pending")
                 self.assertFalse(any(isinstance(p, str) and p.endswith("/verify-node") for p, _ in self.writes))
@@ -1632,8 +1641,8 @@ class ApplyTests(PlanTests):
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
             path = Path(directory) / "journal.json"
             with self.assertRaises(rollout.Refusal):
-                rollout.apply_pod(self.snapshot, path, 1, self.kube, self.get_live,
-                                  self.post, self.mutate, local=self.local)
+                rollout.apply_pod(self.snapshot, path, 1, rollout.PodClients(self.kube, self.get_live,
+                                  self.post, self.mutate), local=self.local)
             journal = dict(stage="nodes", nodes={"adx-node": dict(stage="verified", replacement_uid="new-uid",
                                                                    replacement_session="new-session")})
             self.task = dict(self.snapshot["begin"], kind="pod", protocol_version=3, phase="Active", operations={},
@@ -1642,8 +1651,8 @@ class ApplyTests(PlanTests):
                                     for b in self.snapshot["begin"]["nodes"]})
             self.task["nodes"]["adx-node"].update(phase="verified", pod_uid="new-uid", node_session_id="new-session")
             self.ds["spec"]["template"]["spec"]["containers"][0]["image"] = self.args.target_image
-            self.assertTrue(rollout.advance_pod(self.snapshot, journal, lambda: None, 0, self.kube,
-                                                self.get_live, self.post, self.mutate, local=self.local))
+            self.assertTrue(rollout.advance_pod(self.snapshot, journal, lambda: None, 0, rollout.PodClients(self.kube,
+                                                self.get_live, self.post, self.mutate), local=self.local))
             self.assertNotIn("node-b", journal["nodes"])
             self.assertEqual(self.writes, [])
 
@@ -1657,8 +1666,8 @@ class ApplyTests(PlanTests):
         body = dict(apiVersion="v1", kind="DeleteOptions", preconditions=dict(uid="pod-uid", resourceVersion="20"))
         arguments = ["--context", "test-cluster", "delete", "--raw",
                      "/api/v1/namespaces/ns/pods/workers-a", "-f", "-"]
-        with patch.object(rollout.shutil, "which", return_value="kubectl"),\
-                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen,\
+        with patch.object(rollout.shutil, "which", return_value="kubectl"), \
+                patch.object(rollout.subprocess, "Popen", return_value=manager) as popen, \
                 patch.object(rollout.threading, "Timer"):
             rollout.kubectl_json(arguments, body)
         self.assertEqual(popen.call_args.args[0][1:], ["--request-timeout=10s", *arguments])
@@ -1685,7 +1694,7 @@ class HttpJsonTests(unittest.TestCase):
         connection = self.response(400, rollout.canonical({"error": {
             "code": "InvalidArgument", "message": "node recovery capabilities are unavailable or unverified",
         }}).encode("utf-8"))
-        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
                 self.assertRaises(rollout.Refusal) as rejected:
             rollout.http_json("http://coordinator:9090", "/v1/node-upgrades/tasks/task/verify-node", {})
         self.assertEqual(str(rejected.exception), "management request returned HTTP 400: InvalidArgument: "
@@ -1703,7 +1712,7 @@ class HttpJsonTests(unittest.TestCase):
                 ("application/json", b'{"error":' + b"[" * 10000 + b"0" + b"]" * 10000 + b"}")):
             with self.subTest(content_type=content_type, size=len(body)):
                 connection = self.response(400, body, content_type)
-                with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
+                with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
                         self.assertRaises(rollout.Refusal) as rejected:
                     rollout.http_json("http://coordinator:9090", "/query")
                 self.assertEqual(str(rejected.exception), "management request returned HTTP 400")
@@ -1721,9 +1730,9 @@ class HttpJsonTests(unittest.TestCase):
                 with self.subTest(status=status, error_type=error_type):
                     connection = self.response(status, b"{}")
                     expected = rollout.Refusal if status == 400 else error_type
-                    with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
+                    with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
                             patch.object(connection.getresponse.return_value, "read1",
-                                         side_effect=error_type("response read failed")),\
+                                         side_effect=error_type("response read failed")), \
                             self.assertRaises(expected) as rejected:
                         rollout.http_json("http://coordinator:9090", "/query")
                     detail = "management request returned HTTP 400" if status == 400 else "response read failed"
@@ -1732,8 +1741,8 @@ class HttpJsonTests(unittest.TestCase):
 
     def test_http_error_body_obeys_response_size_limit(self):
         connection = self.response(400, b'{"error":{"code":"InvalidArgument","message":"' + b"x" * 100 + b'"}}')
-        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
-                patch.object(rollout, "LIMIT", 64),\
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
+                patch.object(rollout, "LIMIT", 64), \
                 self.assertRaisesRegex(rollout.Refusal, "management response exceeds size limit"):
             rollout.http_json("http://coordinator:9090", "/query")
         connection.close.assert_called_once()
@@ -1741,9 +1750,9 @@ class HttpJsonTests(unittest.TestCase):
     def test_http_error_body_obeys_original_deadline(self):
         connection = self.response(400, b'{"error":{"code":"InvalidArgument","message":"unavailable"}}')
         response = connection.getresponse.return_value
-        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection),\
-                patch.object(rollout.time, "monotonic", side_effect=[0, rollout.TIMEOUT + 1]),\
-                patch.object(response, "read1", wraps=response.read1) as read,\
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection), \
+                patch.object(rollout.time, "monotonic", side_effect=[0, rollout.TIMEOUT + 1]), \
+                patch.object(response, "read1", wraps=response.read1) as read, \
                 self.assertRaisesRegex(rollout.Refusal, "management request deadline exceeded"):
             rollout.http_json("http://coordinator:9090", "/query")
         read.assert_not_called()
