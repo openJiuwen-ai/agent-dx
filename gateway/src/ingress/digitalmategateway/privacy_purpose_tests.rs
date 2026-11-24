@@ -13,6 +13,7 @@ fn normal_connector_authentication_reuses_the_privacy_workload_credential() {
         exp: current + 60,
         recovery_until: current + 3600,
         bootstrap_until: None,
+        task_batch_id: None,
     };
     let token = signer.sign(&claims).unwrap();
     assert!(signer.verify(&token, false).is_ok());
@@ -36,6 +37,7 @@ fn delivery_bootstrap_connector_cannot_outlive_its_signed_deadline() {
         exp: current + 30,
         recovery_until: current + 30,
         bootstrap_until: Some(current + 30),
+        task_batch_id: None,
     };
     let token = signer.sign_connector_bootstrap(&claims).unwrap();
     assert!(signer.verify_connector(&token, false).is_ok());
@@ -69,6 +71,7 @@ fn shared_workload_identity_retains_expiry_tenant_and_signer_fences() {
         exp: current + 60,
         recovery_until: current + 3600,
         bootstrap_until: None,
+        task_batch_id: None,
     };
     let token = signer.sign(&claims).unwrap();
     assert!(token.starts_with("dm-privacy-v1."));
