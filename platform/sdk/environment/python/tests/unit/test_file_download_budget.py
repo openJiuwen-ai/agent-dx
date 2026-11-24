@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from io import FileIO
 from types import SimpleNamespace
 
 import httpx
@@ -12,9 +13,9 @@ from adx_environment.filesystem import Filesystem
 
 @dataclass
 class Clock:
-    now: float = 0
+    now: float = 0.0
 
-    def advance(self, seconds):
+    def advance(self, seconds: float) -> None:
         self.now += seconds
 
 
@@ -216,23 +217,28 @@ def test_continuous_progress_cannot_extend_total_download_time(client_for, clock
     assert not target.exists()
 
 
-def test_expired_deadline_does_not_advance_download_stream(clock):
-    consumed = []
+def test_expired_deadline_does_not_advance_download_stream(client_for, clock, monkeypatch, tmp_path):
+    class SlowOutputFile(FileIO):
+        def write(self, data):
+            written = super().write(data)
+            clock.advance(6.0)
+            return written
 
-    def source():
-        for chunk in (b"a", b"b"):
-            consumed.append(chunk)
-            yield chunk
+    def steps():
+        yield 0, b"a"
+        pytest.fail("download requested another chunk after the deadline")
 
-    chunks = iter(_transport.EnvironmentClient._download_chunks(source(), deadline=5))
-    assert next(chunks) == b"a"
-    clock.advance(6)
+    def handler(_request):
+        return httpx.Response(200, stream=TimedStream(clock, steps()))
 
+    monkeypatch.setattr(_transport, "open", SlowOutputFile, raising=False)
+    target = tmp_path / "out.bin"
     with pytest.raises(_transport.EnvironmentError) as error:
-        next(chunks)
+        client_for(handler).download_file_direct("environment", "/tmp/out.bin", str(target), rpc_timeout=5)
 
     assert error.value.code == "DOWNLOAD_TIMEOUT"
-    assert consumed == [b"a"]
+    assert target.with_suffix(".bin.part").read_bytes() == b"a"
+    assert not target.exists()
 
 
 def test_streamed_error_body_uses_the_same_download_deadline(client_for, clock, tmp_path):
