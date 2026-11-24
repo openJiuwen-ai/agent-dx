@@ -557,6 +557,16 @@ class MetricsEvidenceTests(unittest.TestCase):
                                       'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/GetChunkSources"}',
                                       'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/GetPlacementSnapshot"}'})
 
+    def test_meta_window_keeps_the_holder_list_rpcs(self):
+        # H2 step 2b: Meta serves holder lists and validates holder-form grants (meta/rpc_metrics.rs).
+        suite = load_suite()
+        name = 'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/%s"}'
+        before = "".join("%s 1\n" % (name % m) for m in ("GetVersionHolders", "ValidateHolderGrant", "Mkdir"))
+        after = "".join("%s %d\n" % (name % m, n) for m, n in (("GetVersionHolders", 5), ("ValidateHolderGrant", 9),
+                                                                ("Mkdir", 4)))
+        self.assertEqual(benchlib.metrics_delta(before, after, suite.META_METRICS),
+                         {name % "GetVersionHolders": 4.0, name % "ValidateHolderGrant": 8.0})
+
     def test_sent_read_payload_sums_every_transport(self):
         recv = 'afs_dfs_payload_bytes_total{direction="recv",operation="replica",transport="grpc"}'
         before = "%s 0\n%s 0\n%s 0\n" % (SEND % "grpc", SEND % "rdma", recv)

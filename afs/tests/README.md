@@ -618,7 +618,7 @@ followers 段保留 seed 读后的缓存状态，层名为 `remote_post_seed`（
 每轮另记：主机`/proc/vmstat`的`oom_kill`差值与`MemAvailable`（角色namespace看不到cgroup文件，按内核整体判断，任何OOM或读不到`oom_kill`都使该轮失败）；
 除各工具窗口外，从写入前到最后一段读结束对Meta与所有Node的内核再记一次（`evidence.round_memory`），覆盖错峰间隔和种子为followers供数的窗口；
 DFS远端读前后Meta与每个Node的`/metrics`差值（`evidence.metrics.<角色>`）：Node记读、peer、服务、准入、GC、缓存及`crc32c_read_bytes`相关计数，
-写者A的部分另记为`evidence.writer_metrics`；Meta记`afs_meta_rpc_requests_total`中读源、读缓存、读者登记与副本放置相关方法。
+写者A的部分另记为`evidence.writer_metrics`；Meta记`afs_meta_rpc_requests_total`中读源、读缓存、读者登记、持有者名单（`GetVersionHolders`、`ValidateHolderGrant`）与副本放置相关方法。
 `evidence.send_check`核对各Node`afs_dfs_payload_bytes_total{direction="send",operation="read"}`差值之和、N·S（读者数×文件大小）与工具读到的字节。
 只有每个Node在前后两次采集中都有同一组该计数且没有变小时（`metrics = "complete"`）才计算差值；序列缺失记`missing`、变小（重启）记`reset`，
 并在`metrics_issues`中列出角色。写者A持有唯一副本（desired=1且`local_copy=required`）时三者必须相等，计数不完整也使该case失败；
