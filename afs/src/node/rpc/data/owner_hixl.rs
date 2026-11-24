@@ -354,6 +354,21 @@ impl OwnerHixlService {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_drained_sessions_for_test(&self) {
+        let mut registry = self.lock_registry().unwrap();
+        assert!(!registry.sessions.is_empty());
+        for session in registry.sessions.values_mut() {
+            assert!(!session.has_pending_slots());
+            session.last_used -= OWNER_HIXL_SESSION_TTL;
+            for tombstone in session.tombstones.by_read.values_mut() {
+                tombstone.inserted_at -= OWNER_HIXL_SESSION_TTL;
+            }
+        }
+        registry.expire_sessions();
+        assert!(registry.sessions.is_empty());
+    }
+
     pub(crate) fn with_policy(mut self, trusted_peers: &[String], buffered_writes: bool) -> Self {
         self.trusted_peers = Some(Arc::new(trusted_peers.iter().cloned().collect()));
         self.buffered_writes = buffered_writes;
@@ -1312,6 +1327,25 @@ impl OwnerHixlService {
         let mut registry = self.lock_registry()?;
         registry.expire_sessions();
         self.quarantine_pending(&mut registry, false)?;
+        if outcome == HixlReleaseOutcome::Completed
+            && request.content_validated
+            && request.session_id < registry.next_session
+            && !registry.sessions.contains_key(&request.session_id)
+            && self
+                .provider
+                .lane_infos()
+                .iter()
+                .any(|lane| lane.generation == request.engine_generation)
+        {
+            // Within an engine generation, IDs are never reused and issued
+            // sessions leave the registry only after all published slots drain.
+            // This is a terminal acknowledgement, not a release of live memory.
+            return Ok(OwnerReleaseHixlReadReply {
+                consumed: true,
+                already_released: true,
+                session_retired: true,
+            });
+        }
         self.release_locked(&mut registry, peer, &request, outcome)
     }
 
@@ -1357,6 +1391,7 @@ impl OwnerHixlService {
                 OwnerReleaseHixlReadReply {
                     consumed: true,
                     already_released: true,
+                    session_retired: false,
                 }
             } else {
                 let Some(record) = session.reads.get_mut(&request.read_id) else {
@@ -1398,6 +1433,7 @@ impl OwnerHixlService {
                         OwnerReleaseHixlReadReply {
                             consumed: true,
                             already_released: false,
+                            session_retired: false,
                         }
                     } else {
                         OwnerReleaseHixlReadReply::default()
@@ -1910,6 +1946,7 @@ impl Session {
         Ok(OwnerReleaseHixlReadReply {
             consumed: true,
             already_released: false,
+            session_retired: false,
         })
     }
 

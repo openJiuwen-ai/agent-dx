@@ -204,6 +204,7 @@ struct FileHandler {
     grpc_writes: AtomicUsize,
     opens: AtomicUsize,
     disable_prefetch: AtomicBool,
+    provide_open_prefetch: AtomicBool,
 }
 
 impl OwnerFilesHandler for FileHandler {
@@ -250,7 +251,9 @@ impl OwnerFilesHandler for FileHandler {
                 ctime_ns: mtime_ns,
                 ..Default::default()
             }),
-            prefetched_data: None,
+            prefetched_data: (self.provide_open_prefetch.load(Ordering::SeqCst)
+                && !request.disable_prefetch)
+                .then(|| self.source.data.lock().unwrap().clone()),
         })
     }
 
@@ -306,6 +309,7 @@ struct Fixture {
     write_prepares: Arc<AtomicUsize>,
     lost_read_prepare_replies: Arc<AtomicUsize>,
     lost_read_releases: Arc<AtomicUsize>,
+    lost_read_release_replies: Arc<AtomicUsize>,
     /// The Home window service; attached to the server only with `home_hixl`.
     home: Arc<OwnerHixlService>,
     registry: afs_metrics::Registry,
@@ -560,6 +564,7 @@ async fn fixture_with_commit_loss(
         grpc_writes: AtomicUsize::new(0),
         opens: AtomicUsize::new(0),
         disable_prefetch: AtomicBool::new(false),
+        provide_open_prefetch: AtomicBool::new(false),
     });
     let mut service = OwnerFilesService::new(handler.clone(), Arc::new(AllowPeer));
     let home = Arc::new(OwnerHixlService::from_parts(
@@ -577,6 +582,8 @@ async fn fixture_with_commit_loss(
     let lose_prepare_replies = lost_read_prepare_replies.clone();
     let lost_read_releases = Arc::new(AtomicUsize::new(0));
     let lose_releases = lost_read_releases.clone();
+    let lost_read_release_replies = Arc::new(AtomicUsize::new(0));
+    let lose_release_replies = lost_read_release_replies.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .layer(tower::layer::layer_fn(
@@ -585,6 +592,7 @@ async fn fixture_with_commit_loss(
                     let prepare_count = prepare_count.clone();
                     let lose_prepare_replies = lose_prepare_replies.clone();
                     let lose_releases = lose_releases.clone();
+                    let lose_release_replies = lose_release_replies.clone();
                     tower::service_fn(move |request: axum::http::Request<tonic::body::Body>| {
                         use tower::ServiceExt;
                         let lose_prepare_reply =
@@ -604,12 +612,25 @@ async fn fixture_with_commit_loss(
                                     left.checked_sub(1)
                                 })
                                 .is_ok();
+                        let lose_release_reply = request.uri().path().ends_with("/ReleaseHixlRead")
+                            && lose_release_replies
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                    left.checked_sub(1)
+                                })
+                                .is_ok();
                         let inner = inner.clone();
                         let lost_commits = lost_commits.clone();
                         async move {
                             if lose_release {
                                 return Ok(tonic::Status::unavailable(
                                     "injected lost read release",
+                                )
+                                .into_http());
+                            }
+                            if lose_release_reply {
+                                let _ = inner.oneshot(request).await?;
+                                return Ok(tonic::Status::unavailable(
+                                    "injected lost read release reply",
                                 )
                                 .into_http());
                             }
@@ -711,6 +732,7 @@ async fn fixture_with_commit_loss(
         write_prepares,
         lost_read_prepare_replies,
         lost_read_releases,
+        lost_read_release_replies,
         home,
         registry,
         _server: server,
@@ -1186,6 +1208,71 @@ async fn failed_idle_release_is_retried_before_closing_the_session() {
     assert_eq!(next, content()[SLOT..SLOT + 1000]);
     assert_eq!(fixture.home_quarantines(), 0);
     assert_eq!(fixture.negotiations(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_release_reply_recovers_after_home_reaps_the_session() {
+    let fixture = parking_fixture(Duration::from_millis(300)).await;
+    fixture
+        .lost_read_release_replies
+        .store(RELEASE_ATTEMPTS, Ordering::SeqCst);
+    let file = fixture
+        .with_open(libc::O_RDONLY, |client, file| {
+            assert_eq!(read(&client, &file, 0, 1000).unwrap(), content()[..1000]);
+            file
+        })
+        .await;
+    fixture
+        .wait_until("the release replies were lost", |fixture| {
+            operations(&fixture.registry, "release") == 1
+        })
+        .await;
+    assert_eq!(fixture.exports.active(), 0);
+    fixture.home.expire_drained_sessions_for_test();
+
+    let result = fixture
+        .with_client(move |client| read(&client, &file, SLOT as u64, 1000))
+        .await;
+    assert_eq!(result.unwrap(), content()[SLOT..SLOT + 1000]);
+    assert_eq!(fixture.negotiations(), 2);
+    assert_eq!(fixture.home_quarantines(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_release_does_not_block_another_home_session() {
+    let mut pooled = policy(DataMode::Hixl);
+    pooled.sessions_per_home = 2;
+    let fixture = fixture_parking(
+        pooled,
+        true,
+        MemorySource::new(content(), 3000),
+        SLOT,
+        SLOT,
+        Duration::from_millis(300),
+    )
+    .await;
+    fixture
+        .lost_read_releases
+        .store(2 * RELEASE_ATTEMPTS, Ordering::SeqCst);
+    let file = fixture
+        .with_open(libc::O_RDONLY, |client, file| {
+            assert_eq!(read(&client, &file, 0, 1000).unwrap(), content()[..1000]);
+            file
+        })
+        .await;
+    fixture
+        .wait_until("the first session's release failed", |fixture| {
+            operations(&fixture.registry, "release") == 1
+        })
+        .await;
+    assert!(fixture.exports.active() > 0);
+
+    let result = fixture
+        .with_client(move |client| read(&client, &file, SLOT as u64, 1000))
+        .await;
+    assert_eq!(result.unwrap(), content()[SLOT..SLOT + 1000]);
+    assert_eq!(fixture.negotiations(), 2);
+    assert_eq!(fixture.home_quarantines(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3112,6 +3199,30 @@ async fn auto_open_prefetch_requires_snapshot_reads() {
             !snapshot_reads
         );
     }
+}
+
+#[tokio::test]
+async fn auto_without_a_hixl_adapter_preserves_grpc_open_prefetch() {
+    let mut fixture = fixture_with(
+        policy(DataMode::Auto),
+        false,
+        MemorySource::new(b"short file".to_vec(), 0),
+    )
+    .await;
+    // Assembly supplies no HIXL adapter when the local module cannot be loaded.
+    Arc::get_mut(&mut fixture.client).unwrap().read_session = None;
+    fixture
+        .handler
+        .provide_open_prefetch
+        .store(true, Ordering::SeqCst);
+    fixture
+        .with_open(libc::O_RDONLY, |client, file| {
+            assert_eq!(read(&client, &file, 0, 10).unwrap(), b"short file");
+        })
+        .await;
+    assert!(!fixture.handler.disable_prefetch.load(Ordering::SeqCst));
+    assert_eq!(fixture.grpc_reads(), 0);
+    assert_eq!(fixture.native_read_batches(), 0);
 }
 
 #[tokio::test]

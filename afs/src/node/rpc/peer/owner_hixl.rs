@@ -373,10 +373,29 @@ impl OwnerHixlReader {
                 .map_err(|_| protocol_error("OwnerFs HIXL Home pool is closed"))?;
         // One permit per slot, and a lease drops its slot guard before its
         // permit, so a permit holder always finds an unlocked slot.
+        // Prefer a usable session or an empty slot to retrying a failed release.
+        // Keep the latter available when there is no other free slot.
+        let mut recovery_slot = None;
         let guard = pool
             .slots
             .iter()
-            .find_map(|slot| slot.clone().try_lock_owned().ok());
+            .find_map(|slot| {
+                let guard = slot.clone().try_lock_owned().ok()?;
+                if guard.parked.is_some()
+                    && guard.session.as_ref().is_some_and(|session| {
+                        session.poisoned.load(Ordering::Acquire)
+                            && session.reply.home_session_id == access.home_session_id
+                    })
+                {
+                    if recovery_slot.is_none() {
+                        recovery_slot = Some(guard);
+                    }
+                    None
+                } else {
+                    Some(guard)
+                }
+            })
+            .or(recovery_slot);
         let mut guard = match guard {
             Some(guard) => guard,
             None => tokio::time::timeout(remaining(deadline)?, pool.slots[0].clone().lock_owned())
@@ -420,36 +439,37 @@ impl OwnerHixlReader {
                 .await
                 .map_err(|_| admission())??;
             }
-            let has_unconfirmed_release = guard.parked.take().is_some();
-            guard.session = None;
-            let metrics = self.metrics.clone();
-            let timeout = self.timeout;
-            let cleanup = tokio::spawn(async move {
-                // An old-generation ticket cannot be released against a new Home.
-                // Leave the previous Home's expiry logic to handle its old session.
-                if has_unconfirmed_release {
-                    return;
-                }
-                let started = Instant::now();
-                let closed = close_session(&session, timeout).await;
-                observe_optional(
-                    metrics.as_ref(),
-                    Operation::Close,
-                    started.elapsed(),
-                    closed.is_ok(),
-                );
-            });
-            tokio::time::timeout(remaining(deadline)?, cleanup)
-                .await
-                .map_err(|_| {
-                    afs_error::Error::coded(
-                        afs_error::CLIENT_DEADLINE_EXCEEDED,
-                        "OwnerFs HIXL timed out waiting for an old session to close",
-                    )
-                })?
-                .map_err(|error| {
-                    afs_error::Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string())
-                })?;
+            // A retired session needs no Close. An unconfirmed ticket belongs
+            // to the previous Home generation and cannot be released here.
+            let session_to_close = guard
+                .session
+                .take()
+                .filter(|_| guard.parked.take().is_none());
+            if let Some(session) = session_to_close {
+                let metrics = self.metrics.clone();
+                let timeout = self.timeout;
+                let cleanup = tokio::spawn(async move {
+                    let started = Instant::now();
+                    let closed = close_session(&session, timeout).await;
+                    observe_optional(
+                        metrics.as_ref(),
+                        Operation::Close,
+                        started.elapsed(),
+                        closed.is_ok(),
+                    );
+                });
+                tokio::time::timeout(remaining(deadline)?, cleanup)
+                    .await
+                    .map_err(|_| {
+                        afs_error::Error::coded(
+                            afs_error::CLIENT_DEADLINE_EXCEEDED,
+                            "OwnerFs HIXL timed out waiting for an old session to close",
+                        )
+                    })?
+                    .map_err(|error| {
+                        afs_error::Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string())
+                    })?;
+            }
         }
         if guard.session.is_none() {
             match self.establish(home, client, access, deadline).await? {
@@ -878,7 +898,7 @@ impl OwnerHixlReader {
         let started = Instant::now();
         let result = release_slots(session, reply, outcome, content_validated, self.timeout).await;
         self.observe(Operation::Release, started.elapsed(), result.is_ok());
-        result
+        result.map(|_| ())
     }
 }
 
@@ -948,10 +968,12 @@ impl HomeSlot {
             started.elapsed(),
             result.is_ok(),
         );
-        if result.is_ok() {
-            self.parked = None;
+        let acknowledgement = result?;
+        self.parked = None;
+        if acknowledgement == ReadReleaseAck::SessionRetired {
+            self.session = None;
         }
-        result
+        Ok(())
     }
 }
 
@@ -1332,13 +1354,19 @@ impl From<&OwnerPrepareBatchHixlReply> for ReadTicket {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadReleaseAck {
+    Accepted,
+    SessionRetired,
+}
+
 async fn release_slots(
     session: &HomeSession,
     reply: &ReadTicket,
     outcome: HixlReleaseOutcome,
     content_validated: bool,
     timeout: Duration,
-) -> afs_error::Result<()> {
+) -> afs_error::Result<ReadReleaseAck> {
     let request = reply.release(outcome, content_validated);
     let mut last = None;
     for _ in 0..RELEASE_ATTEMPTS {
@@ -1348,13 +1376,26 @@ async fn release_slots(
         match client.release_hixl_read(command).await {
             Ok(response) => {
                 let response = response.into_inner();
+                if response.session_retired {
+                    if outcome != HixlReleaseOutcome::Completed
+                        || !content_validated
+                        || !response.consumed
+                        || !response.already_released
+                    {
+                        return Err(protocol_error(
+                            "OwnerFs HIXL invalid session retirement reply",
+                        ));
+                    }
+                    session.poisoned.store(true, Ordering::Release);
+                    return Ok(ReadReleaseAck::SessionRetired);
+                }
                 let pinned = outcome == HixlReleaseOutcome::Unknown;
                 if response.consumed == pinned {
                     return Err(protocol_error(
                         "OwnerFs HIXL release result differs from the reported outcome",
                     ));
                 }
-                return Ok(());
+                return Ok(ReadReleaseAck::Accepted);
             }
             Err(status) => {
                 let error = status_to_error(status);

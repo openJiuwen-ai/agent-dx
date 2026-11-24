@@ -103,6 +103,31 @@ fn release_request(
     }
 }
 
+#[test]
+fn retired_release_acknowledges_only_an_issued_session_in_the_same_engine() {
+    let (service, exports, _) = fixture(SLOT, 8);
+    let session_id = session(&service);
+    let prepared = prepare_window(&service, session_id, "released-read", 0, SLOT as u64).unwrap();
+    let release = release_request(&prepared, HixlReleaseOutcome::Completed);
+    let live = service.release_blocking("node-b", release.clone()).unwrap();
+    assert!(live.consumed && !live.session_retired);
+    assert_eq!(exports.active(), 0);
+    service.expire_drained_sessions_for_test();
+
+    let mut wrong_generation = release.clone();
+    wrong_generation.engine_generation += 1;
+    let mut unissued = release.clone();
+    unissued.session_id += 1;
+    let mut unknown = release.clone();
+    unknown.outcome = HixlReleaseOutcome::Unknown as i32;
+    for rejected in [wrong_generation, unissued, unknown] {
+        assert!(service.release_blocking("node-b", rejected).is_err());
+    }
+    let retired = service.release_blocking("node-b", release).unwrap();
+    assert!(retired.consumed && retired.already_released && retired.session_retired);
+    assert_eq!(exports.active(), 0);
+}
+
 fn session(service: &OwnerHixlService) -> u64 {
     service
         .negotiate_blocking("node-b", negotiate_request("root-a"))

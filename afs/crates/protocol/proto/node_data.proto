@@ -886,6 +886,9 @@ message OwnerReleaseHixlReadRequest {
 message OwnerReleaseHixlReadReply {
   bool consumed = 1;
   bool already_released = 2;
+  // The issued session for this engine generation was retired without live exports.
+  // The client must not use that session again.
+  bool session_retired = 3;
 }
 
 // The digest binds immutable source bytes and file parameters to this write.
