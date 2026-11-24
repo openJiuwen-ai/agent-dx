@@ -23,7 +23,11 @@ pub trait DeliveryAuthorization: Send + Sync {
     /// Identity owner validates the persisted work and admits only its existing
     /// logical workspace. The returned value exposes no Environment route.
     async fn scope(&self, batch: &DeliveryBatch) -> Result<Scope, DeliveryFailure>;
-    async fn headers(&self, batch: &DeliveryBatch) -> Result<HeaderMap, DeliveryFailure>;
+    async fn headers(
+        &self,
+        batch: &DeliveryBatch,
+        route_generation: &str,
+    ) -> Result<HeaderMap, DeliveryFailure>;
 }
 
 pub struct RelayDelivery {
@@ -89,6 +93,7 @@ impl RelayDelivery {
                 }
                 _ => DeliveryFailure::Unknown,
             })?;
+        let route_generation = selection.binding_generation().to_owned();
         let stream = self
             .access
             .connect_service_when_ready(&self.ingress, selection)
@@ -122,7 +127,7 @@ impl RelayDelivery {
         }
         // Readiness may take longer than a credential's lifetime. Obtain fresh
         // current-purpose proof after readiness for each physical HTTP request.
-        let headers = self.authorization.headers(batch).await?;
+        let headers = self.authorization.headers(batch, &route_generation).await?;
         let mut request = Request::builder()
             .method(method)
             .uri(path)

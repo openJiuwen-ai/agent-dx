@@ -172,7 +172,14 @@ impl SubscriptionCoordinator {
             return Err(ProviderError::AccountMismatch.into());
         }
         self.assert_current(scope, connection_id, &current).await?;
-        let binding = expected.binding(id, trigger.trigger_id);
+        let mut binding = expected.binding(id, trigger.trigger_id);
+        if let Some(old) =
+            previous.filter(|old| old.subscription_generation == expected.intent_revision)
+        {
+            // Reconnecting the same mailbox keeps the enrollment reference and
+            // queued digests. register_policy still compares the entire binding.
+            binding.authority_ref = old.authority_ref;
+        }
         self.inbox
             .register_policy(
                 &binding,
@@ -188,7 +195,6 @@ impl SubscriptionCoordinator {
                 !value.enabled
                     || value.intent_revision != expected.intent_revision
                     || value.connection_generation != expected.connection_generation
-                    || value.authority_ref != expected.authority_ref
             }) {
                 // CAS never stops a replacement that another synchronizer committed.
                 match self.inbox.disable_subscription(&binding).await {

@@ -472,7 +472,9 @@ impl DeliveryIdentity {
         owner: &super::connector_owner::OwnerAuthority,
     ) -> Result<serde_json::Value, Error> {
         let admission = self.verify(token).await?;
-        let target = owner.delivery_target(&admission.binding).await?;
+        let target = owner
+            .delivery_target(&admission.binding, &admission.claims.grant_id)
+            .await?;
         let expires_at = admission.claims.exp.min(now()? + DELIVERY_ACCESS_SECONDS);
         let claims = Claims {
             id: admission.claims.grant_id.clone(),
@@ -486,7 +488,11 @@ impl DeliveryIdentity {
         };
         let connector = self.identity.signer.sign_connector_bootstrap(&claims)?;
         self.identity.connector_grant(&connector, false).await?;
-        if owner.delivery_target(&admission.binding).await? != target {
+        if owner
+            .delivery_target(&admission.binding, &admission.claims.grant_id)
+            .await?
+            != target
+        {
             return Err(Error::Unauthorized);
         }
         // Last owner I/O rechecks subscription, persisted batch, grant and Binding.
@@ -534,21 +540,35 @@ impl DeliveryIdentity {
         if binding != batch.binding {
             return Err(Error::Unauthorized);
         }
-        let id = binding.authority_ref.clone();
-        let grant = self.identity.owner_grant(&id).await?;
-        if grant.scope != binding_scope(&binding)?
-            || grant.user != binding.user_id
-            || grant.workspace != binding.workspace
+        // The exact durable registration authorizes mail for this owner. Its
+        // reference remains in the batch digest across sandbox replacements.
+        let scope = binding_scope(&binding)?;
+        let expected_id = super::application_ws::Application::DigitalMate
+            .binding_id(&binding.tenant, &binding.user_id)
+            .map_err(|_| Error::Unauthorized)?;
+        let parameters = super::entrypoint::workspace_parameters(
+            &binding.tenant,
+            &binding.template,
+            &binding.user_id,
+        )
+        .map_err(|_| Error::Unauthorized)?;
+        if binding.tenant != self.identity.signer.tenant
+            || scope.binding_id != expected_id
+            || parameters.get("workspace") != Some(&binding.workspace)
         {
             return Err(Error::Unauthorized);
         }
+        let workload = self
+            .identity
+            .admission_claims(&scope, &binding.workspace, &binding.user_id)
+            .await?;
         let claims = DeliveryClaims {
-            grant_id: id,
+            grant_id: workload.id,
             tenant: binding.tenant,
             batch_id: batch.batch_id.clone(),
             digest: batch.digest.clone(),
             wire_bytes: size,
-            exp: (now()? + DELIVERY_ACCESS_SECONDS).min(grant.expires_at),
+            exp: (now()? + DELIVERY_ACCESS_SECONDS).min(workload.recovery_until),
         };
         let token = self.identity.signer.sign_delivery(&claims)?;
         // Re-read current owned facts before returning an external credential.
@@ -573,7 +593,6 @@ impl DeliveryIdentity {
             || grant.scope != binding_scope(&binding)?
             || grant.workspace != binding.workspace
             || grant.user != binding.user_id
-            || claims.grant_id != binding.authority_ref
             || claims.exp > grant.expires_at
         {
             return Err(Error::Unauthorized);
@@ -603,8 +622,15 @@ impl DeliveryAuthorization for DeliveryIdentity {
         let (_, verified) = self.issue(batch).await.map_err(delivery_failure)?;
         binding_scope(&verified.binding).map_err(delivery_failure)
     }
-    async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
+    async fn headers(
+        &self,
+        batch: &DeliveryBatch,
+        route_generation: &str,
+    ) -> Result<http::HeaderMap, DeliveryFailure> {
         let (token, admission) = self.issue(batch).await.map_err(delivery_failure)?;
+        if admission.binding_generation != route_generation {
+            return Err(DeliveryFailure::Rejected);
+        }
         let current = now().map_err(delivery_failure)?;
         let recovery_until = admission.grant_expires_at;
         let claims = Claims {

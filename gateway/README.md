@@ -504,9 +504,9 @@ Mail callers use the same `select_with_initializer` and
 Their initializer refuses a missing Binding. Existing-Binding initialization
 uses the Agent owner's retry resolve to avoid creating a replacement after a
 concurrent deletion. Selected-route checks and pre-write retry belong to the
-ordinary shared path, not to a mail-specific generation admission. Identity
-owners independently fence the original authorization, represented in mail
-persistence by an actual existing random grant reference. See the
+ordinary shared path, not to a mail-specific generation admission. The Inbox keeps the
+enabled subscription's original enrollment reference across Binding rebuilds.
+The privacy owner issues credentials for the current Binding generation. See the
 [wire-v2/cutover contract](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/ingestion-delivery-contract.md).
 Ordinary managed WS uses shared selection/connection; managed HTTP shares selection/retry while retaining the
 backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
@@ -838,6 +838,15 @@ existing server-side renewal and revocation policy. Delivery-derived credentials
 report `renewable: false` with both deadlines equal to access expiry, and renewal
 is refused. Consumers must verify these responses through the actual authority;
 client-side token decoding or a local file is not an authorization fact.
+
+An enabled mailbox subscription survives a rebuild of the same user's DigitalMate
+workspace. Its stored reference and queued batch digests remain stable. On the
+first delivery after a rebuild, Gateway checks the exact persisted batch and
+enabled subscription, resolves the current Binding for that user and workspace,
+and obtains its workload grant through normal admission. This also handles
+existing subscriptions whose enrollment grant has already been removed.
+Delivery needs no foreground connection or subscription toggle. Disabling or
+replacing a subscription still fences its pending work.
 
 For each delivery request, Gateway waits for sandbox readiness and signs the
 following headers from the same current batch and Binding grant:

@@ -154,6 +154,22 @@ async fn subscription_sync_multiple_accounts_and_non_mail_profile_share_the_real
             .await
             .unwrap(),
     );
+    // A cold sandbox synchronizes with its new workload grant. The registered
+    // mailbox and already queued batch digests retain their enrollment reference.
+    let mut rebuilt = first.clone();
+    rebuilt.authority_ref = "b".repeat(64);
+    owner
+        .values
+        .lock()
+        .unwrap()
+        .insert(first.connection_id.clone(), rebuilt);
+    let same = registered(
+        coordinator
+            .synchronize(&scope, &first.connection_id)
+            .await
+            .unwrap(),
+    );
+    assert!(same == a);
     let mut second = first.clone();
     second.connection_id = "github_connection".into();
     second.provider = "github".into();
