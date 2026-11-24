@@ -1167,12 +1167,14 @@ uid/gid/mode。
 | --- | --- | --- | --- |
 | `grpc`（默认） | gRPC | gRPC | gRPC |
 | `rdma` | RDMA | RDMA | RDMA |
-| `hixl` | HIXL 缓冲读 | HIXL 缓冲写（已打开文件） | Node 启动配置拒绝 |
-| `auto` | 符合文件策略时优先 HIXL，其后为 RDMA、gRPC | 缓冲写达到单次请求阈值时优先 HIXL，其后为 RDMA、gRPC；低于阈值直接按 RDMA、gRPC 策略选择 | RDMA、gRPC |
+| `hixl` | HIXL 缓冲读 | 默认不支持。两端启用缓冲写后使用 HIXL | Node 启动配置拒绝 |
+| `auto` | 符合文件策略时优先 HIXL，其后为 RDMA、gRPC | 默认 RDMA、gRPC。两端启用缓冲写且达到阈值时优先 HIXL | RDMA、gRPC |
 
 `rdma` 需要 `rdma` feature 和 `rdma_device`。`hixl` 需要 `hixl` feature、`fs = "ownerfs"`
-和显式的 `[hixl].engine_id`。HIXL 节点要求 mTLS 和非空的 `trusted_node_certs`，窗口与目录批量
-共享同一个 HIXL runtime、槽池和隔离状态。`auto` 仅尝试配置了设备且支持对应文件操作的候选。
+和显式的 `[hixl].engine_id`。HIXL 要求 mTLS，并要求在 `[hixl].trusted_peers` 中列出
+允许使用同一注册内存池的节点 ID。每个 ID 都须出现在 `trusted_node_certs`。两端分别配置对端，
+设备网络只向这些受信节点开放。普通 Release 只释放软件槽位占用，native 注册仍在。
+在双机验证超时隔绝、保留与槽复用前保持生产 HIXL 关闭。`auto` 仅尝试配置了设备且支持对应文件操作的候选。
 本地或对端明确报告不支持时可以选择下一候选。鉴权、协议、校验失败、临时资源不足和提交结果未知
 返回错误。显式 HIXL 的 OPEN 不携带 gRPC 文件正文。若 `auto` 下 gRPC 是小文件的正文通道，
 仍可使用只读 OPEN 预取。
@@ -1180,7 +1182,9 @@ uid/gid/mode。
 旧 `[hixl].ownerfs_read_mode` 会触发未知字段错误。旧 `off` 加 gRPC 可改为 `data_mode = "grpc"`。
 旧 `preferred` 可改为 `data_mode = "auto"` 并配置 `engine_id`，此时只在明确不支持时回退，
 也可以按需配置 RDMA 候选。旧 `required` 可改为 `data_mode = "hixl"` 和 `fs = "ownerfs"`，
-远端缓冲读走 HIXL。会话协商成功即支持缓冲读写，读写授权仍分别校验。显式 HIXL 的远端可写或截断打开先确认会话；协商失败时不发送 `Open`，文件不会被截断。Create 和 `O_DIRECT` 打开返回不支持。支持写摘要协商时，HIXL 写复用读会话选择的算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。切换模式时移除旧键。
+远端缓冲读走 HIXL。两端均启用 `ownerfs_buffered_writes` 后才可协商缓冲写，读写授权分别校验。显式 HIXL 在远端可写或截断打开前确认写能力。协商失败时不发送 `Open`，文件保持原样。Create 和 `O_DIRECT` 打开返回不支持。支持写摘要协商时，HIXL 写复用读会话选择的算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。切换模式时移除旧键。
+
+更新 HIXL 节点时双方应使用带 Home 代际的 Close。新 Home 拒绝空代际的旧客户端 Close，未收尾会话由过期流程保守处理。原生 engine endpoint 被新进程复用时，已绑定旧代际的 reader 会拒绝复用连接，恢复前需退出旧 reader runtime。
 
 Home 最多同时接受 64 个活跃的 OwnerFs HIXL 会话。已关闭且已排空的会话仅保留有界的重试记录，不占活跃名额。
 
@@ -1225,6 +1229,7 @@ data_mode = "auto"
 
 [hixl]
 engine_id = "192.0.2.10:7920"
+trusted_peers = ["node-b"] # 已登记证书的对端 ID
 transport = "roce"
 buffer_pool = false
 window_bytes = 4194304
@@ -1249,11 +1254,13 @@ ownerfs_batch_max_file_bytes = 4194304
   的两个槽池合计受 `lane 数 × (receive_slots + export_slots) × window_bytes ≤ 1 GiB` 约束：单 lane
   可用 128/128，2 lane 用 64/64，4 lane 用 32/32；默认 16/16 支持最多 8 lane，16 lane 要降到 8/8。
   这是为后续更高带宽预留的上限，尚未实测，小规模部署维持默认即可。
-- `ownerfs_read_group_max_inflight`：1 或 2，默认 2；2 在当前窗口被消费时预取下一个。
+- `ownerfs_snapshot_reads` 默认关闭。只有数据在打开期间保持不可变、授权持续有效的部署可开启。默认按需读，即使另一个节点更新文件，同一个 fd 也会再次从 Home 取数。窗口预读和目录批量仅在该选项开启时生效。
+- `ownerfs_buffered_writes` 默认关闭。两端确认该能力后，才启用窗口写和下一窗口复用。
+- `ownerfs_read_group_max_inflight` 为 1 或 2，默认 2。启用快照读时，2 在消费当前窗口时预取下一个。
 - `ownerfs_read_group_host_budget_bytes`：缓存窗口、在途预取和目录批量共用的进程级预算，默认
   1 GiB。共享切片和 FUSE 回复持有的分配计费到最后一个引用释放。批量索引另受
   `max(4 × ownerfs_read_group_bytes, 预算 / 2)` 限制。预算不足时按需单次取回仍可服务当前请求。
-- `ownerfs_min_file_bytes`：`auto` 下仅在打开时的文件大小达到该值才启用预读窗口，默认 1 MiB。更小的文件可使用
+- `ownerfs_min_file_bytes`：`auto` 下打开时文件大小达到该值才选 HIXL 窗口读取，默认 1 MiB。启用快照读时，更小的文件可使用
   目录批量，普通读路径按 RDMA、gRPC 选择。
 - `ownerfs_min_write_bytes`：`auto` 下 OwnerFs 单次远端缓冲写的正文长度阈值，默认 `524288` 字节（512 KiB），
   有效范围 `0..=1048576`。在发送 `PrepareWriteHixl` 或复用已授予的写槽之前比较；达到阈值才尝试 HIXL，

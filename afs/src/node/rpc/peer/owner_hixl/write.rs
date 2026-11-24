@@ -99,7 +99,9 @@ impl OwnerReadSession {
         options: WriteOptions,
     ) -> afs_error::Result<Option<usize>> {
         let policy = &self.reader.policy;
-        if !policy.buffered_writes || data.is_empty() || (policy.mode == DataMode::Auto && data.len() < policy.min_write_bytes)
+        if !policy.buffered_writes
+            || data.is_empty()
+            || (policy.mode == DataMode::Auto && data.len() < policy.min_write_bytes)
         {
             return Ok(None);
         }
@@ -123,7 +125,9 @@ impl OwnerReadSession {
         let result = runtime.block_on(async {
             let wait = remaining(deadline)?;
             let worker = tokio::spawn(
-                reader.write_inner(request, dispatch.clone()).instrument(span),
+                reader
+                    .write_inner(request, dispatch.clone())
+                    .instrument(span),
             );
             match tokio::time::timeout(wait, worker).await {
                 Ok(result) => result.map_err(write_worker_error)?,
@@ -151,14 +155,23 @@ impl WriteDispatch {
 
     fn begin_commit(&self, deadline: Instant) -> afs_error::Result<()> {
         remaining(deadline)?;
-        self.0.compare_exchange(
-            Self::PENDING, Self::COMMITTING, Ordering::AcqRel, Ordering::Acquire,
-        ).map(|_| ()).map_err(|_| write_deadline_expired())
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| write_deadline_expired())
     }
 
     fn stop_or_committing(&self) -> bool {
         self.0.compare_exchange(
-            Self::PENDING, Self::STOPPED, Ordering::AcqRel, Ordering::Acquire,
+            Self::PENDING,
+            Self::STOPPED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         ) == Err(Self::COMMITTING)
     }
 }

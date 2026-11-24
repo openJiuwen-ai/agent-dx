@@ -109,7 +109,9 @@ impl OwnerHixlService {
         request: OwnerPrepareWriteHixlRequest,
     ) -> Result<Response<OwnerPrepareWriteHixlReply>, Status> {
         if !self.buffered_writes {
-            return Err(super::unsupported_status("OwnerFs HIXL buffered writes are disabled"));
+            return Err(super::unsupported_status(
+                "OwnerFs HIXL buffered writes are disabled",
+            ));
         }
         let service = self.clone();
         self.spawn_phase(Operation::Prepare, move || {
@@ -126,7 +128,9 @@ impl OwnerHixlService {
         request: OwnerFinishWriteHixlRequest,
     ) -> Result<Response<OwnerCommitWriteHixlReply>, Status> {
         if !self.buffered_writes {
-            return Err(super::unsupported_status("OwnerFs HIXL buffered writes are disabled"));
+            return Err(super::unsupported_status(
+                "OwnerFs HIXL buffered writes are disabled",
+            ));
         }
         let service = self.clone();
         self.spawn_phase(Operation::Validate, move || {
@@ -143,7 +147,9 @@ impl OwnerHixlService {
         request: OwnerAbortWriteHixlRequest,
     ) -> Result<Response<OwnerAbortWriteHixlReply>, Status> {
         if !self.buffered_writes {
-            return Err(super::unsupported_status("OwnerFs HIXL buffered writes are disabled"));
+            return Err(super::unsupported_status(
+                "OwnerFs HIXL buffered writes are disabled",
+            ));
         }
         let service = self.clone();
         self.spawn_phase(Operation::Release, move || {
@@ -860,16 +866,16 @@ impl WriteInput {
             .ok_or_else(|| invalid_write("OwnerFs HIXL write length is invalid"))?;
         let lane = usize::try_from(request.lane_id)
             .map_err(|_| invalid_write("OwnerFs HIXL write lane overflows"))?;
-        let checksum = if request.data_checksum_algorithm == HixlSlotChecksumAlgorithm::Unspecified as i32
-        {
-            SlotChecksum::Blake3
-        } else if request.data_checksum_algorithm == negotiated.wire() as i32 {
-            negotiated
-        } else {
-            return Err(invalid_write(
-                "OwnerFs HIXL write digest algorithm differs from negotiation",
-            ));
-        };
+        let checksum =
+            if request.data_checksum_algorithm == HixlSlotChecksumAlgorithm::Unspecified as i32 {
+                SlotChecksum::Blake3
+            } else if request.data_checksum_algorithm == negotiated.wire() as i32 {
+                negotiated
+            } else {
+                return Err(invalid_write(
+                    "OwnerFs HIXL write digest algorithm differs from negotiation",
+                ));
+            };
         if request.data_checksum.len() != checksum.len() {
             return Err(invalid_write("OwnerFs HIXL write digest length is invalid"));
         }

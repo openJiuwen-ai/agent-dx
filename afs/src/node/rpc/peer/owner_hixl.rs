@@ -21,12 +21,11 @@ use super::hixl::{
 };
 use crate::config::DataMode;
 use crate::node::data_plane::hixl::{
-    Completion, HixlMetrics, Operation, TransferRuntime, ReadWindow, SlotChecksum, checked_slot_length, observe_optional, read_batch,
+    Completion, HixlMetrics, Operation, ReadWindow, SlotChecksum, TransferRuntime,
+    checked_slot_length, observe_optional, read_batch,
 };
 use crate::node::rpc::OwnerRpcMetrics;
-use crate::node::rpc::hixl::{
-    HIXL_PROTOCOL_VERSION, is_unsupported,
-};
+use crate::node::rpc::hixl::{HIXL_PROTOCOL_VERSION, is_unsupported};
 use afs_protocol::node_data::{
     HixlLane, HixlReleaseOutcome, OwnerCloseHixlRequest, OwnerHandle, OwnerHixlSlot,
     OwnerNegotiateHixlReply, OwnerNegotiateHixlRequest, OwnerPrepareBatchHixlReply,
@@ -400,7 +399,9 @@ impl OwnerHixlReader {
                     || guard.write_tickets >= MAX_SESSION_WRITE_TICKETS
             })
         {
-            let _ = guard.return_write_window(&session, remaining(deadline)?).await;
+            let _ = guard
+                .return_write_window(&session, remaining(deadline)?)
+                .await;
         }
         let stale = guard.session.as_ref().is_some_and(|session| {
             session.poisoned.load(Ordering::Acquire)
@@ -421,23 +422,35 @@ impl OwnerHixlReader {
                         HixlReleaseOutcome::Completed,
                         true,
                         timeout,
-                    ).await;
-                    observe_optional(metrics.as_ref(), Operation::Release, started.elapsed(), released.is_ok());
+                    )
+                    .await;
+                    observe_optional(
+                        metrics.as_ref(),
+                        Operation::Release,
+                        started.elapsed(),
+                        released.is_ok(),
+                    );
                 }
                 let started = Instant::now();
                 let closed = close_session(&session, timeout).await;
-                observe_optional(metrics.as_ref(), Operation::Close, started.elapsed(), closed.is_ok());
+                observe_optional(
+                    metrics.as_ref(),
+                    Operation::Close,
+                    started.elapsed(),
+                    closed.is_ok(),
+                );
             });
             tokio::time::timeout(remaining(deadline)?, cleanup)
                 .await
-                .map_err(|_| afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "OwnerFs HIXL timed out waiting for an old session to close",
-                ))?
-                .map_err(|error| afs_error::Error::coded(
-                    afs_error::CLIENT_WORKER_FAILED,
-                    error.to_string(),
-                ))?;
+                .map_err(|_| {
+                    afs_error::Error::coded(
+                        afs_error::CLIENT_DEADLINE_EXCEEDED,
+                        "OwnerFs HIXL timed out waiting for an old session to close",
+                    )
+                })?
+                .map_err(|error| {
+                    afs_error::Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string())
+                })?;
         }
         if guard.session.is_none() {
             match self.establish(home, client, access, deadline).await? {

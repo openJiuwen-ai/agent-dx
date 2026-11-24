@@ -170,9 +170,14 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # capacity_bytes = 268435456
 
 [hixl]
-# HIXL is used for eligible OwnerFs buffered reads and writes with data_mode = "auto" and an
-# explicit engine_id, or with data_mode = "hixl". Native HIXL requires the
-# hixl build, mTLS, and administrator-managed trusted_node_certs.
+# HIXL handles eligible OwnerFs buffered reads in auto mode with an engine_id,
+# or in explicit hixl mode. It requires a native HIXL build, mTLS, and an
+# explicit list of peers with administrator-managed trusted_node_certs.
+# trusted_peers = ["node-b"]
+# Enable only when opened data is immutable and read authorization stays valid.
+# ownerfs_snapshot_reads = false
+# Buffered HIXL writes require opt-in on both sides.
+# ownerfs_buffered_writes = false
 # The two Host slot pools across all device lanes may reserve 1 GiB together;
 # one lane can take 128 + 128 slots of 4 MiB windows (the largest reservation),
 # kept for future higher-bandwidth links.

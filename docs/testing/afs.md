@@ -1377,7 +1377,7 @@ cargo test --locked -p afs --lib node::data_plane
 cargo test --locked -p afs --test config_contract --test node_health_contract
 ```
 
-RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需相应的 Linux 运行证据。组件测试范围限于软件契约。
+组件测试也覆盖重启后同号会话拒绝旧 Close、默认按需读在同一 fd 上看到远端覆盖和追加，以及写等待者超时后迟到的设备完成不能触发 Commit。RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需独立 Linux 运行证据。组件测试验证软件契约。
 
 用 `cargo test --locked -p afs-transport --features hixl --test hixl_native_bridge` 做组件验证。对接收槽和导出槽核对这些契约：PCI 节点可用时优先使用 PCI；PCI 节点不可用时，`sched_getaffinity` 读取的是实际分配槽的 owner 线程，且只有非空掩码中的每个允许 CPU 都能确认属于同一个 NUMA 节点时才采用 CPU 回退；没有可信节点、已有非默认策略或无法设置优先策略时沿用原策略。还应核对临时策略在分配及首次触页后恢复，包括分配失败的路径。
 
@@ -1387,7 +1387,7 @@ RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需相应的 Linux 运�
 
 <a id="hixl-pool-shapes"></a>
 
-**等预算比较中转池规格。** 在同一对节点、同一条链路上固定 `buffer_pool = true`，A 组使用默认的每池 4 块 × 8 MiB，B 组使用 8 块 × 4 MiB。每次两端使用同一组配置并重启；保存两端配置，从 `/health` 确认链路、启池状态和每条 lane 的 `relay_hbm_budget_bytes = 67108864`。两组预算相同，单看该指标不能区分块数。固定 `data_mode = "hixl"`、Host 槽、并发度、文件大小、请求大小和内存对齐；每组预热后交替运行至少三对，分别比较 `pwrite` 带宽、含 `fsync` 的带宽和单次 `pwrite` P99。读回并核对 Home 文件摘要，记录两端 HIXL 正文字节数。64 KiB 和 1 MiB 请求分别报告，以免混合均值掩盖差异。
+**等预算比较中转池规格。** 在同一对节点、同一条链路上固定 `buffer_pool = true`，A 组使用默认的每池 4 块 × 8 MiB，B 组使用 8 块 × 4 MiB。每次两端使用同一组配置并重启；保存两端配置，从 `/health` 确认链路、启池状态和每条 lane 的 `relay_hbm_budget_bytes = 67108864`。两组预算相同，单看该指标不能区分块数。两端启用 `ownerfs_buffered_writes`，固定 `data_mode = "hixl"`、Host 槽、并发度、文件大小、请求大小和内存对齐；每组预热后交替运行至少三对，分别比较 `pwrite` 带宽、含 `fsync` 的带宽和单次 `pwrite` P99。读回并核对 Home 文件摘要，记录两端 HIXL 正文字节数。64 KiB 和 1 MiB 请求分别报告，以免混合均值掩盖差异。
 
 写路径的硬件验收应分别在 HCCS 和 RoCE 双机上执行同一文件的顺序写、短写、追加、读回和 fsync。断链时检查目标槽隔离，Commit 回包丢失时以同一票据确认文件只追加一次。记录两端 SDK、设备型号、实际写入字节和读回摘要。
 

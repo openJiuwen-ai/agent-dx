@@ -55,7 +55,9 @@ impl Hixl {
                 let metrics = data_plane::hixl::HixlMetrics::register(&obs.registry)?;
                 match &self.runtime {
                     Some(runtime) => metrics.snapshot(&runtime.status()),
-                    None => metrics.observe(data_plane::hixl::Operation::Fallback, Duration::ZERO, true),
+                    None => {
+                        metrics.observe(data_plane::hixl::Operation::Fallback, Duration::ZERO, true)
+                    }
                 }
                 Some(metrics)
             } else {

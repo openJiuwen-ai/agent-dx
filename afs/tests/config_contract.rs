@@ -801,7 +801,7 @@ fn auto_hixl_requires_node_identity_and_concrete_endpoint() {
 #[test]
 fn explicit_hixl_requires_ownerfs_without_dfs_and_the_native_feature() {
     let identity = "tls_encryption_enabled=true\ntls_ca_certificate='/tmp/ca.pem'\ntls_identity_certificate='/tmp/node.pem'\ntls_identity_private_key='/tmp/node.key'\ntls_server_name='node'\n[trusted_node_certs]\npeer='/tmp/peer.pem'";
-    let engine = "engine_id='127.0.0.1:7920'";
+    let engine = "engine_id='127.0.0.1:7920'\ntrusted_peers=['peer']";
     let auto =
         resolve_hixl_table(&format!("fs='all'\ndata_mode='auto'\n{identity}"), engine).unwrap();
     assert_eq!(auto.data_mode, DataMode::Auto);
@@ -817,6 +817,31 @@ fn explicit_hixl_requires_ownerfs_without_dfs_and_the_native_feature() {
     } else {
         assert!(explicit.unwrap_err().message().contains("not compiled"));
     }
+}
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn enabled_hixl_requires_a_tls_bound_subset_of_trusted_nodes() {
+    let prefix = "fs='ownerfs'
+data_mode='auto'
+tls_encryption_enabled=true
+tls_ca_certificate='/tmp/ca.pem'
+tls_identity_certificate='/tmp/node.pem'
+tls_identity_private_key='/tmp/node.key'
+tls_server_name='node'
+[trusted_node_certs]
+peer='/tmp/peer.pem'";
+    for peers in ["[]", "['other']", "['']"] {
+        let table = format!("engine_id='127.0.0.1:7920'
+trusted_peers={peers}");
+        let error = resolve_hixl_table(prefix, &table).unwrap_err();
+        assert!(error.message().contains("hixl.trusted_peers"));
+    }
+    let cfg = resolve_hixl_table(prefix, "engine_id='127.0.0.1:7920'
+trusted_peers=['peer']").unwrap();
+    assert_eq!(cfg.hixl.trusted_peers, ["peer"]);
+    assert!(!cfg.hixl.ownerfs_buffered_writes);
+    assert!(!cfg.hixl.ownerfs_snapshot_reads);
 }
 
 #[test]

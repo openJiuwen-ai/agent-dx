@@ -3,12 +3,12 @@
 mod export;
 mod metrics;
 
-pub(crate) use export::{ExportProvider, PendingExport, runtime_export_provider};
-pub use metrics::HixlMetrics;
-pub(crate) use metrics::{Operation, observe_optional, runtime_error};
 use afs_transport::hixl::{
     EngineInfo, HixlError, HixlErrorKind, HixlReadOutcome, HixlRuntime, HixlRuntimeGroup,
 };
+pub(crate) use export::{ExportProvider, PendingExport, runtime_export_provider};
+pub use metrics::HixlMetrics;
+pub(crate) use metrics::{Operation, observe_optional, runtime_error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -61,7 +61,8 @@ impl TransferRuntime for HixlRuntimeGroup {
     }
 
     fn lane(&self, lane: usize) -> Option<Arc<dyn TransferLane>> {
-        self.lane(lane).map(|runtime| runtime as Arc<dyn TransferLane>)
+        self.lane(lane)
+            .map(|runtime| runtime as Arc<dyn TransferLane>)
     }
 
     fn quarantine(&self) -> Result<(), HixlError> {
@@ -221,8 +222,7 @@ pub(crate) async fn read_batch(
     checksum: SlotChecksum,
     deadline: Instant,
 ) -> Result<Vec<u8>, ReadFailure> {
-    let bad_length =
-        || ReadFailure::before_submit(protocol_error("HIXL read length overflow"));
+    let bad_length = || ReadFailure::before_submit(protocol_error("HIXL read length overflow"));
     let windows = slots
         .iter()
         .map(|slot| {
@@ -235,9 +235,9 @@ pub(crate) async fn read_batch(
         .iter()
         .try_fold(0_usize, |total, (_, length)| total.checked_add(*length))
         .ok_or_else(bad_length)?;
-    let native = runtime.lane(lane_id).ok_or_else(|| {
-        ReadFailure::before_submit(protocol_error("HIXL local lane disappeared"))
-    })?;
+    let native = runtime
+        .lane(lane_id)
+        .ok_or_else(|| ReadFailure::before_submit(protocol_error("HIXL local lane disappeared")))?;
     let buffer = native
         .prepare_read_batch_buffer(read)
         .map_err(|error| ReadFailure::before_submit(runtime_error(error)))?;

@@ -1547,7 +1547,14 @@ impl RemoteFiles for OwnerPeerClient {
                     },
                 );
         }
-        self.body_opened(grant, path, &handle.opaque, &identity.opaque, flags, &attributes);
+        self.body_opened(
+            grant,
+            path,
+            &handle.opaque,
+            &identity.opaque,
+            flags,
+            &attributes,
+        );
         Ok((
             remote_file(
                 grant,

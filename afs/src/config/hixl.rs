@@ -389,16 +389,6 @@ impl HixlConfig {
 
 /// Checks the `[hixl]` table against the merged configuration.
 pub(super) fn validate(role: Role, cfg: &super::Config) -> Result<()> {
-    if cfg.hixl.enabled(cfg.data_mode, cfg.ownerfs)
-        && (cfg.hixl.trusted_peers.is_empty()
-            || cfg.hixl.trusted_peers.iter().any(|peer| {
-                peer.is_empty() || !cfg.trusted_node_certs.contains_key(peer)
-            }))
-    {
-        return Err(invalid(
-            "hixl.trusted_peers must name at least one node from trusted_node_certs",
-        ));
-    }
     cfg.hixl.validate(
         role,
         HixlDeployment {
@@ -413,7 +403,18 @@ pub(super) fn validate(role: Role, cfg: &super::Config) -> Result<()> {
                 && cfg.tls_server_name.is_some(),
             bound_peers: !cfg.trusted_node_certs.is_empty(),
         },
-    )
+    )?;
+    if cfg.hixl.enabled(cfg.data_mode, cfg.ownerfs)
+        && (cfg.hixl.trusted_peers.is_empty()
+            || cfg.hixl.trusted_peers.iter().any(|peer| {
+                peer.is_empty() || !cfg.trusted_node_certs.contains_key(peer)
+            }))
+    {
+        return Err(invalid(
+            "hixl.trusted_peers must name at least one node from trusted_node_certs",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

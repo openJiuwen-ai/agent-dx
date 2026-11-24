@@ -468,11 +468,13 @@ dispatch 工作线程）、backend（直到回复字节就绪）、handoff（异
 （gate）和同步读选择投递队列（route）另行单独记录。
 
 Node 的 `data_mode` 选择正文通道，gRPC 始终承载控制 RPC。`auto` 按当前操作选已装配的候选，
-顺序为 HIXL、RDMA、gRPC。显式 HIXL 面向 OwnerFs 远端缓冲读写，禁止 gRPC OPEN 携带正文。
-OwnerFs 继续通过 `RemoteFiles` 和 `OwnerPeerClient` 访问 Home。读窗口、目录批量、失效与
-释放回执属于 Owner 会话。Node 公共数据面执行一次 native 批量拉取和槽摘要校验，向 Owner 会话
-报告未提交、已完成或未知。未知结果触发隔离，并按原读取票据通知 Home 保留导出槽。停止等待的读
-仍由后台任务处理完成和释放。
+顺序为 HIXL、RDMA、gRPC。显式 HIXL 默认用于 OwnerFs 远端按需读，禁止 gRPC OPEN 携带正文。
+OwnerFs 继续通过 `RemoteFiles` 和 `OwnerPeerClient` 访问 Home。HIXL 客户端接入 OwnerFiles 的文件操作，
+授权、目录批量、数据新鲜度和写提交归 OwnerFs。控制 RPC 仍由 OwnerFiles 认证。
+`node/data_plane/hixl` 管理原生批量搬运、导出窗口和完整性校验，分别报告未提交、已完成或未知。
+未知结果隔离并保留槽位。一次 HIXL I/O 共用一个绝对期限。等待读或写超时后，后台任务继续持有
+尚未退役的槽。提交前超时会关掉 Commit 入口。Close 校验 peer、会话编号和 Home 代际，
+重启前的 Close 无法关闭同号新会话。
 
 HIXL 的链路与中转池分别由 `transport` 和 `buffer_pool` 选择。RoCE 直传注册 Host 窗口；RoCE 和 HCCS 的中转路径使用 HIXL Buffer Pool。HCCS 只支持中转路径，并校验两端 A3 设备的 super-pod。两端须匹配链路和中转池设置。设备工作线程对每批 READ 或 WRITE 调用一次 `TransferSync`。
 
@@ -486,9 +488,10 @@ Home 排空超时后隔离 runtime 并保留未确认槽，返回 `NODE_TRANSFER
 随后 Node 在服务与挂载收尾后等待 native HIXL runtime 清理。Runtime 仍校验本地接收槽和导出槽
 的占用与隔离状态，清理错误计入停机失败。HIXL 构建的进程级看门狗覆盖 SDK 清理和 C/C++ 退出处理器。
 
-普通缓冲 `O_WRONLY`、`O_RDWR` 通过原有 `OwnerFiles.Open` 获取 Home 句柄。OwnerFs HIXL 会话协商成功即支持缓冲读写；每次操作仍须具备相应授权。显式 HIXL 在执行可写或截断打开前先确认会话，协商失败时不向 Home 发送 `Open`。
-`O_RDWR` 按需读取，写入或截断按文件身份使本地旧窗口失效。显式 HIXL 的 Create 与 `O_DIRECT` 仍返回不支持。
-Auto 读按打开时的文件大小与 `[hixl].ownerfs_min_file_bytes` 比较，决定是否启用预读窗口；小文件仍可走目录批量。
+HIXL 缓冲写默认关闭。两端启用 `ownerfs_buffered_writes` 并由 Home 确认能力后，才使用 HIXL 写入已打开文件。
+显式 HIXL 在可写或截断打开之前确认写能力，能力缺失时不向 Home 发送 `Open`。显式 HIXL 的 Create 与 `O_DIRECT` 返回不支持。
+默认每次读从 Home 获取当前数据，避免跨节点写入后重用旧字节或 EOF。只有数据不可变、打开期间授权稳定的
+部署才启用 `ownerfs_snapshot_reads`，允许只读句柄使用预读窗口和小文件目录批量。
 Auto 写在发送 `PrepareWriteHixl` 或复用已授予的写槽之前，按本次缓冲写的正文长度选择通道。
 `[hixl].ownerfs_min_write_bytes` 默认 `524288` 字节、有效范围 `0..=1048576`；达到阈值才尝试 HIXL，
 低于阈值走原有 RDMA/gRPC 路径，即使已持有写槽。`0` 对所有非空缓冲写尝试 HIXL；显式 HIXL 不受此阈值限制。
@@ -498,7 +501,7 @@ Writer 向槽提交 native `WRITE`，确认设备完成后以同一票据调用 
 Commit 重试复用原会话及 `write_id`。设备 WRITE 已完成而 Commit 超时时，Writer 用同一票据向 Home 查询结果。Home 可回放已有回执（包括实际短写字节数），或封住尚未执行的 Commit 并回收槽。恢复请求本身不执行文件写入。无法取得确定回执时，应用仍得到写结果未知。本节点按 Home 和文件身份停用可复用的读数据，包括批量切片与 Open 预取；同一读句柄在 Home 延迟写入完成后能看到新字节。设备结果未知时隔离槽位。持久化仍由文件 `Fsync` 契约处理。
 
 DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
-窗口目标大小是 `ownerfs_read_group_bytes`（默认 32 MiB，即八个 4 MiB 窗口）。Home 在协商中公布
+启用快照读后，预读组目标大小是 `ownerfs_read_group_bytes`（默认 32 MiB，即八个 4 MiB 窗口）。Home 在协商中公布
 各 lane 的总导出槽数，reader 按会话分摊，再与本地接收槽数和单次 64 个描述符的上限取最小值。
 实际槽大小取两端窗口大小的较小值。同一打开
 认领后复用其切片，本节点写入、setattr 或 `O_TRUNC` 打开使窗口失效。FUSE READ 完全落在窗口内时

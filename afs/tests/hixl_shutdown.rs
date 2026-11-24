@@ -155,7 +155,7 @@ fn spawn(root: &Path, role: &str, bin: &str, extra: &str, mode: Option<&str>) ->
              [trusted_node_certs]\nnode-a = '{0}/tls/node-a.pem'\n{1}",
             root.display(),
             if mode.is_some() {
-                "[hixl]\nengine_id = '127.0.0.1:31000'\n"
+                "[hixl]\nengine_id = '127.0.0.1:31000'\ntrusted_peers = ['node-a']\n"
             } else {
                 ""
             },

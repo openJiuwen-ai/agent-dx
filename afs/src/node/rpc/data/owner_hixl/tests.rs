@@ -412,7 +412,13 @@ fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
     // A released read id cannot be prepared again in the same session.
     assert!(prepare_window(&service, session_id, "r1", 0, 8192).is_err());
     let closed = service
-        .close_blocking("node-b", OwnerCloseHixlRequest { session_id, home_session_id: "home-session-a".to_owned() })
+        .close_blocking(
+            "node-b",
+            OwnerCloseHixlRequest {
+                session_id,
+                home_session_id: "home-session-a".to_owned(),
+            },
+        )
         .unwrap();
     assert!(closed.drained);
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
@@ -432,19 +438,36 @@ fn a_late_close_cannot_close_a_reused_session_id_or_quarantine_its_windows() {
     prepare.access.as_mut().unwrap().home_session_id = current.home_session_id.clone();
     let window = home.prepare_blocking("node-b", prepare).unwrap();
     for old_generation in ["home-session-a", ""] {
-        assert!(home.close_blocking("node-b", OwnerCloseHixlRequest {
-            session_id: previous_id,
-            home_session_id: old_generation.to_owned(),
-        }).is_err());
+        assert!(
+            home.close_blocking(
+                "node-b",
+                OwnerCloseHixlRequest {
+                    session_id: previous_id,
+                    home_session_id: old_generation.to_owned(),
+                }
+            )
+            .is_err()
+        );
     }
     assert_eq!(exports.active(), 1);
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
     assert!(!home.lock_registry().unwrap().sessions[&previous_id].closed);
-    home.release_blocking("node-b", release_request(&window, HixlReleaseOutcome::Completed)).unwrap();
-    assert!(home.close_blocking("node-b", OwnerCloseHixlRequest {
-        session_id: current.session_id,
-        home_session_id: current.home_session_id,
-    }).unwrap().drained);
+    home.release_blocking(
+        "node-b",
+        release_request(&window, HixlReleaseOutcome::Completed),
+    )
+    .unwrap();
+    assert!(
+        home.close_blocking(
+            "node-b",
+            OwnerCloseHixlRequest {
+                session_id: current.session_id,
+                home_session_id: current.home_session_id,
+            }
+        )
+        .unwrap()
+        .drained
+    );
 }
 
 #[test]
@@ -560,7 +583,13 @@ fn closing_with_unreleased_slots_quarantines_the_runtime() {
     let session_id = session(&service);
     prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     let closed = service
-        .close_blocking("node-b", OwnerCloseHixlRequest { session_id, home_session_id: "home-session-a".to_owned() })
+        .close_blocking(
+            "node-b",
+            OwnerCloseHixlRequest {
+                session_id,
+                home_session_id: "home-session-a".to_owned(),
+            },
+        )
         .unwrap();
     assert!(!closed.drained);
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 1);
@@ -1386,7 +1415,13 @@ fn drained_sessions_leave_room_for_new_clients_but_live_sessions_remain_bounded(
         previous = id;
         assert!(
             service
-                .close_blocking("node-b", OwnerCloseHixlRequest { session_id: id, home_session_id: "home-session-a".to_owned() })
+                .close_blocking(
+                    "node-b",
+                    OwnerCloseHixlRequest {
+                        session_id: id,
+                        home_session_id: "home-session-a".to_owned()
+                    }
+                )
                 .unwrap()
                 .drained
         );

@@ -96,7 +96,11 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
         .with_rdma_admission(self.rdma_admission.clone())
         .with_long_wait_channel(long_wait_channel);
-        let client = match self.hixl_reader.as_ref().filter(|_| self.hixl_trusted_peers.contains(home_node_id)) {
+        let client = match self
+            .hixl_reader
+            .as_ref()
+            .filter(|_| self.hixl_trusted_peers.contains(home_node_id))
+        {
             Some(reader) => client.with_hixl(reader.clone(), home_node_id.to_owned()),
             None => client,
         };
@@ -176,7 +180,7 @@ pub(super) async fn assemble(
             rdma_admission: Arc::new(tokio::sync::Semaphore::new(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
-                    hixl_reader: hixl.reader(),
+            hixl_reader: hixl.reader(),
             hixl_trusted_peers: cfg.hixl.trusted_peers.iter().cloned().collect(),
         });
         let recovery_root_meta = root_meta.clone();
@@ -345,7 +349,7 @@ pub(super) fn owner_files_server(
         let service = rpc::data::OwnerFilesService::new(handler, authenticator)
             .with_metrics(owner_rpc_metrics.clone())
             .with_rdma_sessions(owner_rdma_sessions.clone());
-            let service = match hixl_source {
+        let service = match hixl_source {
             Some(source) => service.with_hixl(source.clone()),
             None => service,
         };

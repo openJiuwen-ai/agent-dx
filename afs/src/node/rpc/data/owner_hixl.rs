@@ -28,11 +28,14 @@ use afs_transport::hixl::{EngineInfo, HixlRuntimeGroup, MAX_BATCH_WINDOWS};
 use tonic::{Response, Status};
 
 use super::hixl::{
-    negotiated_lanes, next_session_id, runtime_status, validate_client_engine, validate_transport_request,
+    negotiated_lanes, next_session_id, runtime_status, validate_client_engine,
+    validate_transport_request,
 };
 use super::{presented_access, remote_file_for_handle, time_ns};
 use crate::config::MAX_OWNERFS_HIXL_READ_GROUP_BYTES;
-use crate::node::data_plane::hixl::{ExportProvider, HixlMetrics, Operation, PendingExport, SlotChecksum, runtime_export_provider};
+use crate::node::data_plane::hixl::{
+    ExportProvider, HixlMetrics, Operation, PendingExport, SlotChecksum, runtime_export_provider,
+};
 use crate::node::rpc::OwnerRpcMetrics;
 use crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION;
 use crate::node::vfs::ownerfs::files::RemoteFile;
@@ -358,8 +361,14 @@ impl OwnerHixlService {
     }
 
     pub(super) fn check_peer(&self, peer: &str) -> Result<(), Status> {
-        if self.trusted_peers.as_ref().is_some_and(|peers| !peers.contains(peer)) {
-            return Err(unsupported_status("peer is not enabled for HIXL registered slots"));
+        if self
+            .trusted_peers
+            .as_ref()
+            .is_some_and(|peers| !peers.contains(peer))
+        {
+            return Err(unsupported_status(
+                "peer is not enabled for HIXL registered slots",
+            ));
         }
         Ok(())
     }
@@ -1402,7 +1411,8 @@ impl OwnerHixlService {
         }
         let mut registry = self.lock_registry()?;
         let drained = {
-            let session = registry.bound_session(request.session_id, peer, &request.home_session_id)?;
+            let session =
+                registry.bound_session(request.session_id, peer, &request.home_session_id)?;
             session.closed = true;
             session.last_used = Instant::now();
             !session.has_pending_slots()

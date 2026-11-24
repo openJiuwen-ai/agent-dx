@@ -463,7 +463,10 @@ async fn close_with_outstanding_write_quarantines_its_slots() {
     let close = service
         .close(
             "node-b".into(),
-            OwnerCloseHixlRequest { session_id: reply.session_id, home_session_id: "home-session-a".to_owned() },
+            OwnerCloseHixlRequest {
+                session_id: reply.session_id,
+                home_session_id: "home-session-a".to_owned(),
+            },
         )
         .await
         .unwrap()
@@ -648,7 +651,10 @@ async fn successor_reuses_slot_and_preserves_exact_commit_receipts() {
         service
             .close(
                 "node-b".into(),
-                OwnerCloseHixlRequest { session_id: window.session_id, home_session_id: "home-session-a".to_owned() }
+                OwnerCloseHixlRequest {
+                    session_id: window.session_id,
+                    home_session_id: "home-session-a".to_owned()
+                }
             )
             .await
             .unwrap()

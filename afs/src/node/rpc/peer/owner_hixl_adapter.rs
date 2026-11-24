@@ -32,7 +32,6 @@ impl OwnerPeerClient {
         }
     }
 
-
     pub(super) fn warm_body_transport(&self, grant: &RootGrant) {
         if let Some(hixl) = self.hixl_read_session()
             && let Ok(client) = self.cloned_client()
@@ -41,8 +40,11 @@ impl OwnerPeerClient {
         }
     }
 
-
-    pub(super) fn before_body_open(&self, grant: &RootGrant, flags: i32) -> afs_error::Result<bool> {
+    pub(super) fn before_body_open(
+        &self,
+        grant: &RootGrant,
+        flags: i32,
+    ) -> afs_error::Result<bool> {
         if self.data_mode == DataMode::Hixl && flags & libc::O_DIRECT != 0 {
             return Err(owner_hixl_direct_unsupported());
         }
@@ -80,19 +82,16 @@ impl OwnerPeerClient {
                 self.invalidate_owner_snapshots(identity);
                 hixl.invalidate(identity);
             }
-            hixl.opened(
-                grant,
-                path,
-                handle,
-                identity,
-                flags,
-                attributes,
-            );
+            hixl.opened(grant, path, handle, identity, flags, attributes);
         }
     }
 
     pub(super) fn try_hixl_read(
-        &self, grant: &RootGrant, file: &RemoteFile, offset: u64, out: &mut [u8],
+        &self,
+        grant: &RootGrant,
+        file: &RemoteFile,
+        offset: u64,
+        out: &mut [u8],
     ) -> afs_error::Result<Option<usize>> {
         if let Some(hixl) = self.hixl_read_session() {
             let client = self.cloned_client().map_err(|error| error.0)?;
@@ -114,7 +113,11 @@ impl OwnerPeerClient {
     }
 
     pub(super) fn try_hixl_reply(
-        &self, grant: &RootGrant, file: &RemoteFile, offset: u64, size: usize,
+        &self,
+        grant: &RootGrant,
+        file: &RemoteFile,
+        offset: u64,
+        size: usize,
     ) -> Option<prost::bytes::Bytes> {
         if size != 0
             && let Some(hixl) = self.hixl_read_session()
@@ -133,7 +136,12 @@ impl OwnerPeerClient {
     }
 
     pub(super) fn try_hixl_write(
-        &self, grant: &RootGrant, file: &RemoteFile, offset: u64, data: &[u8], options: WriteOptions,
+        &self,
+        grant: &RootGrant,
+        file: &RemoteFile,
+        offset: u64,
+        data: &[u8],
+        options: WriteOptions,
     ) -> PeerResult<Option<usize>> {
         if !data.is_empty()
             && let Some(session) = self.hixl_read_session()

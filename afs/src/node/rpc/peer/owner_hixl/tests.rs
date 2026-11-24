@@ -1221,16 +1221,25 @@ async fn demand_hixl_reads_on_one_open_see_remote_overwrite_and_append() {
     demand.snapshot_reads = false;
     let fixture = fixture(demand, true).await;
     let source = fixture.source.clone();
-    fixture.with_open(libc::O_RDONLY, move |client, file| {
-        assert!(read(&client, &file, FILE_BYTES as u64, 4).unwrap().is_empty());
-        assert_eq!(read(&client, &file, 1000, 4).unwrap(), &content()[1000..1004]);
-        let mut body = source.data.lock().unwrap();
-        body[1000..1004].copy_from_slice(b"edit");
-        body.extend_from_slice(b"tail");
-        drop(body);
-        assert_eq!(read(&client, &file, FILE_BYTES as u64, 4).unwrap(), b"tail");
-        assert_eq!(read(&client, &file, 1000, 4).unwrap(), b"edit");
-    }).await;
+    fixture
+        .with_open(libc::O_RDONLY, move |client, file| {
+            assert!(
+                read(&client, &file, FILE_BYTES as u64, 4)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                read(&client, &file, 1000, 4).unwrap(),
+                &content()[1000..1004]
+            );
+            let mut body = source.data.lock().unwrap();
+            body[1000..1004].copy_from_slice(b"edit");
+            body.extend_from_slice(b"tail");
+            drop(body);
+            assert_eq!(read(&client, &file, FILE_BYTES as u64, 4).unwrap(), b"tail");
+            assert_eq!(read(&client, &file, 1000, 4).unwrap(), b"edit");
+        })
+        .await;
     assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.native_read_batches(), 3);
 }
@@ -2494,12 +2503,20 @@ async fn late_dma_cannot_dispatch_commit_after_the_write_waiter_times_out() {
     let fixture = fixture(policy(DataMode::Hixl), true).await;
     fixture.native.hold_write.store(true, Ordering::SeqCst);
     let operation = fixture.with_open(libc::O_WRONLY, |client, file| {
-        client.write(&grant(), &file, FILE_BYTES as u64, b"late").unwrap_err()
+        client
+            .write(&grant(), &file, FILE_BYTES as u64, b"late")
+            .unwrap_err()
     });
-    let (error, _) = tokio::join!(operation, fixture.wait_until("write DMA started", |f| f.native_writes() == 1));
+    let (error, _) = tokio::join!(
+        operation,
+        fixture.wait_until("write DMA started", |f| f.native_writes() == 1)
+    );
     let retained_during_dma = fixture.exports.active();
     fixture.native.hold_write.store(false, Ordering::SeqCst);
-    assert_eq!(error.code(), afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT);
+    assert_eq!(
+        error.code(),
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT
+    );
     assert_eq!(retained_during_dma, 1);
     fixture.wait_released().await;
     assert_eq!(*fixture.source.data.lock().unwrap(), content());

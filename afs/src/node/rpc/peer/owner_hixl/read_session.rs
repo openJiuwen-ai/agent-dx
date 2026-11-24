@@ -286,7 +286,10 @@ impl OwnerReadSession {
         size: usize,
     ) -> Option<prost::bytes::Bytes> {
         let entry = self.opens().get(&file.handle).cloned()?;
-        if !entry.cacheable || file.owner_session_id != grant.home_session_id || !self.cache_allowed(&entry.identity) {
+        if !entry.cacheable
+            || file.owner_session_id != grant.home_session_id
+            || !self.cache_allowed(&entry.identity)
+        {
             return None;
         }
         let mut state = entry.state.lock().ok()?;
