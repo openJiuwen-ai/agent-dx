@@ -72,9 +72,9 @@ pub struct Node {
     #[cfg(feature = "dfs")]
     pub dfs: Option<Arc<vfs::dfs::DistributedFs>>,
     /// Shared HIXL runtimes; `None` when HIXL is unconfigured or unavailable in auto mode.
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     pub hixl_runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>,
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     pub hixl_metrics: Option<crate::node::rpc::hixl::HixlMetrics>,
 }
 

@@ -25,7 +25,7 @@ use afs_tracing::Instrument;
 use afs_transport::grpc::error_status::status_to_error;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
@@ -38,12 +38,16 @@ impl OwnerReadSession {
         client: &OwnerFilesClient<Channel>,
         grant: &RootGrant,
     ) -> afs_error::Result<()> {
+        if !self.reader.policy.buffered_writes {
+            return Err(crate::node::rpc::peer::owner_hixl_write_unsupported());
+        }
         let access = root_access(grant);
-        let deadline = self.reader.write_deadline()?;
+        let deadline = self.reader.operation_deadline()?;
         runtime.block_on(async {
             self.reader
                 .acquire(&self.home, client, &access, deadline)
                 .await?
+                .filter(|lease| lease.session.reply.buffered_write_supported)
                 .map(|_| ())
                 .ok_or_else(crate::node::rpc::peer::owner_hixl_write_unsupported)
         })
@@ -95,7 +99,7 @@ impl OwnerReadSession {
         options: WriteOptions,
     ) -> afs_error::Result<Option<usize>> {
         let policy = &self.reader.policy;
-        if data.is_empty() || (policy.mode == DataMode::Auto && data.len() < policy.min_write_bytes)
+        if !policy.buffered_writes || data.is_empty() || (policy.mode == DataMode::Auto && data.len() < policy.min_write_bytes)
         {
             return Ok(None);
         }
@@ -109,29 +113,61 @@ impl OwnerReadSession {
             bytes: data.to_vec(),
             options,
             keep_next: runtime.handle().is_some(),
-            deadline: reader.write_deadline()?,
+            deadline: reader.operation_deadline()?,
         };
         // The owned task holds the lease and the payload until native completion
         // and Commit or Abort, even if the caller stops waiting on the join.
         let span = afs_tracing::tracing::Span::current();
-        let commit_started = Arc::new(AtomicBool::new(false));
+        let deadline = request.deadline;
+        let dispatch = Arc::new(WriteDispatch::default());
         let result = runtime.block_on(async {
-            tokio::spawn(
-                reader
-                    .write_inner(request, commit_started.clone())
-                    .instrument(span),
-            )
-            .await
-            .map_err(write_worker_error)?
+            let wait = remaining(deadline)?;
+            let worker = tokio::spawn(
+                reader.write_inner(request, dispatch.clone()).instrument(span),
+            );
+            match tokio::time::timeout(wait, worker).await {
+                Ok(result) => result.map_err(write_worker_error)?,
+                Err(_) => Err(write_deadline_expired()),
+            }
         });
         result.map_err(|error| {
-            if commit_started.load(Ordering::Acquire) {
+            if dispatch.stop_or_committing() {
                 owner_dispatched_write_error(error)
             } else {
                 before_commit_error(error)
             }
         })
     }
+}
+
+/// Serializes caller timeout with the only point that can dispatch file I/O.
+#[derive(Default)]
+struct WriteDispatch(AtomicU8);
+
+impl WriteDispatch {
+    const PENDING: u8 = 0;
+    const COMMITTING: u8 = 1;
+    const STOPPED: u8 = 2;
+
+    fn begin_commit(&self, deadline: Instant) -> afs_error::Result<()> {
+        remaining(deadline)?;
+        self.0.compare_exchange(
+            Self::PENDING, Self::COMMITTING, Ordering::AcqRel, Ordering::Acquire,
+        ).map(|_| ()).map_err(|_| write_deadline_expired())
+    }
+
+    fn stop_or_committing(&self) -> bool {
+        self.0.compare_exchange(
+            Self::PENDING, Self::STOPPED, Ordering::AcqRel, Ordering::Acquire,
+        ) == Err(Self::COMMITTING)
+    }
+}
+
+fn write_deadline_expired() -> afs_error::Error {
+    afs_error::Error::coded(
+        afs_error::CLIENT_DEADLINE_EXCEEDED,
+        "OwnerFs HIXL write deadline expired",
+    )
 }
 
 struct WriteRequest {
@@ -159,7 +195,7 @@ impl OwnerHixlReader {
     async fn write_inner(
         self: Arc<Self>,
         request: WriteRequest,
-        commit_started: Arc<AtomicBool>,
+        dispatch: Arc<WriteDispatch>,
     ) -> afs_error::Result<Option<usize>> {
         let Some(mut lease) = self
             .acquire_for(
@@ -173,6 +209,9 @@ impl OwnerHixlReader {
         else {
             return Ok(None);
         };
+        if !lease.session.reply.buffered_write_supported {
+            return Ok(None);
+        }
         let (lane_id, remote, slot_bytes, slots) = self.read_lane(&request.home, &lease.session)?;
         if request.bytes.len() > slot_bytes.saturating_mul(slots) {
             lease
@@ -267,8 +306,12 @@ impl OwnerHixlReader {
             Ok(Ok(())) => {
                 // Every retry carries the same Commit. Once an attempt is
                 // ambiguous, only Home's receipt or fence resolves the write.
-                let deadline = self.write_deadline()?;
-                commit_started.store(true, Ordering::Release);
+                if let Err(error) = dispatch.begin_commit(deadline) {
+                    if ticket.abort(false, self.write_deadline()?).await.is_ok() {
+                        ticket.resolved = true;
+                    }
+                    return Err(error);
+                }
                 let mut ambiguous = false;
                 let reply = write_rpc_with_retry_observing(
                     &ticket.lease.session.client,
@@ -824,32 +867,32 @@ mod tests {
 
     #[test]
     fn write_body_checksum_honors_negotiation_and_legacy_wire_shape() {
-        use afs_protocol::node_data::DfsDigestAlgorithm;
+        use afs_protocol::node_data::HixlSlotChecksumAlgorithm;
 
         let body = b"123456789";
         let mut reply = super::super::OwnerNegotiateHixlReply {
             write_checksum_negotiated: true,
-            slot_checksum_algorithm: DfsDigestAlgorithm::Crc32c as i32,
+            slot_checksum_algorithm: HixlSlotChecksumAlgorithm::Crc32c as i32,
             ..Default::default()
         };
         assert_eq!(
             body_checksum(&reply, body).unwrap(),
             (
-                DfsDigestAlgorithm::Crc32c as i32,
+                HixlSlotChecksumAlgorithm::Crc32c as i32,
                 0xe306_9283_u32.to_le_bytes().to_vec()
             )
         );
-        reply.slot_checksum_algorithm = DfsDigestAlgorithm::Blake3 as i32;
+        reply.slot_checksum_algorithm = HixlSlotChecksumAlgorithm::Blake3 as i32;
         let blake = blake3::hash(body).as_bytes().to_vec();
         assert_eq!(
             body_checksum(&reply, body).unwrap(),
-            (DfsDigestAlgorithm::Blake3 as i32, blake.clone())
+            (HixlSlotChecksumAlgorithm::Blake3 as i32, blake.clone())
         );
         reply.write_checksum_negotiated = false;
-        reply.slot_checksum_algorithm = DfsDigestAlgorithm::Crc32c as i32;
+        reply.slot_checksum_algorithm = HixlSlotChecksumAlgorithm::Crc32c as i32;
         assert_eq!(
             body_checksum(&reply, body).unwrap(),
-            (DfsDigestAlgorithm::Unspecified as i32, blake)
+            (HixlSlotChecksumAlgorithm::Unspecified as i32, blake)
         );
     }
 

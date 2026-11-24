@@ -3,7 +3,7 @@
 //! This module keeps the lane, deadline and engine-binding helpers the OwnerFs
 //! reader needs, without any of its window state.
 
-use super::dfs_protocol_error;
+use super::protocol_error;
 use crate::config::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
 use crate::node::data_plane::hixl::ReadRuntime;
 use crate::node::rpc::hixl::{TransportParameters, runtime_error, transport_parameters};
@@ -92,7 +92,7 @@ pub(super) async fn connect_lanes(
         for (index, remote) in lanes.iter().enumerate() {
             native
                 .lane(index)
-                .ok_or_else(|| dfs_protocol_error("HIXL local lane disappeared"))?
+                .ok_or_else(|| protocol_error("HIXL local lane disappeared"))?
                 .connect(&remote.engine_id, deadline)
                 .map_err(runtime_error)?;
         }
@@ -105,7 +105,7 @@ pub(super) async fn connect_lanes(
 pub(super) fn engine_transport_parameters(
     info: &EngineInfo,
 ) -> afs_error::Result<TransportParameters> {
-    transport_parameters(info).map_err(dfs_protocol_error)
+    transport_parameters(info).map_err(protocol_error)
 }
 
 /// Remembers which peer generation owns each engine endpoint. Reusing an

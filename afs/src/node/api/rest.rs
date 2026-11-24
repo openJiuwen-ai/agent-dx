@@ -62,7 +62,7 @@ async fn metrics(
         axum::Extension<crate::node::rpc::control::RdmaSessionRegistry>,
     >,
 ) -> Result<String, RestError> {
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     if let (Some(metrics), Some(runtime)) = (&node.hixl_metrics, &node.hixl_runtime) {
         metrics.snapshot(&runtime.status());
     }
@@ -174,7 +174,7 @@ fn node_health_report(node: &Node) -> HealthReport {
     let mounts_ready = ownerfs_mount.ready && dfs_mount.ready;
     let mounts_configured = ownerfs_mount.configured || dfs_mount.configured;
     let rdma = rdma_check(node);
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     let hixl = {
         let runtime = node.hixl_runtime.as_ref();
         let status = runtime.map(|runtime| runtime.status());
@@ -193,7 +193,7 @@ fn node_health_report(node: &Node) -> HealthReport {
             &lane_statuses,
         )
     };
-    #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
+    #[cfg(not(feature = "ownerfs"))]
     let hixl = hixl_check(
         &node.config.hixl,
         node.config.data_mode,
@@ -290,9 +290,9 @@ fn hixl_check(
     let startup_fallback = configured && data_mode == DataMode::Auto && status.is_none();
     let ready = !configured || running || startup_fallback;
     let devices = config.device_configs();
-    #[cfg(feature = "dfs")]
+    #[cfg(feature = "ownerfs")]
     let protocol_version = status.map(|_| crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION);
-    #[cfg(not(feature = "dfs"))]
+    #[cfg(not(feature = "ownerfs"))]
     let protocol_version = Option::<u32>::None;
     let lanes = (0..lane_count)
         .map(|index| {

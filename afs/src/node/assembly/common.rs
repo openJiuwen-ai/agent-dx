@@ -277,7 +277,7 @@ pub(super) struct Backends {
     pub(super) peer_connections: Arc<rpc::peer::PeerConnectionPool>,
     #[cfg(feature = "ownerfs")]
     pub(super) ownerfs: ownerfs::OwnerFsAssembly,
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     pub(super) hixl_reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
     #[cfg(feature = "dfs")]
     pub(super) dfs: dfs::DfsAssembly,
@@ -292,18 +292,15 @@ impl Backends {
         metrics: FsMetrics,
         storage: NodeStorage,
         registration: &InitialRegistration,
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))] hixl: &super::hixl::Hixl,
+        #[cfg(feature = "ownerfs")] hixl: &super::hixl::Hixl,
     ) -> Result<Self, BoxError> {
         #[cfg(feature = "dfs")]
         let dfs_read = dfs::DfsReadAdmission::new(cfg, registration)?;
         #[cfg(any(feature = "ownerfs", feature = "dfs"))]
         let peer_connections = peer_connections(cfg, startup, &storage)?;
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        #[cfg(feature = "ownerfs")]
         let ownerfs =
             ownerfs::assemble(cfg, startup, &peer_connections, &metrics.owner_rpc, hixl).await?;
-        #[cfg(all(feature = "ownerfs", not(feature = "dfs")))]
-        let ownerfs =
-            ownerfs::assemble(cfg, startup, &peer_connections, &metrics.owner_rpc).await?;
         #[cfg(feature = "dfs")]
         let dfs = dfs::DfsAssembly::assemble(
             cfg,
@@ -330,7 +327,7 @@ impl Backends {
             peer_connections,
             #[cfg(feature = "ownerfs")]
             ownerfs,
-            #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+            #[cfg(feature = "ownerfs")]
             hixl_reader: hixl.reader(),
             #[cfg(feature = "dfs")]
             dfs,
@@ -527,7 +524,7 @@ pub(super) fn node_state(
     registration: &InitialRegistration,
     mounts: &FuseMounts,
     backends: &mut Backends,
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))] hixl: &super::hixl::Hixl,
+    #[cfg(feature = "ownerfs")] hixl: &super::hixl::Hixl,
 ) -> (Arc<NodeReadiness>, Arc<Node>) {
     let needs_meta = startup.needs_meta;
     let registered_node_epoch = registration.epoch;
@@ -587,9 +584,9 @@ pub(super) fn node_state(
         ownerfs: backends.ownerfs.instance.take(),
         #[cfg(feature = "dfs")]
         dfs: backends.dfs.instance.take(),
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        #[cfg(feature = "ownerfs")]
         hixl_runtime: hixl.runtime(),
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        #[cfg(feature = "ownerfs")]
         hixl_metrics: hixl.metrics(),
     });
     (readiness, state)

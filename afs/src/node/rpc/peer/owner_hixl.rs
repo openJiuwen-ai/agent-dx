@@ -67,6 +67,8 @@ const RELEASE_PARK: Duration = Duration::from_millis(10);
 #[derive(Clone, Copy, Debug)]
 pub struct OwnerHixlPolicy {
     pub mode: DataMode,
+    pub snapshot_reads: bool,
+    pub buffered_writes: bool,
     pub max_group_bytes: usize,
     pub max_inflight: usize,
     pub host_budget_bytes: u64,
@@ -190,6 +192,12 @@ impl OwnerHixlReader {
             metrics: None,
             owner_metrics: None,
         })
+    }
+
+    fn operation_deadline(&self) -> afs_error::Result<Instant> {
+        Instant::now()
+            .checked_add(crate::node::call_deadline::bounded(self.timeout))
+            .ok_or_else(|| protocol_error("OwnerFs HIXL deadline overflow"))
     }
 
     #[cfg(test)]
@@ -392,7 +400,7 @@ impl OwnerHixlReader {
                     || guard.write_tickets >= MAX_SESSION_WRITE_TICKETS
             })
         {
-            let _ = guard.return_write_window(&session, self.timeout).await;
+            let _ = guard.return_write_window(&session, remaining(deadline)?).await;
         }
         let stale = guard.session.as_ref().is_some_and(|session| {
             session.poisoned.load(Ordering::Acquire)
@@ -401,15 +409,35 @@ impl OwnerHixlReader {
                 || idle
         });
         if stale && let Some(session) = guard.session.take() {
-            // Home quarantines a session closed while a read holds slots.
-            if let Some(ticket) = guard.parked.take() {
-                let _ = self
-                    .release(&session, &ticket, HixlReleaseOutcome::Completed, true)
-                    .await;
-            }
-            let started = Instant::now();
-            let closed = close_session(&session, self.timeout).await;
-            self.observe(Operation::Close, started.elapsed(), closed.is_ok());
+            let parked = guard.parked.take();
+            let metrics = self.metrics.clone();
+            let timeout = self.timeout;
+            let cleanup = tokio::spawn(async move {
+                if let Some(ticket) = parked {
+                    let started = Instant::now();
+                    let released = release_slots(
+                        &session,
+                        &ticket,
+                        HixlReleaseOutcome::Completed,
+                        true,
+                        timeout,
+                    ).await;
+                    observe_optional(metrics.as_ref(), Operation::Release, started.elapsed(), released.is_ok());
+                }
+                let started = Instant::now();
+                let closed = close_session(&session, timeout).await;
+                observe_optional(metrics.as_ref(), Operation::Close, started.elapsed(), closed.is_ok());
+            });
+            tokio::time::timeout(remaining(deadline)?, cleanup)
+                .await
+                .map_err(|_| afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "OwnerFs HIXL timed out waiting for an old session to close",
+                ))?
+                .map_err(|error| afs_error::Error::coded(
+                    afs_error::CLIENT_WORKER_FAILED,
+                    error.to_string(),
+                ))?;
         }
         if guard.session.is_none() {
             match self.establish(home, client, access, deadline).await? {
@@ -1313,6 +1341,7 @@ async fn release_slots(
 async fn close_session(session: &HomeSession, timeout: Duration) -> afs_error::Result<()> {
     let mut request = afs_tracing::request_with_current_context(OwnerCloseHixlRequest {
         session_id: session.reply.session_id,
+        home_session_id: session.reply.home_session_id.clone(),
     });
     request.set_timeout(timeout);
     let mut client = session.client.clone();

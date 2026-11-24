@@ -1,6 +1,6 @@
 use super::test_support::{MemoryExports, MemorySource, OPEN_HANDLE, memory_home};
 use super::*;
-use afs_protocol::node_data::{DfsDigestAlgorithm, OwnerHandle, RootAccess};
+use afs_protocol::node_data::{HixlSlotChecksumAlgorithm, OwnerHandle, RootAccess};
 use std::sync::atomic::Ordering;
 
 const SLOT: usize = 4096;
@@ -412,7 +412,7 @@ fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
     // A released read id cannot be prepared again in the same session.
     assert!(prepare_window(&service, session_id, "r1", 0, 8192).is_err());
     let closed = service
-        .close_blocking("node-b", OwnerCloseHixlRequest { session_id })
+        .close_blocking("node-b", OwnerCloseHixlRequest { session_id, home_session_id: "home-session-a".to_owned() })
         .unwrap();
     assert!(closed.drained);
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
@@ -531,7 +531,7 @@ fn closing_with_unreleased_slots_quarantines_the_runtime() {
     let session_id = session(&service);
     prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     let closed = service
-        .close_blocking("node-b", OwnerCloseHixlRequest { session_id })
+        .close_blocking("node-b", OwnerCloseHixlRequest { session_id, home_session_id: "home-session-a".to_owned() })
         .unwrap();
     assert!(!closed.drained);
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 1);
@@ -783,13 +783,13 @@ fn negotiation_picks_crc32c_slot_checksums_when_the_reader_offers_them() {
     let (service, _, _) = fixture(SLOT, 4);
     let mut offered = negotiate_request("root-a");
     offered.slot_checksum_algorithms = vec![
-        DfsDigestAlgorithm::Crc32c as i32,
-        DfsDigestAlgorithm::Blake3 as i32,
+        HixlSlotChecksumAlgorithm::Crc32c as i32,
+        HixlSlotChecksumAlgorithm::Blake3 as i32,
     ];
     let reply = service.negotiate_blocking("node-b", offered).unwrap();
     assert_eq!(
         reply.slot_checksum_algorithm,
-        DfsDigestAlgorithm::Crc32c as i32
+        HixlSlotChecksumAlgorithm::Crc32c as i32
     );
 
     // A reader that offers nothing keeps BLAKE3.
@@ -798,7 +798,7 @@ fn negotiation_picks_crc32c_slot_checksums_when_the_reader_offers_them() {
         .unwrap();
     assert_eq!(
         reply.slot_checksum_algorithm,
-        DfsDigestAlgorithm::Blake3 as i32
+        HixlSlotChecksumAlgorithm::Blake3 as i32
     );
 }
 
@@ -806,7 +806,7 @@ fn negotiation_picks_crc32c_slot_checksums_when_the_reader_offers_them() {
 fn crc32c_session_slots_carry_crc32c_digests() {
     let (service, exports, source) = fixture(10_000, 4);
     let mut offered = negotiate_request("root-a");
-    offered.slot_checksum_algorithms = vec![DfsDigestAlgorithm::Crc32c as i32];
+    offered.slot_checksum_algorithms = vec![HixlSlotChecksumAlgorithm::Crc32c as i32];
     let session_id = service
         .negotiate_blocking("node-b", offered)
         .unwrap()
@@ -830,19 +830,19 @@ fn crc32c_session_slots_carry_crc32c_digests() {
 
 #[test]
 fn slot_checksum_negotiation_falls_back_to_blake3() {
-    use afs_protocol::node_data::DfsDigestAlgorithm;
+    use afs_protocol::node_data::HixlSlotChecksumAlgorithm;
     assert_eq!(
-        SlotChecksum::negotiate(&[DfsDigestAlgorithm::Blake3 as i32]),
+        SlotChecksum::negotiate(&[HixlSlotChecksumAlgorithm::Blake3 as i32]),
         SlotChecksum::Blake3
     );
     assert_eq!(SlotChecksum::negotiate(&[]), SlotChecksum::Blake3);
     // A Home that predates the field leaves it unset; that is BLAKE3.
     assert_eq!(
-        SlotChecksum::from_reply(DfsDigestAlgorithm::Unspecified as i32),
+        SlotChecksum::from_reply(HixlSlotChecksumAlgorithm::Unspecified as i32),
         Some(SlotChecksum::Blake3)
     );
     assert_eq!(
-        SlotChecksum::from_reply(DfsDigestAlgorithm::Crc32cSegmentsV1 as i32),
+        SlotChecksum::from_reply(2),
         None,
         "only BLAKE3 and plain CRC32C are slot algorithms"
     );
@@ -1357,7 +1357,7 @@ fn drained_sessions_leave_room_for_new_clients_but_live_sessions_remain_bounded(
         previous = id;
         assert!(
             service
-                .close_blocking("node-b", OwnerCloseHixlRequest { session_id: id })
+                .close_blocking("node-b", OwnerCloseHixlRequest { session_id: id, home_session_id: "home-session-a".to_owned() })
                 .unwrap()
                 .drained
         );

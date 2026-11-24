@@ -68,6 +68,8 @@ impl Hixl {
                         cfg.id.clone(),
                         rpc::peer::owner_hixl::OwnerHixlPolicy {
                             mode: cfg.data_mode,
+                            snapshot_reads: cfg.hixl.ownerfs_snapshot_reads,
+                            buffered_writes: cfg.hixl.ownerfs_buffered_writes,
                             max_group_bytes: cfg.hixl.ownerfs_read_group_bytes,
                             max_inflight: cfg.hixl.ownerfs_read_group_max_inflight,
                             host_budget_bytes: cfg.hixl.ownerfs_read_group_host_budget_bytes,

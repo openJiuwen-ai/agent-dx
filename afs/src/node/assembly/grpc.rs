@@ -20,15 +20,15 @@ use std::{sync::Arc, time::Instant};
 const OWNER_ONLY_TCP_MAX_FRAME_SIZE: u32 = 256 * 1024;
 
 pub(super) struct GrpcShutdown {
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     home: Option<Arc<rpc::data::owner_hixl::OwnerHixlService>>,
 }
 
 impl GrpcShutdown {
     pub(super) async fn drain_home(self, deadline: Instant) -> Result<(), BoxError> {
-        #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
+        #[cfg(not(feature = "ownerfs"))]
         let _ = deadline;
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        #[cfg(feature = "ownerfs")]
         if let Some(home) = self.home {
             if let Err(status) = home.drain_until(deadline).await {
                 let error = afs_transport::grpc::error_status::status_to_error(status);
@@ -150,7 +150,7 @@ pub(super) fn start(
             )?),
         },
     );
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     let owner_hixl_source = match (
         &state.hixl_runtime,
         state.ownerfs.as_ref(),
@@ -161,7 +161,8 @@ pub(super) fn start(
                 runtime.clone(),
                 ownerfs.peer_executor()?,
             )
-            .with_owner_metrics(backends.metrics.owner_rpc.clone());
+            .with_owner_metrics(backends.metrics.owner_rpc.clone())
+            .with_policy(&cfg.hixl.trusted_peers, cfg.hixl.ownerfs_buffered_writes);
             if let Some(metrics) = &state.hixl_metrics {
                 source = source.with_metrics(metrics.clone());
             }
@@ -169,12 +170,11 @@ pub(super) fn start(
         }
         _ => None,
     };
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     if let Some(source) = &owner_hixl_source {
         super::hixl::spawn_expiry(services, source.clone());
     }
     #[cfg(feature = "ownerfs")]
-    #[cfg(feature = "dfs")]
     let owner_files = ownerfs::owner_files_server(
         cfg,
         state,
@@ -182,10 +182,6 @@ pub(super) fn start(
         owner_rdma_sessions,
         owner_hixl_source.as_ref(),
     )?;
-    #[cfg(feature = "ownerfs")]
-    #[cfg(not(feature = "dfs"))]
-    let owner_files =
-        ownerfs::owner_files_server(cfg, state, &backends.metrics.owner_rpc, owner_rdma_sessions)?;
     #[cfg(feature = "dfs")]
     let grpc_state = state.clone();
     services.spawn(async move {
@@ -216,7 +212,7 @@ pub(super) fn start(
             .map_err(Into::into)
     });
     Ok(GrpcShutdown {
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        #[cfg(feature = "ownerfs")]
         home: owner_hixl_source,
     })
 }

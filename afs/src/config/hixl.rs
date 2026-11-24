@@ -67,6 +67,12 @@ pub struct HixlConfig {
     pub ownerfs_min_file_bytes: u64,
     /// Minimum size of one buffered write for Auto to try HIXL (inclusive).
     pub ownerfs_min_write_bytes: usize,
+    /// Allow buffered HIXL writes on both ingress and Home.
+    pub ownerfs_buffered_writes: bool,
+    /// Enable cross-request caching only for immutable, long-lived read grants.
+    pub ownerfs_snapshot_reads: bool,
+    /// Nodes explicitly trusted to share this runtime's registered HIXL slots.
+    pub trusted_peers: Vec<String>,
     /// Reader control sessions per Home; each admits one window fetch at a
     /// time. Defaults to 2 so two opens of one Home prepare and transfer at
     /// once; the measurements are in the deployment guide.
@@ -115,6 +121,9 @@ impl Default for HixlConfig {
             ownerfs_read_group_host_budget_bytes: 1024 * 1024 * 1024,
             ownerfs_min_file_bytes: 1024 * 1024,
             ownerfs_min_write_bytes: 512 * 1024,
+            ownerfs_buffered_writes: false,
+            ownerfs_snapshot_reads: false,
+            trusted_peers: Vec::new(),
             ownerfs_sessions_per_home: 2,
             ownerfs_batch_read: true,
             ownerfs_batch_max_file_bytes: MAX_OWNERFS_HIXL_BATCH_FILE_BYTES,
@@ -193,9 +202,9 @@ impl HixlConfig {
         if data_mode == DataMode::Hixl && dfs {
             return Err(invalid("data_mode = hixl is unsupported for DFS"));
         }
-        if data_mode == DataMode::Hixl && !cfg!(all(feature = "ownerfs", feature = "dfs")) {
+        if data_mode == DataMode::Hixl && !cfg!(feature = "ownerfs") {
             return Err(invalid(
-                "HIXL requires an OwnerFs build with the dfs feature",
+                "HIXL requires an OwnerFs build",
             ));
         }
         self.validate_ownerfs()?;
@@ -380,6 +389,16 @@ impl HixlConfig {
 
 /// Checks the `[hixl]` table against the merged configuration.
 pub(super) fn validate(role: Role, cfg: &super::Config) -> Result<()> {
+    if cfg.hixl.enabled(cfg.data_mode, cfg.ownerfs)
+        && (cfg.hixl.trusted_peers.is_empty()
+            || cfg.hixl.trusted_peers.iter().any(|peer| {
+                peer.is_empty() || !cfg.trusted_node_certs.contains_key(peer)
+            }))
+    {
+        return Err(invalid(
+            "hixl.trusted_peers must name at least one node from trusted_node_certs",
+        ));
+    }
     cfg.hixl.validate(
         role,
         HixlDeployment {

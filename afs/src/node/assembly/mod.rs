@@ -27,7 +27,7 @@ pub(super) mod common;
 #[cfg(feature = "dfs")]
 pub(super) mod dfs;
 mod grpc;
-#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[cfg(feature = "ownerfs")]
 mod hixl;
 #[cfg(feature = "ownerfs")]
 mod outlet;
@@ -51,18 +51,18 @@ pub(super) async fn run_node(
     obs: Observability,
     on_shutdown: impl Fn() -> std::time::Instant,
 ) -> Result<(), BoxError> {
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     let mut hixl = hixl::Hixl::default();
     let result = assemble_and_serve(
         cfg,
         obs,
         &on_shutdown,
-        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        #[cfg(feature = "ownerfs")]
         &mut hixl,
     )
     .await;
 
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     {
         // Startup errors can bypass Services' shutdown callback. Arm the same
         // process deadline before waiting for the native owner in that case.
@@ -81,7 +81,7 @@ async fn assemble_and_serve(
     cfg: Config,
     obs: Observability,
     on_shutdown: impl FnOnce() -> std::time::Instant,
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))] hixl: &mut hixl::Hixl,
+    #[cfg(feature = "ownerfs")] hixl: &mut hixl::Hixl,
 ) -> Result<(), BoxError> {
     // 1–2. Bind all TCP ingress before spawning services. A failed bind
     // cannot leave a half-ready Node. Storage opens before registration.
@@ -101,7 +101,7 @@ async fn assemble_and_serve(
     let node_descriptor = common::node_descriptor(&cfg, &startup, &storage, management_labels);
     // The shared HIXL runtime starts before registration so explicit HIXL
     // fails startup before any mount exists.
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     hixl.start(
         &cfg,
         &obs,
@@ -112,11 +112,11 @@ async fn assemble_and_serve(
     let registration =
         common::InitialRegistration::register(&cfg, &startup, node_descriptor.as_ref()).await?;
     // 5–9.
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     let mut backends =
         common::Backends::assemble(&cfg, &obs, &startup, metrics, storage, &registration, hixl)
             .await?;
-    #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
+    #[cfg(not(feature = "ownerfs"))]
     let mut backends =
         common::Backends::assemble(&cfg, &obs, &startup, metrics, storage, &registration).await?;
     #[cfg(feature = "dfs")]
@@ -139,7 +139,7 @@ async fn assemble_and_serve(
     // 10–12.
     let (endpoints, local) = common::LocalEndpoints::serve(&cfg, &obs, &backends).await?;
     let (mounts, local) = common::FuseMounts::mount(&cfg, &backends, local).await?;
-    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     let (readiness, state) = common::node_state(
         &cfg,
         obs,
@@ -149,7 +149,7 @@ async fn assemble_and_serve(
         &mut backends,
         hixl,
     );
-    #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
+    #[cfg(not(feature = "ownerfs"))]
     let (readiness, state) =
         common::node_state(&cfg, obs, &startup, &registration, &mounts, &mut backends);
     // 13. Services.

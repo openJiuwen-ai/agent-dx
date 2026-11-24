@@ -739,6 +739,14 @@ message OwnerReleaseRequest {
 
 message OwnerReleaseReply {}
 
+// HIXL slot digests. Values 1 and 3 match the original protocol.
+enum HixlSlotChecksumAlgorithm {
+  HIXL_SLOT_CHECKSUM_ALGORITHM_UNSPECIFIED = 0;
+  HIXL_SLOT_CHECKSUM_ALGORITHM_BLAKE3 = 1;
+  reserved 2;
+  HIXL_SLOT_CHECKSUM_ALGORITHM_CRC32C = 3;
+}
+
 // OwnerFs HIXL read-ahead windows. The session is only a transport lease that
 // the authenticated peer opened with one valid RootAccess; every prepare
 // carries its own RootAccess and open handle and is authorized like Read.
@@ -756,7 +764,7 @@ message OwnerNegotiateHixlRequest {
   uint32 lane_count = 9;
   // Slot digests the reader can verify. Home picks CRC32C when offered and
   // falls back to BLAKE3; an empty list means BLAKE3 only.
-  repeated DfsDigestAlgorithm slot_checksum_algorithms = 10;
+  repeated HixlSlotChecksumAlgorithm slot_checksum_algorithms = 10;
 }
 
 // A negotiated session supports buffered reads and writes; each operation still
@@ -772,10 +780,11 @@ message OwnerNegotiateHixlReply {
   optional uint64 hccs_domain_id = 7;
   repeated HixlLane lanes = 8;
   // Algorithm of every slot checksum on this session: BLAKE3 or CRC32C.
-  DfsDigestAlgorithm slot_checksum_algorithm = 9;
+  HixlSlotChecksumAlgorithm slot_checksum_algorithm = 9;
   reserved 10;
   // Home supports using the negotiated read checksum for WRITE payloads.
   bool write_checksum_negotiated = 11;
+  bool buffered_write_supported = 12;
 }
 
 // read_id is reader-generated and stays identical across transport retries of
@@ -894,7 +903,7 @@ message OwnerPrepareWriteHixlRequest {
   uint32 lane_id = 9;
   uint64 slot_bytes = 10;
   // Explicit values must match the negotiated algorithm; unspecified means legacy BLAKE3.
-  DfsDigestAlgorithm data_checksum_algorithm = 11;
+  HixlSlotChecksumAlgorithm data_checksum_algorithm = 11;
 }
 
 message OwnerPrepareWriteHixlReply {
@@ -953,6 +962,7 @@ message OwnerWriteHixlFailure {
 
 message OwnerCloseHixlRequest {
   uint64 session_id = 1;
+  string home_session_id = 2;
 }
 
 message OwnerCloseHixlReply {

@@ -6,7 +6,7 @@
 
 pub mod control;
 pub mod data;
-#[cfg(feature = "dfs")]
+#[cfg(feature = "ownerfs")]
 pub mod hixl;
 pub mod meta;
 #[cfg(feature = "ownerfs")]

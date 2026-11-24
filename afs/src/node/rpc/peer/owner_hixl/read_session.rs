@@ -209,7 +209,7 @@ impl OwnerReadSession {
             return;
         }
         let windowed = policy.mode == DataMode::Hixl || size >= policy.min_file_bytes;
-        let cacheable = mode == libc::O_RDONLY;
+        let cacheable = mode == libc::O_RDONLY && policy.snapshot_reads;
         let batch =
             (cacheable && size > OPEN_PREFETCH_LIMIT && size <= policy.batch_max_file_bytes)
                 .then(|| batch_route(grant, path, attributes, !windowed))
@@ -286,7 +286,7 @@ impl OwnerReadSession {
         size: usize,
     ) -> Option<prost::bytes::Bytes> {
         let entry = self.opens().get(&file.handle).cloned()?;
-        if file.owner_session_id != grant.home_session_id || !self.cache_allowed(&entry.identity) {
+        if !entry.cacheable || file.owner_session_id != grant.home_session_id || !self.cache_allowed(&entry.identity) {
             return None;
         }
         let mut state = entry.state.lock().ok()?;
@@ -305,7 +305,7 @@ impl OwnerReadSession {
                     route,
                     &mut state,
                     epoch,
-                    false,
+                    None,
                 )
                 .ok()
                 .flatten()
@@ -360,6 +360,7 @@ impl OwnerReadSession {
         let Some(handle) = runtime.handle() else {
             return Ok(WindowRead::Fallback { served: 0 });
         };
+        let deadline = self.reader.operation_deadline()?;
         let mut state = entry
             .state
             .lock()
@@ -396,7 +397,7 @@ impl OwnerReadSession {
                 route,
                 &mut state,
                 epoch,
-                true,
+                Some(deadline),
             )? {
                 let start = usize::try_from(offset)
                     .unwrap_or(usize::MAX)
@@ -444,7 +445,7 @@ impl OwnerReadSession {
                 && pending.offset == cursor
             {
                 let waited = handle.block_on(async {
-                    match remaining(Instant::now() + reader.timeout) {
+                    match remaining(deadline) {
                         Ok(wait) => tokio::time::timeout(wait, pending.receiver).await.ok(),
                         Err(_) => None,
                     }
@@ -503,9 +504,7 @@ impl OwnerReadSession {
                 handle: file.handle.clone(),
                 offset: cursor,
                 size,
-                deadline: Instant::now()
-                    .checked_add(reader.timeout)
-                    .ok_or_else(|| protocol_error("OwnerFs HIXL deadline overflow"))?,
+                deadline,
             };
             let deadline = request.deadline;
             let keep_window = cacheable && budget.is_some();
@@ -592,7 +591,7 @@ impl OwnerReadSession {
         route: &BatchRoute,
         state: &mut WindowState,
         epoch: u64,
-        wait: bool,
+        deadline: Option<Instant>,
     ) -> afs_error::Result<Option<prost::bytes::Bytes>> {
         if let Some(claimed) = &state.claimed {
             if claimed.epoch == epoch {
@@ -604,7 +603,7 @@ impl OwnerReadSession {
         if epoch != 0 {
             return Ok(None);
         }
-        let mut may_start = wait && handle.is_some() && client.is_some();
+        let mut may_start = deadline.is_some() && handle.is_some() && client.is_some();
         // Start, wait and claim: three rounds at most.
         for _ in 0..3 {
             let claim = self.batches().claim(&entry.identity, route, may_start);
@@ -620,12 +619,12 @@ impl OwnerReadSession {
                     }
                     return Ok(Some(bytes));
                 }
-                Claim::Wait(mut done) if wait => {
-                    let Some(handle) = handle else {
+                Claim::Wait(mut done) => {
+                    let (Some(handle), Some(deadline)) = (handle, deadline) else {
                         return Ok(None);
                     };
                     self.reader.count(ReadOutcome::BatchWait);
-                    let timeout = self.reader.timeout;
+                    let timeout = remaining(deadline)?;
                     handle.block_on(async move {
                         let landed = tokio::time::timeout(timeout, done.wait_for(Option::is_some))
                             .await

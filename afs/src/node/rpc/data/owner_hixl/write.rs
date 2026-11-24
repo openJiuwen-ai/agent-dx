@@ -10,7 +10,7 @@ use super::{
 use crate::node::storage::MAX_TRANSFER_BYTES;
 use crate::node::vfs::types::WriteOptions;
 use afs_protocol::node_data::{
-    DfsDigestAlgorithm, OwnerAbortWriteHixlReply, OwnerAbortWriteHixlRequest,
+    HixlSlotChecksumAlgorithm, OwnerAbortWriteHixlReply, OwnerAbortWriteHixlRequest,
     OwnerCommitWriteHixlReply, OwnerFinishWriteHixlRequest, OwnerPrepareWriteHixlReply,
     OwnerPrepareWriteHixlRequest, OwnerWriteHixlFailure, owner_abort_write_hixl_reply::Recovery,
 };
@@ -108,6 +108,9 @@ impl OwnerHixlService {
         peer: String,
         request: OwnerPrepareWriteHixlRequest,
     ) -> Result<Response<OwnerPrepareWriteHixlReply>, Status> {
+        if !self.buffered_writes {
+            return Err(super::unsupported_status("OwnerFs HIXL buffered writes are disabled"));
+        }
         let service = self.clone();
         self.spawn_phase(Operation::Prepare, move || {
             service.prepare_write_blocking(&peer, request)
@@ -122,6 +125,9 @@ impl OwnerHixlService {
         peer: String,
         request: OwnerFinishWriteHixlRequest,
     ) -> Result<Response<OwnerCommitWriteHixlReply>, Status> {
+        if !self.buffered_writes {
+            return Err(super::unsupported_status("OwnerFs HIXL buffered writes are disabled"));
+        }
         let service = self.clone();
         self.spawn_phase(Operation::Validate, move || {
             service.commit_write_blocking(&peer, &request)
@@ -136,6 +142,9 @@ impl OwnerHixlService {
         peer: String,
         request: OwnerAbortWriteHixlRequest,
     ) -> Result<Response<OwnerAbortWriteHixlReply>, Status> {
+        if !self.buffered_writes {
+            return Err(super::unsupported_status("OwnerFs HIXL buffered writes are disabled"));
+        }
         let service = self.clone();
         self.spawn_phase(Operation::Release, move || {
             service.abort_write_blocking(&peer, request)
@@ -153,7 +162,7 @@ impl OwnerHixlService {
         let access = presented_access(request.access.clone()).map_err(error_to_status)?;
         let checksum = self
             .lock_registry()?
-            .prepare_session(request.session_id, peer, &access.home_session_id)?
+            .bound_session(request.session_id, peer, &access.home_session_id)?
             .checksum;
         let input = WriteInput::parse(&request, access, checksum)?;
         let (lane, length) = (input.lane, input.length);
@@ -851,7 +860,7 @@ impl WriteInput {
             .ok_or_else(|| invalid_write("OwnerFs HIXL write length is invalid"))?;
         let lane = usize::try_from(request.lane_id)
             .map_err(|_| invalid_write("OwnerFs HIXL write lane overflows"))?;
-        let checksum = if request.data_checksum_algorithm == DfsDigestAlgorithm::Unspecified as i32
+        let checksum = if request.data_checksum_algorithm == HixlSlotChecksumAlgorithm::Unspecified as i32
         {
             SlotChecksum::Blake3
         } else if request.data_checksum_algorithm == negotiated.wire() as i32 {

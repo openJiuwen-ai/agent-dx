@@ -10,7 +10,7 @@
 //! Write tickets reuse those sessions and the same export pool.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -272,6 +272,8 @@ pub struct OwnerHixlService {
     batch_snapshots: Arc<Mutex<VecDeque<BatchDirectorySnapshot>>>,
     metrics: Option<HixlMetrics>,
     owner_metrics: Option<OwnerRpcMetrics>,
+    trusted_peers: Option<Arc<HashSet<String>>>,
+    buffered_writes: bool,
     /// Slot algorithms each reader offered, in negotiation order.
     #[cfg(test)]
     offered_checksums: Arc<Mutex<Vec<Vec<i32>>>>,
@@ -333,6 +335,8 @@ impl OwnerHixlService {
             batch_snapshots: Arc::new(Mutex::new(VecDeque::new())),
             metrics: None,
             owner_metrics: None,
+            trusted_peers: None,
+            buffered_writes: cfg!(test),
             #[cfg(test)]
             offered_checksums: Arc::new(Mutex::new(Vec::new())),
         }
@@ -346,6 +350,19 @@ impl OwnerHixlService {
             .ok()
             .and_then(|offers| offers.last().cloned())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn with_policy(mut self, trusted_peers: &[String], buffered_writes: bool) -> Self {
+        self.trusted_peers = Some(Arc::new(trusted_peers.iter().cloned().collect()));
+        self.buffered_writes = buffered_writes;
+        self
+    }
+
+    pub(super) fn check_peer(&self, peer: &str) -> Result<(), Status> {
+        if self.trusted_peers.as_ref().is_some_and(|peers| !peers.contains(peer)) {
+            return Err(unsupported_status("peer is not enabled for HIXL registered slots"));
+        }
+        Ok(())
     }
 
     pub fn with_metrics(mut self, metrics: HixlMetrics) -> Self {
@@ -623,7 +640,8 @@ impl OwnerHixlService {
             hccs_domain_id,
             lanes,
             slot_checksum_algorithm: checksum.wire() as i32,
-            write_checksum_negotiated: true,
+            write_checksum_negotiated: self.buffered_writes,
+            buffered_write_supported: self.buffered_writes,
         })
     }
 
@@ -637,7 +655,7 @@ impl OwnerHixlService {
         registry.expire_sessions();
         self.quarantine_pending(&mut registry, false)?;
         if let Some((home_session_id, prior_release)) = read_context {
-            registry.prepare_session(session_id, peer, home_session_id)?;
+            registry.bound_session(session_id, peer, home_session_id)?;
             self.apply_prior_release(&mut registry, peer, session_id, prior_release)?;
         }
         Ok(registry)
@@ -1377,17 +1395,15 @@ impl OwnerHixlService {
         peer: &str,
         request: OwnerCloseHixlRequest,
     ) -> Result<OwnerCloseHixlReply, Status> {
-        if request.session_id == 0 {
+        if request.session_id == 0 || request.home_session_id.is_empty() {
             return Err(coded_status(
                 afs_error::NODE_TRANSFER_INVALID,
                 "OwnerFs HIXL close identity is incomplete",
             ));
         }
         let mut registry = self.lock_registry()?;
-        registry.expire_sessions();
-        self.quarantine_pending(&mut registry, false)?;
         let drained = {
-            let session = registry.session_mut(request.session_id, peer)?;
+            let session = registry.bound_session(request.session_id, peer, &request.home_session_id)?;
             session.closed = true;
             session.last_used = Instant::now();
             !session.has_pending_slots()
@@ -1708,7 +1724,7 @@ impl Registry {
         Ok(session)
     }
 
-    fn prepare_session(
+    fn bound_session(
         &mut self,
         session_id: u64,
         peer: &str,
@@ -1717,7 +1733,7 @@ impl Registry {
         let session = self.session_mut(session_id, peer)?;
         if session.home_session_id != home_session_id {
             return Err(Status::permission_denied(
-                "OwnerFs HIXL prepare belongs to another Home session",
+                "OwnerFs HIXL request belongs to another Home session",
             ));
         }
         Ok(session)

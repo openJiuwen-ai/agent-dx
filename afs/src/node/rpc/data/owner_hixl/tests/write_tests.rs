@@ -17,7 +17,7 @@ fn request(session_id: u64, data: &[u8]) -> OwnerPrepareWriteHixlRequest {
         length: data.len().try_into().unwrap(),
         kill_suidgid: true,
         data_checksum: SlotChecksum::Blake3.digest(data),
-        data_checksum_algorithm: DfsDigestAlgorithm::Blake3 as i32,
+        data_checksum_algorithm: HixlSlotChecksumAlgorithm::Blake3 as i32,
         lane_id: 0,
         slot_bytes: SLOT as u64,
     }
@@ -215,7 +215,7 @@ async fn recovery_fences_late_commit_and_can_replay_the_fence() {
 async fn recovery_fences_reused_window_and_rejects_a_mismatched_binding() {
     let (service, exports, source) = fixture(0, 1);
     let mut first = request(session(&service), b"a");
-    first.data_checksum_algorithm = DfsDigestAlgorithm::Unspecified as i32;
+    first.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Unspecified as i32;
     let reply = prepare(&service, first.clone()).await;
     exports.write(reply.slots[0].address, b"a");
     let mut finish = commit(&reply);
@@ -463,9 +463,7 @@ async fn close_with_outstanding_write_quarantines_its_slots() {
     let close = service
         .close(
             "node-b".into(),
-            OwnerCloseHixlRequest {
-                session_id: reply.session_id,
-            },
+            OwnerCloseHixlRequest { session_id: reply.session_id, home_session_id: "home-session-a".to_owned() },
         )
         .await
         .unwrap()
@@ -650,9 +648,7 @@ async fn successor_reuses_slot_and_preserves_exact_commit_receipts() {
         service
             .close(
                 "node-b".into(),
-                OwnerCloseHixlRequest {
-                    session_id: window.session_id
-                }
+                OwnerCloseHixlRequest { session_id: window.session_id, home_session_id: "home-session-a".to_owned() }
             )
             .await
             .unwrap()
@@ -667,20 +663,20 @@ async fn negotiated_crc32c_detects_corruption_against_known_vector() {
     let (service, exports, source) = fixture(0, 1);
     let mut offer = negotiate_request("root-a");
     offer.slot_checksum_algorithms = vec![
-        DfsDigestAlgorithm::Crc32c as i32,
-        DfsDigestAlgorithm::Blake3 as i32,
+        HixlSlotChecksumAlgorithm::Crc32c as i32,
+        HixlSlotChecksumAlgorithm::Blake3 as i32,
     ];
     let session_id = service
         .negotiate_blocking("node-b", offer)
         .unwrap()
         .session_id;
     let mut valid = request(session_id, b"123456789");
-    valid.data_checksum_algorithm = DfsDigestAlgorithm::Crc32c as i32;
+    valid.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Crc32c as i32;
     valid.data_checksum = vec![0x83, 0x92, 0x06, 0xe3];
-    for value in [0, DfsDigestAlgorithm::Blake3 as i32, i32::MAX] {
+    for value in [0, HixlSlotChecksumAlgorithm::Blake3 as i32, i32::MAX] {
         let mut invalid = valid.clone();
         invalid.data_checksum_algorithm = value;
-        if value == DfsDigestAlgorithm::Blake3 as i32 {
+        if value == HixlSlotChecksumAlgorithm::Blake3 as i32 {
             invalid.data_checksum = SlotChecksum::Blake3.digest(b"123456789");
         }
         assert!(
@@ -719,7 +715,7 @@ async fn negotiated_crc32c_detects_corruption_against_known_vector() {
     };
     let mut mismatched = reused.clone();
     let metadata = mismatched.reused.as_mut().unwrap();
-    metadata.data_checksum_algorithm = DfsDigestAlgorithm::Blake3 as i32;
+    metadata.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Blake3 as i32;
     metadata.data_checksum = SlotChecksum::Blake3.digest(b"123456789");
     assert!(
         service
@@ -746,7 +742,7 @@ async fn negotiated_crc32c_detects_corruption_against_known_vector() {
 async fn unknown_abort_of_unused_successor_pins_window() {
     let (service, exports, source) = fixture(0, 1);
     let mut legacy = request(session(&service), b"x");
-    legacy.data_checksum_algorithm = DfsDigestAlgorithm::Unspecified as i32;
+    legacy.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Unspecified as i32;
     let prepared = prepare(&service, legacy).await;
     exports.write(prepared.slots[0].address, b"x");
     let mut first = commit(&prepared);

@@ -34,8 +34,8 @@ struct OwnerFilesFactory {
     timeout: std::time::Duration,
     rdma_admission: Arc<tokio::sync::Semaphore>,
     /// HIXL read-ahead windows; `None` keeps every read on gRPC.
-    #[cfg(feature = "dfs")]
     hixl_reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
+    hixl_trusted_peers: std::collections::HashSet<String>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -96,8 +96,7 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
         .with_rdma_admission(self.rdma_admission.clone())
         .with_long_wait_channel(long_wait_channel);
-        #[cfg(feature = "dfs")]
-        let client = match &self.hixl_reader {
+        let client = match self.hixl_reader.as_ref().filter(|_| self.hixl_trusted_peers.contains(home_node_id)) {
             Some(reader) => client.with_hixl(reader.clone(), home_node_id.to_owned()),
             None => client,
         };
@@ -125,7 +124,7 @@ pub(super) async fn assemble(
     startup: &Startup<'_>,
     peer_connections: &Arc<rpc::peer::PeerConnectionPool>,
     owner_rpc_metrics: &rpc::OwnerRpcMetrics,
-    #[cfg(feature = "dfs")] hixl: &super::hixl::Hixl,
+    hixl: &super::hixl::Hixl,
 ) -> Result<OwnerFsAssembly, BoxError> {
     let meta_endpoint = startup.meta_endpoint;
     let session_id = &startup.session_id;
@@ -177,8 +176,8 @@ pub(super) async fn assemble(
             rdma_admission: Arc::new(tokio::sync::Semaphore::new(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
-            #[cfg(feature = "dfs")]
-            hixl_reader: hixl.reader(),
+                    hixl_reader: hixl.reader(),
+            hixl_trusted_peers: cfg.hixl.trusted_peers.iter().cloned().collect(),
         });
         let recovery_root_meta = root_meta.clone();
         let roots = Arc::new(
@@ -331,7 +330,7 @@ pub(super) fn owner_files_server(
     state: &Node,
     owner_rpc_metrics: &rpc::OwnerRpcMetrics,
     owner_rdma_sessions: &rpc::control::RdmaSessionRegistry,
-    #[cfg(feature = "dfs")] hixl_source: Option<&Arc<rpc::data::owner_hixl::OwnerHixlService>>,
+    hixl_source: Option<&Arc<rpc::data::owner_hixl::OwnerHixlService>>,
 ) -> Result<OwnerFilesServer<rpc::data::OwnerFilesService>, BoxError> {
     let owner_files = if let Some(ownerfs) = state.ownerfs.as_ref() {
         let trusted = cfg
@@ -346,8 +345,7 @@ pub(super) fn owner_files_server(
         let service = rpc::data::OwnerFilesService::new(handler, authenticator)
             .with_metrics(owner_rpc_metrics.clone())
             .with_rdma_sessions(owner_rdma_sessions.clone());
-        #[cfg(feature = "dfs")]
-        let service = match hixl_source {
+            let service = match hixl_source {
             Some(source) => service.with_hixl(source.clone()),
             None => service,
         };

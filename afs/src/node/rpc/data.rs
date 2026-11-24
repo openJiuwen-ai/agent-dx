@@ -79,9 +79,9 @@ mod dfs_range_stream;
 mod dfs_read_authz;
 #[cfg(feature = "dfs")]
 mod dfs_replica_authz;
-#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[cfg(feature = "ownerfs")]
 mod hixl;
-#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[cfg(feature = "ownerfs")]
 pub mod owner_hixl;
 #[cfg(feature = "dfs")]
 use dfs_chunks::*;
@@ -1704,7 +1704,6 @@ pub struct OwnerFilesService {
     authenticator: Option<Arc<dyn PeerAuthenticator>>,
     metrics: Option<super::OwnerRpcMetrics>,
     rdma_sessions: Option<RdmaSessionRegistry>,
-    #[cfg(feature = "dfs")]
     hixl: Option<Arc<owner_hixl::OwnerHixlService>>,
 }
 
@@ -1720,7 +1719,6 @@ impl OwnerFilesService {
             authenticator: Some(authenticator),
             metrics: None,
             rdma_sessions: None,
-            #[cfg(feature = "dfs")]
             hixl: None,
         }
     }
@@ -1728,7 +1726,6 @@ impl OwnerFilesService {
     /// Enables OwnerFs HIXL read-ahead windows. Without it the HIXL RPCs
     /// report the capability as unsupported after authenticating the peer.
     #[must_use]
-    #[cfg(feature = "dfs")]
     pub fn with_hixl(mut self, hixl: Arc<owner_hixl::OwnerHixlService>) -> Self {
         self.hixl = Some(hixl);
         self
@@ -2196,21 +2193,11 @@ pub fn make_owner_files_server_with_handler_metrics_and_rdma(
 macro_rules! owner_hixl_rpc {
     ($service:ident, $request:ident, $operation:literal, $method:ident) => {{
         let peer = $service.owner_peer($operation, &$request)?;
-        #[cfg(feature = "dfs")]
-        {
-            let home = $service.hixl.as_ref().ok_or_else(|| {
-                owner_hixl::unsupported_status("OwnerFs HIXL capability is unavailable")
-            })?;
-            home.$method(peer, $request.into_inner()).await
-        }
-        #[cfg(not(feature = "dfs"))]
-        {
-            let _ = peer;
-            Err(coded_status(
-                afs_error::NODE_TRANSFER_UNSUPPORTED,
-                "OwnerFs HIXL capability is unavailable",
-            ))
-        }
+        let home = $service.hixl.as_ref().ok_or_else(|| {
+            owner_hixl::unsupported_status("OwnerFs HIXL capability is unavailable")
+        })?;
+        home.check_peer(&peer)?;
+        home.$method(peer, $request.into_inner()).await
     }};
 }
 

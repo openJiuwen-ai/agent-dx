@@ -1,6 +1,6 @@
 //! Node data movement shared across filesystem adapters.
 
-#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[cfg(feature = "ownerfs")]
 pub(crate) mod hixl;
 
 use crate::config::DataMode;

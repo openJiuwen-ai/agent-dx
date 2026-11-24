@@ -405,6 +405,8 @@ impl Fixture {
 fn policy(mode: DataMode) -> OwnerHixlPolicy {
     OwnerHixlPolicy {
         mode,
+        snapshot_reads: true,
+        buffered_writes: true,
         max_group_bytes: 4 * SLOT,
         max_inflight: 1,
         host_budget_bytes: 1024 * 1024,
@@ -1364,8 +1366,8 @@ async fn reader_negotiates_crc32c_slot_checksums_with_a_capable_home() {
     assert_eq!(
         fixture.home.negotiated_slot_checksums(),
         vec![
-            afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32,
-            afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+            afs_protocol::node_data::HixlSlotChecksumAlgorithm::Crc32c as i32,
+            afs_protocol::node_data::HixlSlotChecksumAlgorithm::Blake3 as i32,
         ],
         "a reader offers CRC32C first and keeps BLAKE3 for older Homes"
     );

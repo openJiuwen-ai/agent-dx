@@ -10,6 +10,41 @@ use afs_protocol::node_data::HixlTransport;
 use afs_transport::hixl::{EngineInfo, ReadTransport};
 use afs_transport::hixl::{HixlError, HixlErrorKind, HixlReadTiming, RuntimeStatus};
 
+use crate::node::data_plane::hixl::SlotChecksum;
+use afs_protocol::node_data::HixlSlotChecksumAlgorithm;
+
+impl SlotChecksum {
+    /// The reader's offer in preference order: hardware CRC32C first.
+    pub(crate) const OFFER: [SlotChecksum; 2] = [SlotChecksum::Crc32c, SlotChecksum::Blake3];
+
+    /// Home's choice: CRC32C when offered, otherwise BLAKE3, which every
+    /// reader verifies.
+    pub(crate) fn negotiate(offered: &[i32]) -> Self {
+        if offered.contains(&(HixlSlotChecksumAlgorithm::Crc32c as i32)) {
+            Self::Crc32c
+        } else {
+            Self::Blake3
+        }
+    }
+
+    /// Algorithm a Home reply names; an unset field is a Home without the
+    /// negotiation and means BLAKE3.
+    pub(crate) fn from_reply(algorithm: i32) -> Option<Self> {
+        match HixlSlotChecksumAlgorithm::try_from(algorithm) {
+            Ok(HixlSlotChecksumAlgorithm::Unspecified | HixlSlotChecksumAlgorithm::Blake3) => Some(Self::Blake3),
+            Ok(HixlSlotChecksumAlgorithm::Crc32c) => Some(Self::Crc32c),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn wire(self) -> HixlSlotChecksumAlgorithm {
+        match self {
+            Self::Blake3 => HixlSlotChecksumAlgorithm::Blake3,
+            Self::Crc32c => HixlSlotChecksumAlgorithm::Crc32c,
+        }
+    }
+}
+
 pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 1;
 
 #[cfg(feature = "ownerfs")]
