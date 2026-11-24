@@ -4,9 +4,16 @@
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
+#[ignore = "requires the CANN SDK headers and C++ compiler"]
 fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sdk = PathBuf::from(env!("AFS_HIXL_SDK_PATH"));
+    let configured = PathBuf::from(std::env::var_os("ADX_CANN_PATH").expect("set ADX_CANN_PATH"));
+    let target = configured.join(format!("{}-linux", std::env::consts::ARCH));
+    let sdk = if target.join("include").is_dir() {
+        target
+    } else {
+        configured
+    };
     let scratch = tempfile::tempdir().unwrap();
     let executable = scratch.path().join("hixl-bridge-test");
     let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());

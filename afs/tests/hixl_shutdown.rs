@@ -6,6 +6,7 @@
 use std::{
     fs,
     net::TcpListener,
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -34,7 +35,10 @@ fn blocked_c_exit_handler_exits_124_after_native_shutdown() {
 }
 
 fn run(mode: &str, expected: Option<i32>) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let root = tmp.path();
     prepare_mock(root);
     let [meta_grpc, meta_rest, node_grpc, node_rest] = {
@@ -128,6 +132,11 @@ fn prepare_mock(root: &Path) {
     let compile = Command::new("c++")
         .args(["-shared", "-fPIC", "-std=c++17", "-I"])
         .arg(include)
+        // Export only the SDK calls replaced by the fixture. Vendor C++ header
+        // singletons must stay local to this preloaded library.
+        .arg("-Wl,--version-script")
+        .arg("-Xlinker")
+        .arg(afs.join("tests/fixtures/hixl_shutdown_sdk.map"))
         .arg(afs.join("tests/fixtures/hixl_shutdown_sdk.cc"))
         .arg("-o")
         .arg(root.join("mock.so"))

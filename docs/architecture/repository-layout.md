@@ -29,7 +29,7 @@ Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢
 
 AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构与关键时序图](afs.md)，其中包含 OwnerFs／DFS 总览、workspace bind 与远端路径、DFS 外部 S3 发布和读取流程。
 
-OwnerFs 的读窗口、预读与目录批量由读会话管理。Node 公共数据面负责批量拉取与槽校验，`afs/crates/transport` 负责 native runtime 与槽池。`ADX_AFS_WITH_HIXL=1` 控制构建，`data_mode` 选择 Node 正文通道，默认 gRPC。A2 RoCE 与故障恢复尚待验收。详见 [AFS 部署](../deployment/afs.md) 与 [测试门禁](../testing/afs.md)。
+OwnerFs 的读窗口、预读与目录批量由读会话管理。Node 公共数据面负责批量拉取与槽校验，`afs/crates/transport` 负责 native runtime 与槽池。`AFS_WITH_HIXL=1` 构建支持 HIXL 的进程和独立原生模块。进程根据 `data_mode` 按需加载模块，默认走 gRPC。A2 RoCE 与故障恢复尚待验收。详见 [AFS 部署](../deployment/afs.md) 与 [测试门禁](../testing/afs.md)。
 
 ## 可选 E2B 兼容链路
 

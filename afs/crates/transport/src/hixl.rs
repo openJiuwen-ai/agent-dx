@@ -1937,106 +1937,11 @@ fn owner_loop<B: NativeBackend>(
 }
 
 #[cfg(feature = "hixl")]
-mod ffi {
-    use std::ffi::{c_char, c_void};
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct Window {
-        pub slot_id: u64,
-        pub generation: u64,
-        pub address: u64,
-        pub length: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct BatchWindow {
-        pub slot_id: u64,
-        pub remote_address: u64,
-        pub length: u64,
-    }
-
-    // SAFETY: these declarations mirror native/hixl.h. Rust keeps every
-    // pointer live for the duration of the synchronous owner-thread call.
-    unsafe extern "C" {
-        pub fn afs_hixl_start(
-            device_id: i32,
-            engine_id: *const c_char,
-            device_listen_port: u32,
-            window_bytes: usize,
-            receive_slots: usize,
-            export_slots: usize,
-            transport: u32,
-            buffer_pool_count: usize,
-            buffer_pool_size_mib: usize,
-            out_hccs_domain_id: *mut u64,
-            out: *mut *mut c_void,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_connect(
-            runtime: *mut c_void,
-            peer: *const c_char,
-            timeout_ms: u32,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_reserve_export(
-            runtime: *mut c_void,
-            slot_id: u64,
-            generation: u64,
-            len: usize,
-            out: *mut Window,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_release_export(
-            runtime: *mut c_void,
-            slot_id: u64,
-            generation: u64,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_read_sync_batch(
-            runtime: *mut c_void,
-            peer: *const c_char,
-            windows: *const BatchWindow,
-            count: usize,
-            slot_addresses: *mut u64,
-            timeout_ms: u32,
-            dispatch_started: *mut u32,
-            sdk_transfer_ns: *mut u64,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_write_batch(
-            runtime: *mut c_void,
-            peer: *const c_char,
-            windows: *const BatchWindow,
-            count: usize,
-            bytes: *const u8,
-            len: usize,
-            timeout_ms: u32,
-            dispatch_started: *mut u32,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_release_receives(
-            runtime: *mut c_void,
-            slot_ids: *const u64,
-            count: usize,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_shutdown(runtime: *mut c_void, error: *mut c_char, error_len: usize)
-        -> u32;
-        pub fn afs_hixl_destroy(runtime: *mut c_void);
-    }
-}
+mod ffi;
 
 #[cfg(feature = "hixl")]
 struct RealNative {
+    api: &'static ffi::Api,
     handle: Option<std::ptr::NonNull<std::ffi::c_void>>,
     hccs_domain_id: Option<u64>,
 }
@@ -2136,6 +2041,7 @@ impl NativeBackend for RealNative {
                 accepted: false,
             }
         })?;
+        let api = ffi::api()?;
         let (buffer_pool_count, buffer_pool_size_mib) = options.buffer_pool_dims();
         let mut handle = std::ptr::null_mut();
         let mut hccs_domain_id = 0;
@@ -2143,7 +2049,7 @@ impl NativeBackend for RealNative {
         // SAFETY: engine_id and error remain live for the synchronous native call;
         // options were validated before the owner thread was spawned.
         let status = unsafe {
-            ffi::afs_hixl_start(
+            (api.afs_hixl_start)(
                 options.device_id,
                 engine_id.as_ptr(),
                 options.device_listen_port.map(u32::from).unwrap_or(0),
@@ -2175,6 +2081,7 @@ impl NativeBackend for RealNative {
             accepted: false,
         })?;
         Ok(Self {
+            api,
             handle: Some(handle),
             hccs_domain_id: (options.transport == ReadTransport::Hccs).then_some(hccs_domain_id),
         })
@@ -2191,7 +2098,7 @@ impl NativeBackend for RealNative {
         // SAFETY: the handle, NUL-terminated peer, and writable error buffer are live;
         // the owner thread has exclusive access to the native engine.
         let status = unsafe {
-            ffi::afs_hixl_connect(
+            (self.api.afs_hixl_connect)(
                 handle.as_ptr(),
                 peer.as_ptr(),
                 timeout_ms,
@@ -2214,7 +2121,7 @@ impl NativeBackend for RealNative {
         // SAFETY: output and error buffers remain live for the synchronous
         // call, and native retains neither pointer.
         let status = unsafe {
-            ffi::afs_hixl_reserve_export(
+            (self.api.afs_hixl_reserve_export)(
                 handle.as_ptr(),
                 slot_id,
                 generation,
@@ -2241,7 +2148,7 @@ impl NativeBackend for RealNative {
         // SAFETY: the owner thread exclusively owns the valid native handle and
         // writable error buffer for this synchronous release call.
         let status = unsafe {
-            ffi::afs_hixl_release_export(
+            (self.api.afs_hixl_release_export)(
                 handle.as_ptr(),
                 slot_id,
                 generation,
@@ -2275,7 +2182,7 @@ impl NativeBackend for RealNative {
         // SAFETY: the owner thread owns the runtime for the entire blocking
         // call, and `addresses` holds one writable entry per descriptor.
         let status = unsafe {
-            ffi::afs_hixl_read_sync_batch(
+            (self.api.afs_hixl_read_sync_batch)(
                 handle.as_ptr(),
                 peer.as_ptr(),
                 descriptors.as_ptr(),
@@ -2300,7 +2207,7 @@ impl NativeBackend for RealNative {
         // SAFETY: `slot_ids` and the error buffer remain live for the
         // synchronous call, and native retains neither pointer.
         let status = unsafe {
-            ffi::afs_hixl_release_receives(
+            (self.api.afs_hixl_release_receives)(
                 handle.as_ptr(),
                 slot_ids.as_ptr(),
                 slot_ids.len(),
@@ -2327,7 +2234,7 @@ impl NativeBackend for RealNative {
         // pointers are valid for the call, and native DMA uses only copied
         // bytes in native-owned slots that remain allocated on uncertainty.
         let status = unsafe {
-            ffi::afs_hixl_write_batch(
+            (self.api.afs_hixl_write_batch)(
                 handle.as_ptr(),
                 peer.as_ptr(),
                 descriptors.as_ptr(),
@@ -2350,13 +2257,14 @@ impl NativeBackend for RealNative {
         let mut error = ErrorBuffer::default();
         // SAFETY: the owner thread has exclusive access and shutdown consumes the
         // native engine only after the Rust state machine proves no slot is active.
-        let status = unsafe { ffi::afs_hixl_shutdown(handle.as_ptr(), error.ptr(), ERR_BYTES) };
+        let status =
+            unsafe { (self.api.afs_hixl_shutdown)(handle.as_ptr(), error.ptr(), ERR_BYTES) };
         error.check_status(status, true).inspect_err(|_| {
             self.handle = Some(handle);
         })?;
         // SAFETY: native shutdown completed successfully and no caller can issue
         // another command after this method returns.
-        unsafe { ffi::afs_hixl_destroy(handle.as_ptr()) };
+        unsafe { (self.api.afs_hixl_destroy)(handle.as_ptr()) };
         Ok(())
     }
 }

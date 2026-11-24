@@ -433,6 +433,10 @@ uint32_t disconnect_peers(Runtime *runtime, char *error, size_t error_len) {
 
 }  // namespace
 
+extern "C" uint32_t afs_hixl_abi_version(void) {
+    return AFS_HIXL_ABI_VERSION;
+}
+
 extern "C" uint32_t afs_hixl_start(int32_t device_id,
                                     const char *engine_id,
                                     uint32_t device_listen_port,

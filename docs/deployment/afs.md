@@ -1161,6 +1161,12 @@ uid/gid/mode。
 
 ## OwnerFs HIXL 预读窗口与目录批量
 
+部署 HIXL 需要开启 `hixl` feature 的 `afs-node`、配套的 `libafs_hixl.so` 和 CANN 运行环境。
+模块默认从 `afs-node` 实际二进制所在目录加载，也可用进程环境变量 `AFS_HIXL_MODULE` 指定绝对路径。
+请将模块和 CANN 库放在受部署方管理的目录。主程序可在普通 Linux 上编译，只有构建模块需要 CANN SDK。
+配置 gRPC 时不加载模块。配置显式 HIXL 时，缺模块或缺运行库会报出缺失信息。
+Auto 在本机缺模块或运行库时使用现有回落路径。模块 ABI 不匹配、符号损坏和本机初始化失败仍会报错。
+
 `data_mode` 选择 Node 发起的远端正文通道。控制 RPC、元数据和释放回执继续使用 gRPC。
 
 | 模式 | OwnerFs 远端读 | OwnerFs 远端写 | DFS |

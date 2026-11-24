@@ -1,0 +1,18 @@
+{
+    global:
+        aclInit;
+        aclFinalize;
+        aclrtGetLogicDevIdByUserDevId;
+        aclrtSetDevice;
+        aclrtResetDevice;
+        aclrtSetCurrentContext;
+        aclrtCreateContext;
+        aclrtDestroyContext;
+        aclrtMallocHost;
+        aclrtFreeHost;
+        _ZN4hixl4Hixl10InitializeE*;
+        _ZN4hixl4Hixl8FinalizeEv;
+        _ZN4hixl4Hixl11RegisterMemE*;
+        _ZN4hixl4Hixl13DeregisterMemE*;
+    local: *;
+};

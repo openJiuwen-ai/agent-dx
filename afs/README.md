@@ -82,12 +82,16 @@ python3 build/ci/run.py afs
 
 SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
 
-HIXL 为 OwnerFs 提供可选的远端缓冲读。不可变数据可单独启用预读窗口和小文件目录批量。默认不编译 native HIXL；
-支持要求为 CANN ≥ 9.1.0、HDK ≥ 25.5.0，且 CANN、HDK 与设备型号需使用配套组合。在已安装匹配
-HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
-`make afs-check ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`。
+HIXL 为 OwnerFs 提供可选的远端缓冲读。不可变数据可单独启用预读窗口和小文件目录批量。
+`cargo build --locked -p afs --bins --features hixl` 在普通 Linux 构建环境中编译支持加载 HIXL 的进程。
+原生模块需要 CANN ≥ 9.1.0 的 HIXL/ACL SDK。在 SDK 环境运行
+`make afs-hixl-module ADX_CANN_PATH=/opt/ascend/cann AFS_HIXL_MODULE=/absolute/path/libafs_hixl.so`
+可单独构建模块。也可用
+`make afs-build ADX_WITH_AFS=1 AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`
+一起构建进程和模块。部署 HIXL 时，模块放在 `afs-node` 同目录，或用进程环境变量
+`AFS_HIXL_MODULE` 指定绝对路径。CANN、HDK（≥ 25.5.0）与设备型号需使用配套组合。
 `data_mode = "grpc" | "rdma" | "hixl" | "auto"` 选择节点间正文通道，控制面走 gRPC，默认使用 `"grpc"`。
-`"hixl"` 用于启用了 native HIXL 的 OwnerFs-only Node。HIXL 要求 mTLS 和显式配置 `[hixl].trusted_peers`，名单中的节点必须有 `trusted_node_certs`。默认按需读取，每次由 Home 校验授权。`"auto"` 配置 `[hixl].engine_id` 后为符合条件的 OwnerFs 缓冲读优先选择 HIXL。
+`"hixl"` 用于启用了 HIXL 的 OwnerFs-only Node。HIXL 要求 mTLS 和显式配置 `[hixl].trusted_peers`，名单中的节点必须有 `trusted_node_certs`。默认按需读取，每次由 Home 校验授权。`"auto"` 配置 `[hixl].engine_id` 后为符合条件的 OwnerFs 缓冲读优先选择 HIXL。只有这两种配置选中 HIXL 时才加载模块。`"grpc"` 启动无需模块或 CANN 运行库。
 仅为不可变数据且授权在打开期间保持稳定的部署启用 `ownerfs_snapshot_reads`。HIXL 缓冲写需要两端开启 `ownerfs_buffered_writes`，默认关闭。
 Auto 写的 `[hixl].ownerfs_min_write_bytes` 按本次请求的正文长度判断，在申请或复用写槽前选通道。
 默认 `524288` 字节（512 KiB），有效范围 `0..=1048576`；达到阈值才尝试 HIXL，低于阈值沿用普通 RDMA/gRPC 策略。

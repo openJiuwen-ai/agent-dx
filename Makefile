@@ -34,10 +34,14 @@ endif
 ifneq ($(origin ADX_DFS_ALL_FEATURES),undefined)
 $(error ADX_DFS_ALL_FEATURES was replaced by ADX_AFS_ALL_FEATURES; update the caller)
 endif
+ifneq ($(origin ADX_AFS_WITH_HIXL),undefined)
+$(error ADX_AFS_WITH_HIXL was replaced by AFS_WITH_HIXL; update the caller)
+endif
 ADX_WITH_AFS ?= 0
 ADX_AFS_ALL_FEATURES ?= 0
-ADX_AFS_WITH_HIXL ?= 0
-AFS_NATIVE_FEATURES := $(if $(filter 1,$(ADX_AFS_WITH_HIXL)),--features hixl,)
+AFS_WITH_HIXL ?= 0
+AFS_NATIVE_FEATURES := $(if $(filter 1,$(AFS_WITH_HIXL)),--features hixl,)
+AFS_HIXL_MODULE ?= $(abspath $(CARGO_TARGET_DIR))/debug/libafs_hixl.so
 AFS_PACKAGES := -p afs -p afs-client -p afs-error -p afs-logging \
 	-p afs-metrics -p afs-protocol -p afs-tracing -p afs-transport -p afs-tools
 AFS_EXCLUDES := --exclude afs --exclude afs-client --exclude afs-error \
@@ -48,13 +52,13 @@ else ifeq ($(ADX_WITH_AFS),0)
 else
 $(error ADX_WITH_AFS must be 0 or 1)
 endif
-ifeq ($(ADX_AFS_WITH_HIXL),1)
+ifeq ($(AFS_WITH_HIXL),1)
 ifneq ($(ADX_WITH_AFS),1)
-$(error ADX_AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1)
+$(error AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1)
 endif
-else ifeq ($(ADX_AFS_WITH_HIXL),0)
+else ifeq ($(AFS_WITH_HIXL),0)
 else
-$(error ADX_AFS_WITH_HIXL must be 0 or 1)
+$(error AFS_WITH_HIXL must be 0 or 1)
 endif
 ifeq ($(ADX_AFS_ALL_FEATURES),1)
 else ifeq ($(ADX_AFS_ALL_FEATURES),0)
@@ -92,8 +96,14 @@ rust-test:
 		$(MAKE) afs-test JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
 	fi
 afs-check: afs-build afs-lint afs-build-identity afs-test
+ifeq ($(AFS_WITH_HIXL),1)
+afs-build afs-test: afs-hixl-module
+endif
 afs-build:
 	$(CARGO) build --locked -p afs --bins $(AFS_NATIVE_FEATURES) -j $(JOBS)
+.PHONY: afs-hixl-module
+afs-hixl-module:
+	bash afs/crates/transport/native/build-hixl-module.sh "$(AFS_HIXL_MODULE)"
 # Build-identity regression: linked worktree, a commit on the same branch, an
 # uncommitted tracked change and a source archive without `.git`. Pure shell: it
 # compiles afs/build.rs standalone, so it costs about a second and never writes
@@ -130,7 +140,7 @@ afs-lint:
 	@if [ "$(ADX_AFS_ALL_FEATURES)" = "1" ]; then \
 		$(MAKE) afs-all-features-lint JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
 	else \
-		echo 'Skipping AFS all-features lint; set ADX_AFS_ALL_FEATURES=1 after libibverbs and CANN are prepared.'; \
+		echo 'Skipping AFS all-features lint; set ADX_AFS_ALL_FEATURES=1 after libibverbs development files are prepared.'; \
 	fi
 afs-all-features-lint:
 	@command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libibverbs || { echo 'ADX_AFS_ALL_FEATURES=1 requires libibverbs development files' >&2; exit 2; }
@@ -143,6 +153,10 @@ afs-native-rdma-test:
 	"$(OUT)/afs-check/rdma-retirement"
 afs-test:
 	$(CARGO) test --locked $(AFS_PACKAGES) --all-targets $(AFS_NATIVE_FEATURES) -j $(JOBS) -- --test-threads=$(JOBS)
+ifeq ($(AFS_WITH_HIXL),1)
+	$(CARGO) test --locked -p afs-transport --features hixl --test hixl_native_bridge -j $(JOBS) -- --ignored
+	AFS_HIXL_MODULE="$(abspath $(AFS_HIXL_MODULE))" $(CARGO) test --locked -p afs --features hixl --test hixl_shutdown -j $(JOBS) -- --ignored --test-threads=1
+endif
 scheduler-bench:
 	$(CARGO) test --locked --release -p adx-coordinator --test benchmark -j $(JOBS) -- --ignored --nocapture
 .PHONY: python-check
@@ -179,7 +193,7 @@ platform-release:
 		echo 'platform-release requires an isolated CARGO_TARGET_DIR; use cargo-cache-isolated-env or set an explicit release cache' >&2; \
 		exit 2; \
 	fi
-	JOBS=$(JOBS) PYTHON=$(PYTHON) ADX_WITH_AFS=$(ADX_WITH_AFS) ADX_AFS_WITH_HIXL=$(ADX_AFS_WITH_HIXL) bash build/release/build.sh
+	JOBS=$(JOBS) PYTHON=$(PYTHON) ADX_WITH_AFS=$(ADX_WITH_AFS) AFS_WITH_HIXL=$(AFS_WITH_HIXL) bash build/release/build.sh
 process-smoke:
 	$(PYTHON) build/ci/process_smoke.py --package "$(PACKAGE_DIR)" --output "$(EVIDENCE_DIR)"
 

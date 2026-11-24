@@ -1379,7 +1379,11 @@ cargo test --locked -p afs --test config_contract --test node_health_contract
 
 组件测试也覆盖重启后同号会话拒绝旧 Close、默认按需读在同一 fd 上看到远端覆盖和追加，以及写等待者超时后迟到的设备完成不能触发 Commit。RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需独立 Linux 运行证据。组件测试验证软件契约。
 
-用 `cargo test --locked -p afs-transport --features hixl --test hixl_native_bridge` 做组件验证。对接收槽和导出槽核对这些契约：PCI 节点可用时优先使用 PCI；PCI 节点不可用时，`sched_getaffinity` 读取的是实际分配槽的 owner 线程，且只有非空掩码中的每个允许 CPU 都能确认属于同一个 NUMA 节点时才采用 CPU 回退；没有可信节点、已有非默认策略或无法设置优先策略时沿用原策略。还应核对临时策略在分配及首次触页后恢复，包括分配失败的路径。
+无 CANN 的 Linux 环境可以用 `cargo test --locked -p afs-transport --features hixl` 检查模块加载错误和软件路径。
+有 SDK 且已准备 CANN 运行库时，运行
+`make afs-test ADX_WITH_AFS=1 AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`
+构建模块并运行 native bridge 和停机夹具，无需设备。
+对接收槽和导出槽核对这些契约：PCI 节点可用时优先使用 PCI；PCI 节点不可用时，`sched_getaffinity` 读取的是实际分配槽的 owner 线程，且只有非空掩码中的每个允许 CPU 都能确认属于同一个 NUMA 节点时才采用 CPU 回退；没有可信节点、已有非默认策略或无法设置优先策略时沿用原策略。还应核对临时策略在分配及首次触页后恢复，包括分配失败的路径。
 
 单卡真机验收时，用 `npu-smi info` 核对所选 NPU 的 PCI 地址，并用对应的 `numa_node` 核对 `AFS_HIXL_NUMA` 的 `source=pci`。核对 `source=worker_cpu` 时，确认 PCI 节点不可用，并检查实际分配槽的 owner 线程（`/proc/<pid>/task/<tid>/status` 的 `Cpus_allowed_list`）允许的全部 CPU 是否同属日志所示节点；无可信节点时预期 `source=unknown node=-1`。另核对 `policy=preferred|inherited`。无需修改 TOML，AFS 也不会自动绑核。
 

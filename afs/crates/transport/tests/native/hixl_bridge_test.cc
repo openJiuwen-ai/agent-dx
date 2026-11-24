@@ -526,7 +526,7 @@ int main(int argc, char **argv) {
         afs_hixl_batch_window_t windows[]{{0, exports[0].address, 3}, {1, exports[1].address, 4}};
         uint8_t payload[]{'a', 'b', 'c', 'd', 'e', 'f', 'g'};
         uint32_t dispatched = 1;
-        auto write = [&](size_t len = sizeof(payload), uint32_t timeout = 123) {
+        auto write = [&](size_t len, uint32_t timeout = 123) {
             return afs_hixl_write_batch(runtime, peer, windows, 2, payload, len, timeout,
                                         &dispatched, error, sizeof(error));
         };
@@ -534,11 +534,11 @@ int main(int argc, char **argv) {
         assert(sync_calls == 0);
         if (scenario.find("-write-success") != std::string::npos) {
             assert(setenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH", "1", 1) == 0);
-            assert(write() != 0 && dispatched == 0);
+            assert(write(sizeof(payload)) != 0 && dispatched == 0);
             assert(unsetenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH") == 0);
             for (int attempt = 0; attempt < 2; ++attempt) {
                 ++payload[0];
-                assert(write() == 0 && dispatched == 1);
+                assert(write(sizeof(payload)) == 0 && dispatched == 1);
                 assert(std::memcmp(reinterpret_cast<void *>(exports[0].address), payload, 3) == 0);
                 assert(std::memcmp(reinterpret_cast<void *>(exports[1].address), payload + 3, 4) == 0);
             }
@@ -554,7 +554,7 @@ int main(int argc, char **argv) {
             const auto status = write(sizeof(payload), 123);
             assert(status != 0 && dispatched == 1 && sync_calls == 1);
             if (sync_status == hixl::TIMEOUT) { assert(status == hixl::TIMEOUT); }
-            assert(write() != 0 && dispatched == 0);
+            assert(write(sizeof(payload)) != 0 && dispatched == 0);
             assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != 0);
             assert(allocations == 4 && finalizations == 0);
         }

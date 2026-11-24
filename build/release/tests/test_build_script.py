@@ -47,7 +47,7 @@ class AfsBuildBoundaryTests(unittest.TestCase):
                 ADX_RELEASE_TARGET=host,
                 ADX_RELEASE_OUTPUT=str(root / "output"),
                 ADX_WITH_AFS=flag,
-                ADX_AFS_WITH_HIXL=hixl,
+                AFS_WITH_HIXL=hixl,
             )
             if legacy is not None:
                 env[legacy] = "1"
@@ -57,13 +57,13 @@ class AfsBuildBoundaryTests(unittest.TestCase):
     def test_hixl_requires_explicit_afs_component_before_build(self):
         result, built = self.run_build("0", hixl="1")
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("ADX_AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1", result.stderr)
+        self.assertIn("AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1", result.stderr)
         self.assertFalse(built)
 
     def test_invalid_hixl_flag_stops_before_build(self):
         result, built = self.run_build("1", hixl="yes")
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("ADX_AFS_WITH_HIXL must be 0 or 1", result.stderr)
+        self.assertIn("AFS_WITH_HIXL must be 0 or 1", result.stderr)
         self.assertFalse(built)
 
     def test_hixl_feature_is_added_only_to_explicit_afs_build(self):
@@ -86,7 +86,7 @@ class AfsBuildBoundaryTests(unittest.TestCase):
         self.assertFalse(built)
 
     def test_legacy_flags_are_rejected_before_build(self):
-        for legacy in ("ADX_WITH_DFS", "ADX_DFS_ALL_FEATURES"):
+        for legacy in ("ADX_WITH_DFS", "ADX_DFS_ALL_FEATURES", "ADX_AFS_WITH_HIXL"):
             with self.subTest(legacy=legacy):
                 result, built = self.run_build("1", legacy=legacy)
                 self.assertEqual(result.returncode, 2)

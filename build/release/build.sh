@@ -7,6 +7,10 @@ for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
     exit 2
   fi
 done
+if [[ ${ADX_AFS_WITH_HIXL+x} ]]; then
+  echo 'ADX_AFS_WITH_HIXL was replaced by AFS_WITH_HIXL; update the caller' >&2
+  exit 2
+fi
 # Native release builder with optional external sandboxd binaries.
 : "${CARGO_TARGET_DIR:?set persistent Cargo cache}"
 : "${ADX_REDIS_SERVER:?provide pinned Redis 7.2.5 binary}"
@@ -16,17 +20,17 @@ done
 JOBS=${JOBS:-2}
 PYTHON=${PYTHON:-python3}
 ADX_WITH_AFS=${ADX_WITH_AFS:-0}
-ADX_AFS_WITH_HIXL=${ADX_AFS_WITH_HIXL:-0}
+AFS_WITH_HIXL=${AFS_WITH_HIXL:-0}
 case "$ADX_WITH_AFS" in
   0|1) ;;
   *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
 esac
-case "$ADX_AFS_WITH_HIXL" in
+case "$AFS_WITH_HIXL" in
   0|1) ;;
-  *) echo 'ADX_AFS_WITH_HIXL must be 0 or 1' >&2; exit 2 ;;
+  *) echo 'AFS_WITH_HIXL must be 0 or 1' >&2; exit 2 ;;
 esac
-if [[ "$ADX_AFS_WITH_HIXL" == "1" && "$ADX_WITH_AFS" != "1" ]]; then
-  echo 'ADX_AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1' >&2
+if [[ "$AFS_WITH_HIXL" == "1" && "$ADX_WITH_AFS" != "1" ]]; then
+  echo 'AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1' >&2
   exit 2
 fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -60,13 +64,16 @@ done
 if [[ "$ADX_WITH_AFS" == "1" ]]; then
   echo "--- :file_folder: Compile Agent FS (AFS)"
   afs_features=()
-  if [[ "$ADX_AFS_WITH_HIXL" == "1" ]]; then
+  if [[ "$AFS_WITH_HIXL" == "1" ]]; then
     afs_features=(--features hixl)
   fi
   cargo build --locked --release -j "$JOBS" -p afs --bins "${afs_features[@]}"
   for name in afs-meta afs-node; do
     cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
   done
+  if [[ "$AFS_WITH_HIXL" == "1" ]]; then
+    bash afs/crates/transport/native/build-hixl-module.sh "$stage/libafs_hixl.so"
+  fi
 fi
 if [[ "$host" == *-linux-gnu ]]; then
   musl_target="${host%-gnu}-musl"
@@ -101,6 +108,9 @@ package_args=(
 )
 if [[ "$ADX_WITH_AFS" == "1" ]]; then
   package_args+=(--with-afs)
+fi
+if [[ "$AFS_WITH_HIXL" == "1" ]]; then
+  package_args+=(--with-hixl)
 fi
 if [[ "${ADX_WITH_SANDBOXD:-0}" == "1" ]]; then
   echo "--- :package: Prepare pinned sandboxd backend"

@@ -36,6 +36,10 @@ typedef struct afs_hixl_batch_window {
 #define AFS_HIXL_TRANSPORT_ROCE 1U
 #define AFS_HIXL_TRANSPORT_HCCS 2U
 
+/* Increment when changing any exported signature or shared layout. */
+#define AFS_HIXL_ABI_VERSION 1U
+uint32_t afs_hixl_abi_version(void);
+
 /* Pool dimensions are both zero for direct RoCE, or both positive for relay.
  * HCCS requires relay. RoCE relay requires HCCL_INTRA_ROCE_ENABLE=1,
  * HCCL_INTRA_PCIE_ENABLE=0 and HCCL_INTER_HCCS_DISABLE=TRUE before SDK startup.
