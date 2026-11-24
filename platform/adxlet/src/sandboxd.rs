@@ -2,7 +2,7 @@
 //! cannot race its client task. Failed starts are terminal; ambiguous outcomes
 //! retain targeted cleanup retries until their backend can be removed.
 use crate::{runtime_router::RuntimeInventory, RuntimeDriver};
-use adx_core::scheduling::{valid_node_capability_runtime, CHECKPOINT_RESTORE_V1};
+use adx_core::scheduling::{valid_node_capability_runtime, CHECKPOINT_RESTORE};
 use adx_core::{EnvironmentSpec, Error, Result, UnsupportedCapability};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -254,7 +254,7 @@ impl Sandboxd {
             if valid_node_capability_runtime(&detail.runtime_class)
                 && supports_checkpoint_restore(&detail)
             {
-                capabilities.insert(detail.runtime_class, [CHECKPOINT_RESTORE_V1.into()].into());
+                capabilities.insert(detail.runtime_class, [CHECKPOINT_RESTORE.into()].into());
             }
         }
         classes.retain(|class| !class.trim().is_empty());

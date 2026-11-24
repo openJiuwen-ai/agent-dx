@@ -455,9 +455,9 @@ class Environment:
                 ``proxy_port - 1``. Defaults to 8766.
             tunnel_connect_timeout: Seconds to wait for the tunnel WebSocket.
             detached: If True, ``kill()`` / context-manager exit skips teardown.
-            required_node_capabilities: Versioned capabilities all required on
+            required_node_capabilities: Capabilities all required on
                 the selected worker. Requires an explicit runtime and a fresh
-                create. ``checkpoint-restore.v1`` is currently supported.
+                create. ``checkpoint-restore`` is currently supported.
             xpu: Optional whole-device XPU request in ``type:model:count``
                 format. Leave ``model`` empty to accept any model. The first
                 version supports one ``gpu`` or ``npu`` request.

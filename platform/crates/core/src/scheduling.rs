@@ -9,7 +9,7 @@ pub const NODE_HOST_UUID_LABEL: &str = "ADX_NODE_HOST_UUID";
 /// Node labels in this namespace are derived from authenticated runtime observations.
 pub const NODE_CAPABILITY_LABEL_PREFIX: &str = "adx.internal/node-capability/";
 pub const NODE_CAPABILITY_LABEL_VALUE: &str = "true";
-pub const CHECKPOINT_RESTORE_V1: &str = "checkpoint-restore.v1";
+pub const CHECKPOINT_RESTORE: &str = "checkpoint-restore";
 
 /// Runtime names used in capability labels must fit in one key component.
 pub fn valid_node_capability_runtime(runtime: &str) -> bool {
@@ -303,7 +303,7 @@ impl SchedulingPolicy {
         let Some(first) = labels.next() else {
             return Ok(());
         };
-        let checkpoint = node_capability_label(runtime, CHECKPOINT_RESTORE_V1);
+        let checkpoint = node_capability_label(runtime, CHECKPOINT_RESTORE);
         if !valid_node_capability_runtime(runtime)
             || first != checkpoint
             || labels.any(|key| key != checkpoint)
@@ -602,7 +602,7 @@ mod tests {
     }
     #[test]
     fn reserved_capability_labels_require_positive_predicates_in_every_alternative() {
-        let key = node_capability_label("runsc", CHECKPOINT_RESTORE_V1);
+        let key = node_capability_label("runsc", CHECKPOINT_RESTORE);
         for (op, values, valid) in [
             (SelectorOp::In, vec!["true"], true),
             (SelectorOp::In, vec!["false"], false),

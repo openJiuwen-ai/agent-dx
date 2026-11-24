@@ -173,7 +173,7 @@ fn central_scheduler_places_only_on_reported_runtime_class() {
 
 fn require_checkpoint_restore(request: &mut EnvironmentSpec) {
     request.scheduling.required_node = vec![selector(
-        "adx.internal/node-capability/runsc/checkpoint-restore.v1",
+        "adx.internal/node-capability/runsc/checkpoint-restore",
         "true",
     )];
 }
@@ -219,7 +219,7 @@ fn queued_capability_request_waits_for_compatible_capacity_on_another_shard() {
     let mut replacement = node("replacement", "z");
     replacement.runtime_classes = vec!["runc".into()];
     replacement.labels.insert(
-        "adx.internal/node-capability/runc/checkpoint-restore.v1".into(),
+        "adx.internal/node-capability/runc/checkpoint-restore".into(),
         "true".into(),
     );
     assert_eq!(coordinator.register(replacement.clone()).unwrap(), 1);

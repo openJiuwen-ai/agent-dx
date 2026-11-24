@@ -1155,7 +1155,8 @@ components:
               minItems: 1
               maxItems: 32
               uniqueItems: true
-              items: {type: string, enum: [checkpoint-restore.v1]}
+              description: Hard requirements for the selected runtime. checkpoint-restore requires both checkpoint and restore support and ready checkpoint storage on the worker.
+              items: {type: string, enum: [checkpoint-restore]}
           anyOf:
             - required: [runtime]
             - required: [rootfs]

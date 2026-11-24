@@ -261,7 +261,7 @@ mod tests {
                     expressions: vec![pb::LabelRequirement {
                         key: adx_core::scheduling::node_capability_label(
                             "runsc",
-                            adx_core::scheduling::CHECKPOINT_RESTORE_V1,
+                            adx_core::scheduling::CHECKPOINT_RESTORE,
                         ),
                         op: pb::SelectorOp::In as i32,
                         values: vec!["true".into()],

@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 import yaml
@@ -95,7 +96,8 @@ def control_routes():
 
 def runtime_actions():
     source = (ROOT / 'platform/runtime/execd/src/runtime/dispatch.rs').read_text()
-    table = source.split('fn normalize_environment_action(', 1)[1].split('pub(crate) fn dispatch_runtime_action_with_trace', 1)[0]
+    table = source.split('fn normalize_environment_action(', 1)[1]
+    table = table.split('pub(crate) fn dispatch_runtime_action_with_trace', 1)[0]
     return set(re.findall(r'"((?:process|file|shell|entrypoint)\.[^"]+)"', table))
 
 
@@ -145,11 +147,22 @@ def audit(control, data, *, routes=None, actions=None):
                 errors.append(f'{label}: invalid schema {name}: {error.message}')
         if valid_refs:
             errors.extend(f'{label}: {error}' for error in example_errors(doc))
-    documented = {(method.upper(), path) for path, entry in control['paths'].items() for method in entry if method in METHODS}
+    documented = {
+        (method.upper(), path) for path, entry in control['paths'].items() for method in entry if method in METHODS
+    }
     for method, path in sorted((control_routes() if routes is None else routes) - documented):
         errors.append(f'missing control operation: {method} {path}')
-    for name in sorted(create_fields() - control['components']['schemas']['CreateEnvironmentRequest']['properties'].keys()):
+    control_schemas = control['components']['schemas']
+    ordinary_create_fields = control_schemas['CreateEnvironmentRequest']['properties']
+    implemented_create_fields = create_fields()
+    # Both routes decode the same Rust struct, but only constrained create accepts this field.
+    capability_field = 'requiredNodeCapabilities'
+    for name in sorted(implemented_create_fields - ordinary_create_fields.keys() - {capability_field}):
         errors.append(f'missing create field: {name}')
+    if capability_field in implemented_create_fields:
+        branches = control_schemas['ConstrainedEnvironmentRequest']['allOf']
+        if not any(capability_field in branch.get('properties', {}) for branch in branches):
+            errors.append(f'missing constrained create field: {capability_field}')
     schemas = data['components']['schemas']
     covered = set()
     for branch in schemas['InvokeRequest'].get('oneOf', []):
@@ -183,10 +196,11 @@ def main():
         'runtime_actions': len(runtime_actions()),
         'errors': audit(control, data),
     }
+    output = json.dumps(result, indent=2) + '\n'
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(result, indent=2) + '\n')
-    print(json.dumps(result, indent=2))
+        args.output.write_text(output)
+    sys.stdout.write(output)
     return bool(result['errors'])
 
 

@@ -10,14 +10,14 @@ fn caller() -> pb::CallerContext {
 
 #[test]
 fn required_node_capabilities_combine_with_hard_placement() {
-    let key = "adx.internal/node-capability/runsc/checkpoint-restore.v1";
+    let key = "adx.internal/node-capability/runsc/checkpoint-restore";
     let selector = |node| {
         json!({"kind":0,"affinity":2,"labelOps":[
             {"type":0,"labelKey":"NODE_ID","labelValues":[node]}
         ]})
     };
     let input = json!({"image":"image", "rootfs":{"runtime":"runsc"},
-        "requiredNodeCapabilities":["checkpoint-restore.v1"],
+        "requiredNodeCapabilities":["checkpoint-restore"],
         "scheduleAffinities":[selector("node-a"), selector("node-b")],
         "pauseOptions":{"storage":"shared"}});
     let spec = create_spec(input, &caller()).unwrap();

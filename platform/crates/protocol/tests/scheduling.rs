@@ -6,7 +6,7 @@ use prost::Message;
 fn protobuf_rejects_weakening_a_reserved_capability_predicate() {
     let selector = wire::LabelSelector {
         expressions: vec![wire::LabelRequirement {
-            key: node_capability_label("runsc", CHECKPOINT_RESTORE_V1),
+            key: node_capability_label("runsc", CHECKPOINT_RESTORE),
             op: wire::SelectorOp::In as i32,
             values: vec![NODE_CAPABILITY_LABEL_VALUE.into()],
         }],

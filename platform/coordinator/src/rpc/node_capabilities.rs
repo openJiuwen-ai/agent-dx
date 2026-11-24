@@ -1,7 +1,7 @@
 use crate::Node;
 use adx_core::{
     scheduling::{
-        node_capability_label, valid_node_capability_runtime, CHECKPOINT_RESTORE_V1,
+        node_capability_label, valid_node_capability_runtime, CHECKPOINT_RESTORE,
         NODE_CAPABILITY_LABEL_PREFIX, NODE_CAPABILITY_LABEL_VALUE,
     },
     Result,
@@ -19,10 +19,10 @@ pub(super) fn registered_node(report: &pb::RegisterNodeRequest) -> Result<Node> 
             && capabilities
                 .capability_ids
                 .iter()
-                .any(|capability| capability == CHECKPOINT_RESTORE_V1)
+                .any(|capability| capability == CHECKPOINT_RESTORE)
         {
             node.labels.insert(
-                node_capability_label(runtime, CHECKPOINT_RESTORE_V1),
+                node_capability_label(runtime, CHECKPOINT_RESTORE),
                 NODE_CAPABILITY_LABEL_VALUE.into(),
             );
         }
@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn registration_derives_labels_only_from_current_runtime_observations() {
-        let capability_label = node_capability_label("runsc", CHECKPOINT_RESTORE_V1);
+        let capability_label = node_capability_label("runsc", CHECKPOINT_RESTORE);
         let mut report = pb::RegisterNodeRequest {
             node_id: "node".into(),
             capacity: Some(pb::Resources::default()),
@@ -56,13 +56,13 @@ mod tests {
             (
                 "runsc".into(),
                 pb::RuntimeCapabilities {
-                    capability_ids: vec![CHECKPOINT_RESTORE_V1.into(), "unknown.v1".into()],
+                    capability_ids: vec![CHECKPOINT_RESTORE.into(), "unknown.v1".into()],
                 },
             ),
             (
                 "kata".into(),
                 pb::RuntimeCapabilities {
-                    capability_ids: vec![CHECKPOINT_RESTORE_V1.into()],
+                    capability_ids: vec![CHECKPOINT_RESTORE.into()],
                 },
             ),
         ]
@@ -74,7 +74,7 @@ mod tests {
             .contains_key(&node_capability_label("runsc", "unknown.v1")));
         assert!(!node
             .labels
-            .contains_key(&node_capability_label("kata", CHECKPOINT_RESTORE_V1)));
+            .contains_key(&node_capability_label("kata", CHECKPOINT_RESTORE)));
 
         report.runtime_capabilities.clear();
         assert!(!registered_node(&report)

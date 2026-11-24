@@ -138,14 +138,14 @@ class CreateRequestTests(unittest.TestCase):
 
     def test_node_capabilities_use_only_the_constrained_create_endpoint(self):
         with Environment(
-            image="tools:1", runtime="runsc", required_node_capabilities=("checkpoint-restore.v1",),
+            image="tools:1", runtime="runsc", required_node_capabilities=("checkpoint-restore",),
             detached=True, connection=self.connection,
         ):
             pass
         self.assertEqual(len(self.exchanges), 1)
         self.assertEqual(self.exchanges[0].url.path, _CONSTRAINED_CREATE)
         body = json.loads(self.exchanges[0].content)
-        self.assertEqual(body["requiredNodeCapabilities"], ["checkpoint-restore.v1"])
+        self.assertEqual(body["requiredNodeCapabilities"], ["checkpoint-restore"])
         self.assertNotIn("requiredNodeCapabilities", self.capture_create(required_node_capabilities=[]))
 
     def test_future_identifier_is_forwarded_for_server_validation(self):
@@ -157,12 +157,12 @@ class CreateRequestTests(unittest.TestCase):
 
     def test_invalid_node_capability_constraints_fail_before_transport(self):
         for options in (
-            {"required_node_capabilities": "checkpoint-restore.v1"},
-            {"required_node_capabilities": ["checkpoint-restore.v1"]},
+            {"required_node_capabilities": "checkpoint-restore"},
+            {"required_node_capabilities": ["checkpoint-restore"]},
             {"required_node_capabilities": ["not a token"], "runtime": "runsc"},
             {"required_node_capabilities": ["duplicate.v1", "duplicate.v1"], "runtime": "runsc"},
-            {"required_node_capabilities": ["checkpoint-restore.v1"], "runtime": "invalid/runtime"},
-            {"required_node_capabilities": ["checkpoint-restore.v1"], "runtime": "runsc", "snapshot_id": "snap"},
+            {"required_node_capabilities": ["checkpoint-restore"], "runtime": "invalid/runtime"},
+            {"required_node_capabilities": ["checkpoint-restore"], "runtime": "runsc", "snapshot_id": "snap"},
         ):
             with self.subTest(options=options), self.assertRaises((TypeError, ValueError)):
                 Environment(image="tools:1", connection=self.connection, **options)
@@ -172,7 +172,7 @@ class CreateRequestTests(unittest.TestCase):
         for response in (404, httpx.Response(404, text="route not found")):
             self.constrained_failures = [response]
             with self.subTest(response=response), self.assertRaises(SDKEnvironmentError) as raised:
-                Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+                Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore"],
                             connection=self.connection)
             self.assertEqual((raised.exception.code, raised.exception.outcome), ("UNSUPPORTED", "not_started"))
         self.assertEqual([request.url.path for request in self.exchanges], [_CONSTRAINED_CREATE] * 2)
@@ -181,7 +181,7 @@ class CreateRequestTests(unittest.TestCase):
         for status in (404, 405, 501):
             self.constrained_failures = [httpx.Response(status, text="proxy response")]
             with self.subTest(status=status), self.assertRaises(SDKEnvironmentError) as raised:
-                Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+                Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore"],
                             connection=self.connection)
             self.assertIsNone(raised.exception.outcome)
             self.assertIn(f"HTTP {status} proxy response", str(raised.exception))
@@ -202,7 +202,7 @@ class CreateRequestTests(unittest.TestCase):
                 self.subTest(status=status), patch("adx_environment._transport.time.sleep"),
                 self.assertRaises(SDKEnvironmentError) as raised,
             ):
-                Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+                Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore"],
                             connection=self.connection)
             error = raised.exception
             self.assertEqual(
@@ -216,7 +216,7 @@ class CreateRequestTests(unittest.TestCase):
     def test_old_server_after_lost_response_preserves_the_same_operation(self):
         self.constrained_failures = [None, 404]
         with patch("adx_environment._transport.time.sleep"), self.assertRaises(SDKEnvironmentError) as raised:
-            Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+            Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore"],
                         connection=self.connection)
         error = raised.exception
         self.assertEqual((error.code, error.retry, error.outcome), ("OUTCOME_UNKNOWN", "same_operation", "unknown"))
@@ -233,7 +233,7 @@ class CreateRequestTests(unittest.TestCase):
             "environmentId": "trusted-environment", "operationId": "operation-19",
         }, None, 404]
         with patch("adx_environment._transport.time.sleep"), self.assertRaises(SDKEnvironmentError) as raised:
-            Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+            Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore"],
                         connection=self.connection)
         error = raised.exception
         self.assertEqual((error.code, error.retry, error.outcome), ("OUTCOME_UNKNOWN", "same_operation", "unknown"))

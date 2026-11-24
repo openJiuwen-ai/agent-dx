@@ -20,7 +20,9 @@ JSON inside the normal response envelope, or as the final SSE event:
 {"environmentId":"tenant-worker","status":"running","requestId":"create-request","newlyCreated":true}
 ```
 
-Use `POST /api/environment/v1/constrained-environments` for fresh creation with required node capabilities. Supply `requiredNodeCapabilities` as a nonempty list of up to 32 distinct supported identifiers and explicitly select `runtime` or `rootfs.runtime`. The first supported identifier is `checkpoint-restore.v1`. Snapshot restore requests and capability fields on the ordinary create route return InvalidArgument.
+Use `POST /api/environment/v1/constrained-environments` for fresh creation with required node capabilities. Supply `requiredNodeCapabilities` as a nonempty list of up to 32 distinct supported identifiers and explicitly select `runtime` or `rootfs.runtime`. Combining capability requirements with snapshot restore or sending the capability field to the ordinary create route returns InvalidArgument.
+
+`checkpoint-restore` requires the selected runtime to support both checkpoint and restore and the worker's configured checkpoint storage to pass its readiness checks. Compatibility of a particular checkpoint with a destination is evaluated by the restore operation. Capability identifiers are matched exactly. Compatible improvements keep the same identifier, and an incompatible contract uses a new identifier.
 
 Constrained creation uses the same authentication, JSON/SSE response and request identity as ordinary creation. The scheduler requires every capability for the selected runtime together with the existing placement and resource constraints. If the local-first gateway has no compatible worker in its current directory, it submits the request to the bounded central queue. An older API server rejects the dedicated route before scheduling. A named or replayed creation can return a retained Environment only when its stored placement satisfies the request and the Coordinator verifies current ownership, session and node placement in one read.
 

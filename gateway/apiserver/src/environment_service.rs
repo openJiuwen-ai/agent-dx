@@ -1176,7 +1176,7 @@ mod tests {
     fn replay_detects_capabilities_in_all_required_node_selectors() {
         let key = adx_core::scheduling::node_capability_label(
             "runsc",
-            adx_core::scheduling::CHECKPOINT_RESTORE_V1,
+            adx_core::scheduling::CHECKPOINT_RESTORE,
         );
         let spec = pb::EnvironmentSpec {
             scheduling: Some(pb::SchedulingPolicy {

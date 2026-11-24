@@ -363,7 +363,7 @@ async fn qualifies_only_complete_checkpoint_restore_runtime_details() {
         inventory.capabilities,
         BTreeMap::from([(
             "runsc".into(),
-            [adx_core::scheduling::CHECKPOINT_RESTORE_V1.into()].into(),
+            [adx_core::scheduling::CHECKPOINT_RESTORE.into()].into(),
         )])
     );
 }
@@ -371,7 +371,7 @@ async fn qualifies_only_complete_checkpoint_restore_runtime_details() {
 #[tokio::test]
 async fn rechecks_current_node_capability_before_submitting_runtime_start() {
     use adx_core::scheduling::{
-        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE, NODE_CAPABILITY_LABEL_VALUE,
     };
     use adxlet::runtime_router::RuntimeRouter;
 
@@ -391,7 +391,7 @@ async fn rechecks_current_node_capability_before_submitting_runtime_start() {
     constrained.runtime_class = "runsc".into();
     constrained.scheduling.required_node = vec![LabelSelector {
         match_labels: [(
-            node_capability_label("runsc", CHECKPOINT_RESTORE_V1),
+            node_capability_label("runsc", CHECKPOINT_RESTORE),
             NODE_CAPABILITY_LABEL_VALUE.into(),
         )]
         .into(),
@@ -1001,7 +1001,7 @@ fn lifecycle_assignment() -> Assignment {
 #[tokio::test]
 async fn checkpoint_capability_requires_configured_worker_storage() {
     use adx_core::scheduling::{
-        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE, NODE_CAPABILITY_LABEL_VALUE,
     };
 
     let server = Server::default();
@@ -1015,7 +1015,7 @@ async fn checkpoint_capability_requires_configured_worker_storage() {
     constrained.runtime_class = "runsc".into();
     constrained.scheduling.required_node = vec![LabelSelector {
         match_labels: [(
-            node_capability_label("runsc", CHECKPOINT_RESTORE_V1),
+            node_capability_label("runsc", CHECKPOINT_RESTORE),
             NODE_CAPABILITY_LABEL_VALUE.into(),
         )]
         .into(),

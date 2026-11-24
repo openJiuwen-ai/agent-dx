@@ -27,6 +27,19 @@ class OpenApiContractTests(unittest.TestCase):
         del doc['components']['schemas']['CreateEnvironmentRequest']['properties']['cwd']
         self.assertIn('missing create field: cwd', '\n'.join(openapi_check.audit(doc, self.data)))
 
+    def test_missing_constrained_create_field_is_detected(self):
+        doc = copy.deepcopy(self.control)
+        constrained = doc['components']['schemas']['ConstrainedEnvironmentRequest']
+        del constrained['allOf'][1]['properties']['requiredNodeCapabilities']
+        self.assertIn('missing constrained create field: requiredNodeCapabilities', openapi_check.audit(doc, self.data))
+
+    def test_constrained_create_uses_the_canonical_checkpoint_restore_identifier(self):
+        schema = 'ConstrainedEnvironmentRequest'
+        request = {'image': 'tools:1', 'runtime': 'runsc', 'requiredNodeCapabilities': ['checkpoint-restore']}
+        self.assertEqual(openapi_check.payload_errors(self.control, schema, request), [])
+        request['requiredNodeCapabilities'] = ['checkpoint-restore.v1']
+        self.assertTrue(openapi_check.payload_errors(self.control, schema, request))
+
     def test_missing_runtime_action_and_missing_typed_args_are_detected(self):
         doc = copy.deepcopy(self.data)
         schemas = doc['components']['schemas']
@@ -45,11 +58,16 @@ class OpenApiContractTests(unittest.TestCase):
 
     def test_dangling_reference_is_detected(self):
         doc = copy.deepcopy(self.data)
-        doc['components']['schemas']['ProcessStartRequest']['properties']['args'] = {'$ref': '#/components/schemas/Absent'}
+        doc['components']['schemas']['ProcessStartRequest']['properties']['args'] = {
+            '$ref': '#/components/schemas/Absent',
+        }
         self.assertIn('Absent', '\n'.join(openapi_check.audit(self.control, doc)))
 
     def test_request_schema_rejects_wrong_action_args(self):
-        good = {'action': 'process.start', 'args': {'command_id': 'cmd-1', 'command': 'pwd', 'cwd': '/tmp', 'want_stdin': True}}
+        good = {
+            'action': 'process.start',
+            'args': {'command_id': 'cmd-1', 'command': 'pwd', 'cwd': '/tmp', 'want_stdin': True},
+        }
         self.assertEqual(openapi_check.payload_errors(self.data, 'InvokeRequest', good), [])
         for bad in (
             {'action': 'process.start', 'args': {'command': 'pwd', 'want_stdin': 'yes'}},
@@ -64,8 +82,15 @@ class OpenApiContractTests(unittest.TestCase):
     def test_response_schema_covers_running_spawn_failure_and_wait_timeout(self):
         for response in (
             {'command_id': 'cmd-1', 'pid': 42, 'status': 'RUNNING', 'error': None, 'error_code': None},
-            {'command_id': 'cmd-1', 'pid': -1, 'status': 'FAILED', 'running': False, 'cmd': 'pwd', 'state_version': 2, 'stdout': '', 'stderr': '', 'exit_code': None, 'exit_signal': None, 'error_code': 'SPAWN_FAILED', 'error_message': 'No such file or directory'},
-            {'status': 'running', 'error_code': 'WAIT_TIMEOUT', 'error_message': 'command wait timed out', 'error': None},
+            {
+                'command_id': 'cmd-1', 'pid': -1, 'status': 'FAILED', 'running': False, 'cmd': 'pwd',
+                'state_version': 2, 'stdout': '', 'stderr': '', 'exit_code': None, 'exit_signal': None,
+                'error_code': 'SPAWN_FAILED', 'error_message': 'No such file or directory',
+            },
+            {
+                'status': 'running', 'error_code': 'WAIT_TIMEOUT',
+                'error_message': 'command wait timed out', 'error': None,
+            },
         ):
             with self.subTest(response=response):
                 self.assertEqual(openapi_check.payload_errors(self.data, 'InvokeResult', response), [])
@@ -115,14 +140,21 @@ class OpenApiContractTests(unittest.TestCase):
                 self.assertEqual(openapi_check.payload_errors(self.data, 'InvokeRequest', request), [])
 
     def test_key_request_and_list_use_real_wire_fields(self):
-        self.assertEqual(openapi_check.payload_errors(self.control, 'CreateTenantKeyRequest', {'tenantId': 'team-a', 'expiresAtUnixSeconds': 0}), [])
+        create = {'tenantId': 'team-a', 'expiresAtUnixSeconds': 0}
+        self.assertEqual(openapi_check.payload_errors(self.control, 'CreateTenantKeyRequest', create), [])
         self.assertTrue(openapi_check.payload_errors(self.control, 'CreateTenantKeyRequest', {'tenant': 'team-a'}))
         self.assertTrue(openapi_check.payload_errors(self.control, 'TenantKeyList', {'items': [], 'apiKey': 'secret'}))
 
     def test_affinity_enums_and_label_requirements_match_the_contract(self):
-        good = {'kind': 0, 'affinity': 2, 'weight': 1, 'labelOps': [{'type': 0, 'labelKey': 'NODE_ID', 'labelValues': ['node-1']}]}
+        good = {
+            'kind': 0, 'affinity': 2, 'weight': 1,
+            'labelOps': [{'type': 0, 'labelKey': 'NODE_ID', 'labelValues': ['node-1']}],
+        }
         self.assertEqual(openapi_check.payload_errors(self.control, 'ScheduleAffinity', good), [])
-        for change in ({'kind': 2}, {'weight': 1001}, {'preferredAntiOtherLabels': True}, {'labelOps': [{'type': 0, 'labelKey': 'NODE_ID'}]}):
+        for change in (
+            {'kind': 2}, {'weight': 1001}, {'preferredAntiOtherLabels': True},
+            {'labelOps': [{'type': 0, 'labelKey': 'NODE_ID'}]},
+        ):
             with self.subTest(change=change):
                 self.assertTrue(openapi_check.payload_errors(self.control, 'ScheduleAffinity', {**good, **change}))
 

@@ -42,7 +42,7 @@ async fn node_capabilities_require_the_constrained_create_route_and_a_fresh_expl
         ("constrained-environments", json!({"runtime":"runsc"})),
         (
             "constrained-environments",
-            json!({"requiredNodeCapabilities":["checkpoint-restore.v1"]}),
+            json!({"requiredNodeCapabilities":["checkpoint-restore"]}),
         ),
         (
             "constrained-environments",
@@ -50,15 +50,19 @@ async fn node_capabilities_require_the_constrained_create_route_and_a_fresh_expl
         ),
         (
             "constrained-environments",
-            json!({"runtime":"runsc", "requiredNodeCapabilities":["checkpoint-restore.v1", "checkpoint-restore.v1"]}),
+            json!({"runtime":"runsc", "requiredNodeCapabilities":["checkpoint-restore.v1"]}),
         ),
         (
             "constrained-environments",
-            json!({"runtime":"runsc", "snapshotId":"snapshot", "requiredNodeCapabilities":["checkpoint-restore.v1"]}),
+            json!({"runtime":"runsc", "requiredNodeCapabilities":["checkpoint-restore", "checkpoint-restore"]}),
         ),
         (
             "constrained-environments",
-            json!({"runtime":"bad/runtime", "requiredNodeCapabilities":["checkpoint-restore.v1"]}),
+            json!({"runtime":"runsc", "snapshotId":"snapshot", "requiredNodeCapabilities":["checkpoint-restore"]}),
+        ),
+        (
+            "constrained-environments",
+            json!({"runtime":"bad/runtime", "requiredNodeCapabilities":["checkpoint-restore"]}),
         ),
     ] {
         let mut body = body;
@@ -83,7 +87,7 @@ async fn node_capabilities_require_the_constrained_create_route_and_a_fresh_expl
 #[tokio::test]
 async fn constrained_create_replay_requires_current_session_proof_without_resubmission() {
     let fixture = Fixture::new().await;
-    let key = "adx.internal/node-capability/runsc/checkpoint-restore.v1";
+    let key = "adx.internal/node-capability/runsc/checkpoint-restore";
     *fixture.state.entry_node.lock().unwrap() = Some(pb::NodeEndpoint {
         node_id: "capable-node".into(),
         session_id: "original-session".into(),
@@ -91,7 +95,7 @@ async fn constrained_create_replay_requires_current_session_proof_without_resubm
         ..Default::default()
     });
     let body = json!({"name":"example", "image":"image", "runtime":"runsc",
-        "requiredNodeCapabilities":["checkpoint-restore.v1"]});
+        "requiredNodeCapabilities":["checkpoint-restore"]});
     let send = |request_id: &'static str, accept: &'static str, node: Option<&'static str>| {
         let api = fixture.api.clone();
         let mut body = body.clone();

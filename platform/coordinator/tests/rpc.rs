@@ -1602,7 +1602,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
 #[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
 async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint() {
     use adx_core::scheduling::{
-        node_capability_label, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+        node_capability_label, CHECKPOINT_RESTORE, NODE_CAPABILITY_LABEL_VALUE,
     };
 
     let redis = common::Redis::new().await;
@@ -1699,9 +1699,9 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
         reconciling: true,
         ..Default::default()
     };
-    let capability_key = node_capability_label("runc", CHECKPOINT_RESTORE_V1);
+    let capability_key = node_capability_label("runc", CHECKPOINT_RESTORE);
     let qualified = pb::RuntimeCapabilities {
-        capability_ids: vec![CHECKPOINT_RESTORE_V1.into()],
+        capability_ids: vec![CHECKPOINT_RESTORE.into()],
     };
     report
         .runtime_capabilities

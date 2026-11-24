@@ -32,12 +32,12 @@ pub(crate) fn retained(requested: &SchedulingPolicy, retained: &SchedulingPolicy
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adx_core::scheduling::{node_capability_label, LabelRequirement, CHECKPOINT_RESTORE_V1};
+    use adx_core::scheduling::{node_capability_label, LabelRequirement, CHECKPOINT_RESTORE};
     use std::collections::BTreeMap;
 
     #[test]
     fn named_replay_requires_every_retained_selector_and_current_label() {
-        let key = node_capability_label("runsc", CHECKPOINT_RESTORE_V1);
+        let key = node_capability_label("runsc", CHECKPOINT_RESTORE);
         let capability = LabelSelector {
             expressions: vec![LabelRequirement {
                 key: key.clone(),

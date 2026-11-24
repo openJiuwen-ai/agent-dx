@@ -180,12 +180,12 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
 
 fn checkpoint_constrained_create(id: &str) -> pb::CreateEnvironmentRequest {
     use adx_core::scheduling::{
-        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE, NODE_CAPABILITY_LABEL_VALUE,
     };
     let mut spec = spec(id);
     spec.scheduling.required_node.push(LabelSelector {
         match_labels: [(
-            node_capability_label("runc", CHECKPOINT_RESTORE_V1),
+            node_capability_label("runc", CHECKPOINT_RESTORE),
             NODE_CAPABILITY_LABEL_VALUE.into(),
         )]
         .into(),
@@ -567,7 +567,7 @@ impl Rig {
             report.runtime_capabilities.insert(
                 "runc".into(),
                 pb::RuntimeCapabilities {
-                    capability_ids: vec![adx_core::scheduling::CHECKPOINT_RESTORE_V1.into()],
+                    capability_ids: vec![adx_core::scheduling::CHECKPOINT_RESTORE.into()],
                 },
             );
         }
