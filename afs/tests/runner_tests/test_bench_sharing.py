@@ -296,6 +296,35 @@ class ConcurrentShareKeyTests(unittest.TestCase):
         row = self.summary("MABC", variant="Vx", node_overrides={"*": {self.SHARE: True, self.HOLDER: 100}})
         self.assertEqual((row["node_overrides"], row["variant_applied"]), ({}, False))
 
+    WAIT = "dfs_holder_wait_ms"
+
+    def test_holder_wait_follows_the_product_limits(self):
+        for good in (0, 1, 500):
+            with self.subTest(good=good):
+                benchlib.parameters(bench(variant="VS", node_overrides={
+                    "B": {self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: good}}))
+        for bad in (-1, 501, True, 100.0, "100"):
+            with self.subTest(bad=bad):
+                blocked(self, variant="Vx",
+                        node_overrides={"B": {self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: bad}})
+
+    def test_holder_wait_acts_only_while_sharing_runs(self):
+        # A holder grant (the only source that sends wait_ms) comes from holder lists, which exist only
+        # with read_sharing on the reading Node (assembly/dfs.rs, read/engine/holders.rs).
+        for settings, inert in (({self.WAIT: 200}, [self.WAIT]),
+                                ({self.CACHE: 64 * MIB, self.WAIT: 200}, [self.WAIT]),
+                                ({self.CACHE: 64 * MIB, self.SHARE: False, self.WAIT: 200}, [self.WAIT]),
+                                ({self.SHARE: True, self.WAIT: 200}, [self.WAIT, self.SHARE]),
+                                ({self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: 200}, []),
+                                ({self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: 0}, [])):
+            with self.subTest(settings=settings):
+                p = benchlib.parameters(bench(variant="VS", node_overrides={"B": settings}))
+                self.assertEqual(p.inert_overrides("B"), inert)
+        row = self.summary("MABC", variant="VS", node_overrides={
+            "*": {self.SHARE: True, self.WAIT: 200}, "B": {self.CACHE: 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: 200}})
+        self.assertEqual(benchlib.node_overrides_toml({self.WAIT: 200}, "/unused"), "dfs_holder_wait_ms = 200\n")
+
     def test_node_evidence_keeps_declared_inert_keys_and_checks_them(self):
         declared = {self.SHARE: True, self.HOLDER: 100}
         with tempfile.TemporaryDirectory() as d:
