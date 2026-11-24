@@ -999,7 +999,7 @@ fn lifecycle_assignment() -> Assignment {
 }
 
 #[tokio::test]
-async fn checkpoint_capability_requires_configured_worker_storage() {
+async fn checkpoint_capability_requires_writable_capture_staging() {
     use adx_core::scheduling::{
         node_capability_label, LabelSelector, CHECKPOINT_RESTORE, NODE_CAPABILITY_LABEL_VALUE,
     };
@@ -1009,7 +1009,7 @@ async fn checkpoint_capability_requires_configured_worker_storage() {
     let (adapter, _server) = connect(server).await;
     let hooks = Arc::new(LifecycleHooks::default());
     let node = lifecycle_node(adapter.clone(), &hooks);
-    assert!(node.checkpoint_capability_storage_ready().await.is_err());
+    assert!(node.check_checkpoint_staging().await.is_err());
 
     let mut constrained = spec();
     constrained.runtime_class = "runsc".into();
@@ -1037,7 +1037,9 @@ async fn checkpoint_capability_requires_configured_worker_storage() {
     let node = lifecycle_node(adapter, &hooks)
         .with_checkpointing(Arc::new(store), Arc::new(control))
         .unwrap();
-    node.checkpoint_capability_storage_ready().await.unwrap();
+    node.check_checkpoint_staging().await.unwrap();
+    std::fs::remove_dir(directory.path()).unwrap();
+    assert!(node.check_checkpoint_staging().await.is_err());
 }
 
 #[tokio::test]

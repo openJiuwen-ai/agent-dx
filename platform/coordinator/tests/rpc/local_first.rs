@@ -166,16 +166,10 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
     );
     assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 1);
 
-    rig.managers[1]
-        .checkpoint_capability_storage_ready()
-        .await
-        .unwrap();
+    rig.managers[1].check_checkpoint_staging().await.unwrap();
     // A successful qualification removes its private staging directory.
     std::fs::remove_dir(checkpoint_root.path().join("b")).unwrap();
-    assert!(rig.managers[1]
-        .checkpoint_capability_storage_ready()
-        .await
-        .is_err());
+    assert!(rig.managers[1].check_checkpoint_staging().await.is_err());
 }
 
 fn checkpoint_constrained_create(id: &str) -> pb::CreateEnvironmentRequest {

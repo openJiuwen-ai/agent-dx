@@ -497,13 +497,13 @@ pub(crate) struct Services {
 }
 
 impl Services {
-    async fn checkpoint_capability_storage_ready(&self) -> Result<()> {
+    async fn check_checkpoint_staging(&self) -> Result<()> {
         self.checkpoint
             .as_ref()
             .ok_or(Error::UnsupportedCapability(
                 adx_core::UnsupportedCapability::CheckpointRestore,
             ))?
-            .validate_qualification()
+            .check_capture_staging()
             .await
     }
 
@@ -558,8 +558,8 @@ pub struct Adxlet {
 impl Adxlet {
     /// Validate the worker's configured checkpoint storage for capability registration.
     /// An absent store or failed provider validation withdraws the capability.
-    pub async fn checkpoint_capability_storage_ready(&self) -> Result<()> {
-        self.services.checkpoint_capability_storage_ready().await
+    pub async fn check_checkpoint_staging(&self) -> Result<()> {
+        self.services.check_checkpoint_staging().await
     }
 
     pub fn checkpoint_storage_alias(&self) -> Option<&str> {
@@ -678,7 +678,7 @@ impl Adxlet {
             .checkpoint = Some(Arc::new(checkpoint::CheckpointServices {
             store,
             cooperation,
-            qualification_probe: Arc::new(tokio::sync::Semaphore::new(1)),
+            staging_probe: Arc::new(tokio::sync::Semaphore::new(1)),
         }));
         Ok(self)
     }

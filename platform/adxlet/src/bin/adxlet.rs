@@ -1,4 +1,6 @@
-use adx_core::scheduling::{NODE_CAPABILITY_LABEL_PREFIX, NODE_HOST_UUID_LABEL};
+use adx_core::scheduling::{
+    CHECKPOINT_RESTORE, NODE_CAPABILITY_LABEL_PREFIX, NODE_HOST_UUID_LABEL,
+};
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
@@ -573,18 +575,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let mut r = last.clone();
-            // Observe storage and runtime capabilities concurrently so storage
-            // does not add another timeout period to the heartbeat path.
-            let (mounts, inventory, checkpoint_storage) = tokio::join!(
+            // Sample capture staging within the same budget as runtime inventory.
+            let (mounts, inventory, checkpoint_staging) = tokio::join!(
                 tokio::time::timeout(
                     sample_timeout,
                     adxlet::managed_mounts::mounted_storage(config.storage_mounts.clone()),
                 ),
                 tokio::time::timeout(sample_timeout, runtime.runtime_inventory()),
-                tokio::time::timeout(
-                    sample_timeout,
-                    manager.checkpoint_capability_storage_ready()
-                ),
+                tokio::time::timeout(sample_timeout, manager.check_checkpoint_staging()),
             );
             // A failed storage observation withdraws only volume eligibility.
             r.storage_mounts = match mounts {
@@ -597,10 +595,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A failed runtime observation closes new admission, while accepted
             // executions and heartbeats continue through reconciliation.
             let mut inventory = inventory.ok().and_then(Result::ok).unwrap_or_default();
-            if !matches!(checkpoint_storage, Ok(Ok(()))) {
-                // Checkpoint/restore qualification requires a usable configured
-                // store. The base runtime classes remain eligible.
-                inventory.capabilities.clear();
+            if !matches!(checkpoint_staging, Ok(Ok(()))) {
+                inventory.capabilities.retain(|_, capabilities| {
+                    capabilities.remove(CHECKPOINT_RESTORE);
+                    !capabilities.is_empty()
+                });
             }
             r.runtime_classes = inventory.classes;
             r.runtime_capabilities = inventory

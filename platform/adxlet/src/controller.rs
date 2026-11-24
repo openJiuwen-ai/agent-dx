@@ -1705,7 +1705,7 @@ impl Controller {
                 .next()
                 .is_some()
             {
-                self.services.checkpoint_capability_storage_ready().await?;
+                self.services.check_checkpoint_staging().await?;
             }
             if self.record.spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause {
                 self.services

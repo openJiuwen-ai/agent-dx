@@ -1155,7 +1155,10 @@ components:
               minItems: 1
               maxItems: 32
               uniqueItems: true
-              description: Hard requirements for the selected runtime. checkpoint-restore requires both checkpoint and restore support and ready checkpoint storage on the worker.
+              description: >-
+                Hard requirements for the selected runtime. checkpoint-restore
+                requires checkpoint and restore support and writable capture
+                staging. S3 access is checked during publication and restore.
               items: {type: string, enum: [checkpoint-restore]}
           anyOf:
             - required: [runtime]

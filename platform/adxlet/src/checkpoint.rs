@@ -182,37 +182,28 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
 pub(crate) struct CheckpointServices {
     pub store: std::sync::Arc<dyn CheckpointAccess>,
     pub cooperation: std::sync::Arc<dyn CheckpointCooperation>,
-    pub qualification_probe: std::sync::Arc<tokio::sync::Semaphore>,
+    pub staging_probe: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl CheckpointServices {
-    pub(crate) async fn validate_qualification(&self) -> Result<()> {
+    pub(crate) async fn check_capture_staging(&self) -> Result<()> {
         let permit = self
-            .qualification_probe
+            .staging_probe
             .clone()
             .acquire_owned()
             .await
             .map_err(|error| {
-                Error::Unavailable(format!("checkpoint storage observation: {error}"))
+                Error::Unavailable(format!("checkpoint staging observation: {error}"))
             })?;
         let store = self.store.clone();
         tokio::spawn(async move {
             // Keep the permit and finish owned staging cleanup if the caller
             // times out while filesystem operations are still running.
             let _permit = permit;
-            let policy_store = store.clone();
-            tokio::task::spawn_blocking(move || {
-                policy_store.validate_policy(adx_core::lifecycle::CheckpointStorage::Configured)
-            })
-            .await
-            .map_err(|error| {
-                Error::Unavailable(format!("checkpoint storage observation: {error}"))
-            })??;
-            let staged = store.begin_capture().await?;
-            store.discard_staged(&staged).await
+            store.probe_capture_staging().await
         })
         .await
-        .map_err(|error| Error::Unavailable(format!("checkpoint storage observation: {error}")))?
+        .map_err(|error| Error::Unavailable(format!("checkpoint staging observation: {error}")))?
     }
 }
 

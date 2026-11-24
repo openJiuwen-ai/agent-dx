@@ -61,6 +61,16 @@ pub trait CheckpointAccess: Send + Sync {
     }
     /// A private capture directory visible to the execution backend; it may be shared-filesystem backed.
     async fn begin_capture(&self) -> Result<PathBuf>;
+    /// Verify that a private capture directory can be created, written and
+    /// discarded. Publication and restore check access to durable artifacts.
+    async fn probe_capture_staging(&self) -> Result<()> {
+        let staged = self.begin_capture().await?;
+        let write = tokio::fs::write(staged.join(".adx-staging-probe"), [0])
+            .await
+            .map_err(io_error);
+        let cleanup = self.discard_staged(&staged).await;
+        write.and(cleanup)
+    }
     /// Durable input reservations recorded before a running capture starts.
     /// Zero size denotes an incomplete capture, which must never be restored.
     fn capture_references(&self, staged: &Path) -> Result<Vec<CheckpointArtifact>> {

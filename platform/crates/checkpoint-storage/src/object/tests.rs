@@ -1,5 +1,35 @@
 use super::*;
 
+#[tokio::test]
+async fn staging_probe_uses_local_storage_even_when_remote_requests_cannot_run() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = object_store::limit::LimitStore::new(object_store::memory::InMemory::new(), 0);
+    let store = ObjectCheckpointStore::new(
+        "shared".into(),
+        Arc::new(remote),
+        "checkpoints".into(),
+        root.path().into(),
+        1024,
+    )
+    .unwrap();
+    // Artifact cache bookkeeping is independent of capture staging.
+    let index = root.path().join("cache-index");
+    std::fs::remove_dir(&index).unwrap();
+    std::fs::write(&index, b"unavailable").unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.probe_capture_staging(),
+    )
+    .await
+    .expect("staging qualification must not contact the object store")
+    .unwrap();
+
+    let staging = root.path().join("staging");
+    std::fs::remove_dir(&staging).unwrap();
+    assert!(store.probe_capture_staging().await.is_err());
+}
+
 #[tokio::test(start_paused = true)]
 async fn idle_verification_is_paced_and_yields_to_execution() {
     let root = tempfile::tempdir().unwrap();

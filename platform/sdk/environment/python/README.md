@@ -844,6 +844,8 @@ copied before the SDK adds a node constraint.
 
 For a fresh Environment, `Environment(runtime="runsc", required_node_capabilities=["checkpoint-restore"])` makes worker capability a hard placement constraint alongside `node_id`, runtime and resources. Every named capability must be advertised for the selected runtime. An empty list uses ordinary creation. A server without the constrained endpoint rejects the request before scheduling. The SDK preserves the operation identity if an earlier constrained attempt has an unknown outcome.
 
+`checkpoint-restore` requires runtime support for checkpoint and restore and writable capture staging on the worker. S3 access is checked when checkpoint operations publish or read artifacts.
+
 
 ## Tool execution identity
 
