@@ -273,7 +273,7 @@ pub(super) struct Backends {
     pub(super) timeout: Duration,
     /// Held until the Node exits, as the pool was before the split; the
     /// backends dial through their own clones.
-    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
+    #[cfg(feature = "ownerfs")]
     pub(super) peer_connections: Arc<rpc::peer::PeerConnectionPool>,
     #[cfg(feature = "ownerfs")]
     pub(super) ownerfs: ownerfs::OwnerFsAssembly,
@@ -321,7 +321,7 @@ impl Backends {
             metrics,
             #[cfg(feature = "dfs")]
             timeout: startup.timeout,
-            #[cfg(any(feature = "ownerfs", feature = "dfs"))]
+            #[cfg(feature = "ownerfs")]
             peer_connections,
             #[cfg(feature = "ownerfs")]
             ownerfs,

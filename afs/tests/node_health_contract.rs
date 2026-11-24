@@ -48,9 +48,9 @@ fn node_with_readiness(config: Config, readiness: Arc<NodeReadiness>) -> Arc<Nod
         ownerfs: None,
         #[cfg(feature = "dfs")]
         dfs: None,
-        #[cfg(feature = "dfs")]
+        #[cfg(feature = "ownerfs")]
         hixl_runtime: None,
-        #[cfg(feature = "dfs")]
+        #[cfg(feature = "ownerfs")]
         hixl_metrics: None,
     })
 }

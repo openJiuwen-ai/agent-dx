@@ -353,6 +353,7 @@ impl LocalFile {
     /// A second descriptor for the same open file. Positional reads through it
     /// need no lock of the owning handle and stay valid after that handle is
     /// closed, so a caller can copy while others close or flush.
+    #[cfg(feature = "ownerfs")]
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             file: self.file.try_clone()?,
@@ -443,6 +444,7 @@ impl LocalDirectory {
     }
 
     /// Attributes of a direct child without following a final symlink.
+    #[cfg(feature = "ownerfs")]
     pub(crate) fn child_metadata(&self, name: &OsStr) -> io::Result<fs::Metadata> {
         if name.is_empty() || Path::new(name).components().count() != 1 {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
