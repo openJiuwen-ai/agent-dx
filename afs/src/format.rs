@@ -127,8 +127,8 @@ pub mod version {
     pub const META_IDENTITY: u16 = 1;
     pub const META_CURRENT: u16 = 3;
     pub const META_CHECKPOINT_FILE: u16 = 1;
-    pub const META_STATE_IMAGE: u16 = 4;
-    pub const META_RECORD_DECISION: u16 = 3;
+    pub const META_STATE_IMAGE: u16 = 5;
+    pub const META_RECORD_DECISION: u16 = 4;
     /// 2: `SetInodeAttrRequest` is digested (optional client revision) and
     /// `CreateFileRequest` names the first write generation (round 2 B1/B4).
     pub const META_REQUEST_DIGEST: u32 = 2;
@@ -344,9 +344,11 @@ mod tests {
             // dedicated NFS address field (outlet import addressing); GC
             // references name their pinned version, and R12's replica failure
             // entity and keys (S4b).
+            // State image 5 and decision 4: OwnerFs workspace deletion
+            // tombstones (entity, key and the mark/clear operations).
             // Chunk catalog snapshot 2: the append layout is persisted
             // incrementally, so the snapshot shape changed as well.
-            (3, 4, 3, 2, 1, 1, 1)
+            (3, 5, 4, 2, 1, 1, 1)
         );
     }
 

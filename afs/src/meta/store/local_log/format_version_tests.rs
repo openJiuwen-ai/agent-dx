@@ -109,7 +109,7 @@ async fn wal_record_decision_schema_is_identified_before_the_full_decode() {
             "Meta WAL record decision",
             WAL,
             "version 1",
-            "supports version 3",
+            "supports version 4",
         ],
     );
 }

@@ -184,6 +184,26 @@ pub struct RootReservationRecord {
     pub created_at_revision: StoreRevision,
 }
 
+/// Durable intent that a deactivated workspace generation still has data to reclaim.
+///
+/// Written in the same transaction that deletes a `Root` whose data is not yet
+/// confirmed gone: for a Home deactivation after it isolated the data into
+/// trash (`isolated`), and for a forced deactivation while the Home was
+/// unreachable (not `isolated`). The Home isolates a not-yet-isolated
+/// generation once, marks it, and clears the tombstone only after the trash is
+/// reclaimed, so a Home that returns later never adopts or re-isolates it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RootTombstoneRecord {
+    pub root_id: String,
+    pub root_epoch: u64,
+    pub home_node_id: String,
+    pub requester_node_id: String,
+    pub deleted_at_unix_ms: u64,
+    /// The generation's data has left the live path: only its trash entry, if
+    /// any, remains. The Home must never touch the live path for it again.
+    pub isolated: bool,
+}
+
 /// Access grant persisted by Meta and echoed to nodes.
 ///
 /// Multiple nodes may hold grants for the same root. B joining through P2P does
@@ -286,6 +306,8 @@ pub enum MetaEntity {
     DfsGc(crate::dfs::GcState),
     /// Appended last: earlier variant indexes are on disk.
     DfsReplicaFailureConfig(crate::dfs::ReplicaFailureConfig),
+    /// Appended last: earlier variant indexes are on disk.
+    RootTombstone(RootTombstoneRecord),
 }
 
 impl MetaEntity {
@@ -312,6 +334,7 @@ impl MetaEntity {
             Self::DfsReference(_) => "dfs_reference",
             Self::DfsGc(_) => "dfs_gc",
             Self::DfsReplicaFailureConfig(_) => "dfs_replica_failure_config",
+            Self::RootTombstone(_) => "root_tombstone",
         }
     }
 }
@@ -339,6 +362,11 @@ pub enum MetaRead {
     },
     RootReservation {
         root_id: String,
+    },
+    RootTombstone {
+        home_node_id: String,
+        root_id: String,
+        root_epoch: u64,
     },
     RootState {
         root_id: String,
@@ -473,6 +501,12 @@ pub enum MetaKey {
     DfsGc,
     /// Appended last: earlier variant indexes are on disk.
     DfsReplicaFailureConfig,
+    /// Appended last: earlier variant indexes are on disk.
+    RootTombstone {
+        home_node_id: String,
+        root_id: String,
+        root_epoch: u64,
+    },
 }
 
 /// Ordered change stream item.
@@ -572,18 +606,21 @@ pub struct RecoveryScan {
     pub roots: Vec<RootRecord>,
 }
 
-/// OwnerFs roots and pending reservations that a restarted Home node may reconcile.
+/// OwnerFs roots, pending reservations and tombstones that a restarted Home
+/// node may reconcile.
 ///
 /// Pending reservations are not access grants. The combined snapshot lets
 /// OwnerFs detect both sides of startup mismatch: active Meta roots without a
 /// local catalog record, and local prepare records whose Meta reservation is
-/// still pending.
+/// still pending. Tombstones name deleted generations whose data the Home
+/// must reclaim rather than adopt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerRootScan {
     pub revision: StoreRevision,
     pub home_node_id: String,
     pub roots: Vec<RootRecord>,
     pub reservations: Vec<RootReservationRecord>,
+    pub tombstones: Vec<RootTombstoneRecord>,
 }
 
 impl fmt::Display for StoreRevision {

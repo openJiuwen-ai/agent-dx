@@ -30,6 +30,8 @@ use crate::node::storage::{DirectoryHandle, FileStore, LocalFs, StoragePath};
 
 /// 已隔离旧代次的回收目录，位于 OwnerFs 存储根内，仅 root 可访问。
 const TRASH_DIR: &str = ".ownerfs-trash";
+/// Meta accepts at most this many tombstones in one clear request.
+const MAX_TOMBSTONE_CLEAR_BATCH: usize = crate::meta::owner_roots::MAX_CLEAR_ROOT_TOMBSTONES;
 
 /// Meta 使用的稳定根身份；与 FUSE inode、磁盘目录名均不同。
 ///
@@ -92,6 +94,23 @@ pub struct RootLookupState {
 pub struct OwnerRootInventory {
     pub active: Vec<RootLocation>,
     pub pending: Vec<RootReservation>,
+    /// Deleted generations whose data this Home must reclaim, never adopt.
+    pub tombstones: Vec<RootTombstoneState>,
+}
+
+/// A Meta tombstone as the Home reconciles it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootTombstoneState {
+    pub tombstone: RootTombstone,
+    /// The generation's data already left the live path; never touch it again.
+    pub isolated: bool,
+}
+
+/// One deleted workspace generation whose data is not yet confirmed gone.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RootTombstone {
+    pub id: RootId,
+    pub epoch: u64,
 }
 
 /// Result of one startup adoption scan.
@@ -243,7 +262,9 @@ pub trait RootMeta: Send + Sync {
     fn abort_root(&self, reservation: &RootReservation) -> Result<()>;
     /// D4: 权威删除一个已 activate 的 active root。
     ///
-    /// Meta 移除 Root，使旧 grant 校验失败。
+    /// Meta 移除 Root，使旧 grant 校验失败。`retain_tombstone` 表示该代数据
+    /// 已隔离进 trash、尚未回收：Meta 在同一事务写 tombstone，回收后由
+    /// `clear_root_tombstones` 清除。
     /// 幂等：root 已不在 Meta active 列表时返回 Ok(())。
     fn deactivate_root(
         &self,
@@ -251,7 +272,36 @@ pub trait RootMeta: Send + Sync {
         epoch: u64,
         home_node_id: &str,
         session_id: &str,
+        retain_tombstone: bool,
     ) -> Result<()>;
+    /// Records that this Home moved these generations' data off the live path.
+    fn mark_root_tombstones_isolated(
+        &self,
+        home_node_id: &str,
+        session_id: &str,
+        tombstones: &[RootTombstone],
+    ) -> Result<()> {
+        let _ = (home_node_id, session_id, tombstones);
+        Err(Error::coded(
+            afs_error::META_STORE_UNIMPLEMENTED,
+            "RootMeta tombstone marking is not wired",
+        ))
+    }
+    /// Removes this Home's tombstones for generations whose data is confirmed
+    /// gone. Already absent tombstones count as cleared; Meta refuses to clear
+    /// a tombstone that is not isolated yet.
+    fn clear_root_tombstones(
+        &self,
+        home_node_id: &str,
+        session_id: &str,
+        tombstones: &[RootTombstone],
+    ) -> Result<()> {
+        let _ = (home_node_id, session_id, tombstones);
+        Err(Error::coded(
+            afs_error::META_STORE_UNIMPLEMENTED,
+            "RootMeta tombstone clearing is not wired",
+        ))
+    }
     fn lookup_root(&self, id: &RootId) -> Result<Option<RootLocation>>;
     /// Return active and pending state in one linearizable observation.
     fn lookup_root_state(&self, id: &RootId) -> Result<RootLookupState> {
@@ -596,6 +646,23 @@ pub struct RootManager {
     workspace_locks: Mutex<HashMap<RootId, Weak<Mutex<()>>>>,
     /// Last cleanup error per trash entry, so a permanent failure warns once.
     trash_failures: Mutex<HashMap<(RootId, u64), String>>,
+    /// Meta tombstones this process still has to finish.
+    tombstones: Mutex<TombstoneReclaim>,
+}
+
+/// Progress on Meta tombstones (deleted generations whose data is reclaimed,
+/// never adopted). Both sets are rebuilt from Meta on the next startup, which
+/// is complete for this process: a forced deactivation needs this Home's
+/// session to be gone, and an expired session stops the process.
+#[derive(Default)]
+struct TombstoneReclaim {
+    /// Generations not yet marked isolated in Meta, with the last error: their
+    /// data may still be on the live path. Adoption and creation refuse these
+    /// names, trash collection keeps their trash entries, maintenance retries.
+    pending: HashMap<RootTombstone, String>,
+    /// Isolated generations whose data is confirmed gone but whose Meta
+    /// tombstone is not cleared yet.
+    clear: HashSet<RootTombstone>,
 }
 
 impl RootManager {
@@ -654,12 +721,7 @@ impl RootManager {
     /// 已隔离或目录已缺失的代次只向前完成：同步目录、撤下本机准入，
     /// 会话变化时先换绑当前会话（不安装缓存），再条件注销并移除 catalog。
     fn finish_isolated(&self, record: &LocalRootRecord) -> Result<()> {
-        match std::fs::File::open(self.trash_path()) {
-            Ok(trash) => trash.sync_all()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.disk.sync_root()?;
+        self.sync_trash()?;
         {
             let mut roots = self
                 .roots
@@ -683,11 +745,16 @@ impl RootManager {
                 if location.home_session_id != self.session_id {
                     self.meta.recover_root(record, &self.session_id)?;
                 }
+                // Data still in trash keeps a tombstone until `collect_trash`
+                // removes it; a generation whose directory is already gone has
+                // nothing left to reclaim.
+                let in_trash = self.trash_entry_exists(&record.id, record.epoch)?;
                 self.meta.deactivate_root(
                     &record.id,
                     record.epoch,
                     &self.local_node_id,
                     &self.session_id,
+                    in_trash,
                 )?;
             }
             Some(location) if location.epoch <= record.epoch => {
@@ -696,6 +763,25 @@ impl RootManager {
             _ => {}
         }
         self.catalog.remove_prepared_root(record)
+    }
+
+    /// Makes a rename into trash durable before Meta may forget the generation.
+    fn sync_trash(&self) -> Result<()> {
+        match std::fs::File::open(self.trash_path()) {
+            Ok(trash) => trash.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.disk.sync_root()?;
+        Ok(())
+    }
+
+    fn trash_entry_exists(&self, id: &RootId, epoch: u64) -> Result<bool> {
+        match std::fs::symlink_metadata(self.trash_path().join(trash_name(id, epoch)?.as_path())) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn trash_entries(&self) -> Result<Vec<(RootId, u64, StoragePath)>> {
@@ -811,12 +897,26 @@ impl RootManager {
     pub(crate) fn collect_trash(&self) -> Result<usize> {
         let entries = self.trash_entries()?;
         if entries.is_empty() {
+            self.flush_tombstone_clears()?;
             return Ok(0);
         }
         let disk = LocalFs::open(self.trash_path())?;
         let mut removed = 0;
+        let pending = self
+            .tombstones
+            .lock()
+            .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+            .pending
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         for (id, epoch, path) in entries {
-            if self
+            // Until Meta records the isolation, this entry is the only proof
+            // that the generation's data already left the live path.
+            if pending.contains(&RootTombstone {
+                id: id.clone(),
+                epoch,
+            }) || self
                 .meta
                 .lookup_root(&id)?
                 .is_some_and(|root| root.epoch <= epoch)
@@ -840,6 +940,14 @@ impl RootManager {
                     }
                     disk.sync_root()?;
                     removed += 1;
+                    self.tombstones
+                        .lock()
+                        .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+                        .clear
+                        .insert(RootTombstone {
+                            id: key.0.clone(),
+                            epoch: key.1,
+                        });
                 }
                 Err(error) => {
                     let error = error.to_string();
@@ -852,7 +960,190 @@ impl RootManager {
                 }
             }
         }
+        self.flush_tombstone_clears()?;
         Ok(removed)
+    }
+
+    /// Moves a not-yet-isolated generation's data off the live path, at most
+    /// once, and records that in Meta. Only this generation's own catalog
+    /// record proves the live directory is its data; without it the directory
+    /// may be new business data and is kept. A newer generation owning the
+    /// path, or an empty live path, proves the data already left. A live
+    /// directory beside a same-epoch trash entry is ambiguous and kept.
+    fn isolate_tombstone(&self, tombstone: &RootTombstone) -> Result<()> {
+        let name = root_name_from_id(&tombstone.id)?;
+        let lock = self.workspace_lock(&tombstone.id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| invalid_grant("workspace lock poisoned"))?;
+        let record = self.catalog.lookup_root(&tombstone.id)?;
+        let newer = record
+            .as_ref()
+            .is_some_and(|record| record.epoch > tombstone.epoch)
+            || self
+                .roots
+                .read()
+                .map_err(|_| invalid_grant("root cache lock poisoned"))?
+                .get(&tombstone.id)
+                // An admitted root is never moved, even if Meta's view contradicts it.
+                .is_some_and(|root| root.epoch >= tombstone.epoch);
+        let own = record.filter(|record| record.epoch == tombstone.epoch);
+        if !newer {
+            // The generation's own record names where its data lives, which
+            // for a legacy-layout record is not the native name.
+            let data_dir = match &own {
+                Some(record) => record.data_dir.clone(),
+                None => root_data_dir(&name, tombstone.epoch)?,
+            };
+            let live =
+                match std::fs::symlink_metadata(self.disk.root_path().join(data_dir.as_path())) {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                };
+            let in_trash = self.trash_entry_exists(&tombstone.id, tombstone.epoch)?;
+            match (live, in_trash) {
+                // Either copy may be the deleted data: keep both until an
+                // operator resolves it, and never clear the tombstone meanwhile.
+                (true, true) => {
+                    return Err(invalid_grant(
+                        "a live directory and a same-epoch trash entry both exist for a deleted generation; kept",
+                    ));
+                }
+                (true, false) => {
+                    let Some(record) = own.as_ref() else {
+                        return Err(invalid_grant(
+                            "live directory of a deleted generation has no catalog evidence; kept",
+                        ));
+                    };
+                    self.rename_to_trash(record)?;
+                    self.sync_trash()?;
+                    afs_logging::info!("root.reconcile.tombstone_isolated";
+                        "root_id" => ?tombstone.id, "epoch" => tombstone.epoch);
+                }
+                // Nothing on the live path: the data is in trash or already gone.
+                (false, _) => {}
+            }
+        }
+        self.meta.mark_root_tombstones_isolated(
+            &self.local_node_id,
+            &self.session_id,
+            std::slice::from_ref(tombstone),
+        )?;
+        // The isolated mark is the durable evidence now; the record would only
+        // let a same-name create take the trash entry's place.
+        if let Some(record) = own {
+            self.catalog.remove_prepared_root(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Queues the clear of an isolated tombstone whose trash entry is gone;
+    /// one still in trash is cleared by `collect_trash` after removal.
+    fn settle_isolated_tombstone(&self, tombstone: RootTombstone) -> Result<()> {
+        if !self.trash_entry_exists(&tombstone.id, tombstone.epoch)? {
+            self.tombstones
+                .lock()
+                .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+                .clear
+                .insert(tombstone);
+        }
+        Ok(())
+    }
+
+    /// Isolates pending tombstones; a failure keeps the name refused for
+    /// adoption and creation and is retried by maintenance.
+    fn isolate_pending_tombstones(&self) -> Result<()> {
+        let pending = self
+            .tombstones
+            .lock()
+            .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+            .pending
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for tombstone in pending {
+            let result = self.isolate_tombstone(&tombstone);
+            let isolated = {
+                let mut state = self
+                    .tombstones
+                    .lock()
+                    .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?;
+                match result {
+                    Ok(()) => {
+                        state.pending.remove(&tombstone);
+                        true
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        if state.pending.get(&tombstone) != Some(&error) {
+                            afs_logging::warn!("root.reconcile.tombstone_pending";
+                                "root_id" => ?tombstone.id, "epoch" => tombstone.epoch,
+                                "error" => error.clone());
+                        }
+                        state.pending.insert(tombstone.clone(), error);
+                        false
+                    }
+                }
+            };
+            if isolated {
+                self.settle_isolated_tombstone(tombstone)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Background retry of tombstoned generations not yet isolated.
+    pub(crate) fn retry_pending_tombstones(&self) -> Result<()> {
+        self.isolate_pending_tombstones()?;
+        self.flush_tombstone_clears()
+    }
+
+    /// Clears acknowledged-gone tombstones in Meta. A failed clear stays queued
+    /// for the next round; a restart rediscovers it from Meta.
+    fn flush_tombstone_clears(&self) -> Result<()> {
+        let pending = self
+            .tombstones
+            .lock()
+            .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+            .clear
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for batch in pending.chunks(MAX_TOMBSTONE_CLEAR_BATCH) {
+            match self
+                .meta
+                .clear_root_tombstones(&self.local_node_id, &self.session_id, batch)
+            {
+                Ok(()) => {
+                    let mut state = self
+                        .tombstones
+                        .lock()
+                        .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?;
+                    for tombstone in batch {
+                        state.clear.remove(tombstone);
+                        afs_logging::info!("root.tombstone.cleared";
+                            "root_id" => ?tombstone.id, "epoch" => tombstone.epoch);
+                    }
+                }
+                Err(error) => {
+                    afs_logging::warn!("root.tombstone.clear_failed";
+                        "count" => batch.len(), "error" => error.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A deleted generation of this name may still have data on the live path.
+    fn tombstone_pending(&self, id: &RootId) -> Result<bool> {
+        Ok(self
+            .tombstones
+            .lock()
+            .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+            .pending
+            .keys()
+            .any(|tombstone| &tombstone.id == id))
     }
 
     /// Open the production root manager, hold the local catalog lock for the
@@ -889,6 +1180,7 @@ impl RootManager {
             pending_legacy_cleanup: Mutex::new(HashSet::new()),
             workspace_locks: Mutex::new(HashMap::new()),
             trash_failures: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(TombstoneReclaim::default()),
         };
         manager.reconcile_on_startup()?;
         Ok(manager)
@@ -993,6 +1285,11 @@ impl RootManager {
             return Ok(false);
         }
         let id = root_id_from_name(name)?;
+        if self.tombstone_pending(&id)? {
+            afs_logging::warn!("ownerfs.adopt.tombstoned";
+                "name" => String::from_utf8_lossy(bytes).into_owned());
+            return Ok(false);
+        }
         if self.catalog.lookup_root(&id)?.is_some() {
             return Ok(false);
         }
@@ -1219,6 +1516,14 @@ impl RootManager {
         let data_dir = root_data_dir(&name, reservation.epoch)?;
         let local_prepare_id = format!("{}:{}", reservation.prepare_token, self.session_id);
         let adopted = matches!(mode, PrepareMode::Adopt);
+        // A deleted generation's data may still be on this path, and its kept
+        // catalog record would let the code below reuse it in place.
+        if self.tombstone_pending(&reservation.id)? {
+            return Err(Error::coded(
+                afs_error::META_OWNER_ROOT_BUSY,
+                "an earlier deleted generation of this workspace is not reclaimed yet",
+            ));
+        }
         let mut local_record = self.catalog.lookup_root(&reservation.id)?;
         if local_record
             .as_ref()
@@ -2075,6 +2380,7 @@ impl RootManager {
             record.epoch,
             &self.local_node_id,
             &self.session_id,
+            false,
         ) {
             Ok(()) => return Ok(()),
             Err(error) => error,
@@ -2273,6 +2579,57 @@ impl RootManager {
                 "Meta has an active Home root without local catalog evidence",
             ));
         }
+
+        // Tombstones first, while a deleted generation's own catalog record —
+        // the only proof that its live directory is its data — still exists.
+        // Isolation moves that data into trash before startup adoption can
+        // publish it again; a failure keeps the name refused and is retried in
+        // the background rather than blocking the mount.
+        let mut isolated = Vec::new();
+        {
+            let mut state = self
+                .tombstones
+                .lock()
+                .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?;
+            for entry in inventory.tombstones {
+                if entry.tombstone.epoch == 0 {
+                    return Err(invalid_grant("Meta returned a tombstone without an epoch"));
+                }
+                if entry.isolated {
+                    isolated.push(entry.tombstone);
+                } else {
+                    state.pending.insert(entry.tombstone, String::new());
+                }
+            }
+        }
+        self.isolate_pending_tombstones()?;
+        for tombstone in isolated {
+            self.settle_isolated_tombstone(tombstone)?;
+        }
+        let pending = self
+            .tombstones
+            .lock()
+            .map_err(|_| invalid_grant("tombstone reclaim state poisoned"))?
+            .pending
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut settled = Vec::new();
+        for (id, record) in &records {
+            // Keep the evidence of a generation still pending isolation, and
+            // forget records the isolation above already removed.
+            if pending
+                .iter()
+                .any(|tombstone| &tombstone.id == id && tombstone.epoch == record.epoch)
+                || self.catalog.lookup_root(id)?.as_ref() != Some(record)
+            {
+                settled.push(id.clone());
+            }
+        }
+        for id in settled {
+            records.remove(&id);
+        }
+
         // The catalog alone cannot see a crash between Reserve and catalog
         // fsync. A pending reservation is never a grant. Cancel it with a
         // reservation CAS before deleting any local evidence; if the process
@@ -2339,7 +2696,8 @@ impl RootManager {
                 // Meta no longer exposes this generation. Never rmdir the
                 // native-named directory: it may hold user data or already be
                 // the next generation's live directory. Dropping the catalog
-                // entry keeps it eligible for adoption on the next startup.
+                // entry keeps it eligible for adoption on the next startup;
+                // a deleted generation's data was reclaimed above.
                 afs_logging::warn!(
                     "root.reconcile.deferred_data_dir";
                     "root_id" => ?record.id,
@@ -2385,12 +2743,17 @@ impl RootManager {
                     record.epoch,
                     &self.local_node_id,
                     &self.session_id,
+                    false,
                 )?;
                 self.catalog.remove_prepared_root(&record)?;
                 continue;
             }
             let grant = self.meta.recover_root(&record, &self.session_id)?;
             self.cache_local_root(&record, grant)?;
+        }
+
+        if let Err(error) = self.flush_tombstone_clears() {
+            afs_logging::warn!("root.tombstone.clear_failed"; "error" => error.to_string());
         }
         Ok(())
     }
@@ -2961,7 +3324,7 @@ mod tests {
             unreachable!("not used by activation test")
         }
 
-        fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
+        fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
             unreachable!("not used by activation test")
         }
 
@@ -3682,6 +4045,9 @@ mod tests {
         /// Sessions whose pending reservation still counts as live; a reserve
         /// against one of them mirrors Meta's ROOT_BUSY.
         live_sessions: Vec<String>,
+        tombstones: Vec<RootTombstoneState>,
+        fail_clear: bool,
+        fail_mark: bool,
     }
 
     #[derive(Default)]
@@ -3764,6 +4130,7 @@ mod tests {
             epoch: u64,
             home: &str,
             session: &str,
+            retain_tombstone: bool,
         ) -> Result<()> {
             let mut state = self.0.lock().unwrap();
             if std::mem::take(&mut state.fail_deactivate) {
@@ -3774,6 +4141,20 @@ mod tests {
                     afs_error::CLIENT_DEADLINE_EXCEEDED,
                     "injected deactivation timeout",
                 ));
+            }
+            if retain_tombstone
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|location| &location.id == root_id)
+            {
+                state.tombstones.push(RootTombstoneState {
+                    tombstone: RootTombstone {
+                        id: root_id.clone(),
+                        epoch,
+                    },
+                    isolated: true,
+                });
             }
             if state.active.as_ref().is_some_and(|location| {
                 location.id == *root_id
@@ -3829,7 +4210,55 @@ mod tests {
                     .filter(|root| root.home_node_id == home)
                     .into_iter()
                     .collect(),
+                tombstones: state.tombstones.clone(),
             })
+        }
+
+        fn mark_root_tombstones_isolated(
+            &self,
+            home: &str,
+            _: &str,
+            tombstones: &[RootTombstone],
+        ) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            assert_eq!(home, "node-a");
+            if std::mem::take(&mut state.fail_mark) {
+                return Err(unavailable_grant("injected tombstone mark failure"));
+            }
+            for entry in &mut state.tombstones {
+                if tombstones.contains(&entry.tombstone) {
+                    entry.isolated = true;
+                }
+            }
+            Ok(())
+        }
+
+        /// Mirrors Meta: a tombstone that is not isolated yet is refused.
+        fn clear_root_tombstones(
+            &self,
+            home: &str,
+            _: &str,
+            tombstones: &[RootTombstone],
+        ) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            assert_eq!(home, "node-a");
+            if std::mem::take(&mut state.fail_clear) {
+                return Err(unavailable_grant("injected tombstone clear failure"));
+            }
+            if state
+                .tombstones
+                .iter()
+                .any(|entry| !entry.isolated && tombstones.contains(&entry.tombstone))
+            {
+                return Err(Error::coded(
+                    afs_error::META_OWNER_ROOT_BUSY,
+                    "tombstone is not isolated yet",
+                ));
+            }
+            state
+                .tombstones
+                .retain(|entry| !tombstones.contains(&entry.tombstone));
+            Ok(())
         }
 
         fn acquire_root(&self, _: &RootId, _: RootRight) -> Result<RootGrant> {
@@ -3853,8 +4282,425 @@ mod tests {
                 return Err(invalid_grant("local prepare identity mismatch"));
             }
             active.home_session_id = session.into();
-            Ok(recovery_grant(record.id.clone(), session))
+            let mut grant = recovery_grant(record.id.clone(), session);
+            grant.epoch = record.epoch;
+            Ok(grant)
         }
+    }
+
+    impl RecoveryMeta {
+        /// Models Meta's force deactivation while the Home is unreachable.
+        fn force_delete(&self, id: &RootId) {
+            let mut state = self.0.lock().unwrap();
+            let active = state.active.take().filter(|root| &root.id == id);
+            let epoch = active.expect("force delete needs an active root").epoch;
+            state.tombstones.push(RootTombstoneState {
+                tombstone: RootTombstone {
+                    id: id.clone(),
+                    epoch,
+                },
+                isolated: false,
+            });
+        }
+
+        fn tombstones(&self) -> Vec<RootTombstone> {
+            self.tombstones_with_state()
+                .into_iter()
+                .map(|entry| entry.tombstone)
+                .collect()
+        }
+
+        fn tombstones_with_state(&self) -> Vec<RootTombstoneState> {
+            self.0.lock().unwrap().tombstones.clone()
+        }
+    }
+
+    /// #142: force delete while the Home is down, then a Home restart with
+    /// startup adoption must neither revive the workspace nor leave its data live.
+    #[test]
+    fn force_deleted_workspace_is_not_adopted_after_home_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        std::fs::create_dir(temp.path().join("alice")).unwrap();
+        std::fs::write(temp.path().join("alice/marker.txt"), b"old").unwrap();
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 1);
+        let id = root_id_from_name(OsStr::new("alice")).unwrap();
+        drop(manager);
+
+        meta.force_delete(&id);
+        // The fake binds reservations to "old-session"; Meta would use the new one.
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        manager.adopt_pre_existing_roots();
+
+        assert!(
+            meta.lookup_root(&id).unwrap().is_none(),
+            "force-deleted workspace was adopted again"
+        );
+        assert!(!temp.path().join("alice").exists());
+        let trash = temp
+            .path()
+            .join(TRASH_DIR)
+            .join(trash_name(&id, 1).unwrap().as_path());
+        assert_eq!(std::fs::read(trash.join("marker.txt")).unwrap(), b"old");
+        assert_eq!(meta.tombstones().len(), 1, "data is not reclaimed yet");
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(!trash.exists());
+        assert!(meta.tombstones().is_empty());
+        // The name is free again: a new workspace starts empty.
+        std::fs::create_dir(temp.path().join("alice")).unwrap();
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 1);
+        assert!(!temp.path().join("alice/marker.txt").exists());
+    }
+
+    /// A Home-initiated recursive delete keeps a tombstone while the data sits in
+    /// trash and clears it once `collect_trash` has removed the data.
+    #[test]
+    fn recursive_delete_tombstone_lives_until_trash_is_collected() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let (id, _) = prepared_job(&manager, temp.path());
+        manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap();
+        assert_eq!(
+            meta.tombstones(),
+            vec![RootTombstone {
+                id: id.clone(),
+                epoch: 1
+            }]
+        );
+        meta.0.lock().unwrap().fail_clear = true;
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert_eq!(meta.tombstones().len(), 1, "a failed clear stays queued");
+        assert_eq!(manager.collect_trash().unwrap(), 0);
+        assert!(meta.tombstones().is_empty(), "the queued clear is retried");
+    }
+
+    /// An empty-directory rmdir removes the data before Meta forgets the root,
+    /// so it leaves no tombstone behind.
+    #[test]
+    fn empty_rmdir_leaves_no_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        std::fs::remove_file(path.join("payload")).unwrap();
+        manager.delete_root(&id, Some(1)).unwrap();
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        assert!(meta.tombstones().is_empty());
+    }
+
+    fn adopted_then_force_deleted(
+        name: &str,
+    ) -> (tempfile::TempDir, Arc<LocalFs>, Arc<RecoveryMeta>, RootId) {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+        std::fs::write(temp.path().join(name).join("data"), b"old").unwrap();
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 1);
+        let id = root_id_from_name(OsStr::new(name)).unwrap();
+        drop(manager);
+        meta.force_delete(&id);
+        (temp, disk, meta, id)
+    }
+
+    /// Review #1: until Meta records the isolation, neither trash collection
+    /// nor a restart may lose it — the trash entry stays, the tombstone stays
+    /// uncleared, and the next startup marks it instead of adopting the name.
+    #[test]
+    fn unmarked_isolation_survives_trash_collection_and_restart() {
+        let (temp, disk, meta, id) = adopted_then_force_deleted("alice");
+        let trash = temp
+            .path()
+            .join(TRASH_DIR)
+            .join(trash_name(&id, 1).unwrap().as_path());
+        meta.0.lock().unwrap().fail_mark = true;
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert!(!temp.path().join("alice").exists());
+        assert!(trash.join("data").exists());
+        assert_eq!(
+            manager.collect_trash().unwrap(),
+            0,
+            "unmarked trash is kept"
+        );
+        assert!(trash.exists());
+        assert!(!meta.tombstones_with_state()[0].isolated);
+        // A same-name directory must neither be adopted nor created meanwhile.
+        std::fs::create_dir(temp.path().join("alice")).unwrap();
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 0);
+        std::fs::remove_dir(temp.path().join("alice")).unwrap();
+        drop(manager);
+
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        assert!(meta.tombstones_with_state()[0].isolated);
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 0);
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(meta.tombstones().is_empty());
+    }
+
+    /// Review #2: an isolated generation never touches the live path again,
+    /// even after its trash is gone and its tombstone is still uncleared.
+    #[test]
+    fn isolated_tombstone_never_moves_a_new_same_name_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap();
+        meta.0.lock().unwrap().fail_clear = true;
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert_eq!(meta.tombstones().len(), 1);
+        drop(manager);
+        // New business data appears under the same name before the restart.
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("new"), b"keep").unwrap();
+
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        assert_eq!(std::fs::read(path.join("new")).unwrap(), b"keep");
+        assert!(meta.tombstones().is_empty());
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 1);
+    }
+
+    /// Second review: live old data beside a same-epoch trash entry is ambiguous.
+    /// A maintenance round followed by a restart must neither clear the
+    /// tombstone nor adopt the live directory.
+    #[test]
+    fn live_data_beside_same_epoch_trash_is_held_across_maintenance_and_restart() {
+        let (temp, disk, meta, id) = adopted_then_force_deleted("dave");
+        let trash = temp
+            .path()
+            .join(TRASH_DIR)
+            .join(trash_name(&id, 1).unwrap().as_path());
+        std::fs::create_dir_all(&trash).unwrap();
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        manager.retry_pending_tombstones().unwrap();
+        manager.collect_trash().unwrap();
+        assert_eq!(
+            meta.tombstones().len(),
+            1,
+            "tombstone cleared by maintenance"
+        );
+        assert!(!meta.tombstones_with_state()[0].isolated);
+        assert!(trash.exists(), "the ambiguous trash entry is kept");
+        drop(manager);
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            manager.adopt_pre_existing_roots().adopted,
+            0,
+            "revived after restart"
+        );
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(temp.path().join("dave/data")).unwrap(),
+            b"old"
+        );
+
+        // An operator resolves it by removing the live copy; maintenance finishes.
+        std::fs::remove_dir_all(temp.path().join("dave")).unwrap();
+        manager.retry_pending_tombstones().unwrap();
+        assert!(meta.tombstones_with_state()[0].isolated);
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(meta.tombstones().is_empty());
+    }
+
+    /// A legacy-layout record names a generation directory rather than the
+    /// native name; reclaim must move that recorded directory, not leave it at
+    /// the storage root for adoption under its generated name.
+    #[test]
+    fn force_deleted_legacy_workspace_is_isolated_from_its_recorded_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let (id, path, _) = write_legacy_record(&disk, "legacy");
+        disk.mkdir(&path, 0o700).unwrap();
+        std::fs::write(temp.path().join(path.as_path()).join("payload"), b"old").unwrap();
+        meta.0.lock().unwrap().tombstones.push(RootTombstoneState {
+            tombstone: RootTombstone {
+                id: id.clone(),
+                epoch: 1,
+            },
+            isolated: false,
+        });
+
+        let manager =
+            RootManager::open("node-a".into(), "session-b".into(), meta.clone(), disk).unwrap();
+        assert!(!temp.path().join(path.as_path()).exists());
+        let trash = manager
+            .trash_path()
+            .join(trash_name(&id, 1).unwrap().as_path());
+        assert_eq!(std::fs::read(trash.join("payload")).unwrap(), b"old");
+        assert!(meta.tombstones_with_state()[0].isolated);
+        assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 0);
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(meta.tombstones().is_empty());
+    }
+
+    /// Without the generation's own catalog record, a live directory may be new
+    /// business data: it is kept and its name refused until an operator acts.
+    #[test]
+    fn live_directory_without_catalog_evidence_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let id = root_id_from_name(OsStr::new("carol")).unwrap();
+        meta.0.lock().unwrap().tombstones.push(RootTombstoneState {
+            tombstone: RootTombstone {
+                id: id.clone(),
+                epoch: 3,
+            },
+            isolated: false,
+        });
+        std::fs::create_dir(temp.path().join("carol")).unwrap();
+        std::fs::write(temp.path().join("carol/data"), b"unknown").unwrap();
+
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        assert!(temp.path().join("carol/data").exists());
+        assert_eq!(manager.adopt_pre_existing_roots().adopted, 0);
+        assert!(!meta.tombstones_with_state()[0].isolated);
+
+        std::fs::remove_dir_all(temp.path().join("carol")).unwrap();
+        manager.retry_pending_tombstones().unwrap();
+        assert!(meta.tombstones().is_empty());
+    }
+
+    /// A kept catalog record of a deleted generation must not let a same-name
+    /// create reuse its directory in place.
+    #[test]
+    fn pending_tombstone_refuses_same_name_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        drop(manager);
+        meta.force_delete(&id);
+        meta.0.lock().unwrap().fail_mark = true;
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        assert!(!path.exists(), "the deleted data moved into trash");
+        let reservation = manager.reserve_workspace(OsStr::new("job")).unwrap();
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        let error = manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"job".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o700,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::META_OWNER_ROOT_BUSY);
+    }
+
+    /// A tombstone for an older generation never touches the newer generation
+    /// that now owns the same path.
+    #[test]
+    fn tombstone_of_an_older_generation_leaves_the_newer_one_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let (id, _) = prepared_job(&manager, temp.path());
+        manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap();
+        // A stale reservation makes the fake mint epoch 2 for the recreate.
+        meta.0.lock().unwrap().pending = Some(RootReservation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            session_id: "gone".into(),
+            create_intent_id: "gone".into(),
+            prepare_token: "gone".into(),
+            requester_node_id: "node-a".into(),
+            requester_session_id: "gone".into(),
+        });
+        let (_, path) = prepared_job(&manager, temp.path());
+        drop(manager);
+
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        assert_eq!(
+            manager
+                .enter_root(&id, RootRight::Read)
+                .unwrap()
+                .grant()
+                .epoch,
+            2
+        );
+        assert_eq!(meta.tombstones().len(), 1, "generation 1 is still in trash");
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(meta.tombstones().is_empty());
+        assert_eq!(std::fs::read(path.join("payload")).unwrap(), b"a");
     }
 
     /// 纳管成功：目录原地保留，catalog 与 Meta 都指向本节点，第二次扫描为幂等。

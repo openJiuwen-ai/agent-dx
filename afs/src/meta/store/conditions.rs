@@ -46,6 +46,11 @@ pub(in crate::meta) fn entity_key(entity: &MetaEntity) -> MetaKey {
         MetaEntity::DfsReplicationConfig(_) => MetaKey::DfsReplicationConfig,
         MetaEntity::DfsDurabilityPolicy(_) => MetaKey::DfsDurabilityPolicy,
         MetaEntity::DfsReplicaFailureConfig(_) => MetaKey::DfsReplicaFailureConfig,
+        MetaEntity::RootTombstone(tombstone) => MetaKey::RootTombstone {
+            home_node_id: tombstone.home_node_id.clone(),
+            root_id: tombstone.root_id.clone(),
+            root_epoch: tombstone.root_epoch,
+        },
         MetaEntity::DfsPlacement(placement) => MetaKey::DfsPlacement(placement.chunk_id.clone()),
         MetaEntity::DfsCopy(copy) => MetaKey::DfsCopy(copy.id.clone()),
         MetaEntity::DfsReplicationTask(task) => MetaKey::DfsReplicationTask(task.id.clone()),

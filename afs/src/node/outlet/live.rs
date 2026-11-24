@@ -2095,6 +2095,7 @@ mod tests {
             _epoch: u64,
             _home_node_id: &str,
             _session_id: &str,
+            _retain_tombstone: bool,
         ) -> Result<()> {
             unreachable!("not exercised by mirror tests")
         }
