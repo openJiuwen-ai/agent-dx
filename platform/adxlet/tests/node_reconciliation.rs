@@ -259,7 +259,6 @@ async fn stalled_authority_report_is_bounded_and_keeps_admission_closed() {
         None,
         Duration::from_millis(20),
         Duration::from_millis(10),
-        tokio::time::Instant::now() + Duration::from_secs(60),
     )
     .await;
     // Tonic's gRPC deadline may cancel first, before the outer wall-clock timer.

@@ -439,6 +439,7 @@ pub(crate) struct Admission {
     valid_until: Option<Instant>,
     maintenance: bool,
     pressure: bool,
+    sandboxd_healthy: bool,
     runtime_classes: Option<std::collections::BTreeSet<String>>,
 }
 
@@ -449,6 +450,7 @@ impl Admission {
         }
         if self.maintenance
             || self.pressure
+            || !self.sandboxd_healthy
             || self
                 .runtime_classes
                 .as_ref()
@@ -585,6 +587,7 @@ impl Adxlet {
                     valid_until: None,
                     maintenance: false,
                     pressure: false,
+                    sandboxd_healthy: true,
                     runtime_classes: None,
                 })),
                 pressure: Arc::new(RwLock::new(resources::NodePressureState::default())),
@@ -719,6 +722,25 @@ impl Adxlet {
         Ok(())
     }
 
+    /// Apply sandboxd health without changing maintenance or resource admission.
+    /// Returns Unavailable if the admission state cannot be locked.
+    pub fn set_sandboxd_healthy(&self, healthy: bool) -> Result<()> {
+        let changed = {
+            let mut admission = self
+                .services
+                .admission
+                .lock()
+                .map_err(|_| Error::Unavailable("node admission state unavailable".into()))?;
+            let changed = admission.sandboxd_healthy != healthy;
+            admission.sandboxd_healthy = healthy;
+            changed
+        };
+        if changed {
+            self.reconciliation_requested.notify_one();
+        }
+        Ok(())
+    }
+
     /// Refresh physical inventory without erasing allocations, including cards
     /// that disappeared or became unhealthy while an execution still holds them.
     pub fn update_devices(&self, devices: Vec<Device>, valid_for: Duration) -> Result<()> {
@@ -830,6 +852,7 @@ impl Adxlet {
             .expect("shared state lock poisoned");
         !admission.maintenance
             && !admission.pressure
+            && admission.sandboxd_healthy
             && admission.ledger.used().fits(&admission.ledger.capacity())
             && admission
                 .runtime_classes

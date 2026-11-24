@@ -10,7 +10,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
+use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
@@ -234,7 +234,6 @@ impl Fixture {
             journal,
             Duration::from_secs(2),
             Duration::from_millis(10),
-            Instant::now() + Duration::from_secs(60),
         )
         .await
     }

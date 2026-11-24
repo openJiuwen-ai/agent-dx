@@ -97,7 +97,6 @@ async fn cycle(authority: &mut authority::Fixture, node: &adxlet::Adxlet) -> Res
         None,
         Duration::from_secs(30),
         Duration::from_secs(1),
-        tokio::time::Instant::now() + Duration::from_secs(60),
     )
     .await
 }
