@@ -1,7 +1,7 @@
 use crate::Node;
 use adx_core::{
     scheduling::{
-        node_capability_label, valid_node_capability_runtime, CHECKPOINT_RESTORE,
+        node_capability_label, valid_node_capability_runtime, NODE_CAPABILITY_IDS,
         NODE_CAPABILITY_LABEL_PREFIX, NODE_CAPABILITY_LABEL_VALUE,
     },
     Result,
@@ -14,15 +14,15 @@ pub(super) fn registered_node(report: &pb::RegisterNodeRequest) -> Result<Node> 
     node.labels
         .retain(|key, _| !key.starts_with(NODE_CAPABILITY_LABEL_PREFIX));
     for (runtime, capabilities) in &report.runtime_capabilities {
-        if valid_node_capability_runtime(runtime)
-            && node.runtime_classes.contains(runtime)
-            && capabilities
-                .capability_ids
-                .iter()
-                .any(|capability| capability == CHECKPOINT_RESTORE)
-        {
+        if !valid_node_capability_runtime(runtime) || !node.runtime_classes.contains(runtime) {
+            continue;
+        }
+        for capability in &capabilities.capability_ids {
+            if !NODE_CAPABILITY_IDS.contains(&capability.as_str()) {
+                continue;
+            }
             node.labels.insert(
-                node_capability_label(runtime, CHECKPOINT_RESTORE),
+                node_capability_label(runtime, capability),
                 NODE_CAPABILITY_LABEL_VALUE.into(),
             );
         }
@@ -33,6 +33,7 @@ pub(super) fn registered_node(report: &pb::RegisterNodeRequest) -> Result<Node> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adx_core::scheduling::CHECKPOINT_RESTORE;
 
     #[test]
     fn registration_derives_labels_only_from_current_runtime_observations() {

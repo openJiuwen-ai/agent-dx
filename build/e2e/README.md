@@ -799,6 +799,16 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   `ADX_E2E_ARTIFACT_COMMIT` of the verified product alongside
   `ADX_E2E_TARGET_CASE=runtime-affinity`; the harness commit may differ from
   the product commit, and both identities are recorded.
+- For OCI image mount capability acceptance, use the isolated two-worker
+  fixture with `ADX_E2E_RUNSC_NODE=node1` on node1 and
+  `ADX_E2E_RUNSC_NODE=node2` on node2 during setup. Set
+  `disable_oci_image_mounts = true` in node2's sandboxd `[plugin.image]`
+  configuration before starting services. From node1, use `node.py create-mode`
+  to select each of `central` and `local_first`. Run
+  `oci_image_mount_capability.py --mode <mode> --output /evidence/oci-<mode>.json`
+  with the installed SDK, then run the fixture's `node.py empty` check on each
+  worker. Use `--marker` to select a known file relative to the mounted image
+  when the fixture's registry image is a dedicated test image.
 - `mixed-soak` (targeted stability case): keep one public-SDK Environment active on
   each node while a third worker alternates create/command/file/delete between
   nodes for 300 seconds. Two concurrent workers exercise command and binary

@@ -457,7 +457,8 @@ class Environment:
             detached: If True, ``kill()`` / context-manager exit skips teardown.
             required_node_capabilities: Capabilities all required on
                 the selected worker. Requires an explicit runtime and a fresh
-                create. ``checkpoint-restore`` is currently supported.
+                create. Supported identifiers include ``checkpoint-restore``
+                and ``oci-image-mount-readonly``.
             xpu: Optional whole-device XPU request in ``type:model:count``
                 format. Leave ``model`` empty to accept any model. The first
                 version supports one ``gpu`` or ``npu`` request.

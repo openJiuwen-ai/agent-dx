@@ -2,11 +2,13 @@
 //! cannot race its client task. Failed starts are terminal; ambiguous outcomes
 //! retain targeted cleanup retries until their backend can be removed.
 use crate::{runtime_router::RuntimeInventory, RuntimeDriver};
-use adx_core::scheduling::{valid_node_capability_runtime, CHECKPOINT_RESTORE};
+use adx_core::scheduling::{
+    valid_node_capability_runtime, CHECKPOINT_RESTORE, OCI_IMAGE_MOUNT_READONLY,
+};
 use adx_core::{EnvironmentSpec, Error, Result, UnsupportedCapability};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -251,10 +253,19 @@ impl Sandboxd {
         let mut capabilities = BTreeMap::new();
         for detail in response.runtimes {
             classes.push(detail.runtime_class.clone());
-            if valid_node_capability_runtime(&detail.runtime_class)
-                && supports_checkpoint_restore(&detail)
-            {
-                capabilities.insert(detail.runtime_class, [CHECKPOINT_RESTORE.into()].into());
+            if valid_node_capability_runtime(&detail.runtime_class) {
+                let observed: BTreeSet<_> = [
+                    supports_checkpoint_restore(&detail).then_some(CHECKPOINT_RESTORE.into()),
+                    detail
+                        .supports_read_only_oci_image_mounts
+                        .then_some(OCI_IMAGE_MOUNT_READONLY.into()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !observed.is_empty() {
+                    capabilities.insert(detail.runtime_class, observed);
+                }
             }
         }
         classes.retain(|class| !class.trim().is_empty());
@@ -1498,6 +1509,20 @@ impl RuntimeDriver for Sandboxd {
             memory_limit_bytes: value.memory_limit_bytes,
         })
     }
+    async fn read_only_oci_image_mount_supported(&self, runtime: &str) -> Result<()> {
+        if self
+            .capabilities(runtime)
+            .await?
+            .is_some_and(|info| info.supports_read_only_oci_image_mounts)
+        {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedCapability(
+                UnsupportedCapability::OciImageMountReadonly,
+            ))
+        }
+    }
+
     async fn checkpoint_supported(&self, runtime: &str) -> Result<()> {
         if self
             .capabilities(runtime)

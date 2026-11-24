@@ -846,6 +846,8 @@ For a fresh Environment, `Environment(runtime="runsc", required_node_capabilitie
 
 `checkpoint-restore` requires runtime support for checkpoint and restore and writable capture staging on the worker. S3 access is checked when checkpoint operations publish or read artifacts.
 
+To require a worker that supports read-only OCI image volumes, pass `required_node_capabilities=["oci-image-mount-readonly"]` alongside `Mount(target="/mnt/data", image_url=image_ref)` and an explicit runtime. The sandboxd runsc handler advertises this capability after validating its local OCI mount path. The chosen image must still be accessible to the worker's registry client.
+
 
 ## Tool execution identity
 

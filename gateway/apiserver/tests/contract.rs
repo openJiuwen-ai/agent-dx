@@ -44,6 +44,20 @@ fn required_node_capabilities_combine_with_hard_placement() {
 }
 
 #[test]
+fn combines_checkpoint_and_read_only_oci_mount_capabilities() {
+    let request = json!({
+        "image": "root:1",
+        "runtime": "runsc",
+        "requiredNodeCapabilities": ["checkpoint-restore", "oci-image-mount-readonly"],
+    });
+    let spec = create_spec(request, &caller()).unwrap();
+    let policy: adx_core::scheduling::SchedulingPolicy =
+        spec.scheduling.unwrap().try_into().unwrap();
+    assert!(policy.validate_node_capability_runtime("runsc").is_ok());
+    assert_eq!(policy.required_node_capability_labels().count(), 2);
+}
+
+#[test]
 fn explicit_forever_pause_retention_is_accepted() {
     let result = create_spec(
         json!({"image":"image","idleTimeoutSeconds":30,"idleAction":"pause",

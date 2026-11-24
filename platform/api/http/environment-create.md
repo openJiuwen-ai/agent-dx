@@ -26,6 +26,8 @@ Use `POST /api/environment/v1/constrained-environments` for fresh creation with 
 
 Constrained creation uses the same authentication, JSON/SSE response and request identity as ordinary creation. The scheduler requires every capability for the selected runtime together with the existing placement and resource constraints. If the local-first gateway has no compatible worker in its current directory, it submits the request to the bounded central queue. An older API server rejects the dedicated route before scheduling. A named or replayed creation can return a retained Environment only when its stored placement satisfies the request and the Coordinator verifies current ownership, session and node placement in one read.
 
+`oci-image-mount-readonly` requires a worker that reports verified support for read-only OCI image volumes on the selected runtime. Use it with a read-only image mount in `mounts`. The runtime capability is independent of the selected image. Registry access and preparation of the requested image are checked when starting the Environment.
+
 `requestId` identifies the request that created the **current Env**. If R1 created
 an Env, CREATE with R2 returns the existing Env with `requestId: R1`. If the Env
 is deleted and recreated by R3, replaying R1 returns the current Env with

@@ -1,6 +1,6 @@
 //! Public JSON contract converted directly to typed Environment RPC payloads.
 use adx_core::scheduling::{
-    node_capability_label, valid_node_capability_runtime, CHECKPOINT_RESTORE,
+    node_capability_label, valid_node_capability_runtime, NODE_CAPABILITY_IDS,
     NODE_CAPABILITY_LABEL_PREFIX, NODE_CAPABILITY_LABEL_VALUE,
 };
 use adx_protocol::control as pb;
@@ -696,7 +696,7 @@ pub fn create_spec_with_environment(
         }
         if r.required_node_capabilities
             .iter()
-            .any(|id| id != CHECKPOINT_RESTORE)
+            .any(|id| !NODE_CAPABILITY_IDS.contains(&id.as_str()))
         {
             return Err(invalid("unsupported requiredNodeCapabilities identifier"));
         }

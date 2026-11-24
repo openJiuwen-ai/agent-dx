@@ -163,6 +163,11 @@ pub trait RuntimeDriver: Send + Sync {
             "runtime does not support checkpoint/restore".into(),
         ))
     }
+    async fn read_only_oci_image_mount_supported(&self, _runtime: &str) -> Result<()> {
+        Err(Error::UnsupportedCapability(
+            adx_core::UnsupportedCapability::OciImageMountReadonly,
+        ))
+    }
     /// Immutable execution requirements captured before checkpointing. An empty
     /// profile is unknown, not evidence of cross-node restore compatibility.
     fn recovery_profile(

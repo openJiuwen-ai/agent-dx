@@ -3,6 +3,7 @@ use crate::{
     jiuwenbox::Jiuwenbox, sandboxd::Sandboxd, RestoreSource, RuntimeDriver, RuntimeObservation,
     RuntimeStatus,
 };
+use adx_core::scheduling::{CHECKPOINT_RESTORE, OCI_IMAGE_MOUNT_READONLY};
 use adx_core::{
     execution::NetworkPolicy, scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec,
     Error, Result,
@@ -114,7 +115,22 @@ async fn check_launch_capabilities(
     }
     spec.scheduling
         .validate_node_capability_runtime(&spec.runtime_class)?;
-    let check = driver.checkpoint_supported(&spec.runtime_class);
+    let check = async {
+        let class = &spec.runtime_class;
+        if spec
+            .scheduling
+            .requires_node_capability(class, CHECKPOINT_RESTORE)
+        {
+            driver.checkpoint_supported(class).await?;
+        }
+        if spec
+            .scheduling
+            .requires_node_capability(class, OCI_IMAGE_MOUNT_READONLY)
+        {
+            driver.read_only_oci_image_mount_supported(class).await?;
+        }
+        Ok(())
+    };
     if let Some(deadline) = deadline {
         tokio::time::timeout_at(deadline, check)
             .await

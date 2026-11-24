@@ -10,6 +10,8 @@ pub const NODE_HOST_UUID_LABEL: &str = "ADX_NODE_HOST_UUID";
 pub const NODE_CAPABILITY_LABEL_PREFIX: &str = "adx.internal/node-capability/";
 pub const NODE_CAPABILITY_LABEL_VALUE: &str = "true";
 pub const CHECKPOINT_RESTORE: &str = "checkpoint-restore";
+pub const OCI_IMAGE_MOUNT_READONLY: &str = "oci-image-mount-readonly";
+pub const NODE_CAPABILITY_IDS: &[&str] = &[CHECKPOINT_RESTORE, OCI_IMAGE_MOUNT_READONLY];
 
 /// Runtime names used in capability labels must fit in one key component.
 pub fn valid_node_capability_runtime(runtime: &str) -> bool {
@@ -270,6 +272,12 @@ impl SchedulingPolicy {
             .flat_map(LabelSelector::node_capability_labels)
     }
 
+    pub fn requires_node_capability(&self, runtime: &str, capability: &str) -> bool {
+        let key = node_capability_label(runtime, capability);
+        self.required_node_capability_labels()
+            .any(|label| label == key)
+    }
+
     /// All required runtime capabilities must be present on the node.
     pub fn matches_node_capabilities(&self, labels: &BTreeMap<String, String>) -> bool {
         self.required_node_capability_labels().all(|key| {
@@ -303,10 +311,13 @@ impl SchedulingPolicy {
         let Some(first) = labels.next() else {
             return Ok(());
         };
-        let checkpoint = node_capability_label(runtime, CHECKPOINT_RESTORE);
+        let prefix = node_capability_label(runtime, "");
         if !valid_node_capability_runtime(runtime)
-            || first != checkpoint
-            || labels.any(|key| key != checkpoint)
+            || std::iter::once(first).chain(labels).any(|label| {
+                label
+                    .strip_prefix(&prefix)
+                    .is_none_or(|id| !NODE_CAPABILITY_IDS.contains(&id))
+            })
         {
             return Err(Error::Invalid(
                 "invalid required node capability for the selected runtime".into(),

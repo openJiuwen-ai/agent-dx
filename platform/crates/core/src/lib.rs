@@ -82,6 +82,7 @@ pub enum BackendFailureCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedCapability {
     CheckpointRestore,
+    OciImageMountReadonly,
 }
 
 impl UnsupportedCapability {
@@ -89,6 +90,7 @@ impl UnsupportedCapability {
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::CheckpointRestore => "checkpoint_restore",
+            Self::OciImageMountReadonly => "oci_image_mount_readonly",
         }
     }
 
@@ -96,6 +98,7 @@ impl UnsupportedCapability {
     pub fn from_wire_name(value: &str) -> Option<Self> {
         match value {
             "checkpoint_restore" => Some(Self::CheckpointRestore),
+            "oci_image_mount_readonly" => Some(Self::OciImageMountReadonly),
             _ => None,
         }
     }

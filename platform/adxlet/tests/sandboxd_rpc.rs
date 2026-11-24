@@ -257,6 +257,7 @@ impl sandbox_service_server::SandboxService for Server {
                 supports_checkpoint_restore: true,
                 checkpoint_handoff_path: "/run/backend/checkpoint".into(),
                 restore_env_path: "/run/backend/environment".into(),
+                supports_read_only_oci_image_mounts: false,
             }],
         }))
     }
@@ -332,6 +333,7 @@ async fn qualifies_only_complete_checkpoint_restore_runtime_details() {
         supports_checkpoint_restore: supported,
         checkpoint_handoff_path: checkpoint.into(),
         restore_env_path: restore.into(),
+        supports_read_only_oci_image_mounts: runtime == "runsc",
     };
     let (adapter, _server) = connect(Server {
         available_runtimes: Arc::new(Mutex::new(Some(ListAvailableRuntimesResponse {
@@ -363,7 +365,11 @@ async fn qualifies_only_complete_checkpoint_restore_runtime_details() {
         inventory.capabilities,
         BTreeMap::from([(
             "runsc".into(),
-            [adx_core::scheduling::CHECKPOINT_RESTORE.into()].into(),
+            [
+                adx_core::scheduling::CHECKPOINT_RESTORE.into(),
+                adx_core::scheduling::OCI_IMAGE_MOUNT_READONLY.into(),
+            ]
+            .into(),
         )])
     );
 }

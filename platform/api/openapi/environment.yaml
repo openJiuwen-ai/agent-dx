@@ -1159,7 +1159,9 @@ components:
                 Hard requirements for the selected runtime. checkpoint-restore
                 requires checkpoint and restore support and writable capture
                 staging. S3 access is checked during publication and restore.
-              items: {type: string, enum: [checkpoint-restore]}
+                oci-image-mount-readonly requires verified read-only OCI image
+                volume support on the selected runtime.
+              items: {type: string, enum: [checkpoint-restore, oci-image-mount-readonly]}
           anyOf:
             - required: [runtime]
               properties:
