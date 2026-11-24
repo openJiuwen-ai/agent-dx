@@ -453,6 +453,7 @@ fn entity_root_epoch(entity: &MetaEntity) -> u64 {
         MetaEntity::RootGrant(value) => value.root_epoch,
         MetaEntity::RootCommand(value) => value.root_epoch,
         MetaEntity::RootCommandAck(value) => value.root_epoch,
+        MetaEntity::RootTombstone(value) => value.root_epoch,
         _ => 0,
     }
 }

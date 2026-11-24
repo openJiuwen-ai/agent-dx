@@ -11,9 +11,13 @@ use afs_error::{Error, Result};
 use super::store::{
     MetaEntity, MetaFuture, MetaKey, MetaRead, MetaStore, MetaTxn, NodeSession, OperationResult,
     RecoveryCursor, RequestKey, RootAccessGrant, RootCommandAck, RootCommandRecord,
-    RootCommandType, RootRecord, RootReservationRecord, RootRight, StoreOperation, StoreRevision,
-    TxnCondition, TxnMutation, TxnOutcome, WatchBatch, WatchChange, unavailable_meta_store,
+    RootCommandType, RootRecord, RootReservationRecord, RootRight, RootTombstoneRecord,
+    StoreOperation, StoreRevision, TxnCondition, TxnMutation, TxnOutcome, WatchBatch, WatchChange,
+    unavailable_meta_store,
 };
+
+/// Upper bound on tombstones one mark or clear request may name.
+pub const MAX_CLEAR_ROOT_TOMBSTONES: usize = 256;
 
 pub trait OwnerRootAuthority: Send + Sync {
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput>;
@@ -21,6 +25,17 @@ pub trait OwnerRootAuthority: Send + Sync {
     fn abort_root(&self, input: AbortRootInput) -> MetaFuture<'_, ()>;
     fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()>;
     fn force_deactivate_root(&self, _input: ForceDeactivateRootInput) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+    /// Records that the Home moved these generations' data off the live path.
+    /// Absent or already isolated tombstones are left as they are.
+    fn mark_root_tombstones_isolated(&self, _input: RootTombstonesInput) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+    /// Removes the Home's tombstones once their generations' data is confirmed
+    /// gone. A tombstone that is not isolated yet is refused; absent ones are
+    /// ignored, so a retry after a lost reply succeeds.
+    fn clear_root_tombstones(&self, _input: RootTombstonesInput) -> MetaFuture<'_, ()> {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState>;
@@ -218,7 +233,7 @@ impl StoreOwnerRootAuthority {
             txn.conditions.extend([
                 TxnCondition::RequestAbsent(key),
                 TxnCondition::NodeSessionCurrent {
-                    node_id: caller_node,
+                    node_id: caller_node.clone(),
                     session_id: caller_session,
                 },
                 TxnCondition::EntityEquals(MetaEntity::Root(root.clone())),
@@ -226,6 +241,24 @@ impl StoreOwnerRootAuthority {
             txn.mutations.push(TxnMutation::Delete(MetaKey::Root {
                 root_id: root.root_id.clone(),
             }));
+            // A forced deactivation never reached the Home's data, and a Home
+            // that isolated it into trash has not reclaimed it yet: both leave
+            // a tombstone so the data is reclaimed, never adopted again.
+            if force.is_some() || input.retain_tombstone {
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::RootTombstone(
+                        RootTombstoneRecord {
+                            root_id: root.root_id.clone(),
+                            root_epoch: root.root_epoch,
+                            home_node_id: root.home_node_id.clone(),
+                            requester_node_id: caller_node.clone(),
+                            deleted_at_unix_ms: now_unix_ms(),
+                            // Only the Home isolates data, and only before its own
+                            // deactivation; a forced one leaves it on the live path.
+                            isolated: force.is_none(),
+                        },
+                    )));
+            }
             // Root absence fences every old grant in the authoritative view.
             // Physical grant removal is bounded background work, not part of this ACK.
             txn.conditions
@@ -242,6 +275,122 @@ impl StoreOwnerRootAuthority {
             let _ = commit_or_replay(self.store.as_ref(), txn).await?;
             Ok(())
         })
+    }
+
+    /// Marks or clears the calling Home's tombstones in one transaction that
+    /// conditions on each tombstone it changes and on the Home's current session.
+    async fn update_tombstones(
+        &self,
+        input: RootTombstonesInput,
+        update: TombstoneUpdate,
+    ) -> Result<()> {
+        if let Some(authenticated) = &input.authenticated_home_node_id
+            && authenticated != &input.home_node_id
+        {
+            return Err(permission_denied(format!(
+                "authenticated node {authenticated} does not match Home {}",
+                input.home_node_id
+            )));
+        }
+        if input.tombstones.len() > MAX_CLEAR_ROOT_TOMBSTONES {
+            return Err(invalid(format!(
+                "at most {MAX_CLEAR_ROOT_TOMBSTONES} tombstones may be updated at once"
+            )));
+        }
+        let mut changes: Vec<RootTombstoneRecord> = Vec::new();
+        for tombstone in &input.tombstones {
+            let snapshot = self
+                .store
+                .read(MetaRead::RootTombstone {
+                    home_node_id: input.home_node_id.clone(),
+                    root_id: tombstone.root_id.clone(),
+                    root_epoch: tombstone.root_epoch,
+                })
+                .await?;
+            let Some(MetaEntity::RootTombstone(record)) = snapshot.entity else {
+                continue;
+            };
+            match update {
+                TombstoneUpdate::MarkIsolated if record.isolated => continue,
+                // Clearing a generation whose data may still be live would let
+                // a later startup adopt it again.
+                TombstoneUpdate::Clear if !record.isolated => {
+                    return Err(root_busy(format!(
+                        "tombstone {} epoch {} is not isolated yet",
+                        record.root_id, record.root_epoch
+                    )));
+                }
+                _ => {}
+            }
+            if !changes.contains(&record) {
+                changes.push(record);
+            }
+        }
+        if changes.is_empty() {
+            // Nothing left to change (e.g. a retry after a lost reply): still
+            // only the current Home session may observe success.
+            let snapshot = self
+                .store
+                .read(MetaRead::CurrentNodeSession {
+                    node_id: input.home_node_id.clone(),
+                })
+                .await?;
+            let current = matches!(snapshot.entity,
+                Some(MetaEntity::NodeSession(ref session))
+                    if session.session_id == input.home_session_id
+                        && session.is_live_at_unix_ms(now_unix_ms()));
+            return if current {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "tombstone update caller is not the current Home session",
+                ))
+            };
+        }
+        let key = request_key(
+            format!("{}/{}", input.home_node_id, input.home_session_id),
+            input.request_id,
+        );
+        let operation = match update {
+            TombstoneUpdate::MarkIsolated => StoreOperation::MarkRootTombstonesIsolated,
+            TombstoneUpdate::Clear => StoreOperation::ClearRootTombstones,
+        };
+        let mut txn = MetaTxn::new(key.clone(), operation);
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(key),
+            TxnCondition::NodeSessionCurrent {
+                node_id: input.home_node_id,
+                session_id: input.home_session_id,
+            },
+        ]);
+        for record in changes {
+            txn.conditions
+                .push(TxnCondition::EntityEquals(MetaEntity::RootTombstone(
+                    record.clone(),
+                )));
+            txn.mutations.push(match update {
+                TombstoneUpdate::MarkIsolated => {
+                    TxnMutation::Put(MetaEntity::RootTombstone(RootTombstoneRecord {
+                        isolated: true,
+                        ..record
+                    }))
+                }
+                TombstoneUpdate::Clear => TxnMutation::Delete(MetaKey::RootTombstone {
+                    home_node_id: record.home_node_id,
+                    root_id: record.root_id,
+                    root_epoch: record.root_epoch,
+                }),
+            });
+        }
+        txn.mutations.push(TxnMutation::RecordRequestOutcome(
+            super::store::RequestOutcome {
+                request: txn.request.clone(),
+                operation: txn.operation,
+                result: OperationResult::Empty,
+            },
+        ));
+        let _ = commit_or_replay(self.store.as_ref(), txn).await?;
+        Ok(())
     }
 
     // Commands and the resume cursor come from the same pinned authority view.
@@ -673,6 +822,14 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
         )
     }
 
+    fn mark_root_tombstones_isolated(&self, input: RootTombstonesInput) -> MetaFuture<'_, ()> {
+        Box::pin(self.update_tombstones(input, TombstoneUpdate::MarkIsolated))
+    }
+
+    fn clear_root_tombstones(&self, input: RootTombstonesInput) -> MetaFuture<'_, ()> {
+        Box::pin(self.update_tombstones(input, TombstoneUpdate::Clear))
+    }
+
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState> {
         Box::pin(async move {
             let snapshot = self
@@ -708,6 +865,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 authority_revision: scan.revision,
                 active_roots: scan.roots,
                 pending_reservations: scan.reservations,
+                tombstones: scan.tombstones,
             })
         })
     }
@@ -1306,6 +1464,29 @@ pub struct DeactivateRootInput {
     pub home_session_id: String,
     pub reason: String,
     pub authenticated_home_node_id: Option<String>,
+    /// The Home isolated this generation's data into trash and has not
+    /// reclaimed it yet; Meta records a tombstone with the deactivation.
+    pub retain_tombstone: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TombstoneUpdate {
+    MarkIsolated,
+    Clear,
+}
+
+pub struct RootTombstonesInput {
+    pub request_id: String,
+    pub home_node_id: String,
+    pub home_session_id: String,
+    pub tombstones: Vec<RootTombstoneRef>,
+    pub authenticated_home_node_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootTombstoneRef {
+    pub root_id: String,
+    pub root_epoch: u64,
 }
 
 pub struct ForceDeactivateRootInput {
@@ -1332,6 +1513,7 @@ pub struct ListOwnerRootsOutput {
     pub authority_revision: StoreRevision,
     pub active_roots: Vec<RootRecord>,
     pub pending_reservations: Vec<RootReservationRecord>,
+    pub tombstones: Vec<RootTombstoneRecord>,
 }
 
 /// 全局 Active root 快照（outlet 镜像面输入）。

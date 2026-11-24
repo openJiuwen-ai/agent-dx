@@ -118,6 +118,7 @@ impl RootMeta for LossyActivation {
         epoch: u64,
         home: &str,
         session: &str,
+        retain_tombstone: bool,
     ) -> afs_error::Result<()> {
         if let Some(gate) = self.delete_gate.lock().unwrap().take() {
             let _ = gate.entered.send(());
@@ -129,7 +130,8 @@ impl RootMeta for LossyActivation {
                 "injected deactivation failure",
             ));
         }
-        self.inner.deactivate_root(id, epoch, home, session)?;
+        self.inner
+            .deactivate_root(id, epoch, home, session, retain_tombstone)?;
         if self.lose_deactivate_reply.swap(false, Ordering::SeqCst) {
             return Err(Error::coded(
                 afs_error::IO_UNAVAILABLE,
@@ -152,6 +154,23 @@ impl RootMeta for LossyActivation {
     }
     fn list_owner_roots(&self, home: &str) -> afs_error::Result<root::OwnerRootInventory> {
         self.inner.list_owner_roots(home)
+    }
+    fn mark_root_tombstones_isolated(
+        &self,
+        home: &str,
+        session: &str,
+        tombstones: &[root::RootTombstone],
+    ) -> afs_error::Result<()> {
+        self.inner
+            .mark_root_tombstones_isolated(home, session, tombstones)
+    }
+    fn clear_root_tombstones(
+        &self,
+        home: &str,
+        session: &str,
+        tombstones: &[root::RootTombstone],
+    ) -> afs_error::Result<()> {
+        self.inner.clear_root_tombstones(home, session, tombstones)
     }
     fn acquire_root(
         &self,
@@ -791,6 +810,44 @@ fn permanent_workspace_errors_do_not_advertise_retry() {
         ApiError::operation(Error::coded(afs_error::IO_UNAVAILABLE, "offline")).into_response();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()[RETRY_AFTER], "1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_workspace_keeps_a_tombstone_until_its_trash_is_collected() {
+    let fixture = Fixture::new().await;
+    fixture.prepare_workspace("reclaim").await;
+    let tombstones = || async {
+        fixture
+            .store
+            .scan_owner_roots_for_recovery("entry")
+            .await
+            .unwrap()
+            .tombstones
+    };
+    assert_eq!(
+        fixture
+            .request("DELETE", "/v1/workspaces/reclaim", Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let recorded = tombstones().await;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].root_epoch, 1);
+    assert_eq!(recorded[0].home_node_id, "entry");
+    let api = fixture.api.clone();
+    bridge::spawn_blocking(move || api.owner.maintain_workspace_deletions())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("ownerfs/.ownerfs-trash/root-7265636c61696d-e1")
+            .exists()
+    );
+    assert!(tombstones().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

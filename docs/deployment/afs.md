@@ -306,7 +306,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `uds_path` | 产品差异 | Node | `/tmp/afs-<id>/local.sock` | Local SDK 的 Unix socket 路径 |
 | `ownerfs_mount` | 产品差异 | Node | 无 | OwnerFs FUSE 挂载点；不设则不挂载 |
 | `ownerfs_mkdir_load_balance` | 产品差异 | Meta | `false` | 新 OwnerFs workspace 由 Meta 按 HRW 放置；写在 Node 配置里会启动失败 |
-| `ownerfs_adopt_on_startup` | 产品差异 | Node | `false` | 启动时把 OwnerFs 数据根下已存在的一级目录纳管为 workspace；隐藏项、`lost+found`、非 ASCII/非 UTF-8 名、挂载点与超长名跳过并告警；非 Node 或未启用 OwnerFs 时写在配置里会启动失败 |
+| `ownerfs_adopt_on_startup` | 产品差异 | Node | `false` | 启动时把 OwnerFs 数据根下已存在的一级目录纳管为 workspace；隐藏项、`lost+found`、非 ASCII/非 UTF-8 名、挂载点与超长名跳过并告警；Meta tombstone 记录为已删除的 workspace 不纳管，其目录移入 trash 回收；非 Node 或未启用 OwnerFs 时写在配置里会启动失败 |
 | `dfs_mount` | 产品差异 | Node | 无 | DFS FUSE 挂载点；不设则不挂载 |
 | `dfs_external_backend` | 产品差异 | 两者 | 无 | 外部 S3 持久化；不设则用原生副本，子键见[DFS 外部 S3 连接](#dfs-外部-s3-连接)。仅 TOML |
 | `dfs_peer_cache` | 产品差异 | Node | 无 | 原生 Peer 可丢弃磁盘读缓存；不设则关闭，与 `dfs_external_backend` 互斥。仅 TOML |
@@ -424,7 +424,7 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换（OwnerFs 部署同样适用）：
 
-- **集群线协议**：Node 注册带 `protocol_version`（当前 10，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
+- **集群线协议**：Node 注册带 `protocol_version`（当前 11，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
 - **持久格式**：Meta 数据目录（`CURRENT`、WAL 信封、记录决策、状态 image 等）、Redis／etcd key 布局、Node catalog、外部对象 key 前缀，版本不符一律 `STORAGE_FORMAT_INCOMPATIBLE`，不迁移、不自动删除（[规则](../architecture/afs.md#持久格式与协议版本规则)）。
 
 步骤：
@@ -437,10 +437,19 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 
 回滚只能用旧二进制配旧的完整数据目录与旧桶，不得让旧二进制打开新目录。
 
+#### 协议 10→11（workspace 删除 tombstone）
+
+协议 11 同时改了线协议和 Meta 持久格式：Meta 新增 workspace 删除 tombstone，状态 image 升到 5、
+记录决策升到 4。按上文步骤整集群停机替换，第 3 步**必须新建** Meta 数据目录（Redis／etcd 用新前缀）；
+新 Meta 以 `STORAGE_FORMAT_INCOMPATIBLE` 拒绝旧目录。Node 的 OwnerFs 存储根与 catalog 格式不变。
+
+写入过 tombstone 的数据目录只能由协议 11 的 Meta 打开。回滚到协议 10 时，用旧二进制配升级前备份的
+Meta 数据目录；新目录中的删除记录随之丢弃，Home 不会再回收这些删除遗留的目录，需要人工核对存储根。
+
 #### 协议 7→8（第 2 轮元数据协议）
 
 协议 8 只改线协议，本身不改 Meta 数据目录、WAL、checkpoint、Node catalog 的格式。能否保留数据目录取决于升级起点：
-- **起点已经是当前持久格式**（Meta WAL 信封 3、状态 image 4、记录决策 3）：第 3 步**保留**原数据目录与 chunk 目录，不新建；备份仍建议做。
+- **起点已经是协议 8 时的持久格式**（Meta WAL 信封 3、状态 image 4、记录决策 3）：第 3 步**保留**原数据目录与 chunk 目录，不新建；备份仍建议做。
 - **起点更早**（例如还没有 OwnerFs NFS 出口的版本，状态 image 3）：持久格式已变，第 3 步照上文新建，新 Meta 会以 `STORAGE_FORMAT_INCOMPATIBLE` 拒绝旧目录。
 
 两种情况的其余步骤都同上，**必须先停全部 Node，再停 Meta**。
@@ -945,7 +954,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 10，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 11，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node
@@ -1135,6 +1144,17 @@ uid/gid/mode。
 6. **注意名称约束**。本期不支持非 UTF-8 名字；非 ASCII 名字默认跳过，且删除 API 仍
    拒绝它们。纳管后 workspace 的 live 目录就是原名，删除时目录会被 `rename` 进
    `.ownerfs-trash/root-<hex>-e<epoch>` 后回收。
+7. **保持 Home 身份与存储根不变**。删除 workspace 时，Meta 为数据尚未回收的那一代写
+   tombstone（按 Home 的 `id`、root id 与 epoch 记录）；Home 不可达时的
+   `DELETE /v1/workspaces/<owner>?force=true` 同样写入。Home 启动对账先按 tombstone 把
+   遗留目录移入 trash，之后才执行纳管扫描，因此强制删除的 workspace 不会在 Home 重启后
+   复活；trash 回收完成后 Home 清除 tombstone。这要求同一块数据盘始终以同一个 `id`、
+   同一个 `ownerfs_data_dir` 启动：换 `id` 后旧 tombstone 无人认领，换存储根后旧目录
+   不再被回收。修改任一项前先清理或迁移旧目录。Home 只在本地 catalog 记录能证明活目录
+   属于被删除的那一代时才移动它；catalog 记录丢失，或活目录旁已有同代
+   `.ownerfs-trash/root-<hex>-e<epoch>` 时，保留目录并告警 `root.reconcile.tombstone_pending`，
+   该名字既不纳管也不能同名创建，对应 trash 条目也不回收；人工核对并移走活目录后由后台维护
+   循环完成回收。移入 trash 失败时同样只告警、不阻止启动。
 
 回退：命名与旧实现不兼容，只能回退二进制并重置 AFS 环境；不要期望新二进制读取
 旧的 `root-*` 数据目录。

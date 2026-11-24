@@ -358,6 +358,14 @@ fields_heap!(super::RootReservationRecord {
     requester_session_id,
     created_at_revision
 });
+fields_heap!(super::RootTombstoneRecord {
+    root_id,
+    root_epoch,
+    home_node_id,
+    requester_node_id,
+    deleted_at_unix_ms,
+    isolated
+});
 fields_heap!(super::RootAccessGrant {
     root_id,
     root_epoch,
@@ -619,6 +627,15 @@ impl Heap for super::MetaKey {
             Self::DfsReplicationConfig
             | Self::DfsDurabilityPolicy
             | Self::DfsReplicaFailureConfig => Ok(()),
+            Self::RootTombstone {
+                home_node_id,
+                root_id,
+                root_epoch,
+            } => {
+                c.value(home_node_id)?;
+                c.value(root_id)?;
+                c.value(root_epoch)
+            }
         }
     }
 }
@@ -665,7 +682,8 @@ entity_heap!(
     RootEpochWatermark,
     DfsReference,
     DfsGc,
-    DfsReplicaFailureConfig
+    DfsReplicaFailureConfig,
+    RootTombstone
 );
 impl Heap for super::WatchChange {
     fn heap(&self, c: &mut Charge) -> Result<()> {
