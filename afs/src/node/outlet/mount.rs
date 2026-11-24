@@ -8,9 +8,13 @@
 
 use std::{
     ffi::CString,
+    fs::{self, File, OpenOptions},
     io,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
 };
+
+use crate::node::vfs::ownerfs::fuse_policy::OUTLET_FUSE_LABEL;
 
 /// 单次挂载尝试的上限。
 ///
@@ -124,6 +128,162 @@ fn cstring_path(path: &Path) -> io::Result<CString> {
     use std::os::unix::ffi::OsStrExt;
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// Before starting the mirror, recover only the private legacy FUSE mount left
+/// by a dead daemon. Never follow the mountpoint itself as a symlink.
+pub(crate) fn recover_legacy_outlet_mount(import_root: &Path) -> afs_error::Result<()> {
+    let configured = import_root.join(super::mirror::LEGACY_MOUNT_DIR);
+    let target = import_root
+        .canonicalize()
+        .map_err(|error| legacy_outlet_recovery_error(&configured, &error))?
+        .join(super::mirror::LEGACY_MOUNT_DIR);
+    recover_disconnected_outlet(&target)
+        .map_err(|error| legacy_outlet_recovery_error(&target, &error))
+}
+
+fn legacy_outlet_recovery_error(target: &Path, error: &io::Error) -> afs_error::Error {
+    afs_error::Error::coded(
+        afs_error::CONFIG_INVALID,
+        format!(
+            "legacy OwnerFs outlet mount at {}: {error}. Inspect it with findmnt. After \
+             confirming it is no longer in use, run umount -l on that exact path, then \
+             restart afs-node",
+            target.display()
+        ),
+    )
+}
+
+fn recover_disconnected_outlet(target: &Path) -> io::Result<()> {
+    let read_mount_id = || legacy_outlet_mount_id(&fs::read("/proc/self/mountinfo")?, target);
+    let Some(id) = read_mount_id()? else {
+        return Ok(());
+    };
+
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let probe_target = target.to_path_buf();
+    // A broken or slow FUSE server must not be able to hang startup. This
+    // thread only probes; it cannot detach anything, even after the deadline.
+    std::thread::Builder::new()
+        .name("ownerfs-outlet-probe".into())
+        .spawn(move || {
+            let _ = send.send(probe_disconnected_outlet(&probe_target, id));
+        })?;
+    let pinned = receive
+        .recv_timeout(MOUNT_ATTEMPT_TIMEOUT)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "could not confirm a disconnected FUSE mount: {error}"
+            ))
+        })??;
+    if read_mount_id()? != Some(id) {
+        return Err(io::Error::other("mount identity changed"));
+    }
+    detach_disconnected_outlet(&pinned)?;
+    if read_mount_id()?.is_some() {
+        return Err(io::Error::other("mount remains after cleanup"));
+    }
+    afs_logging::info!(
+        "outlet.legacy_mount_recovered";
+        "mount_path" => target.display().to_string(),
+        "mount_id" => id
+    );
+    Ok(())
+}
+
+fn legacy_outlet_mount_id(mountinfo: &[u8], target: &Path) -> io::Result<Option<u64>> {
+    let wanted = target.as_os_str().as_encoded_bytes();
+    let expected_source = format!("afs-{OUTLET_FUSE_LABEL}");
+    let mut found = None;
+    for line in mountinfo.split(|byte| *byte == b'\n') {
+        let Some(mount) = super::topology::parse_line(line) else {
+            continue;
+        };
+        if mount.mount_point == wanted {
+            if found.is_some()
+                || mount.root != b"/"
+                || mount.fs_type != "fuse"
+                || mount.source != expected_source
+            {
+                return Err(io::Error::other(
+                    "could not confirm a single private OwnerFs outlet FUSE mount",
+                ));
+            }
+            let id =
+                std::str::from_utf8(line.split(|byte| *byte == b' ').next().unwrap_or_default())
+                    .ok()
+                    .and_then(|id| id.parse().ok())
+                    .ok_or_else(|| io::Error::other("invalid kernel mount ID"))?;
+            found = Some(id);
+        } else if mount
+            .mount_point
+            .strip_prefix(wanted)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+        {
+            return Err(io::Error::other("outlet path contains a nested mount"));
+        }
+    }
+    Ok(found)
+}
+
+#[allow(unsafe_code)]
+fn probe_disconnected_outlet(target: &Path, id: u64) -> io::Result<File> {
+    let mount = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(target)?;
+    let fd = mount.as_raw_fd();
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+    let pinned_id = info
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .and_then(|value| value.trim().parse().ok());
+    if pinned_id != Some(id) {
+        return Err(io::Error::other("mount identity changed during FUSE probe"));
+    }
+
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // The OwnerFs root's live statfs can return unsupported; only the kernel's
+    // disconnected-transport errno is evidence for recovery.
+    // SAFETY: mount owns fd and stats points to a writable statfs buffer.
+    if unsafe { libc::fstatfs(fd, stats.as_mut_ptr()) } == 0 {
+        return Err(io::Error::other("FUSE connection still responds"));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOTCONN) {
+        return Err(io::Error::other(format!(
+            "could not confirm a disconnected FUSE mount: {error}"
+        )));
+    }
+    Ok(mount)
+}
+
+#[allow(unsafe_code)]
+fn detach_disconnected_outlet(mount: &File) -> io::Result<()> {
+    let target = cstring_path(Path::new(&format!("/proc/self/fd/{}", mount.as_raw_fd())))?;
+    // SAFETY: target is NUL-terminated. The procfs link refers to the pinned
+    // mount root, so a replacement at the configured path cannot be detached.
+    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(io::Error::other(format!(
+            "cleanup of disconnected FUSE mount failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// Disconnect the owned legacy outlet even if consumers still hold binds of
+/// its FUSE tree. The private mount at this path is removed without lazy detach.
+#[allow(unsafe_code)]
+pub(super) fn unmount_legacy_fuse(path: &Path) -> afs_error::Result<()> {
+    let target = cstring_path(path).map_err(afs_error::Error::from)?;
+    // SAFETY: the CString is live and the caller has verified the mount ID.
+    // Linux FUSE aborts the connection on MNT_FORCE, waking its receiver so
+    // the daemon can join the callbacks even if a consumer still has a bind.
+    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_FORCE) } != 0 {
+        return Err(afs_error::Error::from(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Run a mount helper with a deadline, killing it if the deadline passes.
@@ -276,6 +436,58 @@ pub fn mount_point(import_root: &Path, home: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_recovery_selects_only_the_private_outlet_mount() {
+        let target = Path::new("/run/afs imports/.ownerfs-outlet");
+        let unrelated =
+            b"40 1 0:1 / /run/afs\x5c040imports/other rw - fuse afs-ownerfs-outlet rw\n";
+        let outlet =
+            b"41 1 0:2 / /run/afs\x5c040imports/.ownerfs-outlet rw - fuse afs-ownerfs-outlet rw\n";
+        let foreign = b"42 1 0:3 / /run/afs\x5c040imports/.ownerfs-outlet rw - tmpfs tmpfs rw\n";
+        let child =
+            b"43 41 0:4 / /run/afs\x5c040imports/.ownerfs-outlet/nested rw - tmpfs tmpfs rw\n";
+        let subtree = b"44 1 0:2 /proj /run/afs\x5c040imports/.ownerfs-outlet rw - fuse afs-ownerfs-outlet rw\n";
+
+        assert_eq!(
+            legacy_outlet_mount_id(unrelated, target).expect("no outlet mount"),
+            None
+        );
+        assert_eq!(
+            legacy_outlet_mount_id(&[unrelated.as_slice(), outlet].concat(), target)
+                .expect("private outlet mount"),
+            Some(41)
+        );
+        for mountinfo in [
+            foreign.as_slice(),
+            subtree,
+            &[outlet.as_slice(), foreign].concat(),
+            &[outlet.as_slice(), child].concat(),
+        ] {
+            assert!(legacy_outlet_mount_id(mountinfo, target).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_reports_kernel_cleanup_failure_with_operator_instructions() {
+        let root = tempfile::tempdir().expect("temporary import root");
+        let target = root.path().join(super::super::mirror::LEGACY_MOUNT_DIR);
+        // This newly created ordinary file cannot be unmounted. Exercise the
+        // real error path without needing FUSE, root or a fault-injection seam.
+        let file = File::create_new(&target).expect("ordinary file at the reserved path");
+        let error = detach_disconnected_outlet(&file).expect_err("ordinary file is not a mount");
+        let diagnostic = legacy_outlet_recovery_error(&target, &error);
+        assert_eq!(diagnostic.code(), afs_error::CONFIG_INVALID);
+        for expected in [
+            target.to_str().expect("UTF-8 temporary path"),
+            "cleanup of disconnected FUSE mount failed",
+            "findmnt",
+            "umount -l on that exact path",
+            "restart afs-node",
+        ] {
+            assert!(diagnostic.message().contains(expected), "{diagnostic}");
+        }
+    }
 
     #[test]
     fn octal_escapes_are_decoded() {

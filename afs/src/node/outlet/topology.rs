@@ -42,7 +42,7 @@ pub fn parse(mountinfo: &[u8]) -> Vec<Mount> {
         .collect()
 }
 
-fn parse_line(line: &[u8]) -> Option<Mount> {
+pub(super) fn parse_line(line: &[u8]) -> Option<Mount> {
     let split = line.windows(3).position(|window| window == b" - ")?;
     let fields = &line[..split];
     let fs_fields = &line[split + 3..];

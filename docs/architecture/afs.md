@@ -1128,10 +1128,10 @@ OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 
 ## 跨节点 Workspace 出口（outlet）
 
 outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在
-Home 节点的本地盘上，不做复制。每台需要读该名字视图的节点各自跑一份镜像，
-输入都是同一份 Meta 快照。
+Home 节点的本地盘上，不做复制。各节点从同一份 Meta 快照取得工作区身份和 NFS
+地址，再向当前 Home 会话核对可服务的工作区和目录布局。
 
-**Meta 契约**：`OwnerRoots.ListActiveOutletRoots` 是 outlet 镜像面的唯一输入，
+**Meta 契约**：`OwnerRoots.ListActiveOutletRoots` 提供 outlet 镜像的工作区清单，
 返回全局 Active root 全量快照（`root_id`、`root_epoch`、`home_node_id`、
 `home_nfs_addr`），按 `root_id` 升序以保证 diff 可复现。调用方可携带已持有
 集合的摘要（`known_digest`），Meta 判定无变化时以 `unchanged` 短路——但语义
@@ -1144,17 +1144,26 @@ Home 节点的本地盘上，不做复制。每台需要读该名字视图的节
 `home_nfs_addr` 来自该 Home 注册会话上报的 NFS 导出地址；为空表示未上报，
 消费方只能跳过并告警，不得猜测兜底。
 
-**节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
-`/public/<name> -> <import_root>/<home>/users/<name>` 软链，自动维护对端（NFS）与
-本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
-tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
-没有运行期数据回收：删除契约以 Home 侧物理目录的原子判空为决策点（非空返回
-`ENOTEMPTY` 并回滚，Meta、catalog 与缓存都不改变），提交后删除不会留下"待回收"的目录。
-启动 reconcile 是唯一的收敛点，并且不得 `rmdir` 原生命名目录——它可能承载业务数据，
-也可能已是下一代 workspace 的活目录。catalog 有记录而 Meta 已无该 root 时，reconcile
-只丢弃 catalog 记录并告警，目录原地保留，重新具备被纳管扫描接管的资格。因此 catalog
-记录的语义是"该目录已被纳管"的准入判据，不是回收证据：留下的幽灵记录会永久挡住
-该名字的纳管与删除，只能靠人工删除 catalog 文件解锁。
+**节点侧**：镜像 worker 维护远端 NFS 及本机 bind 的 import 挂载。Home 的
+`WorkspaceOutletLayouts` 只返回当前会话已恢复或激活且代次匹配的工作区。对原生
+目录布局，`/public/<name>` 指向 `<import_root>/<home>/users/<name>`。对历史
+布局，指向 `<import_root>/.ownerfs-outlet/<name>`。首次发布历史工作区时启动
+这个不启用私有缓存的 OwnerFs FUSE 挂载，由 Home 按逻辑工作区身份核验新访问。
+目录写权限仅来自附加组时，出口会核实调用进程的附加组后重试权限检查。
+Node 停机时主动断开该 FUSE 会话并等待回调收尾。消费者保留的旧 bind mount
+会断开，Node 重启后重新绑定 `/public/<name>` 可访问当前挂载。
+强杀后若历史出口的 FUSE 挂载残留，Node 启动时只摘除确认已断开的本出口挂载。
+无法确认或摘除失败时拒绝启动，日志给出挂载点的绝对路径和清理指引。
+节点启动时撤下以前直接指向历史落盘目录的链接。Workspace API 就绪检查核对
+Home 返回的布局及对应挂载。Home 明确未准入某工作区时，镜像撤下该软链。
+Home 会话或网络暂时不可达时保留已发布的名字，历史目标仍走 OwnerFs 准入。
+旧 Home 不支持布局 RPC 时沿用原生目录目标。独立 tmpfs、宿主 mount namespace
+和 `mount(2)` 权限在启动时校验。
+
+Workspace API 的递归删除将对应代次先原子移入 trash，再下线 Meta 及清理 catalog。
+退役目录交给后台回收，同名新工作区使用新的 epoch。启动时已知历史记录若可确认
+只是删除残留，补完收尾。暂时清理失败时交给后台重试，包括目录已经缺失的记录。
+目录或归属存在冲突时保留该记录和数据，且不准入该工作区，其余工作区照常恢复。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若

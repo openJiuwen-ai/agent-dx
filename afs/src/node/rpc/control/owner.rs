@@ -120,7 +120,7 @@ impl OwnerControl for OwnerControlService {
         authenticate_peer(authenticator.as_ref(), &request)?;
         let request = request.into_inner();
         let id = crate::node::vfs::ownerfs::root::RootId(request.root_id);
-        let attributes = crate::node::bridge::spawn_blocking(move || {
+        let (attributes, legacy_layout) = crate::node::bridge::spawn_blocking(move || {
             owner.workspace_attributes(&id, request.epoch)
         })
         .await
@@ -131,8 +131,22 @@ impl OwnerControl for OwnerControlService {
                 uid: attributes.uid,
                 gid: attributes.gid,
                 mode: attributes.mode,
+                legacy_layout,
             },
         ))
+    }
+
+    async fn workspace_outlet_layouts(
+        &self,
+        request: Request<afs_protocol::node_control::WorkspaceOutletLayoutsRequest>,
+    ) -> Result<Response<afs_protocol::node_control::WorkspaceOutletLayoutsReply>, Status> {
+        if request.get_ref().roots.len() > 128 || request.get_ref().home_session_id.is_empty() {
+            return Err(Status::invalid_argument("invalid outlet layout lookup"));
+        }
+        self.dispatch_owner_lock(request, false, |owner, _, body| {
+            owner.workspace_outlet_layouts(body)
+        })
+        .await
     }
 
     async fn workspace_defaults(

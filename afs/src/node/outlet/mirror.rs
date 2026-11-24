@@ -8,9 +8,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
 };
 
-use crate::node::vfs::ownerfs::root::{OutletRoot, RESERVED_ROOT_NAMES, root_name_from_id};
+use crate::node::vfs::ownerfs::root::{
+    OutletRoot, RESERVED_ROOT_NAMES, RootId, root_id_from_name, root_name_from_id,
+};
 
 /// One filesystem action the mirror must perform.
 ///
@@ -62,6 +65,38 @@ pub fn target_path(import_root: &str, home_node_id: &str, name: &str) -> String 
     )
 }
 
+pub(crate) const LEGACY_MOUNT_DIR: &str = ".ownerfs-outlet";
+
+pub(crate) fn legacy_target_path(import_root: &Path, name: &str) -> PathBuf {
+    import_root.join(LEGACY_MOUNT_DIR).join(name)
+}
+
+/// Links from earlier binaries to a legacy backing directory must not survive
+/// into the guarded outlet, even before the first successful Meta round.
+pub(crate) fn is_direct_legacy_target(import_root: &Path, name: &OsStr, target: &Path) -> bool {
+    let Ok(path) = target.strip_prefix(import_root) else {
+        return false;
+    };
+    let mut parts = path.iter();
+    let (Some(home), Some(users), Some(dir), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if users != "users" || !home.to_str().is_some_and(crate::config::is_safe_node_id) {
+        return false;
+    }
+    let (Ok(id), Some((owner, epoch))) = (
+        root_id_from_name(name),
+        dir.to_str().and_then(|dir| dir.rsplit_once("-e")),
+    ) else {
+        return false;
+    };
+    owner == id.0 && epoch.parse::<u64>().is_ok_and(|epoch| epoch != 0)
+}
+
+pub(crate) type RootLayouts = std::collections::HashMap<(RootId, u64), bool>;
+
 /// Names the mirror reserves for its own bookkeeping and never publishes.
 ///
 /// Defined by OwnerFs because the same set is rejected at workspace creation:
@@ -97,11 +132,22 @@ fn is_reserved(name: &OsStr) -> bool {
 /// Withdrawing an already published name would instead make downstream
 /// containers fail to bind during a transient outage (spec H7). So: never
 /// publish into a hole, never retract a name that worked.
+#[cfg(test)]
 pub fn plan(
     import_root: &str,
     active: &[OutletRoot],
     ready_homes: &BTreeSet<String>,
     present: &BTreeMap<OsString, PresentEntry>,
+) -> Vec<Action> {
+    plan_with_layouts(import_root, active, ready_homes, present, &BTreeMap::new())
+}
+
+pub(crate) fn plan_with_layouts(
+    import_root: &str,
+    active: &[OutletRoot],
+    ready_homes: &BTreeSet<String>,
+    present: &BTreeMap<OsString, PresentEntry>,
+    layouts: &BTreeMap<String, RootLayouts>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
 
@@ -149,7 +195,30 @@ pub fn plan(
                 "root_id" => ?root.root_id.0);
             continue;
         };
-        let target = target_path(import_root, &root.home_node_id, name_text);
+        // A reachable Home can omit a root that it did not admit. Withdraw
+        // only a link managed by the mirror, and leave foreign entries alone.
+        let legacy = match layouts.get(&root.home_node_id) {
+            Some(home) => match home.get(&(root.root_id.clone(), root.root_epoch)) {
+                Some(legacy) => *legacy,
+                None => {
+                    if publishable
+                        && matches!(present.get(name), Some(PresentEntry::Symlink { .. }))
+                    {
+                        actions.push(Action::Remove { name: name.clone() });
+                    }
+                    continue;
+                }
+            },
+            // A peer that predates the layout RPC uses the existing native path.
+            None => false,
+        };
+        let target = if legacy {
+            legacy_target_path(Path::new(import_root), name_text)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            target_path(import_root, &root.home_node_id, name_text)
+        };
         match present.get(name) {
             Some(PresentEntry::Symlink { target: current }) if current == &target => {}
             // A wrong target is republished in place: stale after a generation
@@ -363,6 +432,63 @@ mod tests {
             }],
             "ready home republishes with the current generation"
         );
+    }
+
+    #[test]
+    fn legacy_outlet_follows_home_layout_and_withdraws_unadmitted_root() {
+        let root = root("root-61", 7, "node-a");
+        let ready = all_ready(&["node-a"]);
+        let target = "/imports/.ownerfs-outlet/a";
+        let mut layouts = BTreeMap::from([(
+            "node-a".into(),
+            RootLayouts::from([((root.root_id.clone(), 7), true)]),
+        )]);
+        assert_eq!(
+            plan_with_layouts(
+                "/imports",
+                std::slice::from_ref(&root),
+                &ready,
+                &present(&[]),
+                &layouts
+            ),
+            vec![Action::Publish {
+                name: "a".into(),
+                target: target.into()
+            }],
+        );
+        let published = present(&[("a", symlink(target))]);
+        assert!(
+            plan_with_layouts(
+                "/imports",
+                std::slice::from_ref(&root),
+                &ready,
+                &published,
+                &layouts
+            )
+            .is_empty()
+        );
+        layouts.get_mut("node-a").unwrap().clear();
+        assert_eq!(
+            plan_with_layouts("/imports", &[root], &ready, &published, &layouts),
+            vec![Action::Remove { name: "a".into() }],
+        );
+    }
+
+    #[test]
+    fn detects_preexisting_direct_legacy_links_without_matching_native_names() {
+        let import = Path::new("/imports");
+        let old = Path::new("/imports/node-a/users/root-61-e7");
+        assert!(is_direct_legacy_target(import, OsStr::new("a"), old));
+        assert!(!is_direct_legacy_target(
+            import,
+            OsStr::new("root-61-e7"),
+            old
+        ));
+        assert!(!is_direct_legacy_target(
+            import,
+            OsStr::new("a"),
+            &legacy_target_path(import, "a"),
+        ));
     }
 
     #[test]

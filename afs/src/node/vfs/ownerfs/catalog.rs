@@ -19,7 +19,7 @@ use std::{
 use afs_error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-use super::root::RootId;
+use super::root::{RootId, root_id_from_name, trash_name};
 use crate::node::storage::{FileStore, LocalFs, StoragePath};
 
 const CATALOG_DIR: &str = ".ownerfs-roots";
@@ -46,6 +46,16 @@ pub struct LocalRootRecord {
     /// A create may reuse its own never-activated predecessor in place, but
     /// must never take over adopted business data.
     pub adopted: bool,
+}
+
+impl LocalRootRecord {
+    /// Pre-adoption writers used a generation directory even for a live root.
+    /// Current writers only use this name under the trash directory.
+    pub(super) fn has_legacy_layout(&self) -> bool {
+        self.epoch != 0
+            && root_id_from_name(&self.name).is_ok_and(|id| id == self.id)
+            && trash_name(&self.id, self.epoch).is_ok_and(|path| path == self.data_dir)
+    }
 }
 
 /// 持有本机数据目录排他锁的扫描结果。
@@ -171,6 +181,12 @@ impl LockedLocalFsRootCatalog {
     }
 
     fn write_record(&self, record: &LocalRootRecord) -> Result<()> {
+        if record.has_legacy_layout() {
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "refusing to write a legacy OwnerFs catalog record",
+            ));
+        }
         let final_path = Self::record_path(&record.id)?;
         let wire = WireRootRecord::from_record(record);
         let bytes = serde_json::to_vec_pretty(&wire).map_err(catalog_encode_error)?;
@@ -220,13 +236,50 @@ mod tests {
     fn record(name: &str) -> LocalRootRecord {
         let id = RootId(format!("root-{}", hex(name.as_bytes())));
         LocalRootRecord {
-            data_dir: StoragePath::new(format!("{}-e1", id.0)).unwrap(),
+            data_dir: StoragePath::new(name).unwrap(),
             id,
             name: OsString::from(name),
             epoch: 1,
             local_prepare_id: "prepare".into(),
             adopted: false,
         }
+    }
+
+    #[test]
+    fn same_version_catalog_distinguishes_historical_and_explicit_origins() {
+        let wire = |value| {
+            serde_json::from_value::<WireRootRecord>(value)
+                .map_err(catalog_decode_error)
+                .and_then(WireRootRecord::try_into_record)
+        };
+        let mut legacy = serde_json::json!({
+            "version": RECORD_VERSION,
+            "root_id": "root-776f726b7370616365",
+            "name_hex": "776f726b7370616365",
+            "epoch": 1,
+            "data_dir": "root-776f726b7370616365-e1",
+            "local_prepare_id": "prepare:legacy:session",
+        });
+        let record = wire(legacy.clone()).unwrap();
+        assert!(record.has_legacy_layout());
+        assert!(!record.adopted);
+
+        legacy["data_dir"] = serde_json::json!("workspace");
+        assert!(
+            wire(legacy.clone())
+                .unwrap_err()
+                .message()
+                .contains("legacy")
+        );
+        legacy["adopted"] = serde_json::Value::Null;
+        assert!(wire(legacy.clone()).is_err());
+        legacy["adopted"] = serde_json::json!(true);
+        let native = wire(legacy.clone()).unwrap();
+        assert!(native.adopted);
+        assert_eq!(
+            serde_json::to_value(WireRootRecord::from_record(&native)).unwrap(),
+            legacy
+        );
     }
 
     #[test]
@@ -275,7 +328,7 @@ mod tests {
         let locked = catalog.lock_and_open().unwrap();
         let name = "bench-private-v10";
         let id = RootId(format!("root-{}", hex(name.as_bytes())));
-        let data_dir = StoragePath::new(format!("{}-e1", id.0)).unwrap();
+        let data_dir = StoragePath::new(name).unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         let session = "12345678-1234-1234-1234-123456789abc";
         let record = LocalRootRecord {
@@ -303,6 +356,12 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
         let final_path = Self::record_path(&record.id)?;
         match self.read_record(&final_path) {
             Ok(existing) if existing == *record => return Ok(()),
+            Ok(existing) if existing.has_legacy_layout() => {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "refusing to replace a legacy OwnerFs catalog record",
+                ));
+            }
             Ok(existing) if existing.epoch != record.epoch => {
                 // 同 root_id（名字派生）但 epoch 不同的旧记录，只可能来自
                 // "已逻辑删除、目录仍待回收"（ENOTEMPTY 时保留 catalog 作为
@@ -416,7 +475,14 @@ struct WireRootRecord {
     epoch: u64,
     data_dir: String,
     local_prepare_id: String,
-    adopted: bool,
+    #[serde(default, deserialize_with = "read_adopted")]
+    adopted: Option<bool>,
+}
+
+fn read_adopted<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 impl WireRootRecord {
@@ -433,7 +499,7 @@ impl WireRootRecord {
                 .to_string_lossy()
                 .into_owned(),
             local_prepare_id: record.local_prepare_id.clone(),
-            adopted: record.adopted,
+            adopted: Some(record.adopted),
         }
     }
 
@@ -444,14 +510,31 @@ impl WireRootRecord {
                 "unsupported local root record version",
             ));
         }
-        Ok(LocalRootRecord {
+        let mut record = LocalRootRecord {
             id: RootId(self.root_id),
             name: OsString::from_vec(unhex(&self.name_hex)?),
             epoch: self.epoch,
             data_dir: StoragePath::new(self.data_dir).map_err(Error::from)?,
             local_prepare_id: self.local_prepare_id,
-            adopted: self.adopted,
-        })
+            adopted: false,
+        };
+        match self.adopted {
+            Some(adopted) if !record.has_legacy_layout() => record.adopted = adopted,
+            None if record.has_legacy_layout() && !record.local_prepare_id.is_empty() => (),
+            Some(_) => {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "legacy OwnerFs catalog path conflicts with explicit adoption field",
+                ));
+            }
+            None => {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "unrecognized legacy OwnerFs catalog origin",
+                ));
+            }
+        }
+        Ok(record)
     }
 }
 

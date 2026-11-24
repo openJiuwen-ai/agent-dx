@@ -1,5 +1,6 @@
 """Test documented offline AFS upgrades and rollback on test-owned stores."""
 
+from functools import partial
 import json
 from pathlib import Path
 from posixpath import join as remote_join
@@ -13,6 +14,7 @@ from suites.operations import wait_read
 
 SEED = b"old build: confirmed before switch\n" * 8192
 AFTER = b"new build: written after switch\n" * 8192
+CATALOG_CASE = "ownerfs.version.catalog_compatibility"
 
 
 def quiesce(cluster):
@@ -164,6 +166,272 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
     run_phase(phases, "rollback", rollback)
 
 
+def state_identity(cluster):
+    return {
+        role: cluster.command(role, ["stat", "-c", "%d:%i", remote_join(cluster.role_dir(role), "state")])[
+            "stdout"
+        ].strip()
+        for role in cluster.roles
+    }
+
+
+def config_identity(cluster):
+    return {
+        role: cluster.channel(role).call("hash", path=remote_join(cluster.role_dir(role), "config.toml"))
+        for role in cluster.roles
+    }
+
+
+def prepare_catalog_case(cluster):
+    cluster.write("A", "seed", SEED)
+    cluster.python("A", "os.chmod(sys.argv[1],0o640)", remote_join(cluster.workspace("A"), "seed"))
+    wait_read(cluster, "B", "seed", SEED)
+    expected = file_state(cluster)
+    location = owner_identity(cluster)
+    quiesce(cluster)
+    return expected, location
+
+
+def catalog_record(cluster, root_id):
+    return remote_join(cluster.role_dir("A"), "state/ownerfs/.ownerfs-roots", root_id + ".json")
+
+
+def catalog_fingerprint(cluster, path):
+    digest = cluster.channel("A").call("hash", path=path)
+    metadata = cluster.command("A", ["stat", "-c", "%d:%i:%f:%u:%g:%s:%y", path])["stdout"].strip()
+    return {**digest, "metadata": metadata}
+
+
+def enable_catalog_adoption(cluster):
+    cluster.python(
+        "A", "from pathlib import Path\n"
+        "with Path(sys.argv[1]).open('a') as config:config.write('ownerfs_adopt_on_startup = true\\n')",
+        remote_join(cluster.role_dir("A"), "config.toml"), owner=False,
+    )
+
+
+def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
+    expected, location = prepare_catalog_case(cluster)
+    recovery_point(cluster)
+    original_state = cluster.record("state.initial", state_identity(cluster))
+    original_config = cluster.record("config.initial", config_identity(cluster))
+    record = catalog_record(cluster, location["root_id"])
+    original_record = cluster.channel("A").call("hash", path=record)
+    original_wire = json.loads(cluster.command("A", ["cat", record])["stdout"])
+    new_root = "after-switch-root"
+    new_root_path = remote_join(cluster.mount("A"), new_root)
+
+    def upgrade():
+        install(cluster, new_inputs, new)
+        start_all(cluster, new)
+        check_seed(cluster, expected, location)
+        cluster.write("B", "after-upgrade", AFTER)
+        wait_read(cluster, "A", "after-upgrade", AFTER)
+        if "adopted" in original_wire:
+            cluster.python("A", "os.mkdir(sys.argv[1])", new_root_path, owner=False)
+            root_id = root_location(cluster, new_root)["root_id"]
+            new_record = catalog_record(cluster, root_id)
+            written = json.loads(cluster.command("A", ["cat", new_record])["stdout"])
+            if written.keys() != original_wire.keys():
+                raise AssertionError(written)
+            if written["version"] != original_wire["version"] or written["adopted"] is not False:
+                raise AssertionError(written)
+            cluster.record("catalog.new_record", written)
+        quiesce(cluster)
+        start_all(cluster, new)
+        check_seed(cluster, expected, location)
+        wait_read(cluster, "A", "after-upgrade", AFTER)
+        wait_read(cluster, "B", "after-upgrade", AFTER)
+        if cluster.channel("A").call("hash", path=record) != original_record:
+            raise AssertionError()
+
+    def binary_rollback():
+        quiesce(cluster)
+        install(cluster, old_inputs, old)
+        start_all(cluster, old)
+        if cluster.record("state.binary_rollback", state_identity(cluster)) != original_state:
+            raise AssertionError()
+        if cluster.record("config.binary_rollback", config_identity(cluster)) != original_config:
+            raise AssertionError()
+        if cluster.channel("A").call("hash", path=record) != original_record:
+            raise AssertionError()
+        check_seed(cluster, expected, location)
+        wait_read(cluster, "A", "after-upgrade", AFTER)
+        wait_read(cluster, "B", "after-upgrade", AFTER)
+        if "adopted" in original_wire:
+            cluster.python("B", "assert os.path.isdir(sys.argv[1])", remote_join(cluster.mount("B"), new_root))
+        cluster.write("A", "after-binary-rollback", SEED)
+        wait_read(cluster, "B", "after-binary-rollback", SEED)
+
+    def snapshot_rollback():
+        quiesce(cluster)
+        archived = remote_join(cluster.role_dir("A"), "state-after-upgrade", "ownerfs")
+        recovery_point(cluster, restore=True)
+        if cluster.record("state.snapshot_rollback", state_identity(cluster)) == original_state:
+            raise AssertionError()
+        install(cluster, old_inputs, old)
+        start_all(cluster, old)
+        check_seed(cluster, expected, location)
+        for name, contents in (("after-upgrade", AFTER), ("after-binary-rollback", SEED)):
+            cluster.python(
+                "B", "try:open(sys.argv[1],'rb').close()\n"
+                "except OSError as exc:assert exc.errno==errno.ENOENT,exc\n"
+                "else:raise AssertionError('post-snapshot file was restored')",
+                remote_join(cluster.workspace("B"), name),
+            )
+            cluster.python(
+                "A", "assert open(sys.argv[1],'rb').read()==bytes.fromhex(sys.stdin.read())",
+                remote_join(archived, original_wire["data_dir"], name), stdin=contents.hex(), owner=False,
+            )
+        if "adopted" in original_wire:
+            cluster.python("A", "assert not os.path.lexists(sys.argv[1])", new_root_path)
+        cluster.write("B", "after-snapshot-rollback", AFTER)
+        wait_read(cluster, "A", "after-snapshot-rollback", AFTER)
+
+    for name, operation in (("upgrade", upgrade), ("binary_rollback", binary_rollback),
+                            ("snapshot_rollback", snapshot_rollback)):
+        run_phase(phases, name, operation)
+        if phases[name]["status"] != "passed":
+            break
+
+
+def catalog_rejections(cluster, new_inputs, new, phases):
+    _, location = prepare_catalog_case(cluster)
+    record = catalog_record(cluster, location["root_id"])
+    original_raw = cluster.command("A", ["cat", record])["stdout"]
+    original = json.loads(original_raw)
+    storage = remote_join(cluster.role_dir("A"), "state/ownerfs")
+    seed = remote_join(storage, original["data_dir"], "seed")
+    unrelated = remote_join(storage, "adoption-canary")
+    cluster.python("A", "from pathlib import Path\np=Path(sys.argv[1]);p.mkdir();(p/'file').write_bytes(b'canary')",
+                   unrelated, owner=False)
+    paths = (seed, remote_join(unrelated, "file"))
+    original_data = [catalog_fingerprint(cluster, path) for path in paths]
+    install(cluster, new_inputs, new)
+    enable_catalog_adoption(cluster)
+    start_role(cluster, "M", new)
+    initial = json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0)
+
+    def write_test_record(raw):
+        cluster.python(
+            "A", "from pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
+            record, owner=False, stdin=raw,
+        )
+
+    def refuse(name, wire, diagnostic):
+        write_test_record(json.dumps(wire, indent=2))
+        before = catalog_fingerprint(cluster, record)
+        log = remote_join(cluster.root("A"), "A.log")
+        cluster.command("A", ["truncate", "-s", "0", log])
+        channel = cluster.channel("A")
+        try:
+            try:
+                start_role(cluster, "A", new)
+            except RuntimeError as exc:
+                if "product exited before ready" not in str(exc):
+                    raise AssertionError(exc) from exc
+            else:
+                raise AssertionError("Home unexpectedly started with " + name)
+            exit_status = channel.call("status")["A"]["returncode"]
+            if exit_status != 1:
+                raise AssertionError(exit_status)
+            if channel.call("snapshot")["mounts"]:
+                raise AssertionError("Home mounted a filesystem after rejecting catalog")
+            failed_log = cluster.command("A", ["cat", log])["stdout"]
+            (cluster.output / (name + ".log")).write_text(failed_log)
+            if diagnostic not in failed_log:
+                raise AssertionError(failed_log[-4000:])
+            if "ownerfs.adopt.adopted" in failed_log:
+                raise AssertionError(failed_log[-4000:])
+            if catalog_fingerprint(cluster, record) != before:
+                raise AssertionError()
+            if [catalog_fingerprint(cluster, path) for path in paths] != original_data:
+                raise AssertionError()
+            root = root_location(cluster, "workspace")
+            if not all(root[key] == value for key, value in location.items()):
+                raise AssertionError(root)
+            if json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0) != initial:
+                raise AssertionError()
+            cluster.record(name, {"diagnostic": diagnostic, "exit": exit_status, "mounts": [], "record": before,
+                                  "data": original_data, "identity": location, "meta_roots": initial})
+        finally:
+            if "A" in channel.call("status"):
+                try:
+                    cluster.stop("A")
+                except RuntimeError:
+                    if "A" in channel.call("status"):
+                        raise
+
+    unknown = {key: value for key, value in original.items() if key != "adopted"}
+    unknown["data_dir"] = "workspace"
+    identity_conflict = dict(original, local_prepare_id="unrelated-prepare")
+    samples = (
+        ("unknown_origin", unknown, "unrecognized legacy OwnerFs catalog origin"),
+        ("identity_conflict", identity_conflict, "recover request does not match durable root"),
+        ("unsupported_format", dict(original, version=65535), "unsupported local root record version"),
+    )
+    legacy = "adopted" not in original
+    for name, wire, diagnostic in samples:
+        if name != "identity_conflict" or not legacy:
+            run_phase(phases, name, partial(refuse, name, wire, diagnostic))
+
+    if legacy:
+        def quarantine_conflicting_identity():
+            write_test_record(json.dumps(identity_conflict, indent=2))
+            before = catalog_fingerprint(cluster, record)
+            retired_hex = b"retired".hex()
+            retired_id = "root-" + retired_hex
+            retired_record = catalog_record(cluster, retired_id)
+            retired = dict(original, root_id=retired_id, name_hex=retired_hex,
+                           data_dir=f"{retired_id}-e{original['epoch']}")
+            cluster.python("A", "from pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
+                           retired_record, owner=False, stdin=json.dumps(retired, indent=2))
+            start_role(cluster, "A", new)
+            log = cluster.command("A", ["cat", remote_join(cluster.root("A"), "A.log")])["stdout"]
+            (cluster.output / "identity_conflict.log").write_text(log)
+            if "ownerfs.legacy_root_quarantined" not in log:
+                raise AssertionError(log[-4000:])
+            cluster.python(
+                "A", "try:open(sys.argv[1],'rb').close()\nexcept OSError:pass\n"
+                "else:raise AssertionError('quarantined workspace is readable')",
+                remote_join(cluster.workspace("A"), "seed"),
+            )
+            cluster.python(
+                "A", "if os.path.lexists(sys.argv[1]):raise AssertionError('retired catalog is still present')",
+                retired_record, owner=False,
+            )
+            ready = cluster.command("A", ["cat", remote_join(cluster.mount("A"), "adoption-canary/file")])
+            if ready["stdout"] != "canary":
+                raise AssertionError("unaffected workspace is unreadable")
+            if catalog_fingerprint(cluster, record) != before:
+                raise AssertionError("quarantine rewrote the legacy record")
+            if [catalog_fingerprint(cluster, path) for path in paths] != original_data:
+                raise AssertionError("quarantine modified file data")
+            cluster.record("identity_conflict", {"diagnostic": "ownerfs.legacy_root_quarantined",
+                                                "record": before, "data": original_data,
+                                                "healthy_workspace": "adoption-canary"})
+            cluster.stop("A")
+
+        run_phase(phases, "identity_conflict", quarantine_conflicting_identity)
+        if phases["identity_conflict"]["status"] != "passed":
+            return
+
+        def recover_with_adoption_enabled():
+            write_test_record(original_raw)
+            start_role(cluster, "A", new)
+            start_role(cluster, "B", new)
+            cluster.topology()
+            wait_read(cluster, "B", "seed", SEED)
+            if owner_identity(cluster) != location:
+                raise AssertionError()
+            cluster.python("A", "assert not os.path.lexists(sys.argv[1])",
+                           remote_join(cluster.mount("A"), original["data_dir"]), owner=False)
+            if root_location(cluster, "adoption-canary")["status"] != "serving":
+                raise AssertionError()
+
+        run_phase(phases, "legacy_directory_keeps_its_owner", recover_with_adoption_enabled)
+
+
 def command_counts(cluster, label):
     store = json.loads(cluster.health("M", "/v1/store"))
     entities = store["entities"]
@@ -223,11 +491,13 @@ def retained_command(cluster, new_inputs, new, phases):
     run_phase(phases, "root_command_after_upgrade", verify_after_upgrade)
 
 
-def artifact_pair(old_inputs, new_inputs):
+def artifact_pair(old_inputs, new_inputs, *, allow_same=False):
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
     old, new = identities
-    if old["commit"] == new["commit"] or old["target"] != new["target"]:
+    if old["target"] != new["target"] or (old["commit"] == new["commit"] and not allow_same):
         raise ValueError("expected distinct commits of the same target")
+    if old["commit"] == new["commit"] and old["binaries"] != new["binaries"]:
+        raise ValueError("same-commit control requires identical executable digests")
     for inputs, identity in zip((old_inputs, new_inputs), identities):
         for binary in ("afs-meta", "afs-node"):
             if sha256(inputs / binary) != identity["binaries"][binary]:
@@ -236,20 +506,24 @@ def artifact_pair(old_inputs, new_inputs):
 
 
 DEFAULT_CASES = (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"))
+CATALOG_CASES = (("ownerfs", "catalog_recovery"), ("ownerfs", "catalog_rejections"))
+CATALOG_CONTROL = CATALOG_CASES[:1]
 
 
-def selected_cases(requested):
+def selected_cases(requested, *, same_commit=False):
     if requested is None:
         return DEFAULT_CASES
     if requested == "ownerfs.version.old_root_command":
         return (("ownerfs", "old_root_command"),)
-    raise ValueError("expected ownerfs.version.old_root_command or an unset upgrade case selector")
+    if requested == CATALOG_CASE:
+        return CATALOG_CONTROL if same_commit else CATALOG_CASES
+    raise ValueError(f"expected {CATALOG_CASE}, ownerfs.version.old_root_command or an unset selector")
 
 
 def exercise(config, old_inputs, new_inputs, output, *, selection=DEFAULT_CASES):
     """Run selected scenarios with independent results and cleanup."""
     output.mkdir()
-    old, new = artifact_pair(old_inputs, new_inputs)
+    old, new = artifact_pair(old_inputs, new_inputs, allow_same=selection == CATALOG_CONTROL)
     write_json(output / "versions.json", {"old": old, "new": new})
     entries = []
     cleanup_errors = []
@@ -270,6 +544,10 @@ def exercise(config, old_inputs, new_inputs, output, *, selection=DEFAULT_CASES)
                 running_identity(cluster, role, old)
             if suffix == "old_root_command":
                 retained_command(cluster, new_inputs, new, result["phases"])
+            elif suffix == "catalog_recovery":
+                catalog_recovery(cluster, old_inputs, new_inputs, old, new, result["phases"])
+            elif suffix == "catalog_rejections":
+                catalog_rejections(cluster, new_inputs, new, result["phases"])
             else:
                 exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"])
             if all(phase["status"] == "passed" for phase in result["phases"].values()):
