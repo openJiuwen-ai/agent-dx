@@ -151,29 +151,12 @@ pub(super) fn start(
         },
     );
     #[cfg(feature = "ownerfs")]
-    let owner_hixl_source = match (
-        &state.hixl_runtime,
-        state.ownerfs.as_ref(),
-        &backends.hixl_reader,
-    ) {
-        (Some(runtime), Some(ownerfs), Some(_)) => {
-            let mut source = rpc::data::owner_hixl::OwnerHixlService::new(
-                runtime.clone(),
-                ownerfs.peer_executor()?,
-            )
-            .with_owner_metrics(backends.metrics.owner_rpc.clone())
-            .with_policy(&cfg.hixl.trusted_peers, cfg.hixl.ownerfs_buffered_writes);
-            if let Some(metrics) = &state.hixl_metrics {
-                source = source.with_metrics(metrics.clone());
-            }
-            Some(Arc::new(source))
-        }
-        _ => None,
-    };
-    #[cfg(feature = "ownerfs")]
-    if let Some(source) = &owner_hixl_source {
-        super::hixl::spawn_expiry(services, source.clone());
-    }
+    let owner_hixl_source = super::hixl::serve_home(
+        cfg,
+        state,
+        &backends.metrics.owner_rpc,
+        services,
+    )?;
     #[cfg(feature = "ownerfs")]
     let owner_files = ownerfs::owner_files_server(
         cfg,

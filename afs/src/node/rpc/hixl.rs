@@ -42,7 +42,7 @@ impl SlotChecksum {
     }
 }
 
-pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 2;
 
 #[cfg(feature = "ownerfs")]
 pub(super) type TransportParameters = (HixlTransport, u32, u32, Option<u64>);

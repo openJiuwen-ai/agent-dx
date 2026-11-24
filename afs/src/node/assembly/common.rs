@@ -277,8 +277,6 @@ pub(super) struct Backends {
     pub(super) peer_connections: Arc<rpc::peer::PeerConnectionPool>,
     #[cfg(feature = "ownerfs")]
     pub(super) ownerfs: ownerfs::OwnerFsAssembly,
-    #[cfg(feature = "ownerfs")]
-    pub(super) hixl_reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
     #[cfg(feature = "dfs")]
     pub(super) dfs: dfs::DfsAssembly,
 }
@@ -327,8 +325,6 @@ impl Backends {
             peer_connections,
             #[cfg(feature = "ownerfs")]
             ownerfs,
-            #[cfg(feature = "ownerfs")]
-            hixl_reader: hixl.reader(),
             #[cfg(feature = "dfs")]
             dfs,
         })

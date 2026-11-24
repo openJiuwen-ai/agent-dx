@@ -127,9 +127,33 @@ impl Hixl {
     }
 }
 
+/// The OwnerFiles service receives only the authenticated window adapter.
+pub(super) fn serve_home(
+    cfg: &Config,
+    state: &crate::node::Node,
+    owner_metrics: &rpc::OwnerRpcMetrics,
+    services: &mut crate::runtime::Services,
+) -> Result<Option<Arc<rpc::data::owner_hixl::OwnerHixlService>>, BoxError> {
+    let (Some(runtime), Some(ownerfs)) = (&state.hixl_runtime, &state.ownerfs) else {
+        return Ok(None);
+    };
+    let mut source = rpc::data::owner_hixl::OwnerHixlService::new(
+        runtime.clone(),
+        ownerfs.peer_executor()?,
+    )
+    .with_owner_metrics(owner_metrics.clone())
+    .with_policy(&cfg.hixl.trusted_peers, cfg.hixl.ownerfs_buffered_writes);
+    if let Some(metrics) = &state.hixl_metrics {
+        source = source.with_metrics(metrics.clone());
+    }
+    let source = Arc::new(source);
+    spawn_expiry(services, source.clone());
+    Ok(Some(source))
+}
+
 /// Retires expired Home sessions every five seconds until shutdown. A failed
 /// tick is logged and retried; it never ends the Node's other services.
-pub(super) fn spawn_expiry(
+fn spawn_expiry(
     services: &mut crate::runtime::Services,
     source: Arc<rpc::data::owner_hixl::OwnerHixlService>,
 ) {

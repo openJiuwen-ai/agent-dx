@@ -1184,7 +1184,9 @@ uid/gid/mode。
 也可以按需配置 RDMA 候选。旧 `required` 可改为 `data_mode = "hixl"` 和 `fs = "ownerfs"`，
 远端缓冲读走 HIXL。两端均启用 `ownerfs_buffered_writes` 后才可协商缓冲写，读写授权分别校验。显式 HIXL 在远端可写或截断打开前确认写能力。协商失败时不发送 `Open`，文件保持原样。Create 和 `O_DIRECT` 打开返回不支持。支持写摘要协商时，HIXL 写复用读会话选择的算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。切换模式时移除旧键。
 
-更新 HIXL 节点时双方应使用带 Home 代际的 Close。新 Home 拒绝空代际的旧客户端 Close，未收尾会话由过期流程保守处理。原生 engine endpoint 被新进程复用时，已绑定旧代际的 reader 会拒绝复用连接，恢复前需退出旧 reader runtime。
+HIXL 线协议 v2 要求 Close 携带 Home 代际。v1 和 v2 在协商阶段明确报告不支持。
+滚动更新时，Auto 可按能力不足切换到 RDMA 或 gRPC，显式 HIXL 需要两端都升级。空代际
+Close 会被拒绝，未收尾会话由过期流程保守处理。原生 engine endpoint 被新进程复用时，已绑定旧代际的 reader 会拒绝复用连接，恢复前需退出旧 reader runtime。
 
 Home 最多同时接受 64 个活跃的 OwnerFs HIXL 会话。已关闭且已排空的会话仅保留有界的重试记录，不占活跃名额。
 

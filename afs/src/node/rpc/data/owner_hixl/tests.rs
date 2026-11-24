@@ -424,6 +424,23 @@ fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn read_only_home_does_not_admit_hixl_writes() {
+    let (home, exports, _) = fixture(SLOT, 2);
+    let home = home.with_policy(&["node-b".to_owned()], false);
+    assert!(home.check_peer("node-b").is_ok());
+    assert!(home.check_peer("other-node").is_err());
+    let session = home.negotiate_blocking("node-b", negotiate_request("root-a")).unwrap();
+    assert!(!session.buffered_write_supported);
+    assert!(!session.write_checksum_negotiated);
+    let reply = home
+        .prepare_write("node-b".to_owned(), Default::default())
+        .await
+        .unwrap_err();
+    assert_eq!(reply.code(), tonic::Code::Unimplemented);
+    assert_eq!(exports.active(), 0);
+}
+
 #[test]
 fn a_late_close_cannot_close_a_reused_session_id_or_quarantine_its_windows() {
     let (previous, _, _) = fixture(SLOT, 2);
