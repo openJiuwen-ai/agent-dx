@@ -1276,6 +1276,107 @@ async fn a_failed_release_does_not_block_another_home_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_release_request_is_retried_while_healthy_session_keeps_reading() {
+    let mut pooled = policy(DataMode::Hixl);
+    pooled.sessions_per_home = 2;
+    pooled.snapshot_reads = false;
+    let fixture = fixture_parking(
+        pooled,
+        true,
+        MemorySource::new(content(), 3000),
+        SLOT,
+        SLOT,
+        Duration::from_millis(300),
+    )
+    .await;
+    fixture
+        .lost_read_releases
+        .store(RELEASE_ATTEMPTS, Ordering::SeqCst);
+    let file = fixture
+        .with_open(libc::O_RDONLY, |client, file| {
+            assert_eq!(read(&client, &file, 0, 1000).unwrap(), content()[..1000]);
+            file
+        })
+        .await;
+    fixture
+        .wait_until("the initial read release requests were lost", |fixture| {
+            operations(&fixture.registry, "release") == 1
+        })
+        .await;
+    assert!(fixture.exports.active() > 0);
+    assert_eq!(fixture.lost_read_releases.load(Ordering::SeqCst), 0);
+
+    // The connection has recovered. Foreground reads can keep choosing the
+    // second slot and need not revisit the first slot to send its release.
+    let recovered_at = Instant::now();
+    let crossing_ttl = Duration::from_secs(31);
+    let pool = fixture.reader.home_pool("node-a").unwrap();
+    let mut completed = 0;
+    while recovered_at.elapsed() < crossing_ttl {
+        // Let the healthy slot's idle release finish before the next read.
+        drop(pool.slots[1].lock().await);
+        let file = file.clone();
+        let result = fixture
+            .with_client(move |client| read(&client, &file, SLOT as u64, 1000))
+            .await;
+        assert_eq!(
+            result.unwrap_or_else(|error| panic!(
+                "healthy read failed after {:?}, {completed} reads, {} Home quarantines: {error}",
+                recovered_at.elapsed(),
+                fixture.home_quarantines(),
+            )),
+            content()[SLOT..SLOT + 1000],
+        );
+        completed += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    fixture.home.expire().await.unwrap();
+    assert_eq!(fixture.home_quarantines(), 0);
+    fixture.wait_released().await;
+    eprintln!(
+        "kept reading after recovery for {:?}, {completed} reads, no Home quarantine",
+        recovered_at.elapsed(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_release_loss_exhausts_the_budget_and_keeps_home_fenced() {
+    let fixture = parking_fixture(Duration::from_millis(300)).await;
+    fixture
+        .lost_read_releases
+        .store(usize::MAX, Ordering::SeqCst);
+    fixture
+        .with_open(libc::O_RDONLY, |client, file| {
+            assert_eq!(read(&client, &file, 0, 1000).unwrap(), content()[..1000]);
+        })
+        .await;
+    let read_finished = tokio::time::Instant::now();
+    tokio::time::sleep_until(read_finished + RELEASE_RETRY_BUDGET + Duration::from_secs(1)).await;
+    let after_budget = fixture.lost_read_releases.load(Ordering::SeqCst);
+    assert!(usize::MAX - after_budget > RELEASE_ATTEMPTS);
+    tokio::time::sleep_until(read_finished + Duration::from_secs(31)).await;
+    assert_eq!(
+        fixture.lost_read_releases.load(Ordering::SeqCst),
+        after_budget
+    );
+
+    fixture.home.expire().await.unwrap();
+    assert_eq!(fixture.home_quarantines(), 1);
+    assert!(fixture.exports.active() > 0);
+    assert!(
+        fixture.reader.home_pool("node-a").unwrap().slots[0]
+            .lock()
+            .await
+            .parked
+            .is_some()
+    );
+    eprintln!(
+        "Release requests stopped at the budget cutoff after {} attempts; Home fenced the still-pinned slot",
+        usize::MAX - after_budget
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_session_idle_limit_replaces_an_idle_session() {
     let mut short = policy(DataMode::Hixl);
     short.session_idle = Duration::from_secs(1);

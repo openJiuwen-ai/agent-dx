@@ -61,6 +61,11 @@ const RELEASE_ATTEMPTS: usize = 3;
 /// A parked release that no prepare of its session carries within this long
 /// is sent on its own, so idle slots return to Home promptly.
 const RELEASE_PARK: Duration = Duration::from_millis(10);
+/// Keep background retries below the Home's 30-second idle session TTL.
+const RELEASE_RETRY_BUDGET: Duration = Duration::from_secs(20);
+const RELEASE_RETRY_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+const RELEASE_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(500);
+const RELEASE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 /// OwnerFs HIXL transfer policy shared by every open of this process.
 #[derive(Clone, Copy, Debug)]
@@ -941,6 +946,9 @@ struct HomeSlot {
     write_window: Option<write::WriteWindow>,
     /// Completed release of the session's last read, not yet acknowledged by Home.
     parked: Option<ReadTicket>,
+    /// A ticket starts one bounded background flush, even when a failed
+    /// Prepare carries it and then parks it again.
+    scheduled_release: Option<String>,
 }
 
 impl HomeSlot {
@@ -1093,19 +1101,20 @@ impl Drop for HomeLease {
                 window.expires(),
             ));
         }
-        let Some(read_id) = self
-            .guard
-            .parked
-            .as_ref()
-            .map(|ticket| ticket.read_id.clone())
-        else {
+        let Some(ticket) = self.guard.parked.as_ref() else {
             return;
         };
+        if self.guard.scheduled_release.as_ref() == Some(&ticket.read_id) {
+            return;
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let read_id = ticket.read_id.clone();
+        self.guard.scheduled_release = Some(read_id.clone());
+        let deadline = tokio::time::Instant::now() + RELEASE_RETRY_BUDGET;
         let slot = OwnedMutexGuard::mutex(&self.guard).clone();
-        runtime.spawn(self.flush.clone().run(slot, read_id));
+        runtime.spawn(self.flush.clone().run(slot, read_id, deadline));
     }
 }
 
@@ -1119,33 +1128,55 @@ struct ParkedFlush {
 }
 
 impl ParkedFlush {
-    async fn run(self, slot: Arc<Mutex<HomeSlot>>, read_id: String) {
-        tokio::time::sleep(self.park).await;
-        let Ok(_permit) = self.pool.permits.clone().acquire_owned().await else {
-            return;
+    async fn run(
+        self,
+        slot: Arc<Mutex<HomeSlot>>,
+        read_id: String,
+        deadline: tokio::time::Instant,
+    ) {
+        let flush = async {
+            let mut delay = self.park;
+            let mut backoff = RELEASE_RETRY_MIN_BACKOFF;
+            let timeout = self.timeout.min(RELEASE_RETRY_RPC_TIMEOUT);
+            loop {
+                tokio::time::sleep(delay).await;
+                delay = backoff;
+                backoff = (backoff * 2).min(RELEASE_RETRY_MAX_BACKOFF);
+                let Ok(_permit) = self.pool.permits.clone().acquire_owned().await else {
+                    return;
+                };
+                // A foreground request can carry or re-park this ticket.
+                // Drop the permit and check again after the backoff.
+                let Ok(mut guard) = slot.clone().try_lock_owned() else {
+                    continue;
+                };
+                if guard
+                    .parked
+                    .as_ref()
+                    .is_none_or(|ticket| ticket.read_id != read_id)
+                {
+                    return;
+                }
+                let Some(session) = guard.session.clone() else {
+                    return;
+                };
+                match guard
+                    .flush_parked(&session, timeout, self.metrics.as_ref())
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(error) => {
+                        session.poisoned.store(true, Ordering::Release);
+                        if !retries_release(&error) {
+                            return;
+                        }
+                    }
+                }
+            }
         };
-        // A held slot needs no flush: its holder carries or re-parks the
-        // release. The guard drops before the permit.
-        let Ok(mut guard) = slot.try_lock_owned() else {
-            return;
-        };
-        if guard
-            .parked
-            .as_ref()
-            .is_none_or(|ticket| ticket.read_id != read_id)
-        {
-            return;
-        }
-        let Some(session) = guard.session.clone() else {
-            return;
-        };
-        if guard
-            .flush_parked(&session, self.timeout, self.metrics.as_ref())
-            .await
-            .is_err()
-        {
-            session.poisoned.store(true, Ordering::Release);
-        }
+        // A deadline leaves the ticket parked without asserting that Home
+        // released its exports. Home can still fence the unconfirmed session.
+        let _ = tokio::time::timeout_at(deadline, flush).await;
     }
 }
 
@@ -1373,8 +1404,8 @@ async fn release_slots(
         let mut command = afs_tracing::request_with_current_context(request.clone());
         command.set_timeout(timeout);
         let mut client = session.client.clone();
-        match client.release_hixl_read(command).await {
-            Ok(response) => {
+        let error = match tokio::time::timeout(timeout, client.release_hixl_read(command)).await {
+            Ok(Ok(response)) => {
                 let response = response.into_inner();
                 if response.session_retired {
                     if outcome != HixlReleaseOutcome::Completed
@@ -1397,19 +1428,25 @@ async fn release_slots(
                 }
                 return Ok(ReadReleaseAck::Accepted);
             }
-            Err(status) => {
-                let error = status_to_error(status);
-                if !matches!(
-                    error.kind(),
-                    afs_error::ErrorKind::Unavailable | afs_error::ErrorKind::DeadlineExceeded
-                ) {
-                    return Err(error);
-                }
-                last = Some(error);
-            }
+            Ok(Err(status)) => status_to_error(status),
+            Err(_) => afs_error::Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "OwnerFs HIXL read release RPC timed out",
+            ),
+        };
+        if !retries_release(&error) {
+            return Err(error);
         }
+        last = Some(error);
     }
     Err(last.unwrap_or_else(|| protocol_error("OwnerFs HIXL release produced no result")))
+}
+
+fn retries_release(error: &afs_error::Error) -> bool {
+    matches!(
+        error.kind(),
+        afs_error::ErrorKind::Unavailable | afs_error::ErrorKind::DeadlineExceeded
+    )
 }
 
 async fn close_session(session: &HomeSession, timeout: Duration) -> afs_error::Result<()> {
