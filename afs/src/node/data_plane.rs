@@ -1,5 +1,7 @@
 //! Node data movement shared across filesystem adapters.
 
+pub(crate) mod checksum;
+
 #[cfg(feature = "ownerfs")]
 pub(crate) mod hixl;
 

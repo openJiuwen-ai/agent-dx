@@ -8,10 +8,27 @@ use afs_transport::hixl::{
 };
 pub(crate) use export::{ExportProvider, PendingExport, runtime_export_provider};
 pub use metrics::HixlMetrics;
-pub(crate) use metrics::{Operation, observe_optional, runtime_error};
+pub(crate) use metrics::{Operation, observe_optional};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+pub(crate) fn runtime_error(error: HixlError) -> afs_error::Error {
+    let code = match error.kind {
+        HixlErrorKind::Unsupported => afs_error::NODE_TRANSFER_UNSUPPORTED,
+        HixlErrorKind::InvalidArgument => afs_error::NODE_TRANSFER_INVALID,
+        HixlErrorKind::ResourceExhausted => afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
+        HixlErrorKind::DeadlineExceeded => afs_error::IO_TIMEOUT,
+        HixlErrorKind::EnginePoisoned | HixlErrorKind::ShutdownIncomplete => {
+            afs_error::NODE_TRANSFER_DRAIN_INCOMPLETE
+        }
+        HixlErrorKind::Internal => afs_error::NODE_TRANSFER_INTERNAL,
+        HixlErrorKind::InvalidState | HixlErrorKind::NativeFailure => {
+            afs_error::NODE_TRANSFER_UNAVAILABLE
+        }
+    };
+    afs_error::Error::coded(code, error.to_string())
+}
 
 /// Native calls are the only replaceable boundary in the reader control path.
 pub(crate) trait TransferLane: Send + Sync {
@@ -119,14 +136,14 @@ impl SlotChecksum {
     fn matches(self, bytes: &[u8], expected: &[u8]) -> bool {
         match self {
             Self::Blake3 => blake3::hash(bytes).as_bytes() == expected,
-            Self::Crc32c => crate::node::chunk_crc32c::checksum(bytes).to_le_bytes() == expected,
+            Self::Crc32c => super::checksum::checksum(bytes).to_le_bytes() == expected,
         }
     }
 
     pub(crate) fn digest(self, bytes: &[u8]) -> Vec<u8> {
         match self {
             Self::Blake3 => blake3::hash(bytes).as_bytes().to_vec(),
-            Self::Crc32c => crate::node::chunk_crc32c::checksum(bytes)
+            Self::Crc32c => super::checksum::checksum(bytes)
                 .to_le_bytes()
                 .to_vec(),
         }

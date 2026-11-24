@@ -4,7 +4,7 @@ use afs_metrics::{
     Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, MetricsError,
     Registry, register_collector,
 };
-use afs_transport::hixl::{HixlError, HixlErrorKind, HixlReadTiming, RuntimeStatus};
+use afs_transport::hixl::{HixlReadTiming, RuntimeStatus};
 
 /// Reports one phase into the optional bounded HIXL metrics.
 pub(crate) fn observe_optional(
@@ -16,23 +16,6 @@ pub(crate) fn observe_optional(
     if let Some(metrics) = metrics {
         metrics.observe(phase, elapsed, success);
     }
-}
-
-pub(crate) fn runtime_error(error: HixlError) -> afs_error::Error {
-    let code = match error.kind {
-        HixlErrorKind::Unsupported => afs_error::NODE_TRANSFER_UNSUPPORTED,
-        HixlErrorKind::InvalidArgument => afs_error::NODE_TRANSFER_INVALID,
-        HixlErrorKind::ResourceExhausted => afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
-        HixlErrorKind::DeadlineExceeded => afs_error::IO_TIMEOUT,
-        HixlErrorKind::EnginePoisoned | HixlErrorKind::ShutdownIncomplete => {
-            afs_error::NODE_TRANSFER_DRAIN_INCOMPLETE
-        }
-        HixlErrorKind::Internal => afs_error::NODE_TRANSFER_INTERNAL,
-        HixlErrorKind::InvalidState | HixlErrorKind::NativeFailure => {
-            afs_error::NODE_TRANSFER_UNAVAILABLE
-        }
-    };
-    afs_error::Error::coded(code, error.to_string())
 }
 
 /// Labels are fixed phases, never Node IDs, addresses, chunks or grants.
