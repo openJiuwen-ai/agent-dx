@@ -2671,6 +2671,26 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         trace
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
+                let network_generation = if let Some(value) = request
+                    .metadata()
+                    .get(adx_protocol::NETWORK_SOURCE_GENERATION)
+                {
+                    if principal != Principal::ApiServer {
+                        return Err(Status::permission_denied("API Server identity required"));
+                    }
+                    Some(
+                        value
+                            .to_str()
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .filter(|value| *value != 0)
+                            .ok_or_else(|| {
+                                Status::invalid_argument("invalid network source generation")
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 let r = request.into_inner();
                 let (session, cached) = {
                     let state = self.0.state.lock().await;
@@ -2679,9 +2699,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         state.environments.get(&r.environment_id).cloned(),
                     )
                 };
-                let stored = match cached {
-                    Some(stored) if stored.result.is_none() => stored,
-                    _ => session.get(&r.environment_id).await.map_err(status)?,
+                let (stored, migration) = match (network_generation, cached) {
+                    (Some(generation), _) => session
+                        .network_migration(&r.environment_id, generation)
+                        .await
+                        .map_err(status)?,
+                    (None, Some(stored)) if stored.result.is_none() => (stored, None),
+                    _ => (session.get(&r.environment_id).await.map_err(status)?, None),
                 };
                 let state = self.0.state.lock().await;
                 match principal {
@@ -2700,11 +2724,18 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .nodes
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                Ok(Response::new(pb::GetEnvironmentResponse {
+                let mut response = Response::new(pb::GetEnvironmentResponse {
                     record: Some((&stored).try_into().map_err(status)?),
                     node_address: node.address.clone(),
                     relay_address: node.proxy_address.clone(),
-                }))
+                });
+                if let Some(migration) = migration {
+                    response.metadata_mut().insert(
+                        adx_protocol::NETWORK_MIGRATION,
+                        tonic::metadata::MetadataValue::from_static(migration),
+                    );
+                }
+                Ok(response)
             })
             .await
     }

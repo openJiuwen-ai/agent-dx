@@ -6,8 +6,9 @@ under `/v1/node-upgrades` and adxlet process upgrades under
 authentication. Isolate it to trusted publishing Jobs and operator sources; never
 forward it through the public API/Ingress. Owner fields are task identity, not
 credentials. Kubernetes ServiceAccount/RBAC does not replace management-network
-access restrictions. This boundary does not provide the former publisher mTLS
-caller authentication. Node RPC authentication remains in place.
+access restrictions. Before enabling rollouts, verify access from the publishing
+Job and designated operator sources, denied access from an ordinary workload,
+and no public API or Ingress route. Node RPC authentication remains in place.
 
 ## Process Maintenance
 

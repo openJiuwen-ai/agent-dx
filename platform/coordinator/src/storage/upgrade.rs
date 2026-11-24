@@ -269,6 +269,46 @@ impl UpgradeTask {
     }
 }
 impl Session {
+    /// Check the record and migration in one authoritative read. A finished
+    /// transfer can still explain a rejection sent to the old generation.
+    pub(crate) async fn network_migration(
+        &self,
+        id: &str,
+        generation: u64,
+    ) -> Result<(StoredEnvironment, Option<&'static str>)> {
+        let [header, environment, upgrade] = self
+            .store
+            .fields([HEADER.into(), format!("environment:{id}"), UPGRADE.into()])
+            .await?;
+        self.header(&header)?;
+        let stored: StoredEnvironment = decode(environment.as_deref().ok_or(Error::NotFound)?)?;
+        stored.validate()?;
+        let task: Option<UpgradeTask> = upgrade.as_deref().map(decode).transpose()?;
+        let hint = task.as_ref().and_then(|task| {
+            task.operations.values().find_map(|op| {
+                if op.environment_id != id || !op.was_running || stored.invalidated {
+                    return None;
+                }
+                let source = op.source_generation == generation
+                    && stored.assignment.generation == generation
+                    && stored.assignment.node_id == op.source_node_id;
+                let transfer = op.owns_transfer(&stored)
+                    && (op.source_generation == generation
+                        || stored.assignment.generation == generation);
+                if !(source || transfer) {
+                    return None;
+                }
+                match op.phase.as_str() {
+                    "Prepared" | "Assigned" | "Deferring" if task.active() => Some("waiting"),
+                    "Completed" if transfer => Some("ready"),
+                    "Deferred" if source => Some("ready"),
+                    _ => None,
+                }
+            })
+        });
+        Ok((stored, hint))
+    }
+
     pub(crate) async fn confirmed_deletion(
         &self,
         id: &str,
@@ -308,9 +348,24 @@ impl Session {
         task.require_protocol()?;
         task.validate()?;
         for _ in 0..ATTEMPTS {
-            // Registration can add isolation after the last release RPC. Read
-            // every node with the same header that fences the terminal write.
-            let inventory = self.store.raw().await?;
+            // Creation checks every process maintenance marker. Terminal writes
+            // check every node for isolation added after the last release RPC.
+            let full_inventory = expected_revision.is_none() || !task.active();
+            let inventory = if full_inventory {
+                self.store.raw().await?
+            } else {
+                // Process maintenance cannot start while the Pod task is active.
+                let fields: Vec<_> = [HEADER.into(), UPGRADE.into()]
+                    .into_iter()
+                    .chain(task.nodes.keys().map(|id| format!("node:{id}")))
+                    .collect();
+                let values = self.store.fields_vec(&fields).await?;
+                fields
+                    .into_iter()
+                    .zip(values)
+                    .filter_map(|(field, value)| value.map(|value| (field, value)))
+                    .collect()
+            };
             let raw = inventory.get(HEADER).cloned();
             let value = inventory.get(UPGRADE).cloned();
             let header = self.header(&raw)?;
@@ -324,16 +379,18 @@ impl Session {
                 (Some(old), Some(revision))
                     if old.task_id == task.task_id
                         && old.epoch == task.epoch
-                        && old.revision == revision => {}
+                        && old.revision == revision
+                        && (old.active() || !task.active()) => {}
                 (Some(old), None) if old.active() => return Err(Error::Conflict),
                 (None, None) | (Some(_), None) => {}
                 _ => return Err(Error::Conflict),
             }
             let mut checks = vec![(HEADER.into(), raw.clone())];
             if task.active() {
-                if inventory
-                    .keys()
-                    .any(|field| field.starts_with("process-upgrade:"))
+                if full_inventory
+                    && inventory
+                        .keys()
+                        .any(|field| field.starts_with("process-upgrade:"))
                 {
                     return Err(Error::Conflict);
                 }
@@ -454,7 +511,13 @@ impl Session {
                 // Resume intent and the upgrade barrier share this header CAS.
                 // Never fence an accepted wake: migration cannot consume its
                 // checkpoint until the wake settles, so doing so would deadlock.
-                let values = self.store.raw().await?;
+                let snapshot;
+                let values = if full_inventory {
+                    &inventory
+                } else {
+                    snapshot = self.store.raw().await?;
+                    &snapshot
+                };
                 if values.get(HEADER) != raw.as_ref() {
                     continue;
                 }
@@ -514,7 +577,7 @@ impl Session {
                         }
                     }
                 }
-                for (field, value) in &values {
+                for (field, value) in values {
                     if field.starts_with("environment:") {
                         let stored: StoredEnvironment = decode(value)?;
                         if stored.resume.is_some()
@@ -581,6 +644,54 @@ impl Session {
 #[cfg(test)]
 mod drain_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn active_upgrade_progress_does_not_read_the_full_inventory() {
+        let redis = transport_test_redis::Redis::new().await;
+        let store = redis.store().await;
+        let session = store.begin(1).await.unwrap();
+        let task = UpgradeTask {
+            protocol_version: 3,
+            task_id: "upgrade".into(),
+            epoch: 1,
+            namespace: "test".into(),
+            daemonset_uid: "daemonset".into(),
+            target_image: format!("node@sha256:{}", "a".repeat(64)),
+            phase: "Active".into(),
+            nodes: [(
+                "node".into(),
+                UpgradeNode {
+                    node_id: "node".into(),
+                    pod_uid: "pod".into(),
+                    node_session_id: "session".into(),
+                    phase: "pending".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let task = session.save_upgrade(task, None).await.unwrap();
+        let command_stats = || async {
+            let mut command = redis::cmd("INFO");
+            command.arg("commandstats");
+            let info: String = store.query(command).await.unwrap();
+            info.lines()
+                .find_map(|line| line.strip_prefix("cmdstat_hgetall:calls="))
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let initial = command_stats().await;
+        let revision = task.revision;
+        let task = session.save_upgrade(task, Some(revision)).await.unwrap();
+        assert_eq!(task.revision, revision + 1);
+        assert_eq!(command_stats().await, initial);
+    }
 
     #[test]
     fn drain_resume_requires_the_current_task_owned_source_session() {

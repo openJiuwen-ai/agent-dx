@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import http.client
+from itertools import chain
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -923,7 +924,7 @@ def validate_process_plan(plan):
     batches = plan["batches"]
     require(isinstance(batches, list) and bool(batches), "missing batches")
     require(all(isinstance(batch, list) and bool(batch) for batch in batches), "invalid batch")
-    require(batches[0] == ids[:1] and [item for batch in batches for item in batch] == ids,
+    require(batches[0] == ids[:1] and list(chain.from_iterable(batches)) == ids,
             "invalid canary or batch order")
 
 
@@ -1372,10 +1373,21 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
     if state["stage"] == "release_intent":
         body = dict(owner=owner, node_session=state["release_session"])
         receipt = process_release_receipt(post, owner, body["node_session"]) if resuming_release else None
+        task = query_task()
         if receipt is not None:
             require(receipt == body, "release receipt differs")
+            require(task.get("phase") == state["outcome"], "local task outcome differs from release intent")
+            if "attempt" in state:
+                execution = same_execution(task)
+                terminal_stage = "completed" if state["outcome"] == "completed" else "original_selected"
+                require(execution.get("stage") == terminal_stage, "local task has no terminal selection")
+                require(execution["node_session"] == body["node_session"], "local release session differs")
+                require(execution.get("rollback_from") == state.get("rollback_from"), "local rollback source differs")
+            else:
+                require(state["outcome"] == "failed" and task.get("adxlet_execution") is None
+                        and task.get("execution") is None, "local task did not retain original process")
+                require(body["node_session"] == expected["node_session"], "local original session differs")
         else:
-            task = query_task()
             if "rollback_from" in state and state["outcome"] == "failed":
                 execution = same_execution(task)
                 require(execution.get("rollback_from") == state["rollback_from"], "release B names a different A")
@@ -1455,10 +1467,10 @@ def advance_process(plan, node, state, save, kube, local, cli, post, sleep):
     return state["stage"] if state["stage"] in ("completed", "failed") else "pending"
 
 
-def declaration_patch(source, rv, before, after, data_present=True, fence=None):
+def declaration_patch(source, resource_version, before, after, data_present=True, fence=None):
     key = source["key"].replace("~", "~0").replace("/", "~1")
     body = [dict(op="test", path="/metadata/uid", value=source["uid"]),
-            dict(op="test", path="/metadata/resourceVersion", value=rv)]
+            dict(op="test", path="/metadata/resourceVersion", value=resource_version)]
     if before is not None:
         body.append(dict(op="test", path="/data/" + key, value=before))
     if before == after:
@@ -1480,7 +1492,7 @@ def declaration_write(plan, journal, save, kube, mutate, restore=False):
     obj = kube(["get", "configmap", source["name"], "--namespace", source["namespace"]])
     evidence, current = declaration_configmap(obj, source["namespace"], source["name"], source["key"])
     require(evidence["uid"] == source["uid"], "ConfigMap UID changed")
-    rv = evidence["resource_version"]
+    resource_version = evidence["resource_version"]
     marker_key = "adx.dev/rollout-input-fence"
     nonce = template_hash(plan)
     applied, restored = nonce + ":applied", nonce + ":restored"
@@ -1513,7 +1525,7 @@ def declaration_write(plan, journal, save, kube, mutate, restore=False):
             require(current == source["original_text"], "restored marker/data conflict")
             return
         require((marker == applied and current == source["candidate_text"])
-                or (rv == source["resource_version"] and current == source["original_text"]),
+                or (resource_version == source["resource_version"] and current == source["original_text"]),
                 "CM ownership unknown or superseded")
         name = "declaration_restore"
         before, after = current, source["original_text"]
@@ -1525,7 +1537,7 @@ def declaration_write(plan, journal, save, kube, mutate, restore=False):
             require(owned is not None, "foreign candidate without owned intent")
             require(current == source["candidate_text"], "applied marker/data conflict")
             return
-        require(rv == source["resource_version"] and current == source["original_text"],
+        require(resource_version == source["resource_version"] and current == source["original_text"],
                 "CM ownership unknown or superseded; replan required")
         name, before, after = "declaration_write", source["original_text"], source["candidate_text"]
         desired_marker = applied
@@ -1533,13 +1545,13 @@ def declaration_write(plan, journal, save, kube, mutate, restore=False):
     fence[marker_key] = desired_marker
     intent = journal.get(name)
     if intent is None:
-        intent = dict(rv=rv, data_present="data" in obj, fence=fence, before=before,
-                      body=declaration_patch(source, rv, before, after, "data" in obj, fence))
+        intent = dict(rv=resource_version, data_present="data" in obj, fence=fence, before=before,
+                      body=declaration_patch(source, resource_version, before, after, "data" in obj, fence))
         journal[name] = intent
         save()
-    require(intent["rv"] == rv and intent["before"] == current, "fixed CM intent no longer applicable")
+    require(intent["rv"] == resource_version and intent["before"] == current, "fixed CM intent no longer applicable")
     require(mutate is not None, "ConfigMap mutation transport unavailable")
-    if intent["rv"] == rv:
+    if intent["rv"] == resource_version:
         require(intent["data_present"] == ("data" in obj), "CM intent data presence differs")
     require(intent["fence"] == fence, "fence annotations differ from fresh object")
     mutate(["patch", "configmap", source["name"], "--namespace", source["namespace"],
@@ -1548,7 +1560,7 @@ def declaration_write(plan, journal, save, kube, mutate, restore=False):
     identity_now, text_now = declaration_configmap(fresh, source["namespace"], source["name"], source["key"])
     require(identity_now["uid"] == source["uid"] and text_now == after
             and fresh["metadata"].get("annotations", {}).get(marker_key) == desired_marker
-            and identity_now["resource_version"] != rv, "ConfigMap effect unconfirmed")
+            and identity_now["resource_version"] != resource_version, "ConfigMap effect unconfirmed")
 
 
 def declaration_gate(plan, node, kube, local, sleep, override=False, expected_text=None, marker="applied"):
@@ -1729,7 +1741,7 @@ def apply_process(plan, journal_path, batch_index, kube, local, cli, post, sleep
             or (not promote and type(batch_index) is int
                 and 0 <= batch_index < len(plan["batches"])), "select batch index or promotion")
     path = Path(journal_path).absolute()
-    lock = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    lock = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(lock, "a+b") as lock_stream:
         require(stat.S_ISREG(os.fstat(lock_stream.fileno()).st_mode), "lock must be regular")
         try:
@@ -1911,7 +1923,7 @@ def validate_pod_plan(plan):
     require(begin["nodes"] == bindings, "begin bindings differ")
     batches = plan["batches"]
     require(isinstance(batches, list) and batches and all(isinstance(b, list) and b for b in batches)
-            and batches[0] == ids[:1] and [n for b in batches for n in b] == ids, "invalid Pod batches")
+            and batches[0] == ids[:1] and list(chain.from_iterable(batches)) == ids, "invalid Pod batches")
 
 
 def pod_task(plan, get, cleanup=False):
@@ -2008,9 +2020,9 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
     base = "/v1/node-upgrades/tasks/" + quote(begin["task_id"], safe="")
     stage = journal["stage"]
     if stage == "new":
-        ds = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
-        require(identity(ds, kind, begin["namespace"])["uid"] == workload["uid"]
-                and template_hash(ds["spec"]["template"]) == workload["original_template_hash"],
+        current_workload = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
+        require(identity(current_workload, kind, begin["namespace"])["uid"] == workload["uid"]
+                and template_hash(current_workload["spec"]["template"]) == workload["original_template_hash"],
                 kind + " changed before begin")
         inventory = pod_inventory(begin["namespace"], kube)
         for pod in plan["pods"]:
@@ -2038,7 +2050,8 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
         return False
     task = pod_task(plan, get, cleanup)
     selected = [cleanup_node] if cleanup else plan["batches"][batch_index]
-    for prior in ([] if cleanup else [n for b in plan["batches"][:batch_index] for n in b]):
+    prior_batches = [] if cleanup else plan["batches"][:batch_index]
+    for prior in chain.from_iterable(prior_batches):
         require(journal["nodes"].get(prior, {}).get("stage") == "verified"
                 and task["nodes"][prior]["phase"] == "verified", "prior batch is not verified")
     if task["phase"] == "Completed":
@@ -2047,10 +2060,10 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
         journal["stage"] = "completed"
         save()
         return True
-    ds = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
-    evidence = identity(ds, kind, begin["namespace"])
+    current_workload = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
+    evidence = identity(current_workload, kind, begin["namespace"])
     require(evidence["uid"] == workload["uid"], kind + " owner changed")
-    fingerprint = template_hash(ds["spec"]["template"])
+    fingerprint = template_hash(current_workload["spec"]["template"])
     if stage in ("template", "patch_intent"):
         if fingerprint == workload["target_template_hash"]:
             require(stage == "patch_intent" or workload["original_template_hash"] == fingerprint,
@@ -2059,7 +2072,7 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
             save()
             return False
         require(fingerprint == workload["original_template_hash"], "foreign template change")
-        containers = ds["spec"]["template"]["spec"]["containers"]
+        containers = current_workload["spec"]["template"]["spec"]["containers"]
         indexes = [i for i, c in enumerate(containers) if c["name"] == plan["container"]]
         require(len(indexes) == 1, "selected template container changed")
         pointer = "/spec/template/spec/containers/" + str(indexes[0]) + "/image"
@@ -2216,10 +2229,9 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
         if local_stage == "delete_intent":
             require(node["permit_id"] == state["permit_id"] and node["control_revision"] == state["control_revision"],
                     "source permit changed")
-            if "delete_rv" not in state:
+            if node.get("delete_resource_version") is None and "intent" not in state:
                 state["delete_rv"] = originals[0]["metadata"]["resourceVersion"]
                 save()
-            require(originals[0]["metadata"]["resourceVersion"] == state["delete_rv"], "delete RV changed")
             if node.get("delete_resource_version") != state["delete_rv"]:
                 require(node.get("delete_resource_version") is None, "foreign delete intent")
                 pod_inspection(plan, pod, pod["uid"], original_session, get,
@@ -2233,18 +2245,46 @@ def advance_pod(plan, journal, save, batch_index, kube, get, post, mutate, clean
             return False
         if local_stage == "delete":
             require(node["pod_uid"] == pod["uid"] and node["node_session_id"] == original_session
-                    and node["permit_id"] == state["permit_id"]
-                    and node["control_revision"] == state["control_revision"]
-                    and node["delete_resource_version"] == state["delete_rv"], "DELETE authorization changed")
+                    and node["control_revision"] == state["control_revision"], "DELETE binding changed")
+            authorized = (node["permit_id"] == state["permit_id"]
+                          and node["delete_resource_version"] == state["delete_rv"])
+            revoking = state.get("intent")
+            require(authorized or (revoking and node["permit_id"] is None
+                                   and node["delete_resource_version"] is None), "DELETE authorization changed")
             originals = [p for p in pod_inventory(begin["namespace"], kube) if p["metadata"]["uid"] == pod["uid"]]
             if not originals:
+                require(authorized and not revoking, "original disappeared during DELETE revocation")
                 state["stage"] = "replacement"
                 save()
                 return False
             current = originals[0]
             if current["metadata"].get("deletionTimestamp"):
                 raise Refusal("original UID is terminating; wait for authoritative disappearance")
-            require(current["metadata"]["resourceVersion"] == state["delete_rv"], "DELETE RV changed; revoke required")
+            current_rv = current["metadata"]["resourceVersion"]
+            if current_rv != state["delete_rv"]:
+                require(identity(current, "Pod", begin["namespace"])["name"] == pod["name"]
+                        and image(current, plan["container"]) == pod["original_image"]
+                        and workload_owns(workload, current)
+                        and current["spec"].get("nodeName") == pod["kubernetes_node_name"], "original Pod changed")
+                pod_inspection(plan, pod, pod["uid"], original_session, get,
+                               "Quiescing", state["permit_id"] if authorized else None, state["control_revision"])
+                # The old UID/RV DELETE can no longer apply. Persist the revocation
+                # before requesting another strict-empty check and permit.
+                fenced_rv = revoking["body"]["pod_resource_version"] if revoking else current_rv
+                response = action("revoke-delete", dict(expected_delete_resource_version=state["delete_rv"],
+                                                        pod_resource_version=fenced_rv))
+                cleared = response["nodes"][node_id]
+                require(response["task_id"] == begin["task_id"] and response["epoch"] == begin["epoch"]
+                        and cleared["pod_uid"] == pod["uid"] and cleared["node_session_id"] == original_session
+                        and cleared["control_revision"] == state["control_revision"]
+                        and cleared["permit_id"] is None and cleared["delete_resource_version"] is None,
+                        "DELETE revocation receipt differs")
+                state.update(stage="quiesce", baseline_revision=state["control_revision"])
+                for key in ("intent", "delete_rv", "permit_id", "control_revision"):
+                    state.pop(key)
+                save()
+                return False
+            require(not revoking, "DELETE revocation still pending")
             body = dict(apiVersion="v1", kind="DeleteOptions",
                          preconditions=dict(uid=pod["uid"], resourceVersion=state["delete_rv"]))
             if "declaration" in plan:
@@ -2417,9 +2457,9 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
     task = pod_task(plan, get, cleanup=True)
     if task["phase"] in ("Aborted", "Completed"):
         if task["phase"] == "Aborted":
-            ds = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
-            require(identity(ds, kind, begin["namespace"])["uid"] == workload["uid"]
-                    and template_hash(ds["spec"]["template"]) == workload["original_template_hash"],
+            current_workload = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
+            require(identity(current_workload, kind, begin["namespace"])["uid"] == workload["uid"]
+                    and template_hash(current_workload["spec"]["template"]) == workload["original_template_hash"],
                     "aborted task current template unknown")
             if "declaration_write" in journal:
                 declaration_write(plan, journal, save, kube, mutate, restore=True)
@@ -2573,17 +2613,17 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
                     cleanup=True, cleanup_node=node_id, local=local)
         return None
 
-    ds = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
-    evidence = identity(ds, kind, begin["namespace"])
+    current_workload = kube(["get", resource, workload["name"], "--namespace", begin["namespace"]])
+    evidence = identity(current_workload, kind, begin["namespace"])
     require(evidence["uid"] == workload["uid"],
             "cleanup workload identity changed")
-    fingerprint = template_hash(ds["spec"]["template"])
+    fingerprint = template_hash(current_workload["spec"]["template"])
     marker = template_hash([begin, "template-fence"])
     patch = [{"op": "test", "path": "/metadata/uid", "value": workload["uid"]},
              {"op": "test", "path": "/metadata/resourceVersion", "value": evidence["resource_version"]}]
     if fingerprint == workload["target_template_hash"] and fingerprint != workload["original_template_hash"]:
         require("patch" in journal, "target template is not publisher-owned")
-        containers = ds["spec"]["template"]["spec"]["containers"]
+        containers = current_workload["spec"]["template"]["spec"]["containers"]
         indexes = [i for i, c in enumerate(containers) if c["name"] == plan["container"]]
         require(len(indexes) == 1, "template container changed")
         pointer = "/spec/template/spec/containers/" + str(indexes[0]) + "/image"
@@ -2594,7 +2634,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
         old_patch = journal.get("patch")
         old_rv = old_patch[1]["value"] if old_patch else None
         if old_rv == evidence["resource_version"]:
-            if "annotations" not in ds["metadata"]:
+            if "annotations" not in current_workload["metadata"]:
                 patch.append(dict(op="add", path="/metadata/annotations", value={}))
             patch.append(dict(op="add", path="/metadata/annotations/adx.dev~1rollout-template-fence", value=marker))
         else:
@@ -2622,7 +2662,8 @@ def apply_pod(plan, journal_path, batch_index, kube, get, post, mutate, sleep=ti
             or (not promote and type(batch_index) is int
                 and 0 <= batch_index < len(plan["batches"])), "select batch index or promotion")
     path = Path(journal_path).absolute()
-    descriptor = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    descriptor = os.open(path.with_name(path.name + ".lock"),
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(descriptor, "a+b") as lock:
         require(stat.S_ISREG(os.fstat(lock.fileno()).st_mode), "lock must be regular")
         try:

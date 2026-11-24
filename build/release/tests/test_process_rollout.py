@@ -990,8 +990,20 @@ class ProcessApplyTests(unittest.TestCase):
             fixture.cli.reset_mock()
             fixture.post.reset_mock()
             self.assertEqual(self.run_adxlet(fixture)["status"], "completed")
-            fixture.cli.assert_not_called()
+            fixture.cli.assert_called_once_with(fixture.node, ["query", "--task-id", fixture.owner["local_task_id"]])
             fixture.post.assert_called_once_with("/v1/adxlet-process-upgrades/query", dict(owner=fixture.owner))
+
+    def test_adxlet_release_receipt_does_not_override_inconsistent_local_task(self):
+        snapshot = plan(arguments(nodes=("pod-a=node-a",)))
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
+            fixture.lost_acks.update(("release", "query_release"))
+            self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+            self.assertIsNotNone(fixture.receipt)
+            fixture.task["adxlet_execution"]["attempt"] = "different-attempt"
+            fixture.events.clear()
+            self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+            self.assertEqual(fixture.events, ["http.query.released", "runtime", "query"])
 
     def test_adxlet_absent_release_receipt_rechecks_proof_and_replays_release(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
@@ -1569,16 +1581,22 @@ class ProcessApplyTests(unittest.TestCase):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / "journal.json"
-            state = dict(stage="release_intent", outcome="failed", release_session="recovered", first_submit_unix_ms=1)
+            rollback_from = dict(attempt="target-attempt", node_session="target-session")
+            state = dict(stage="release_intent", outcome="failed", release_session="recovered",
+                         attempt="original-attempt", node_session="recovered", rollback_from=rollback_from,
+                         first_submit_unix_ms=1)
             rollout.write_journal(journal, dict(schema_version=2, plan_hash=rollout.template_hash(snapshot),
                                                 nodes={"node-a": state}))
-            owner = rollout.maintenance_owner(snapshot, snapshot["nodes"][0])
-            cli, local = MagicMock(), MagicMock()
+            node = snapshot["nodes"][0]
+            owner = rollout.maintenance_owner(snapshot, node)
+            execution = dict(stage="original_selected", attempt=state["attempt"],
+                             node_session=state["node_session"], rollback_from=rollback_from)
+            task = dict(submission=node["submission"], phase="failed", adxlet_execution=execution)
+            cli = MagicMock(return_value=dict(ok=True, task=task))
             post = MagicMock(return_value=dict(status="released", owner=owner, node_session="recovered"))
-            result = self.run_batch(snapshot, journal, cli, post=post, local=local)
+            result = self.run_batch(snapshot, journal, cli, post=post)
             self.assertEqual(result["status"], "failed")
-            cli.assert_not_called()
-            local.assert_not_called()
+            cli.assert_called_once_with(node, ["query", "--task-id", owner["local_task_id"]])
             post.assert_called_once_with("/v1/adxlet-process-upgrades/query", dict(owner=owner))
 
     def test_relay_completed_never_calls_coordinator(self):

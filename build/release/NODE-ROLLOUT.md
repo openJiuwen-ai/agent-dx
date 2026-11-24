@@ -159,7 +159,10 @@ The management listener has no caller authentication. Restrict it to trusted
 publishing Jobs and operator sources; never expose it through public API/Ingress.
 Owner data is not a credential, and ServiceAccount/RBAC does not replace HTTP
 network isolation. This boundary does not provide the former publisher mTLS
-caller authentication. Deployment isolation has not been verified for this
+caller authentication. Before rollout, verify that the deployed listener is
+reachable from the publishing Job and designated operator sources, and that a
+workload outside those sources cannot reach it. Verify that no public API or
+Ingress route exposes it. Deployment isolation has not been verified for this
 revision. The publisher has no dedicated gRPC client, generated rollout stubs,
 Supervisor certificate configuration or session-approval phase. The former
 `--handoff-config`, `--handoff-stubs` and `--handoff-timeout` options are removed;
@@ -473,12 +476,12 @@ requires the current terminal Task/runtime and matching active Coordinator
 session, then POSTs `{action:"release", owner, node_session}` to
 `/v1/adxlet-process-upgrades`. An uncertain release acknowledgement uses the HTTP
 query with that exact owner. On recovery from a durable release intent, query is
-checked first: `status:released` with the exact owner and frozen release session
-proves this rollout already released, even if a later restart changed its PID or
-another task now has maintenance. If no receipt exists, the publisher re-queries
-the same Task, checks its exact Submission and terminal outcome, and obtains fresh
-complete runtime evidence with the frozen release session before replay. A
-foreign marker returns 409; neither that conflict nor `status:absent` proves
+checked first. With an exact `status:released` receipt, the publisher also
+queries the original supervisor's Task for the matching terminal outcome and
+saved identity. A later adxlet PID or subsequent maintenance owner does not
+invalidate the historical receipt. If no receipt exists, the publisher also
+obtains fresh complete runtime evidence with the frozen release session before
+replay. A foreign marker returns 409; neither that conflict nor `status:absent` proves
 release. The release body never changes. Unproven outcomes retain protection.
 The former three `/v1/node-upgrades/process-maintenance` routes and publisher
 NodeHandoff Query/ReplaceSession RPCs are removed. The owning Node continues
@@ -726,10 +729,12 @@ containing `v1/DeleteOptions` and both UID and resourceVersion preconditions.
 It never uses force deletion or UID-only preconditions.
 
 After ambiguous DELETE, only a complete authoritative PodList proving the original
-UID absent permits replacement progression. Original UID still present remains
-pending or replays the identical UID/RV DELETE; nonterminating changed RV requires
-a later revoke workflow, never deletion under a new RV. A terminating original
-waits for authoritative disappearance even when its RV changed; it is not exit proof.
+UID absent permits replacement progression. If the original Pod is still present
+at the same RV, the publisher replays the identical UID/RV DELETE. If the same
+nonterminating original Pod has a different RV, the publisher journals and
+revokes the old authorization, checks that the node is still strictly empty,
+then obtains and confirms a new permit before issuing a DELETE for the new RV.
+A terminating original waits for authoritative disappearance even when its RV changes.
 Replacement must have the same controller UID, target digest, Downward UID and a
 fresh authenticated session, with protocol 3, unknown=false, isolated,
 task/epoch-matching inspection and four zero inventory counts before replacement

@@ -148,11 +148,24 @@ impl Controller {
         operation_id: String,
         expected_revision: u64,
     ) -> Result<OperationResult> {
-        if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Network)? {
+        let reject = || Error::BackendFailure {
+            code: adx_core::BackendFailureCode::FailedPrecondition,
+            message: adx_protocol::NETWORK_PRECONDITION.into(),
+        };
+        let replay = self
+            .replay_operation(&operation_id, expected_revision, LifecycleKind::Network)
+            .map_err(|error| {
+                if error == Error::Conflict {
+                    reject()
+                } else {
+                    error
+                }
+            })?;
+        if replay {
             return self.replay_or_sync().await;
         }
         if self.record.state != EnvironmentState::Running {
-            return Err(Error::Conflict);
+            return Err(reject());
         }
         if let Some(policy) = &policy {
             policy.validate()?;

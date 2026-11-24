@@ -504,16 +504,46 @@ impl Clients {
             authorize(caller, value.record.as_ref())?;
             return Ok(value);
         }
+        Box::pin(self.authoritative_owner(id, caller, None))
+            .await
+            .map(|(owner, _)| owner)
+    }
+
+    /// The migration hint is returned only by the authoritative Coordinator lookup.
+    pub(crate) async fn authoritative_owner(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        network_generation: Option<u64>,
+    ) -> Result<(pb::GetEnvironmentResponse, Option<bool>), Status> {
         let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
             self.coordinator().await?,
         );
-        let v = self
+        let mut request = trace::inject(pb::GetEnvironmentRequest {
+            environment_id: id.into(),
+            caller: Some(caller.clone()),
+        });
+        if let Some(generation) = network_generation {
+            let value = generation
+                .to_string()
+                .parse()
+                .map_err(|_| Status::internal("invalid network generation metadata"))?;
+            request
+                .metadata_mut()
+                .insert(adx_protocol::NETWORK_SOURCE_GENERATION, value);
+        }
+        let (v, waiting) = self
             .rpc(
                 "apiserver.get_environment",
-                client.get_environment(trace::inject(pb::GetEnvironmentRequest {
-                    environment_id: id.into(),
-                    caller: Some(caller.clone()),
-                })),
+                Box::pin(async {
+                    let reply = client.get_environment(request).await?;
+                    let waiting = match reply.metadata().get(adx_protocol::NETWORK_MIGRATION) {
+                        Some(value) if value == "waiting" => Some(true),
+                        Some(value) if value == "ready" => Some(false),
+                        _ => None,
+                    };
+                    Ok(reply.map(|owner| (owner, waiting)))
+                }),
             )
             .await?;
         authorize(caller, v.record.as_ref())?;
@@ -526,7 +556,7 @@ impl Clients {
             return Err(Status::data_loss("incomplete owner response"));
         }
         self.put_owner(v.clone()).await?;
-        Ok(v)
+        Ok((v, waiting))
     }
     pub(crate) async fn visible_environments(
         &self,

@@ -963,7 +963,12 @@ async fn await_ready(
         let mut bootstrap_pending = true;
         loop {
             tokio::select! {
-                _ = &mut bootstrap, if bootstrap_pending => { bootstrap_pending = false; }
+                result = &mut bootstrap, if bootstrap_pending => {
+                    bootstrap_pending = false;
+                    if let Err(error) = result {
+                        eprintln!("adxlet bootstrap delivery to PID {pid} failed: {error}");
+                    }
+                }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
             if stopped.load(Ordering::Acquire) {

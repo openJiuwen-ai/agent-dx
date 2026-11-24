@@ -673,6 +673,7 @@ class ApplyTests(PlanTests):
         self.lost = set()
         self.instance = None
         self.action_losses = set()
+        self.source_permit = "original-permit"
 
     def get_live(self, path):
         if "/tasks/" in path:
@@ -732,11 +733,11 @@ class ApplyTests(PlanTests):
                 if not body.get("delete_intent"):
                     node.update(pod_uid=body["pod_uid"], node_session_id=body["node_session_id"],
                                 phase="quiescing", control_revision=node["control_revision"] + 1,
-                                permit_id="new-permit" if self.deleted else "original-permit")
+                                permit_id="new-permit" if self.deleted else self.source_permit)
                     node["delete_resource_version"] = None
                 else:
-                    self.assertEqual(body["permit_id"], "original-permit")
-                    self.assertEqual(body["pod_resource_version"], "20")
+                    self.assertEqual(body["permit_id"], node["permit_id"])
+                    self.assertIn(node["delete_resource_version"], (None, body["pod_resource_version"]))
                     node["delete_resource_version"] = body["pod_resource_version"]
                 result = dict(task_id="release-1", epoch=1, node_id="adx-node",
                             pod_uid=node["pod_uid"], observed_pod_uid=node["pod_uid"],
@@ -769,7 +770,9 @@ class ApplyTests(PlanTests):
             elif action == "revoke-delete":
                 self.assertIn(node["delete_resource_version"], (None, body["expected_delete_resource_version"]))
                 self.assertNotEqual(body["pod_resource_version"], body["expected_delete_resource_version"])
-                node.update(delete_resource_version=None, permit_id=None)
+                if node["delete_resource_version"] is not None:
+                    node.update(delete_resource_version=None, permit_id=None)
+                    self.source_permit = "renewed-permit"
             else:
                 self.fail("unknown action: " + action)
             if action not in ("quiesce", "migrate") and not (
@@ -790,7 +793,10 @@ class ApplyTests(PlanTests):
             self.assertEqual(args, ["delete", "--raw", "/api/v1/namespaces/ns/pods/workers-a", "-f", "-"])
             self.assertEqual(body["apiVersion"], "v1")
             self.assertEqual(body["kind"], "DeleteOptions")
-            self.assertEqual(body["preconditions"], {"uid": "pod-uid", "resourceVersion": "20"})
+            self.assertEqual(body["preconditions"]["uid"], "pod-uid")
+            if self.task:
+                self.assertEqual(body["preconditions"]["resourceVersion"],
+                                 self.task["nodes"]["adx-node"]["delete_resource_version"])
             metadata = self.pods["items"][0]["metadata"]
             if any(metadata[k] != v for k, v in body["preconditions"].items()):
                 raise rollout.Refusal("DELETE precondition conflict")
@@ -1170,21 +1176,63 @@ class ApplyTests(PlanTests):
             self.assertNotIn("revoke", outcome["detail"])
             self.assertEqual(rollout.read_json_file(path)["nodes"]["adx-node"]["delete_rv"], "20")
 
-    def test_original_uid_and_changed_rv_remain_pending(self):
-        for changed in (False, True):
-            with self.subTest(changed=changed):
+    def test_original_uid_and_unchanged_rv_retry_identical_delete(self):
+        self.retain_original = True
+        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
+            path = Path(directory) / "journal.json"
+            for _ in range(2):
+                outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
+                                            self.post, self.mutate, sleep=lambda _: None, local=self.local)
+                self.assertEqual(outcome["status"], "pending")
+            self.assertEqual(rollout.read_json_file(path)["nodes"]["adx-node"]["delete_rv"], "20")
+        deletes = [body["preconditions"] for args, body in self.writes
+                   if isinstance(args, list) and args[0] == "delete"]
+        self.assertEqual(deletes, [{"uid": "pod-uid", "resourceVersion": "20"}] * 2)
+        self.assertFalse(self.deleted)
+
+    def test_changed_pod_rv_reauthorizes_after_lost_delete_or_confirmation_reply(self):
+        for lost_at in ("delete", "confirm-before-save", "confirm-after-save"):
+            with self.subTest(lost_at=lost_at), tempfile.TemporaryDirectory() as directory:
                 self.setUp()
-                self.retain_original, self.change_rv = True, changed
-                with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
+                post = self.post
+                first_confirmation = True
+
+                def lose_confirmation(endpoint, body, send=post, persisted=lost_at == "confirm-after-save"):
+                    nonlocal first_confirmation
+                    if first_confirmation and body.get("delete_intent"):
+                        first_confirmation = False
+                        self.pods["items"][0]["metadata"]["resourceVersion"] = "21"
+                        if persisted:
+                            send(endpoint, body)
+                        raise TimeoutError("lost delete confirmation reply")
+                    return send(endpoint, body)
+
+                if lost_at == "delete":
+                    self.retain_original = self.change_rv = True
+                else:
+                    self.post = lose_confirmation
+                try:
                     path = Path(directory) / "journal.json"
-                    for _ in range(2):
-                        outcome = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
+                    with patch.object(rollout.sys, "platform", "linux"):
+                        pending = rollout.apply_pod(self.snapshot, path, 0, self.kube, self.get_live,
                                                     self.post, self.mutate, sleep=lambda _: None, local=self.local)
-                        self.assertEqual(outcome["status"], "pending")
-                    journal = rollout.read_json_file(path)
-                    self.assertEqual(journal["nodes"]["adx-node"]["stage"], "delete")
-                    self.assertEqual(journal["nodes"]["adx-node"]["delete_rv"], "20")
-                self.assertFalse(self.deleted)
+                    self.assertEqual(pending["status"], "pending")
+                    self.retain_original = self.change_rv = False
+                    self.action_losses.add("revoke-delete")
+                    self.drive(path)
+                finally:
+                    self.post = post
+                revokes = [b for p, b in self.writes if isinstance(p, str) and p.endswith("/revoke-delete")]
+                self.assertTrue(revokes)
+                self.assertTrue(all(body == revokes[0] for body in revokes))
+                self.assertEqual(revokes[0]["expected_delete_resource_version"], "20")
+                self.assertEqual(revokes[0]["pod_resource_version"], "21")
+                confirmations = [(b["pod_resource_version"], b["permit_id"]) for p, b in self.writes
+                                 if isinstance(p, str) and p.endswith("/quiesce") and b.get("delete_intent")]
+                self.assertEqual(confirmations, [("20", "original-permit"), ("21", "renewed-permit")])
+                deletes = [b["preconditions"] for p, b in self.writes if isinstance(p, list) and p[0] == "delete"]
+                expected_rvs = ["20", "21"] if lost_at == "delete" else ["21"]
+                self.assertEqual(deletes, [dict(uid="pod-uid", resourceVersion=rv) for rv in expected_rvs])
 
     def test_fake_jsonpatch_tests_are_enforced(self):
         changes = [{"op": "test", "path": "/metadata/uid", "value": "wrong"}] * 4
