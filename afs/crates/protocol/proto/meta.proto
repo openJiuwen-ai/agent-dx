@@ -172,6 +172,14 @@ message RootLocation {
   // 走：新增节点只需声明自己，任何既有节点都不必改配置。
   // 为空表示该 home 没有上报，消费方不得猜测，只能跳过并告警。
   string home_nfs_addr = 6;
+  // 该 root 在 home 上持久准备时使用的身份，与 ActivateRoot 的
+  // local_prepare_id 同源。仅供 home 在启动对账时重建丢失的本地 catalog
+  // 记录使用（目录仍在、记录丢失的场景）；它不是授权凭据，不能替代
+  // RootAccess，也不改变 epoch 或 home 归属。
+  // 只由 ListOwnerRoots 下发（该 RPC 与 home 节点做身份绑定）；
+  // LookupRoot 与 outlet 快照等任意节点可读的回复一律为空。
+  // 为空表示该 root 的记录早于本字段或调用方不是 home，调用方不得据此重建。
+  string local_prepare_id = 7;
 }
 
 // RootReservation 是 reserve 阶段的准备记录。Node 拿到它后只能本地 mkdir、

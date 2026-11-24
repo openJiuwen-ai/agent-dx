@@ -345,6 +345,9 @@ impl RootMeta for ContractMeta {
                 .into_iter()
                 .collect(),
             tombstones: Vec::new(),
+            // This fixture has no durable prepare identity, so startup keeps
+            // refusing a missing catalog record.
+            prepare_ids: Default::default(),
         })
     }
 

@@ -90,6 +90,9 @@ impl RootMeta for Meta {
                 .into_iter()
                 .collect(),
             tombstones: Vec::new(),
+            // No durable prepare identity in this mock: a missing catalog record
+            // must still be refused here.
+            prepare_ids: Default::default(),
         })
     }
     fn acquire_root(&self, _: &RootId, _: RootRight) -> Result<RootGrant> {
