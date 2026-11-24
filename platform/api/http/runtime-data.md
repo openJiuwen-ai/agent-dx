@@ -52,6 +52,17 @@ mkdir 的默认递归行为保留；非递归模式父目录缺失时失败，�
 迁移旧递归调用时显式选择所需 depth。`recursive` 不是此 action 的参数，
 直接传入会返回 `INVALID_ARGUMENT`。
 
+## 目录创建与权限
+
+`file.mkdir` / `file.make_dir` 只接受 `path` 和可选的 `recursive`，不支持 `mode`。
+传入 `mode` 返回 HTTP 400 与 `error_code=INVALID_ARGUMENT`，错误信息为
+`unsupported file argument: mode`，不会创建目录或修改权限。
+
+新目录权限由文件系统创建规则及运行时进程的 umask 决定，不保证固定为 `0755`。
+目标目录已存在时返回 `created=false`，保留其权限；递归创建的父目录也使用默认创建权限。
+调用方需要设置权限时，通过 `process.exec` 执行 `chmod`，例如
+`chmod 700 /work/private`。
+
 ## 文件上传与权限
 
 `POST /direct/{environmentId}/upload` 流式接收文件或 tar 正文。
