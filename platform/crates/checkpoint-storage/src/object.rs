@@ -406,8 +406,8 @@ impl CheckpointAccess for ObjectCheckpointStore {
     async fn begin_capture(&self) -> Result<PathBuf> {
         self.staging.begin_capture().await
     }
-    async fn probe_capture_staging(&self) -> Result<()> {
-        self.staging.probe_capture_staging().await
+    fn probe_capture_staging(&self) -> Result<()> {
+        self.staging.probe_capture_staging()
     }
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
         self.staging.discard_staged(staged).await?;

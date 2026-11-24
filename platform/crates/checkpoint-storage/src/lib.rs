@@ -61,15 +61,13 @@ pub trait CheckpointAccess: Send + Sync {
     }
     /// A private capture directory visible to the execution backend; it may be shared-filesystem backed.
     async fn begin_capture(&self) -> Result<PathBuf>;
-    /// Verify that a private capture directory can be created, written and
-    /// discarded. Publication and restore check access to durable artifacts.
-    async fn probe_capture_staging(&self) -> Result<()> {
-        let staged = self.begin_capture().await?;
-        let write = tokio::fs::write(staged.join(".adx-staging-probe"), [0])
-            .await
-            .map_err(io_error);
-        let cleanup = self.discard_staged(&staged).await;
-        write.and(cleanup)
+    /// Check that a private capture directory can be created, written and
+    /// discarded. This performs blocking filesystem I/O. Run it off the async
+    /// executor. Stores without a staging probe do not qualify for admission.
+    fn probe_capture_staging(&self) -> Result<()> {
+        Err(Error::UnsupportedCapability(
+            adx_core::UnsupportedCapability::CheckpointRestore,
+        ))
     }
     /// Durable input reservations recorded before a running capture starts.
     /// Zero size denotes an incomplete capture, which must never be restored.
@@ -177,6 +175,27 @@ impl LocalCheckpointStore {
 fn io_error(e: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("checkpoint storage: {e}"))
 }
+fn create_capture_directory(root: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let path = root.join(uuid::Uuid::new_v4().to_string());
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .map_err(io_error)?;
+    // Keep the capture usable even if the process has a more restrictive umask.
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)) {
+        let _ = std::fs::remove_dir(&path);
+        return Err(io_error(error));
+    }
+    Ok(path)
+}
+fn probe_capture_directory(root: &Path) -> Result<()> {
+    let staged = create_capture_directory(root)?;
+    let write = std::fs::write(staged.join(".adx-staging-probe"), [0]);
+    let cleanup = std::fs::remove_dir_all(staged);
+    write.and(cleanup).map_err(io_error)
+}
 fn scan(path: &Path) -> Result<u64> {
     let meta = std::fs::symlink_metadata(path).map_err(io_error)?;
     if meta.is_symlink() {
@@ -226,12 +245,10 @@ impl CheckpointAccess for LocalCheckpointStore {
         .map_err(io_error)?
     }
     async fn begin_capture(&self) -> Result<PathBuf> {
-        let path = self.root.join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir(&path).map_err(io_error)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .map_err(io_error)?;
-        Ok(path)
+        create_capture_directory(&self.root)
+    }
+    fn probe_capture_staging(&self) -> Result<()> {
+        probe_capture_directory(&self.root)
     }
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
         self.release(&CheckpointArtifact {

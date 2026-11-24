@@ -152,10 +152,6 @@ class _InvokeResult(dict):
         self.request_id = request_id
 
 
-class _UnsupportedConstrainedCreateRoute(EnvironmentError):
-    """The request matched a known legacy route rejection."""
-
-
 def _is_missing_constrained_create_route(error: EnvironmentHTTPError) -> bool:
     if error.status_code != 404 or error.request_forwarded is True:
         return False
@@ -241,6 +237,21 @@ def _constrained_environment_id(body: Dict[str, Any]) -> Optional[str]:
     if not name:
         return None
     return f"{body.get('namespace') or 'default'}-{name}"
+
+
+def _create_attempt_may_have_started(error: BaseException) -> bool:
+    if isinstance(error, EnvironmentError):
+        return error.outcome != "not_started" or error.request_forwarded is True
+    return isinstance(error, _DIRECT_UNKNOWN_OUTCOME_ERRORS)
+
+
+def _is_attempt_local_create_rejection(error: EnvironmentError) -> bool:
+    """A pre-execution rejection without a result for the logical create."""
+    if error.outcome != "not_started":
+        return False
+    if error.request_forwarded is not None:
+        return not error.request_forwarded
+    return error.operation_id is None and error.environment_id is None
 
 
 class EnvironmentClient:
@@ -371,6 +382,7 @@ class EnvironmentClient:
         last_error: Optional[BaseException] = None
         first_error: Optional[BaseException] = None
         known_operation_id: Optional[str] = None
+        uncertain_attempt = False
         attempts = 0
 
         for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
@@ -388,9 +400,12 @@ class EnvironmentClient:
                 last_error = exc
                 if first_error is None:
                     first_error = exc
+                if constrained and _create_attempt_may_have_started(exc):
+                    uncertain_attempt = True
                 if constrained and isinstance(exc, _RetryableHTTPStatus):
-                    constrained_environment_id = exc.environment_id or constrained_environment_id
-                    known_operation_id = exc.operation_id or known_operation_id
+                    if not _is_attempt_local_create_rejection(exc):
+                        constrained_environment_id = exc.environment_id or constrained_environment_id
+                        known_operation_id = exc.operation_id or known_operation_id
                 if attempt >= _CREATE_MAX_ATTEMPTS:
                     break
                 remaining = deadline - time.monotonic()
@@ -411,25 +426,30 @@ class EnvironmentClient:
                 time.sleep(backoff)
                 continue
             except EnvironmentError as exc:
-                # Preserve the authoritative final contract. A terminal replay
-                # response must not erase the first failed create attempt.
-                if first_error is not None and isinstance(exc, _UnsupportedConstrainedCreateRoute):
-                    raise EnvironmentError(
-                        "a prior constrained create attempt may have reached a compatible server",
-                        request_id=request_id,
-                        code="OUTCOME_UNKNOWN",
-                        retry="same_operation",
-                        outcome="unknown",
-                        operation_id=known_operation_id,
-                        environment_id=constrained_environment_id,
-                        first_error=first_error,
-                    ) from exc
+                if uncertain_attempt and _is_attempt_local_create_rejection(exc):
+                    last_error = exc
+                    break
                 exc.first_error = first_error
                 raise
 
             self._last_create = data
             return data
 
+        if (
+            uncertain_attempt
+            and isinstance(last_error, EnvironmentError)
+            and _is_attempt_local_create_rejection(last_error)
+        ):
+            raise EnvironmentError(
+                "a prior constrained create attempt may have reached the backend",
+                request_id=request_id,
+                code="OUTCOME_UNKNOWN",
+                retry="same_operation",
+                outcome="unknown",
+                operation_id=known_operation_id,
+                environment_id=constrained_environment_id,
+                first_error=first_error,
+            ) from last_error
         if isinstance(last_error, _RetryableHTTPStatus):
             # A complete service response remains a domain/HTTP failure even
             # after retry exhaustion. Preserve payload, status and diagnostics.
@@ -488,7 +508,7 @@ class EnvironmentClient:
                 error = self._http_error(resp, request_id=request_id)
                 if not _is_missing_constrained_create_route(error):
                     raise error
-                raise _UnsupportedConstrainedCreateRoute(
+                raise EnvironmentError(
                     "server does not support constrained environment creation",
                     request_id=request_id,
                     code="UNSUPPORTED",

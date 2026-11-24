@@ -556,8 +556,8 @@ pub struct Adxlet {
 }
 
 impl Adxlet {
-    /// Validate the worker's configured checkpoint storage for capability registration.
-    /// An absent store or failed provider validation withdraws the capability.
+    /// Check writable capture staging for capability registration and admission.
+    /// An absent store or failed staging check withdraws the capability.
     pub async fn check_checkpoint_staging(&self) -> Result<()> {
         self.services.check_checkpoint_staging().await
     }

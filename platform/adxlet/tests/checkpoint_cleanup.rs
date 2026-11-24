@@ -88,10 +88,16 @@ struct RecordingStore {
     local: LocalCheckpointStore,
     fail_remove_call: AtomicUsize,
     remove_calls: Mutex<Vec<String>>,
+    probe_thread: Mutex<Option<std::thread::ThreadId>>,
 }
 
 #[async_trait]
 impl CheckpointAccess for RecordingStore {
+    fn probe_capture_staging(&self) -> Result<()> {
+        *self.probe_thread.lock().unwrap() = Some(std::thread::current().id());
+        Ok(())
+    }
+
     async fn begin_capture(&self) -> Result<PathBuf> {
         self.local.begin_capture().await
     }
@@ -185,12 +191,31 @@ fn coordinator_request(
 }
 
 #[tokio::test]
+async fn staging_probe_runs_off_the_adxlet_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(RecordingStore {
+        local: LocalCheckpointStore::new(root.path().into()).unwrap(),
+        fail_remove_call: AtomicUsize::new(0),
+        remove_calls: Mutex::new(vec![]),
+        probe_thread: Mutex::new(None),
+    });
+    let manager = test_node()
+        .with_checkpointing(store.clone(), Arc::new(Noop))
+        .unwrap();
+
+    manager.check_checkpoint_staging().await.unwrap();
+    let probe_thread = store.probe_thread.lock().unwrap().unwrap();
+    assert_ne!(probe_thread, std::thread::current().id());
+}
+
+#[tokio::test]
 async fn cleanup_rejects_foreign_local_and_wrong_shared_scope_before_removal() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(RecordingStore {
         local: LocalCheckpointStore::new(root.path().into()).unwrap(),
         fail_remove_call: AtomicUsize::new(0),
         remove_calls: Mutex::new(vec![]),
+        probe_thread: Mutex::new(None),
     });
     let manager = test_node()
         .with_checkpointing(store.clone(), Arc::new(Noop))
@@ -258,6 +283,7 @@ async fn cleanup_retries_the_full_idempotent_sequence_after_partial_remove_failu
         local: LocalCheckpointStore::new(root.path().into()).unwrap(),
         fail_remove_call: AtomicUsize::new(2),
         remove_calls: Mutex::new(vec![]),
+        probe_thread: Mutex::new(None),
     });
     let manager = test_node()
         .with_checkpointing(store.clone(), Arc::new(Noop))

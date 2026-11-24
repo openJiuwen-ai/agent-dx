@@ -95,6 +95,8 @@ class CreateRequestTests(unittest.TestCase):
         self.exchanges.append(request)
         if request.url.path == _CONSTRAINED_CREATE and self.constrained_failures:
             failure = self.constrained_failures.pop(0)
+            if isinstance(failure, httpx.TransportError):
+                raise failure
             if failure is None:
                 raise httpx.ReadTimeout("response was lost", request=request)
             if isinstance(failure, httpx.Response):
@@ -226,6 +228,97 @@ class CreateRequestTests(unittest.TestCase):
         self.assertEqual({request.headers["X-Request-Id"] for request in self.exchanges}, {error.request_id})
         self.assertEqual(self.exchanges[0].content, self.exchanges[1].content)
         self.assertEqual(error.environment_id, f"default-{json.loads(self.exchanges[0].content)['name']}")
+
+    def test_constrained_create_preserves_unknown_after_unforwarded_retry_rejection(self):
+        for status, code, forwarded in (
+            (501, "UNSUPPORTED", False),
+            (400, "INVALID_ARGUMENT", None),
+            (409, "CONFLICT", False),
+        ):
+            detail = {"code": code, "retry": "never", "outcome": "not_started"}
+            if forwarded is not None:
+                detail["requestForwarded"] = forwarded
+            self.constrained_failures = [
+                None, httpx.Response(status, json={"message": "create rejected", "error": detail}),
+            ]
+            with (
+                self.subTest(status=status), patch("adx_environment._transport.time.sleep"),
+                self.assertRaises(SDKEnvironmentError) as raised,
+            ):
+                Environment(runtime="runsc", name="named", required_node_capabilities=["checkpoint-restore"],
+                            connection=self.connection)
+            error = raised.exception
+            self.assertEqual((error.code, error.retry, error.outcome), ("OUTCOME_UNKNOWN", "same_operation", "unknown"))
+            self.assertIsInstance(error.first_error, httpx.ReadTimeout)
+            self.assertEqual(error.environment_id, "default-named")
+            self.assertEqual({request.headers["X-Request-Id"] for request in self.exchanges[-2:]}, {error.request_id})
+        self.assertEqual([request.url.path for request in self.exchanges], [_CONSTRAINED_CREATE] * 6)
+
+    def test_constrained_create_preserves_definite_rejections_when_no_attempt_was_sent(self):
+        for first_attempt in ([], [httpx.ConnectError("could not connect")]):
+            rejected = httpx.Response(501, json={"error": {
+                "code": "UNSUPPORTED", "retry": "never", "outcome": "not_started", "requestForwarded": False,
+            }})
+            self.constrained_failures = [*first_attempt, rejected]
+            with (
+                self.subTest(first_attempt=first_attempt), patch("adx_environment._transport.time.sleep"),
+                self.assertRaises(SDKEnvironmentError) as raised,
+            ):
+                Environment(runtime="runsc", required_node_capabilities=["checkpoint-restore"],
+                            connection=self.connection)
+            error = raised.exception
+            self.assertEqual((error.code, error.retry, error.outcome), ("UNSUPPORTED", "never", "not_started"))
+            self.assertIs(error.request_forwarded, False)
+        self.assertEqual([request.url.path for request in self.exchanges], [_CONSTRAINED_CREATE] * 3)
+
+    def test_constrained_create_preserves_authoritative_result_after_lost_response(self):
+        self.constrained_failures = [None]
+        with patch("adx_environment._transport.time.sleep"), Environment(
+            runtime="runsc", required_node_capabilities=["checkpoint-restore"],
+            detached=True, connection=self.connection,
+        ) as environment:
+            self.assertEqual(environment.id, "create-contract")
+
+        detail = {
+            "code": "DEADLINE_EXCEEDED", "retry": "never", "outcome": "not_started",
+            "environmentId": "default-named", "schedulingFailure": {"nodeCount": 3},
+        }
+        final = json.dumps({"status": "timeout", "errorCode": 504, "error": detail})
+        self.constrained_failures = [
+            None,
+            httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=f"event: final\ndata: {final}\n\n"),
+        ]
+        with patch("adx_environment._transport.time.sleep"), self.assertRaises(SDKEnvironmentError) as raised:
+            Environment(runtime="runsc", name="named", required_node_capabilities=["checkpoint-restore"],
+                        connection=self.connection)
+        error = raised.exception
+        self.assertEqual((error.code, error.retry, error.outcome), ("DEADLINE_EXCEEDED", "never", "not_started"))
+        self.assertEqual(error.environment_id, "default-named")
+        self.assertEqual(error.scheduling_failure, {"nodeCount": 3})
+        self.assertEqual([request.url.path for request in self.exchanges], [_CONSTRAINED_CREATE] * 4)
+
+    def test_constrained_create_preserves_unknown_after_unforwarded_retry_exhaustion(self):
+        self.constrained_failures = [
+            {
+                "code": "OUTCOME_UNKNOWN", "retry": "same_operation", "outcome": "unknown",
+                "environmentId": "trusted-environment", "operationId": "operation-19",
+            },
+            *(
+                {
+                    "code": "UNAVAILABLE", "retry": "after_backoff", "outcome": "not_started",
+                    "requestForwarded": False,
+                }
+                for _ in range(2)
+            ),
+        ]
+        with patch("adx_environment._transport.time.sleep"), self.assertRaises(SDKEnvironmentError) as raised:
+            Environment(runtime="runsc", required_node_capabilities=["checkpoint-restore"],
+                        connection=self.connection)
+        error = raised.exception
+        self.assertEqual((error.code, error.retry, error.outcome), ("OUTCOME_UNKNOWN", "same_operation", "unknown"))
+        self.assertEqual((error.environment_id, error.operation_id), ("trusted-environment", "operation-19"))
+        self.assertEqual([request.url.path for request in self.exchanges], [_CONSTRAINED_CREATE] * 3)
+        self.assertEqual({request.headers["X-Request-Id"] for request in self.exchanges}, {error.request_id})
 
     def test_mixed_server_retry_retains_earlier_authoritative_create_identity(self):
         self.constrained_failures = [{

@@ -17,17 +17,20 @@ async fn staging_probe_uses_local_storage_even_when_remote_requests_cannot_run()
     std::fs::remove_dir(&index).unwrap();
     std::fs::write(&index, b"unavailable").unwrap();
 
+    let store = Arc::new(store);
+    let probe = store.clone();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        store.probe_capture_staging(),
+        tokio::task::spawn_blocking(move || probe.probe_capture_staging()),
     )
     .await
     .expect("staging qualification must not contact the object store")
+    .unwrap()
     .unwrap();
 
     let staging = root.path().join("staging");
     std::fs::remove_dir(&staging).unwrap();
-    assert!(store.probe_capture_staging().await.is_err());
+    assert!(store.probe_capture_staging().is_err());
 }
 
 #[tokio::test(start_paused = true)]

@@ -1,6 +1,9 @@
 //! Direct filesystem access: capture and restore keep the same pathname.
 mod mount;
-use super::{io_error, scan, CheckpointAccess, RestoreAccess};
+use super::{
+    create_capture_directory, io_error, probe_capture_directory, scan, CheckpointAccess,
+    RestoreAccess,
+};
 use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
 use mount::MountGuard;
@@ -240,15 +243,11 @@ impl CheckpointAccess for FilesystemCheckpointStore {
     }
     async fn begin_capture(&self) -> Result<PathBuf> {
         self.ready()?;
-        let path = self
-            .root
-            .join("artifacts")
-            .join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir(&path).map_err(io_error)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .map_err(io_error)?;
-        Ok(path)
+        create_capture_directory(&self.root.join("artifacts"))
+    }
+    fn probe_capture_staging(&self) -> Result<()> {
+        self.ready()?;
+        probe_capture_directory(&self.root.join("artifacts"))
     }
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
         let id = self.staged_id(staged)?;

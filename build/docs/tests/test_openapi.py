@@ -40,6 +40,16 @@ class OpenApiContractTests(unittest.TestCase):
         request['requiredNodeCapabilities'] = ['checkpoint-restore.v1']
         self.assertTrue(openapi_check.payload_errors(self.control, schema, request))
 
+    def test_constrained_create_requires_a_valid_explicit_runtime(self):
+        schema = 'ConstrainedEnvironmentRequest'
+        request = {'image': 'tools:1', 'requiredNodeCapabilities': ['checkpoint-restore']}
+        for runtime in ('', 'run/sc', 'x' * 129):
+            for placement in ({'runtime': runtime}, {'rootfs': {'runtime': runtime}}):
+                with self.subTest(placement=placement):
+                    self.assertTrue(openapi_check.payload_errors(self.control, schema, request | placement))
+        request['rootfs'] = {'runtime': 'runsc'}
+        self.assertEqual(openapi_check.payload_errors(self.control, schema, request), [])
+
     def test_missing_runtime_action_and_missing_typed_args_are_detected(self):
         doc = copy.deepcopy(self.data)
         schemas = doc['components']['schemas']

@@ -196,11 +196,11 @@ impl CheckpointServices {
                 Error::Unavailable(format!("checkpoint staging observation: {error}"))
             })?;
         let store = self.store.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             // Keep the permit and finish owned staging cleanup if the caller
             // times out while filesystem operations are still running.
             let _permit = permit;
-            store.probe_capture_staging().await
+            store.probe_capture_staging()
         })
         .await
         .map_err(|error| Error::Unavailable(format!("checkpoint staging observation: {error}")))?

@@ -1162,10 +1162,21 @@ components:
               items: {type: string, enum: [checkpoint-restore]}
           anyOf:
             - required: [runtime]
+              properties:
+                runtime: {$ref: "#/components/schemas/CapabilityRuntime"}
             - required: [rootfs]
               properties:
-                rootfs: {type: object, required: [runtime]}
+                rootfs:
+                  type: object
+                  required: [runtime]
+                  properties:
+                    runtime: {$ref: "#/components/schemas/CapabilityRuntime"}
           not: {required: [snapshotId]}
+    CapabilityRuntime:
+      type: string
+      minLength: 1
+      maxLength: 128
+      not: {pattern: '[^A-Za-z0-9._-]'}
     WorkloadProcess:
       type: object
       additionalProperties: false

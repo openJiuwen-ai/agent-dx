@@ -842,7 +842,7 @@ when combined with alternatives. See [placement rules](https://gitcode.com/openJ
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.
 
-For a fresh Environment, `Environment(runtime="runsc", required_node_capabilities=["checkpoint-restore"])` makes worker capability a hard placement constraint alongside `node_id`, runtime and resources. Every named capability must be advertised for the selected runtime. An empty list uses ordinary creation. A server without the constrained endpoint rejects the request before scheduling. The SDK preserves the operation identity if an earlier constrained attempt has an unknown outcome.
+For a fresh Environment, `Environment(runtime="runsc", required_node_capabilities=["checkpoint-restore"])` makes worker capability a hard placement constraint alongside `node_id`, runtime and resources. Every named capability must be advertised for the selected runtime. An empty list uses ordinary creation. A server without the constrained endpoint rejects the request before scheduling. If an earlier constrained attempt may have started, a later pre-execution rejection leaves the logical outcome unknown. The SDK keeps the same request and Environment identity, along with any known operation identity.
 
 `checkpoint-restore` requires runtime support for checkpoint and restore and writable capture staging on the worker. S3 access is checked when checkpoint operations publish or read artifacts.
 
