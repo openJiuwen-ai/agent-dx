@@ -1,11 +1,14 @@
 """Explicit command waits refresh activity without extending command execution."""
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
-from adx_environment import _command_watch, commands
+from adx_environment import ConnectionConfig, _command_watch, _transport, commands
 from adx_environment._transport import EnvironmentError as SDKEnvironmentError
 from adx_environment.commands import CommandHandle, Commands, CommandWaitTimeout
 from adx_environment.types import CommandStatus
@@ -76,7 +79,7 @@ def test_explicit_wait_outlives_idle_window_and_stops_activity_after_completion(
     assert service.now == 130
     assert len(service.actions) > 2
     assert all(action == "process.get" for _, action, _, _ in service.actions)
-    assert all(0 < options["timeout"] <= 10 for _, _, _, options in service.actions[1:])
+    assert [options["_deadline"] for _, _, _, options in service.actions[1:]] == list(range(20, 141, 10))
     requests = len(service.actions)
     service.now += 61
     assert service.now - service.last_request > 60
@@ -92,6 +95,74 @@ def test_wait_deadline_is_total_and_does_not_kill_or_resubmit(service, asynchron
     assert result.exit_code is None
     assert service.now == 25
     assert all(action == "process.get" for _, action, _, _ in service.actions)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_initial_registry_read_shares_the_wait_deadline(service, asynchronous):
+    original = service.invoke
+
+    def invoke(environment, action, args, **kwargs):
+        assert kwargs.get("_deadline") == 8
+        service.now += 6
+        return original(environment, action, args, **kwargs)
+
+    service.invoke = invoke
+    handle = CommandHandle("cmd-active", service, "environment")
+    result = asyncio.run(handle.wait_async(8)) if asynchronous else handle.wait(8)
+
+    assert result.error_code == "WAIT_TIMEOUT"
+    assert service.now == 8
+    assert service.waits == [2]
+
+
+def test_registry_read_retries_share_the_wait_deadline(service, monkeypatch):
+    requests = []
+
+    def advance(seconds):
+        service.now += seconds
+
+    def handler(request):
+        requests.append(request)
+        advance(0.5 if len(requests) == 1 else 2 - service.now)
+        raise httpx.ReadTimeout("response delayed", request=request)
+
+    monkeypatch.setattr(_transport, "time", SimpleNamespace(monotonic=lambda: service.now, sleep=advance))
+    monkeypatch.setattr(_transport, "_DIRECT_RETRY_BACKOFF_SECONDS", 0.125)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        monkeypatch.setattr(_transport, "acquire_shared_http_client", lambda *_: http)
+        client = _transport.EnvironmentClient(connection=ConnectionConfig(server_address="ingress", token="test-token"))
+        with pytest.raises(SDKEnvironmentError) as raised:
+            CommandHandle("cmd-active", client, "environment").wait(2)
+
+    assert raised.value.code == "OUTCOME_UNKNOWN"
+    assert [request.url.path for request in requests] == ["/direct/environment/invoke"] * 2
+    assert requests[0].headers["X-ADX-Request-ID"] == requests[1].headers["X-ADX-Request-ID"]
+    assert [r.headers["X-ADX-Processing-Timeout-Ms"] for r in requests] == ["2000", "1375"]
+    assert [r.extensions["timeout"]["read"] for r in requests] == [2.0, 1.375]
+    assert not service.waits
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_expired_watch_notification_does_not_start_another_read(service, asynchronous):
+    service.finishes_at = 8
+    handle = CommandHandle("cmd-active", service, "environment")
+
+    result = asyncio.run(handle.wait_async(8)) if asynchronous else handle.wait(8)
+
+    assert result.error_code == "WAIT_TIMEOUT"
+    assert len(service.actions) == 1
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_wait_zero_checks_status_once_without_watching(service, asynchronous):
+    service.finishes_at = 0
+    handle = CommandHandle("cmd-active", service, "environment")
+    result = asyncio.run(handle.wait_async(0)) if asynchronous else handle.wait(0)
+
+    assert result.status == CommandStatus.SUCCEEDED
+    assert result.exit_code == 0
+    assert [action for _, action, _, _ in service.actions] == ["process.get"]
+    assert not service.waits
 
 
 def test_background_submission_without_wait_does_not_start_activity_polling(service):
@@ -125,6 +196,61 @@ def test_async_wait_cancellation_stops_local_wait_without_killing_command(monkey
         assert all(action == "process.get" for _, action, _, _ in client.actions)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("during_poll", [False, True], ids=["initial-read", "poll-read"])
+def test_async_wait_deadline_cancels_snapshot_queued_in_executor(monkeypatch, during_poll):
+    async def scenario():
+        client = IdleCommandService()
+        handle = CommandHandle("cmd-active", client, "environment")
+        loop = asyncio.get_running_loop()
+        occupied = asyncio.Event()
+        release = threading.Event()
+
+        def occupy_worker():
+            loop.call_soon_threadsafe(occupied.set)
+            release.wait(5)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop.set_default_executor(executor)
+            blocker = None
+
+            async def occupy_executor(*_args):
+                nonlocal blocker
+                blocker = loop.run_in_executor(None, occupy_worker)
+                await asyncio.wait_for(occupied.wait(), timeout=2)
+
+            if during_poll:
+                manager = SimpleNamespace(wait_async=occupy_executor)
+                monkeypatch.setattr(_command_watch, "manager_for", lambda _connection: manager)
+            else:
+                await occupy_executor()
+            try:
+                with pytest.raises(SDKEnvironmentError) as raised:
+                    await asyncio.wait_for(handle.wait_async(0.2), timeout=2)
+                assert raised.value.code == "COMMAND_STATE_UNAVAILABLE"
+                assert raised.value.retry == "same_operation"
+                assert raised.value.outcome == "unknown"
+                assert blocker is not None
+                assert not blocker.done()
+            finally:
+                release.set()
+                if blocker is not None:
+                    await blocker
+            await loop.run_in_executor(None, lambda: None)
+
+        assert [action for _, action, _, _ in client.actions] == (["process.get"] if during_poll else [])
+
+    asyncio.run(scenario())
+
+
+def test_async_wait_preserves_timeout_raised_by_snapshot_worker():
+    error = TimeoutError("snapshot worker failed")
+    client = IdleCommandService()
+    client.invoke = Mock(side_effect=error)
+
+    with pytest.raises(TimeoutError, match="snapshot worker failed"):
+        asyncio.run(CommandHandle("cmd-active", client, "environment").wait_async(1))
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

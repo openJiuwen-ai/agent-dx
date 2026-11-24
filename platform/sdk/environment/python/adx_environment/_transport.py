@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import random
+import re
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
@@ -832,12 +833,14 @@ class EnvironmentClient:
         args: Optional[Dict[str, Any]] = None,
         *,
         timeout: Optional[int] = None,
+        _deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """POST /environments/{id}/invoke with ``{action, args}``.
 
         Returns the decoded JSON ``args``/result object. The HTTP timeout is
         derived from the logical *timeout* with a small network buffer, so a slow
-        primitive does not trip the client first.
+        primitive does not trip the client first. An internal absolute deadline
+        caps both budgets across attempts, including their backoff.
         """
         logical_timeout = ADX_GET_DEFAULT_TIMEOUT if timeout is None else timeout
         if (
@@ -853,6 +856,9 @@ class EnvironmentClient:
         deadline = (
             None if processing_deadline is None else processing_deadline + self._connection.communication_margin_seconds
         )
+        if _deadline is not None:
+            processing_deadline = _deadline if processing_deadline is None else min(processing_deadline, _deadline)
+            deadline = _deadline if deadline is None else min(deadline, _deadline)
 
         # Current gateways expose operations only on /direct. A missing
         # Environment route is not evidence that control-plane invoke exists.
@@ -865,11 +871,11 @@ class EnvironmentClient:
                 request_id,
                 deadline,
                 processing_deadline,
-                None if logical_timeout < 0 else logical_timeout,
+                logical_timeout if _deadline is None and logical_timeout >= 0 else None,
             )
             if not fell_back:
                 return _InvokeResult(result, request_id)
-            if logical_timeout >= 0:
+            if _deadline is None and logical_timeout >= 0:
                 processing_deadline = time.monotonic() + logical_timeout
                 deadline = processing_deadline + self._connection.communication_margin_seconds
 
@@ -905,7 +911,7 @@ class EnvironmentClient:
         request_id: str,
         deadline: Optional[float],
         processing_deadline: Optional[float] = None,
-        processing_timeout: Optional[float] = None,
+        retry_processing_timeout: Optional[float] = None,
     ) -> "tuple[Dict[str, Any], bool]":
         """Try the /direct path. Successful calls return ``(result, False)``.
 
@@ -1055,6 +1061,8 @@ class EnvironmentClient:
                 backoff += random.uniform(0, 0.1)
             if backoff <= 0:
                 break
+            if retry_processing_timeout is None and deadline is not None and backoff >= deadline - time.monotonic():
+                break
             logger.warning(
                 "direct invoke transport error; retrying request_id=%s action=%s attempt=%d/%d error=%s",
                 request_id,
@@ -1064,10 +1072,10 @@ class EnvironmentClient:
                 last_error,
             )
             time.sleep(backoff)
-            if processing_timeout is not None:
+            if retry_processing_timeout is not None:
                 # Every permitted retry is a new HTTP attempt with the same
                 # configured timeout, margin and operation identity.
-                processing_deadline = time.monotonic() + processing_timeout
+                processing_deadline = time.monotonic() + retry_processing_timeout
                 deadline = processing_deadline + self._connection.communication_margin_seconds
 
         if pending_resume is not None and not outcome_unknown and terminal_route_error is None:
@@ -1147,7 +1155,17 @@ class EnvironmentClient:
         return min(seconds, 30.0)
 
     @contextmanager
-    def _data_response(self, method: str, url: str, timeout: Optional[float], *, stream=False, **kwargs):
+    def _data_response(
+        self,
+        method: str,
+        url: str,
+        timeout: Optional[float],
+        *,
+        stream=False,
+        deadline: Optional[float] = None,
+        read_idle_timeout: Optional[float] = None,
+        **kwargs,
+    ):
         """Retry only an authoritative not-forwarded reply, with a replayable body.
 
         Generic file transport failures keep the file API's existing recovery
@@ -1173,23 +1191,39 @@ class EnvironmentClient:
         for attempt in range(attempt_limit):
             if rewind is not None:
                 content.seek(rewind)
-            processing_deadline = None if logical < 0 else time.monotonic() + logical
+            if deadline is None:
+                processing_deadline = None if logical < 0 else time.monotonic() + logical
+                transport_timeout = None if logical < 0 else logical + self._connection.communication_margin_seconds
+                if read_idle_timeout is not None:
+                    transport_timeout = httpx.Timeout(transport_timeout, read=read_idle_timeout)
+            else:
+                remaining = self._download_remaining(deadline)
+                processing_deadline = deadline
+                read_timeout = remaining if read_idle_timeout is None else min(remaining, read_idle_timeout)
+                transport_timeout = httpx.Timeout(remaining, read=read_timeout)
             attempt_headers = {**headers, **self._processing_headers(processing_deadline)}
-            transport_timeout = None if logical < 0 else logical + self._connection.communication_margin_seconds
             context = (self._http.stream(method, url, timeout=transport_timeout, headers=attempt_headers, **kwargs)
                        if stream else nullcontext(getattr(self._http, method.lower())(
                            url, timeout=transport_timeout, headers=attempt_headers, **kwargs)))
             with context as response:
+                if deadline is not None:
+                    self._download_remaining(deadline)
                 if response.status_code < 400:
                     yield response
                     return
                 if stream:
-                    response.read()
+                    if deadline is None or response.is_stream_consumed:
+                        response.read()
+                    else:
+                        content = b"".join(self._download_chunks(response.iter_raw(), deadline))
+                        response = httpx.Response(response.status_code, headers=response.headers, content=content)
                 error = self._http_error(response, request_id=request_id)
                 if not self._is_resuming(response, error, request_id) or not replayable or attempt + 1 == attempt_limit:
                     raise error
                 delay = self._resume_retry_delay(response) + random.uniform(0, 0.1)
             response.close()
+            if deadline is not None and delay >= self._download_remaining(deadline):
+                raise EnvironmentError("direct download budget exhausted before retry", code="DOWNLOAD_TIMEOUT")
             time.sleep(delay)
 
     @staticmethod
@@ -1204,6 +1238,27 @@ class EnvironmentClient:
         if deadline is None:
             return None
         return max(0.0, deadline - time.monotonic())
+
+    @staticmethod
+    def _download_remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EnvironmentError("direct download budget exhausted", code="DOWNLOAD_TIMEOUT")
+        return remaining
+
+    @classmethod
+    def _download_chunks(cls, chunks: Iterable[bytes], deadline: Optional[float]) -> Iterable[bytes]:
+        if deadline is None:
+            yield from chunks
+            return
+        source = iter(chunks)
+        while True:
+            cls._download_remaining(deadline)
+            chunk = next(source, None)
+            cls._download_remaining(deadline)
+            if chunk is None:
+                return
+            yield chunk
 
     def upload_file_direct(
         self,
@@ -1394,10 +1449,13 @@ class EnvironmentClient:
         rpc_timeout: Optional[float] = None,
         *,
         download_type: str = "file",
+        expected_size: Optional[int] = None,
     ) -> None:
         """Download a file/tar over the required /direct binary data path."""
         if download_type == "file":
-            self._download_file_resumable(environment_id, remote_path, local_path, rpc_timeout)
+            self._download_file_resumable(
+                environment_id, remote_path, local_path, rpc_timeout, expected_size=expected_size,
+            )
             return
         url = f"{self._direct_base}/{self._safe_id(environment_id)}/download"
         try:
@@ -1415,40 +1473,124 @@ class EnvironmentClient:
         remote_path: str,
         local_path: str,
         rpc_timeout: Optional[float] = None,
+        *,
+        expected_size: Optional[int],
     ) -> None:
+        if expected_size is not None and (type(expected_size) is not int or expected_size < 0):
+            raise ValueError("expected file size must be a non-negative integer")
+        total_timeout = rpc_timeout
+        if total_timeout is None:
+            total_timeout = float(os.environ.get("ADX_DIRECT_DOWNLOAD_TIMEOUT", "300"))
+        idle_timeout = float(os.environ.get("ADX_DIRECT_DOWNLOAD_IDLE_TIMEOUT", "30"))
+        if isinstance(total_timeout, bool) or not isinstance(total_timeout, (int, float)):
+            raise ValueError("direct download timeout must be numeric")
+        if not math.isfinite(total_timeout) or total_timeout == 0 or total_timeout > 86400:
+            raise ValueError("direct download timeout must be finite, nonzero and at most 86400 seconds")
+        if not 0 < idle_timeout <= 86400:
+            raise ValueError("ADX_DIRECT_DOWNLOAD_IDLE_TIMEOUT must be positive and at most 86400 seconds")
+        deadline = None if total_timeout < 0 else time.monotonic() + total_timeout
         url = f"{self._direct_base}/{self._safe_id(environment_id)}/download"
         part_path = f"{local_path}.part"
         parent = os.path.dirname(os.path.abspath(local_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
         attempts = 0
+        total_size = expected_size
         while True:
             offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
-            headers = {"Range": f"bytes={offset}-"} if offset > 0 else None
+            headers = {"Accept-Encoding": "identity"}
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
             try:
                 with self._data_response(
-                    "GET", url, rpc_timeout, stream=True,
+                    "GET", url, total_timeout, stream=True, deadline=deadline, read_idle_timeout=idle_timeout,
                     params={"path": remote_path, "type": "file"},
-                        headers=headers,
+                    headers=headers,
                 ) as resp:
-                    append = offset > 0 and resp.status_code == 206
-                    if offset > 0 and resp.status_code != 206:
-                        append = False
-                    self._write_stream_to_file(resp, part_path, append=append)
+                    response_size = self._download_response_size(resp, offset, total_size)
+                    if expected_size is not None and response_size is not None and response_size != expected_size:
+                        raise EnvironmentError(
+                            f"file download expected {expected_size} bytes but response declares {response_size}",
+                            code="INVALID_DOWNLOAD_RESPONSE",
+                        )
+                    total_size = response_size if expected_size is None else expected_size
+                    append = resp.status_code == 206
+                    expected = None if total_size is None else total_size - (offset if append else 0)
+                    self._write_stream_to_file(resp, part_path, append=append, expected=expected, deadline=deadline)
+                if deadline is not None:
+                    self._download_remaining(deadline)
                 os.replace(part_path, local_path)
                 return
             except httpx.RequestError as e:
+                if deadline is not None:
+                    self._download_remaining(deadline)
                 attempts += 1
                 if attempts > self._resume_max_retries:
                     raise EnvironmentError(f"direct download {environment_id} failed: {e}") from e
 
     @staticmethod
-    def _write_stream_to_file(resp: httpx.Response, path: str, *, append: bool) -> None:
+    def _download_response_size(
+        resp: httpx.Response,
+        offset: int,
+        previous_total: Optional[int],
+    ) -> Optional[int]:
+        if resp.headers.get("Content-Encoding", "identity").lower() != "identity":
+            raise EnvironmentError("file download requires identity encoding", code="INVALID_DOWNLOAD_RESPONSE")
+        content_length = resp.headers.get("Content-Length")
+        length = None
+        if content_length is not None:
+            if not re.fullmatch(r"[0-9]{1,20}", content_length):
+                raise EnvironmentError("invalid file download Content-Length", code="INVALID_DOWNLOAD_RESPONSE")
+            length = int(content_length)
+        if resp.status_code == 200:
+            # A server may ignore Range. Its full response replaces the partial file.
+            return length
+        if resp.status_code != 206:
+            raise EnvironmentError("unexpected file download status", code="INVALID_DOWNLOAD_RESPONSE")
+        content_range = resp.headers.get("Content-Range", "")
+        match = re.fullmatch(r"bytes ([0-9]{1,20})-([0-9]{1,20})/([0-9]{1,20})", content_range, re.IGNORECASE)
+        if match is None:
+            raise EnvironmentError("invalid file download Content-Range", code="INVALID_DOWNLOAD_RESPONSE")
+        start, end, total = map(int, match.groups())
+        if start != offset or not 0 < start <= end or end != total - 1:
+            raise EnvironmentError(
+                "file download Content-Range does not cover requested suffix", code="INVALID_DOWNLOAD_RESPONSE",
+            )
+        if previous_total is not None and total != previous_total:
+            raise EnvironmentError("file size changed during download", code="INVALID_DOWNLOAD_RESPONSE")
+        if length is not None and length != total - offset:
+            raise EnvironmentError("Content-Length does not match Content-Range", code="INVALID_DOWNLOAD_RESPONSE")
+        return total
+
+    @staticmethod
+    def _write_stream_to_file(
+        resp: httpx.Response,
+        path: str,
+        *,
+        append: bool,
+        expected: Optional[int] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
         mode = "ab" if append else "wb"
         with open(path, mode) as f:
-            for chunk in resp.iter_bytes():
+            start = f.tell()
+            received = 0
+            for chunk in EnvironmentClient._download_chunks(resp.iter_bytes(), deadline):
+                received += len(chunk)
+                if expected is not None and received > expected:
+                    f.truncate(start)
+                    raise EnvironmentError(
+                        f"download response exceeded its expected length of {expected} bytes",
+                        code="INVALID_DOWNLOAD_RESPONSE",
+                    )
                 if chunk:
                     f.write(chunk)
+            if expected is not None and received != expected:
+                f.truncate(start)
+                raise EnvironmentError(
+                    f"download response ended at {received} bytes, expected {expected}",
+                    code="INVALID_DOWNLOAD_RESPONSE",
+                )
 
     def download_bytes_direct(
         self,

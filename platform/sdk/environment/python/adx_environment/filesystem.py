@@ -359,10 +359,13 @@ class Filesystem:
     def copy_to_local(self, remote_path: str, local_path: str) -> None:
         """Copy a file or directory **from** the environment to the local machine.
 
+        A direct regular-file copy checks the received size against the remote
+        file metadata before replacing the destination.
         A remote directory arrives as a single tar archive that is extracted
         under ``local_path``.
         """
-        if self.get_info(remote_path).type == "dir":
+        entry = self.get_info(remote_path)
+        if entry.type == "dir":
             os.makedirs(local_path, exist_ok=True)
             fd, tar_path = tempfile.mkstemp(suffix=".tar")
             os.close(fd)
@@ -408,7 +411,10 @@ class Filesystem:
                     os.unlink(part_path)
             return
 
-        self._client.download_file_direct(self._sid, remote_path, local_path, timeout_or_default())
+        # file.stat reports the link itself for symlinks, while /download
+        # follows the link to its target.
+        expected_size = entry.size if entry.type == "file" else None
+        self._client.download_file_direct(self._sid, remote_path, local_path, expected_size=expected_size)
 
     @staticmethod
     def _entry(result: dict) -> EntryInfo:
