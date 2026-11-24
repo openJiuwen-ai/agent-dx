@@ -200,12 +200,9 @@ ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 
 `pause` 能力是 dormant 升级的硬依赖：`Environment::pause` 默认返回 `Unsupported`，部署的 Environment 适配器必须实现 `pause` 才能让休眠沙箱走"立即 checkpoint 再切换"路径。未实现的部署在候选就绪、E1 已休眠时，`checkpoint_candidate` 会返回 `Unsupported`，reconcile 与 `Invalid` 同等处理——记录警告后**停止主动重试**，等待外部变更（alias 改动、成员变化、进程重启）再检查，**不降级为"不 checkpoint 直接切"**。active 升级路径（E1 活跃、E2 保持 Running 切换）不调用 pause，不受此影响。
 
-### pause 超时预算与 reconcile 步骤对齐
+### 灰度 checkpoint 的超时预算
 
-`checkpoint_candidate` 的 pause 预算取自 reconcile 步骤的剩余 deadline：`pause_timeout_seconds(deadline)` = 剩余秒数 clamp 到 `1..=3600`（与 API Server pause 契约一致）。`pause` 方法在 trait 入口校验 `timeout_seconds ∈ 1..=3600`，越界返回 `Invalid`；HTTP/嵌入式适配器的客户端等待预算就是 `timeout_seconds` 本身，**不再叠加 transport 自身的 `request_timeout_seconds`**。这样 pause 的等待上限恒等于 reconcile 步骤的剩余预算，外层 `tokio::time::timeout(request_timeout_seconds, reconcile_binding(...))` 真正 bound 住整步，不会出现"pause 客户端愿意等的时间 > 步骤剩余预算"导致外层先超时、留误导性 `OutcomeUnknown("reconciliation step timed out")` 的情况。
-
-真实 checkpoint 捕获（CRIU dump + 上传共享存储）在大内存沙箱下可能数十秒到数分钟。当 pause 实际耗时超过步骤剩余预算时，pause 返回 `OutcomeUnknown`，`switch_current` 不执行；下一轮 reconcile 查到候选已是 Paused，走 `Paused => ()` 完成切换——升级最终收敛，不会因慢捕获把候选判死。若 Platform 侧捕获失败把候选置为 Failed，下一轮命中 `Failed | Deleted => Conflict`，候选退役、升级失败，需人工排查。现有测试用内存 fake 覆盖了"慢 pause 下一轮收敛"路径，不证明真实 CRIU/共享存储时序。
-
+候选的 checkpoint 使用其模板的 `lifecycle.pause.timeout_seconds`，省略时为 300 秒。创建候选所用的时间不会扣减此预算。每轮协调最多等待 60 秒；当前轮次到期后，下一轮查询同一候选 Env。若仍需提交 pause，Activator 复用该 Env 的操作 ID。平台确认候选已进入 `Paused` 后，Activator 才提交休眠沙箱的版本切换。
 
 ### 创建排队取消与退避
 

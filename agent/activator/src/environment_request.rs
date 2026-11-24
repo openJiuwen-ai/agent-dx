@@ -5,7 +5,6 @@ use adx_agent_core::{
     lifecycle::RetentionPolicy,
     limits,
     network::{PlatformEgress, TemplateNetwork},
-    transport::{capped_deadline, remaining_time},
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -314,18 +313,6 @@ pub fn pause_operation_id(tenant: &str, id: &str) -> Result<String, EnvironmentE
 /// the Environment inherits the create-time template pause policy.
 pub fn pause_input(timeout_seconds: u64) -> Value {
     json!({ "timeoutSeconds": timeout_seconds })
-}
-
-/// Remaining checkpoint capture budget before an absolute deadline, clamped to the
-/// Platform API bounds [1, 3600] seconds. A local cap keeps the request inside the API
-/// Server's own `timeout_seconds` maximum even when the caller's deadline is far away.
-pub fn pause_timeout_seconds(deadline_unix_ms: u64) -> u64 {
-    remaining_time(capped_deadline(
-        Some(deadline_unix_ms),
-        Duration::from_secs(3600),
-    ))
-    .as_secs()
-    .clamp(1, 3600)
 }
 
 /// Validate a durable Paused response. The Platform acknowledges pause only after the

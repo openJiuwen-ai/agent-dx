@@ -1,5 +1,5 @@
 use adx_activator::environment_request::{
-    create_input, operation_id, pause_input, pause_operation_id, pause_timeout_seconds, paused,
+    create_input, operation_id, pause_input, pause_operation_id, paused,
 };
 use adx_agent_core::environment::{CreateEnvironment, EnvironmentError, EnvironmentPhase};
 use adx_agent_core::network::PlatformEgress;
@@ -294,24 +294,6 @@ fn pause_input_carries_only_the_checkpoint_budget() {
     assert_eq!(pause_input(120), json!({"timeoutSeconds":120}));
     // Retention is intentionally absent: the Environment inherits the template policy.
     assert!(pause_input(120).get("retention").is_none());
-}
-
-#[test]
-fn pause_timeout_seconds_clamps_to_the_platform_api_bounds() {
-    let now = adx_agent_core::unix_time_millis();
-    // A far deadline is capped near the 3600s maximum, not an unbounded budget. The
-    // value is the elapsed-seconds remaining under the cap, so sub-second clock skew
-    // between the caller's `now` and the helper's internal read can shave one second;
-    // the contract is the bounded range [1, 3600], not an exact ceiling.
-    let far = pause_timeout_seconds(now + 10_000_000);
-    assert!(
-        (3599..=3600).contains(&far),
-        "far deadline must be capped near 3600s: {far}"
-    );
-    // A near deadline yields at least 1s so the pause is still submitted.
-    assert_eq!(pause_timeout_seconds(now + 1), 1);
-    // A past deadline is clamped to the 1s floor rather than zero.
-    assert_eq!(pause_timeout_seconds(now.saturating_sub(1000)), 1);
 }
 
 #[test]

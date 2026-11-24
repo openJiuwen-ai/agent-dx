@@ -64,7 +64,7 @@ Platform 检测空闲、保存 checkpoint 并释放执行资源。持续 HTTP/WS
 
 Paused/Pausing/Resuming 保留原 AgentBinding generation 和 Sandbox ID；Activator 冷缓存及 bypass 查询可返回该身份，不创建第二个 Sandbox，也不调用 resume。鉴权后的业务 HTTP/WS/SSH 或文件访问经共享 Gateway 请求 Platform EnsureRunning，等待已提交 Running 路由后转发。并发首请求的恢复去重由 Platform 负责；管理查询、未授权访问和被动健康探测不唤醒。`Target` 表示可路由身份，不保证业务进程已 Ready；Failed/Deleted 和未就绪的创建仍返回原有错误。恢复超时沿用原身份重试，不能据此重建实例。
 
-灰度别名升级是触发 checkpoint 的另一种场景：候选 E2 就绪后，若旧 current E1 已休眠，Activator 立即把 E2 pause 成 checkpoint 再切换，砍掉"E2 空转到模板 pause 超时才休眠"的窗口；若 E1 仍活跃则 E2 保持 Running 切换，省一次唤醒恢复。pause 预算取自 reconcile 步骤的剩余 deadline（clamp 到 API 契约 1..=3600），客户端等待预算与步骤预算对齐。详见 [休眠沙箱升级时立即 checkpoint](activator/README.md#休眠沙箱升级时立即-checkpoint)。
+灰度别名升级是触发 checkpoint 的另一种场景：候选 E2 就绪后，若旧 current E1 已休眠，Activator 立即把 E2 pause 成 checkpoint 再切换，砍掉"E2 空转到模板 pause 超时才休眠"的窗口；若 E1 仍活跃则 E2 保持 Running 切换，省一次唤醒恢复。checkpoint 使用候选模板的 `lifecycle.pause.timeout_seconds`（默认 300 秒）。当前协调轮次超时后，下一轮查询同一候选。详见 [休眠沙箱升级时立即 checkpoint](activator/README.md#休眠沙箱升级时立即-checkpoint)。
 
 ## 受管卷
 

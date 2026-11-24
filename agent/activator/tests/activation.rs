@@ -18,6 +18,7 @@ struct Platform {
     lose_create_response: AtomicBool,
     lose_delete_response: AtomicBool,
     pause_blocks: AtomicBool,
+    pause_budget: std::sync::atomic::AtomicU64,
     pause_count: std::sync::atomic::AtomicU32,
     // When set, `get` for this Environment id sleeps `delay` before replying. Used to let the
     // reconciliation deadline expire between activate_environment and the checkpoint decision.
@@ -101,8 +102,9 @@ impl Environment for Platform {
         &self,
         tenant: &str,
         id: &str,
-        _timeout_seconds: u64,
+        timeout_seconds: u64,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.pause_budget.store(timeout_seconds, Ordering::SeqCst);
         self.pause_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.pause_blocks.load(Ordering::SeqCst) {
@@ -752,6 +754,7 @@ async fn dormant_previous_environment_checkpoints_candidate_before_switch() {
     }];
     state.put_alias(&config, Some(&revision)).await.unwrap();
     assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    assert_eq!(platform.pause_budget.load(Ordering::SeqCst), 300);
     let switched = state.binding(&scope).await.unwrap().unwrap();
     assert_eq!(switched.generation, original.generation);
     assert_eq!(switched.current.version, "2");
@@ -931,12 +934,7 @@ async fn failed_previous_environment_takes_the_active_path_without_checkpointing
     assert!(observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
 }
 
-/// A checkpoint capture slower than the reconciliation step budget must not strand the
-/// upgrade: `checkpoint_candidate` reports the missed step, and the next pass observes the
-/// candidate already Paused (the Platform committed it) and commits the switch. This is the
-/// convergence path review 4(b) requires: the client budget is clamped to `timeout_seconds`
-/// (the step's remaining budget), so the outer reconciliation timeout bounds the capture
-/// instead of overshooting it.
+/// A capture can outlive the current pass. The next pass observes its result.
 #[tokio::test]
 async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops() {
     use adx_agent_core::alias::{AliasConfig, VersionWeight};
@@ -947,6 +945,10 @@ async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops(
     let mut two = one.clone();
     two.version = "2".into();
     two.image = "app:2".into();
+    two.lifecycle.pause = Some(lifecycle::PausePolicy {
+        timeout_seconds: 240,
+        ..Default::default()
+    });
     a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
         .await
         .unwrap();
@@ -992,6 +994,7 @@ async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops(
     )
     .await;
     platform.pause_blocks.store(false, Ordering::SeqCst);
+    assert_eq!(platform.pause_budget.load(Ordering::SeqCst), 240);
     // The step reported the missed capture; it did not commit the switch.
     assert!(
         first.is_err(),
@@ -1013,6 +1016,7 @@ async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops(
         .unwrap()
         .phase = EnvironmentPhase::Paused;
     assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    assert_eq!(platform.pause_count.load(Ordering::SeqCst), 1);
     let switched = state.binding(&scope).await.unwrap().unwrap();
     assert_eq!(switched.current.version, "2");
     let observations = platform.observations.lock().unwrap();
@@ -1023,13 +1027,7 @@ async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops(
     );
 }
 
-/// P3-b: when the reconciliation deadline has already expired by the time
-/// `checkpoint_candidate` runs, the step must NOT fire a pointless pause request.
-/// `pause_timeout_seconds` clamps an expired budget back to 1s, so an explicit
-/// `unix_time_millis() >= deadline` guard must precede it. The candidate is ready and E1 is
-/// dormant (the dormant branch is taken); the only thing that should abort the pause is the
-/// expired-deadline guard. Verified by asserting `pause_count` stays zero and the result is
-/// `OutcomeUnknown`.
+/// An expired pass leaves the candidate for the next pass to checkpoint.
 #[tokio::test]
 async fn checkpoint_is_skipped_when_the_step_deadline_already_expired() {
     use adx_agent_core::alias::{AliasConfig, VersionWeight};

@@ -279,8 +279,14 @@ impl Activator {
                 )
                 .await?
                 {
+                    let budget = published
+                        .template
+                        .lifecycle
+                        .pause
+                        .unwrap_or_default()
+                        .timeout_seconds;
                     let paused = self
-                        .checkpoint_candidate(&binding, &secondary.environment, deadline)
+                        .checkpoint_candidate(&binding, &secondary.environment, deadline, budget)
                         .await?;
                     Self::validate_observation(&binding, &secondary.environment, &paused)?;
                 }
@@ -298,25 +304,19 @@ impl Activator {
         Ok(false)
     }
 
-    /// Checkpoint a ready candidate to a Paused Environment before the switch. The
-    /// timeout budget is derived from the reconciliation deadline. The result must be
-    /// Paused: a non-paused reply is an unknown outcome that re-queries on the next pass.
+    /// Only switch once the Platform confirms the candidate is Paused.
     async fn checkpoint_candidate(
         &self,
         binding: &AgentBinding,
         environment: &EnvironmentRef,
         deadline: u64,
+        timeout_seconds: u64,
     ) -> Result<EnvironmentObservation> {
-        // Decline to pause once the step's absolute deadline has passed: an expired
-        // round must not fire a pointless capture request. pause_timeout_seconds clamps
-        // an already-expired budget back to 1s, so the check must precede it. The next
-        // reconcile pass observes the candidate's current phase and advances from there.
         if adx_agent_core::unix_time_millis() >= deadline {
             return Err(Error::OutcomeUnknown(
                 "checkpoint deadline expired before pause; query the same AgentBinding".into(),
             ));
         }
-        let timeout_seconds = environment_request::pause_timeout_seconds(deadline);
         let paused = self
             .environment
             .pause(
