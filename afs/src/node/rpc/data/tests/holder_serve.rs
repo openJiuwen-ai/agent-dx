@@ -45,6 +45,7 @@ impl DfsHolderGrantValidator for FakeMeta {
 
 struct Holder {
     _temp: tempfile::TempDir,
+    metrics: afs_metrics::Registry,
     local: Arc<LocalChunkStore>,
     meta: Arc<FakeMeta>,
     registry: Arc<HolderRegistry>,
@@ -84,8 +85,8 @@ fn holder(keep_ms: u64) -> Holder {
             .with_peer_serve_wait(std::time::Duration::from_millis(50))
             .unwrap(),
     );
-    let metrics =
-        crate::node::metrics::work::ReadWorkMetrics::register(&afs_metrics::Registry::new());
+    let registry_metrics = afs_metrics::Registry::new();
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry_metrics);
     let local = match metrics {
         Ok(metrics) => Arc::new(
             Arc::try_unwrap(local)
@@ -136,6 +137,7 @@ fn holder(keep_ms: u64) -> Holder {
     ));
     Holder {
         _temp: temp,
+        metrics: registry_metrics,
         local,
         meta,
         registry,
@@ -519,6 +521,48 @@ async fn h2_t19_served_after_waiting_for_an_in_flight_chunk() {
     drop(slots);
     let bytes = task.await.unwrap().unwrap();
     assert_eq!(bytes, h.absent.bytes()[..32768]);
+    // review/18 §8.3: the wait, the waiters, the stages are measured.
+    let count = |name: &str, label: &str| histogram_count(&h.metrics, name, label);
+    assert_eq!(
+        count("afs_dfs_read_holder_wait_seconds", "outcome=\"ready\""),
+        1
+    );
+    assert_eq!(count("afs_dfs_read_holder_waiters", ""), 1);
+    for stage in ["authorize", "slot", "serve"] {
+        assert_eq!(
+            count(
+                "afs_dfs_read_holder_request_seconds",
+                &format!("stage=\"{stage}\"")
+            ),
+            1,
+            "{stage}"
+        );
+    }
+    // The slot wait covers the 8 slots held until the Chunk arrived.
+    let slot = histogram_sum(
+        &h.metrics,
+        "afs_dfs_read_holder_request_seconds",
+        "stage=\"slot\"",
+    );
+    assert!(slot >= 0.005, "{slot}");
+}
+
+/// `_count` of a histogram series whose labels contain `label`.
+fn histogram_count(registry: &afs_metrics::Registry, name: &str, label: &str) -> u64 {
+    histogram_value(registry, &format!("{name}_count"), label) as u64
+}
+
+fn histogram_sum(registry: &afs_metrics::Registry, name: &str, label: &str) -> f64 {
+    histogram_value(registry, &format!("{name}_sum"), label)
+}
+
+fn histogram_value(registry: &afs_metrics::Registry, series: &str, label: &str) -> f64 {
+    afs_metrics::encode_text(registry)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with(series) && line.contains(label))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
 }
 
 /// Absent and not in flight, or `wait_ms` 0: not ready at once.
@@ -735,6 +779,32 @@ async fn h2_p1_crc_chunk_is_read_from_a_holder_end_to_end() {
         })
         .unwrap();
     assert_eq!(served.parse::<u64>().unwrap(), 2 * staged.chunk.length);
+    // review/18 §8.3: each attempt by source role and outcome; route stages.
+    let count = |name: &str, label: &str| histogram_count(&registry_metrics, name, label);
+    let attempts = "afs_dfs_read_peer_attempt_seconds";
+    let holder_ok = afs_metrics::encode_text(&registry_metrics)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            line.starts_with(&format!("{attempts}_count"))
+                && line.contains("role=\"peer_holder\"")
+                && line.contains("outcome=\"ok\"")
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum::<u64>();
+    assert_eq!(holder_ok, 2);
+    assert_eq!(
+        count(attempts, "role=\"durable\""),
+        0,
+        "the writer is never tried"
+    );
+    for stage in ["sources", "holder_list", "remote", "staging"] {
+        assert_eq!(
+            count("afs_dfs_read_route_seconds", &format!("stage=\"{stage}\"")),
+            2,
+            "{stage}"
+        );
+    }
     server.abort();
 }
 

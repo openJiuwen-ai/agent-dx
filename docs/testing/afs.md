@@ -648,6 +648,10 @@ dropped_partial_ranges，单位是chunk或段的事件次数；dropped_partial�
 `afs_dfs_read_source_bytes_total{role}`（local、durable、verified_cache、object、peer_holder；peer_holder是同时在读同一版本的共享读者（版本持有者）；object是BLAKE3整对象路径，不区分副本；单位是交付给本Node
 读者的正文字节），以及`afs_dfs_read_cache_resources{resource}`（queue／partial／segment的当前、峰值、上限字节，按实际持有的缓冲区容量计，segment含空闲复用缓冲；计入读者内存）和
 `afs_dfs_read_cache_work_nanoseconds_total{stage}`／`afs_dfs_read_cache_work_total{stage}`（queue_wait、install、reconcile）。
+读者共享（`dfs_read_share_concurrent`）另有只计量的耗时直方图（秒）：持有者侧`afs_dfs_read_holder_wait_seconds{outcome}`（ready、not_ready、timeout：一次在途等待的时长与结局）、
+`afs_dfs_read_holder_waiters`（一次等待开始时本持有者上的等待者数，含自己）、`afs_dfs_read_holder_request_seconds{stage}`（authorize：Meta验证含排队；slot：取读槽；serve：槽内供数）；
+读者侧`afs_dfs_read_peer_attempt_seconds{role,outcome}`（一次远端读尝试，role为durable、verified_cache、peer_holder，outcome为ok、not_ready、busy、denied、error）与
+`afs_dfs_read_route_seconds{stage}`（sources：取来源；holder_list：取持有者名单；remote：远端读全程；staging：交给拼装与安装）。带标签的直方图在第一次采样后才出现。
 判读：`dropped_queue_full`>0且install耗时之和接近窗口时长，为安装能力不足；install耗时低而queue_wait均值高并与reconcile时段重叠，为安装被阻塞。只有写者持有持久副本时，各读者verified_cache字节之和应等于各读者
 送出的`afs_dfs_payload_bytes_total{direction="send",operation="read"}`之和；不一致时该轮证据不全。
 

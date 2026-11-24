@@ -2025,6 +2025,22 @@ fn h2_a1_in_flight_only_while_fetching_from_a_copy() {
         !meta.lookup_saw_in_flight.load(Ordering::SeqCst),
         "not in flight while looking up sources or holders"
     );
+    // review/18 §8.3: each attempt is timed under its source role and outcome.
+    let attempts = |role: &str, outcome: &str| {
+        afs_metrics::encode_text(&fixture.registry)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.starts_with("afs_dfs_read_peer_attempt_seconds_count")
+                    && line.contains(&format!("role=\"{role}\""))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum::<u64>()
+    };
+    assert_eq!(attempts("peer_holder", "not_ready"), 1);
+    assert_eq!(attempts("durable", "ok"), 1);
+    assert_eq!(attempts("peer_holder", "ok"), 0);
 }
 
 /// review/18 a2: reads that find the holder list missing at the same time

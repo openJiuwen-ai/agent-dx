@@ -442,6 +442,11 @@ impl HolderServe {
         }
     }
 
+    /// Requests waiting here now (measurement).
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiters.lock().unwrap_or_else(|e| e.into_inner()).total
+    }
+
     /// A waiter slot for `peer`, or `None` when the holder or the peer
     /// already has as many waiters as it allows.
     pub(crate) fn wait_slot(&self, peer: &str) -> Option<WaitSlot<'_>> {

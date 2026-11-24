@@ -849,6 +849,14 @@ impl DfsChunksService {
             return Err(holder_denied());
         };
         let event = |name: &'static str| local.record_read_cache_event(name);
+        let timing = local
+            .read_work_metrics()
+            .map(|metrics| metrics.share.clone());
+        let timed = |record: &dyn Fn(&crate::node::metrics::work::ShareTimingMetrics)| {
+            if let Some(timing) = &timing {
+                record(timing);
+            }
+        };
         let denied = |status: Status| {
             if status.code() == tonic::Code::PermissionDenied {
                 event("holder_denied");
@@ -859,10 +867,12 @@ impl DfsChunksService {
         // 1. one kind of grant, this Node, this peer, the request's version
         let grant = holders.check_request(&peer, &request).map_err(denied)?;
         // 2. Meta, outside the read slots
+        let asked = std::time::Instant::now();
         let mut authorized = holders
             .authorize(&peer, &grant, false)
             .await
             .map_err(denied)?;
+        timed(&|t| t.holder_request("authorize", asked.elapsed()));
         // 3. ranges inside the version's layout
         if let Err(status) = holders.check_ranges(&grant, &request.operations) {
             if status.code() == tonic::Code::PermissionDenied {
@@ -898,6 +908,8 @@ impl DfsChunksService {
                 return Err(holder_not_ready());
             };
             event("holder_waited");
+            timed(&|t| t.holder_waiters(holders.waiting()));
+            let waiting = std::time::Instant::now();
             let deadline = tokio::time::Instant::now() + budget;
             loop {
                 let changed = holders.in_flight.changed();
@@ -908,6 +920,7 @@ impl DfsChunksService {
                 // The version may stop being shared while this waits (S3).
                 if !holders.registry.is_shared(&grant.file_version_id) || !all_in_flight(&missing) {
                     event("holder_not_ready");
+                    timed(&|t| t.holder_wait("not_ready", waiting.elapsed()));
                     return Err(holder_not_ready());
                 }
                 if tokio::time::timeout_at(deadline, changed).await.is_err() {
@@ -916,9 +929,11 @@ impl DfsChunksService {
                         break;
                     }
                     event("holder_wait_timeout");
+                    timed(&|t| t.holder_wait("timeout", waiting.elapsed()));
                     return Err(holder_not_ready());
                 }
             }
+            timed(&|t| t.holder_wait("ready", waiting.elapsed()));
             // Ranges again after the wait: the version may have stopped being
             // shared (code review S3).
             if let Err(status) = holders.check_ranges(&grant, &request.operations) {
@@ -937,6 +952,7 @@ impl DfsChunksService {
                 .map_err(denied)?;
         }
         // 6. a fresh admission deadline after any wait (R2), then a slot
+        let slot_wait = std::time::Instant::now();
         let admission_deadline = local.peer_serve_deadline();
         let permit = match self.read_permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -948,6 +964,7 @@ impl DfsChunksService {
             .map_err(|_| Status::resource_exhausted("DFS peer read admission deadline exceeded"))?
             .map_err(|_| Status::unavailable("DFS peer read admission is closed"))?,
         };
+        timed(&|t| t.holder_request("slot", slot_wait.elapsed()));
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         let metrics = self.payload_metrics.clone();
@@ -972,15 +989,20 @@ impl DfsChunksService {
                 return;
             }
             local.record_read_cache_event("holder_served");
+            let serving = std::time::Instant::now();
             // 8. serve
-            if let Err(error) = stream_dfs_ranges_until(
+            let served = stream_dfs_ranges_until(
                 &local,
                 &request,
                 &sender,
                 metrics.as_ref(),
                 admission_deadline,
                 crc_mode,
-            ) {
+            );
+            if let Some(timing) = &timing {
+                timing.holder_request("serve", serving.elapsed());
+            }
+            if let Err(error) = served {
                 let _ = sender.blocking_send(Err(error));
             }
         });

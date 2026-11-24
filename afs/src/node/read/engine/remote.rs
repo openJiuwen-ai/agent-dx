@@ -65,6 +65,13 @@ fn keep_fetched(marks: Vec<crate::node::read::holders::InFlightGuard>) {
 }
 
 impl DfsReadEngine {
+    /// Measurement only (review/18 §8.3): one remote read stage since `since`.
+    pub(super) fn time_route(&self, stage: &'static str, since: Instant) {
+        if let Some(metrics) = self.local.read_work_metrics() {
+            metrics.share.route(stage, since.elapsed());
+        }
+    }
+
     pub(super) async fn read_remote_ranges_async(
         &self,
         batch: &ReadBatch,
@@ -234,7 +241,30 @@ impl DfsReadEngine {
             }
             _ => Vec::new(),
         };
+        let attempted = Instant::now();
         let result = self.try_peer_before(round.deadline, choices, fetch).await;
+        if let Some(metrics) = self.local.read_work_metrics() {
+            let source = &attempt.operations[0].source;
+            let role = if source.holder_grant.is_some() {
+                "peer_holder"
+            } else if source.role == CopyRole::VerifiedCache {
+                "verified_cache"
+            } else {
+                "durable"
+            };
+            let outcome = match &result {
+                Ok(()) => "ok",
+                Err(error) if crate::node::fault::classify::peer_not_ready(error) => "not_ready",
+                Err(error) if crate::node::fault::classify::retryable_backpressure(error) => "busy",
+                Err(error) if crate::node::fault::classify::read_authority_rejected(error) => {
+                    "denied"
+                }
+                Err(_) => "error",
+            };
+            metrics
+                .share
+                .peer_attempt(role, outcome, attempted.elapsed());
+        }
         if result.is_ok() {
             keep_fetched(marks);
         } else {
