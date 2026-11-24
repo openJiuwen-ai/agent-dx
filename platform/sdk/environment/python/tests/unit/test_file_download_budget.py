@@ -216,6 +216,25 @@ def test_continuous_progress_cannot_extend_total_download_time(client_for, clock
     assert not target.exists()
 
 
+def test_expired_deadline_does_not_advance_download_stream(clock):
+    consumed = []
+
+    def source():
+        for chunk in (b"a", b"b"):
+            consumed.append(chunk)
+            yield chunk
+
+    chunks = iter(_transport.EnvironmentClient._download_chunks(source(), deadline=5))
+    assert next(chunks) == b"a"
+    clock.advance(6)
+
+    with pytest.raises(_transport.EnvironmentError) as error:
+        next(chunks)
+
+    assert error.value.code == "DOWNLOAD_TIMEOUT"
+    assert consumed == [b"a"]
+
+
 def test_streamed_error_body_uses_the_same_download_deadline(client_for, clock, tmp_path):
     def handler(_request):
         return httpx.Response(

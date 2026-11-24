@@ -1248,12 +1248,17 @@ class EnvironmentClient:
 
     @classmethod
     def _download_chunks(cls, chunks: Iterable[bytes], deadline: Optional[float]) -> Iterable[bytes]:
-        for chunk in chunks:
-            if deadline is not None:
-                cls._download_remaining(deadline)
-            yield chunk
-        if deadline is not None:
+        if deadline is None:
+            yield from chunks
+            return
+        source = iter(chunks)
+        while True:
             cls._download_remaining(deadline)
+            chunk = next(source, None)
+            cls._download_remaining(deadline)
+            if chunk is None:
+                return
+            yield chunk
 
     def upload_file_direct(
         self,

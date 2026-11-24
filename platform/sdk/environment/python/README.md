@@ -717,10 +717,10 @@ to 30 seconds of HTTP read inactivity. `ADX_DIRECT_DOWNLOAD_TIMEOUT` defaults
 to 300 seconds for the file transfer after the initial metadata lookup. A negative
 total disables the shared deadline while retaining the read-inactivity timeout.
 The SDK caps each request's phase timeouts and deferral retries using the remaining
-budget, and checks the deadline when it receives body chunks and before publishing
-the destination. A synchronous read already in progress returns according to its
-HTTPX timeout before the SDK can check the deadline again. Directory tar downloads
-and uploads use their existing timeouts.
+budget, and checks the deadline before and after reading each body chunk and before
+publishing the destination. A synchronous read already in progress returns
+according to its HTTPX timeout before the SDK can check the deadline again.
+Directory tar downloads and uploads use their existing timeouts.
 
 A `206` resume response must cover the requested offset through the end of the
 file, with a consistent total size and matching body length. A
@@ -839,8 +839,10 @@ request or change checkpoint admission. An explicit checkpoint can still capture
 the running command; automatic idle checkpointing waits for client activity to end.
 For watch-backed waits with a positive `timeout`, the initial registry read,
 watch intervals, subsequent reads and transport retries share the same deadline.
-HTTP request timeouts are enforced per network phase. Retryable failures in
-periodic reads during a checkpoint or transport interruption keep their
+For `wait_async()`, this includes waiting for a thread to run the registry read.
+If this client-side timer expires, the SDK reports `COMMAND_STATE_UNAVAILABLE`
+with an unknown outcome. HTTP request timeouts are enforced per network phase.
+Retryable failures in periodic reads during a checkpoint or transport interruption keep their
 30-second retry ceiling within the caller's remaining budget. Terminal errors
 and exhausted retries preserve their exception metadata. If the command was
 last observed running and the watch budget expires, the wait returns

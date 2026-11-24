@@ -11,7 +11,8 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Union
+from functools import partial
+from typing import Callable, Dict, List, Optional, TypeVar, Union
 
 import httpx
 
@@ -27,6 +28,7 @@ _POLL_INTERVAL = 10
 _POLL_RETRY_DELAY = 1  # seconds between failed wait calls
 _WAIT_READ_RETRY_BUDGET = 30.0
 _COMMAND_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_WaitResult = TypeVar("_WaitResult")
 
 
 def _retryable_wait_read(error: Union[httpx.TransportError, EnvironmentError]) -> bool:
@@ -357,6 +359,38 @@ class CommandHandle:
     def poll(self) -> CommandStatus:
         return self._snapshot().status
 
+    def _async_wait_deadline_error(self) -> EnvironmentError:
+        return EnvironmentError(
+            f"command {self.command_id} state could not be observed before the wait deadline",
+            code="COMMAND_STATE_UNAVAILABLE",
+            retry="same_operation",
+            outcome="unknown",
+            operation_id=self.command_id,
+            environment_id=self._sid,
+        )
+
+    async def _wait_in_worker(self, work: Callable[[], _WaitResult], deadline: Optional[float]) -> _WaitResult:
+        if deadline is None:
+            return await asyncio.to_thread(work)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._async_wait_deadline_error()
+
+        def run() -> _WaitResult:
+            if time.monotonic() >= deadline:
+                raise self._async_wait_deadline_error()
+            return work()
+
+        task = asyncio.create_task(asyncio.to_thread(run))
+        try:
+            completed, _ = await asyncio.wait((task,), timeout=remaining)
+            if completed:
+                return task.result()
+            raise self._async_wait_deadline_error()
+        finally:
+            task.cancel()
+
     def _wait_snapshot(self, deadline: Optional[float]) -> dict:
         retry_deadline = time.monotonic() + _WAIT_READ_RETRY_BUDGET
         if deadline is not None:
@@ -381,7 +415,7 @@ class CommandHandle:
         while True:
             try:
                 read_deadline = min(time.monotonic() + _POLL_INTERVAL, retry_deadline)
-                return await asyncio.to_thread(self._raw_snapshot, deadline=read_deadline)
+                return await self._wait_in_worker(partial(self._raw_snapshot, deadline=read_deadline), read_deadline)
             except (httpx.TransportError, EnvironmentError) as error:
                 if not _retryable_wait_read(error):
                     raise
@@ -449,16 +483,16 @@ class CommandHandle:
         Watch notifications wake the wait early. Periodic registry reads keep
         caller activity visible while the remote command is still running.
         """
-        connection = getattr(self._client, "_connection", None)
-        if connection is None:
-            return await asyncio.to_thread(self.wait, timeout)
-
-        increment("command_wait_total")
         started = time.monotonic()
         deadline = None if timeout is None else started + max(0, timeout)
         read_deadline = started + _POLL_INTERVAL if deadline == started else deadline
+        connection = getattr(self._client, "_connection", None)
+        if connection is None:
+            return await self._wait_in_worker(partial(self.wait, timeout), read_deadline)
+
+        increment("command_wait_total")
         try:
-            snapshot = await asyncio.to_thread(self._raw_snapshot, deadline=read_deadline)
+            snapshot = await self._wait_in_worker(partial(self._raw_snapshot, deadline=read_deadline), read_deadline)
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
                 from ._command_watch import manager_for
 
