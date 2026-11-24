@@ -409,27 +409,26 @@ impl OwnerHixlReader {
                 || guard.write_tickets >= MAX_SESSION_WRITE_TICKETS
                 || idle
         });
-        if stale && let Some(session) = guard.session.take() {
-            let parked = guard.parked.take();
+        if stale && let Some(session) = guard.session.clone() {
+            if session.reply.home_session_id == access.home_session_id {
+                // Keep the session and its ticket if the release is not acknowledged.
+                // Closing it while Home still owns an export would quarantine Home.
+                tokio::time::timeout(
+                    remaining(deadline)?,
+                    guard.flush_parked(&session, self.timeout, self.metrics.as_ref()),
+                )
+                .await
+                .map_err(|_| admission())??;
+            }
+            let has_unconfirmed_release = guard.parked.take().is_some();
+            guard.session = None;
             let metrics = self.metrics.clone();
             let timeout = self.timeout;
             let cleanup = tokio::spawn(async move {
-                if let Some(ticket) = parked {
-                    let started = Instant::now();
-                    let released = release_slots(
-                        &session,
-                        &ticket,
-                        HixlReleaseOutcome::Completed,
-                        true,
-                        timeout,
-                    )
-                    .await;
-                    observe_optional(
-                        metrics.as_ref(),
-                        Operation::Release,
-                        started.elapsed(),
-                        released.is_ok(),
-                    );
+                // An old-generation ticket cannot be released against a new Home.
+                // Leave the previous Home's expiry logic to handle its old session.
+                if has_unconfirmed_release {
+                    return;
                 }
                 let started = Instant::now();
                 let closed = close_session(&session, timeout).await;
@@ -920,8 +919,40 @@ struct HomeSlot {
     touched: Option<Instant>,
     write_tickets: usize,
     write_window: Option<write::WriteWindow>,
-    /// Completed release of the session's last read, not yet sent to Home.
+    /// Completed release of the session's last read, not yet acknowledged by Home.
     parked: Option<ReadTicket>,
+}
+
+impl HomeSlot {
+    async fn flush_parked(
+        &mut self,
+        session: &HomeSession,
+        timeout: Duration,
+        metrics: Option<&HixlMetrics>,
+    ) -> afs_error::Result<()> {
+        let Some(ticket) = &self.parked else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let result = release_slots(
+            session,
+            ticket,
+            HixlReleaseOutcome::Completed,
+            true,
+            timeout,
+        )
+        .await;
+        observe_optional(
+            metrics,
+            Operation::Release,
+            started.elapsed(),
+            result.is_ok(),
+        );
+        if result.is_ok() {
+            self.parked = None;
+        }
+        result
+    }
 }
 
 /// Up to `sessions_per_home` control sessions of one Home.
@@ -1083,25 +1114,14 @@ impl ParkedFlush {
         {
             return;
         }
-        let (Some(ticket), Some(session)) = (guard.parked.take(), guard.session.clone()) else {
+        let Some(session) = guard.session.clone() else {
             return;
         };
-        let started = Instant::now();
-        let result = release_slots(
-            &session,
-            &ticket,
-            HixlReleaseOutcome::Completed,
-            true,
-            self.timeout,
-        )
-        .await;
-        observe_optional(
-            self.metrics.as_ref(),
-            Operation::Release,
-            started.elapsed(),
-            result.is_ok(),
-        );
-        if result.is_err() {
+        if guard
+            .flush_parked(&session, self.timeout, self.metrics.as_ref())
+            .await
+            .is_err()
+        {
             session.poisoned.store(true, Ordering::Release);
         }
     }

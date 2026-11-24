@@ -305,6 +305,7 @@ struct Fixture {
     handler: Arc<FileHandler>,
     write_prepares: Arc<AtomicUsize>,
     lost_read_prepare_replies: Arc<AtomicUsize>,
+    lost_read_releases: Arc<AtomicUsize>,
     /// The Home window service; attached to the server only with `home_hixl`.
     home: Arc<OwnerHixlService>,
     registry: afs_metrics::Registry,
@@ -521,11 +522,15 @@ async fn fixture_with_exports(
     fixture_with_commit_loss(policy, home_hixl, source, exports, reader_slot, park, None).await
 }
 
+#[derive(Default)]
 struct CommitLoss {
     requests: Arc<StdMutex<Vec<prost::bytes::Bytes>>>,
     drop_request: bool,
     drop_recovery: bool,
     late_commit: Option<LateCommit>,
+    forward_commit: bool,
+    stall_commit_reply: bool,
+    stall_first_abort: AtomicBool,
 }
 
 struct LateCommit {
@@ -570,6 +575,8 @@ async fn fixture_with_commit_loss(
     let prepare_count = write_prepares.clone();
     let lost_read_prepare_replies = Arc::new(AtomicUsize::new(0));
     let lose_prepare_replies = lost_read_prepare_replies.clone();
+    let lost_read_releases = Arc::new(AtomicUsize::new(0));
+    let lose_releases = lost_read_releases.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .layer(tower::layer::layer_fn(
@@ -577,6 +584,7 @@ async fn fixture_with_commit_loss(
                     let lost_commits = lost_commits.clone();
                     let prepare_count = prepare_count.clone();
                     let lose_prepare_replies = lose_prepare_replies.clone();
+                    let lose_releases = lose_releases.clone();
                     tower::service_fn(move |request: axum::http::Request<tonic::body::Body>| {
                         use tower::ServiceExt;
                         let lose_prepare_reply =
@@ -590,17 +598,36 @@ async fn fixture_with_commit_loss(
                         if request.uri().path().ends_with("/PrepareWriteHixl") {
                             prepare_count.fetch_add(1, Ordering::SeqCst);
                         }
+                        let lose_release = request.uri().path().ends_with("/ReleaseHixlRead")
+                            && lose_releases
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                    left.checked_sub(1)
+                                })
+                                .is_ok();
                         let inner = inner.clone();
                         let lost_commits = lost_commits.clone();
                         async move {
+                            if lose_release {
+                                return Ok(tonic::Status::unavailable(
+                                    "injected lost read release",
+                                )
+                                .into_http());
+                            }
                             if let Some(loss) = lost_commits {
-                                if loss.drop_recovery
-                                    && request.uri().path().ends_with("/AbortWriteHixl")
-                                {
-                                    return Ok(tonic::Status::unavailable("injected lost Abort")
+                                if request.uri().path().ends_with("/AbortWriteHixl") {
+                                    if loss.stall_first_abort.swap(false, Ordering::SeqCst) {
+                                        return std::future::pending().await;
+                                    }
+                                    if loss.drop_recovery {
+                                        return Ok(tonic::Status::unavailable(
+                                            "injected lost Abort",
+                                        )
                                         .into_http());
+                                    }
                                 }
-                                if !request.uri().path().ends_with("/CommitWriteHixl") {
+                                if loss.forward_commit
+                                    || !request.uri().path().ends_with("/CommitWriteHixl")
+                                {
                                     return inner.oneshot(request).await;
                                 }
                                 let (parts, body) = request.into_parts();
@@ -624,6 +651,9 @@ async fn fixture_with_commit_loss(
                                     }
                                 } else if !loss.drop_request {
                                     let _ = inner.oneshot(request).await?;
+                                }
+                                if loss.stall_commit_reply {
+                                    return std::future::pending().await;
                                 }
                                 return Ok(tonic::Status::deadline_exceeded(
                                     "injected lost commit reply",
@@ -680,6 +710,7 @@ async fn fixture_with_commit_loss(
         handler,
         write_prepares,
         lost_read_prepare_replies,
+        lost_read_releases,
         home,
         registry,
         _server: server,
@@ -1121,6 +1152,39 @@ async fn a_stale_session_sends_its_parked_release_before_closing() {
     // Closing with the window still pinned would have quarantined Home.
     assert_eq!(fixture.home_quarantines(), 0);
     assert_eq!(operations(&fixture.registry, "release"), 1);
+    assert_eq!(fixture.negotiations(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_idle_release_is_retried_before_closing_the_session() {
+    let fixture = parking_fixture(Duration::from_millis(300)).await;
+    fixture
+        .lost_read_releases
+        .store(2 * RELEASE_ATTEMPTS, Ordering::SeqCst);
+    let file = fixture
+        .with_open(libc::O_RDONLY, |client, file| {
+            assert_eq!(read(&client, &file, 0, 1000).unwrap(), content()[..1000]);
+            file
+        })
+        .await;
+    fixture
+        .wait_until("the idle release failed", |fixture| {
+            operations(&fixture.registry, "release") == 1
+        })
+        .await;
+    assert!(fixture.exports.active() > 0);
+    let retry_file = file.clone();
+    let error = fixture
+        .with_client(move |client| read(&client, &retry_file, SLOT as u64, 1000).unwrap_err())
+        .await;
+    assert_eq!(error.kind(), afs_error::ErrorKind::Unavailable);
+    assert_eq!(fixture.home_quarantines(), 0);
+    assert_eq!(fixture.negotiations(), 1);
+    let next = fixture
+        .with_client(move |client| read(&client, &file, SLOT as u64, 1000).unwrap())
+        .await;
+    assert_eq!(next, content()[SLOT..SLOT + 1000]);
+    assert_eq!(fixture.home_quarantines(), 0);
     assert_eq!(fixture.negotiations(), 2);
 }
 
@@ -2564,9 +2628,7 @@ async fn writer_recovers_append_receipt_after_lost_commit_replies() {
         RELEASE_PARK,
         Some(CommitLoss {
             requests: lost.clone(),
-            drop_request: false,
-            drop_recovery: false,
-            late_commit: None,
+            ..Default::default()
         }),
     )
     .await;
@@ -2594,6 +2656,42 @@ async fn writer_recovers_append_receipt_after_lost_commit_replies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_recovers_append_receipt_after_commit_attempts_time_out() {
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let fixture = fixture_with_commit_loss(
+        policy(DataMode::Auto),
+        true,
+        MemorySource::new(content(), SLOT),
+        Arc::new(MemoryExports::new(SLOT, 2)),
+        SLOT,
+        RELEASE_PARK,
+        Some(CommitLoss {
+            requests: requests.clone(),
+            stall_commit_reply: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let written = fixture
+        .with_open(libc::O_WRONLY | libc::O_APPEND, |peer, file| {
+            peer.write(&grant(), &file, content().len() as u64, b"once")
+                .unwrap()
+        })
+        .await;
+    assert_eq!(written, 4);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), PREPARE_ATTEMPTS);
+    assert!(requests.iter().all(|request| request == &requests[0]));
+    assert_eq!(fixture.native_writes(), 1);
+    assert_eq!(fixture.handler.grpc_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.exports.active(), 0);
+    assert_eq!(
+        *fixture.source.data.lock().unwrap(),
+        [content(), b"once".to_vec()].concat()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writer_distinguishes_fenced_lost_requests_from_unreachable_recovery() {
     for drop_recovery in [false, true] {
         let fixture = fixture_with_commit_loss(
@@ -2604,10 +2702,9 @@ async fn writer_distinguishes_fenced_lost_requests_from_unreachable_recovery() {
             SLOT,
             RELEASE_PARK,
             Some(CommitLoss {
-                requests: Arc::default(),
                 drop_request: true,
                 drop_recovery,
-                late_commit: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -2664,13 +2761,12 @@ async fn assert_late_commit_is_visible(path: &'static str, batched: bool) {
         slot,
         RELEASE_PARK,
         Some(CommitLoss {
-            requests: Arc::default(),
-            drop_request: false,
             drop_recovery: true,
             late_commit: Some(LateCommit {
                 entered,
                 finished: StdMutex::new(Some(finished)),
             }),
+            ..Default::default()
         }),
     )
     .await;
@@ -2888,6 +2984,73 @@ async fn writer_reuses_one_session_window_for_alternating_sizes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_close_skips_unrelated_busy_slots() {
+    let mut policy = policy(DataMode::Hixl);
+    policy.sessions_per_home = 2;
+    let fixture = fixture_with_exports(
+        policy,
+        true,
+        MemorySource::new(content(), SLOT),
+        Arc::new(MemoryExports::new(SLOT, 2)),
+        SLOT,
+        Duration::from_secs(30),
+    )
+    .await;
+    let file = fixture
+        .with_open(libc::O_RDWR, |peer, file| {
+            assert_eq!(peer.write(&grant(), &file, 0, b"body").unwrap(), 4);
+            file
+        })
+        .await;
+    let pool = fixture.reader.home_pool("node-a").unwrap();
+    assert!(pool.slots[0].lock().await.write_window.is_some());
+    let busy = pool.slots[1].lock().await;
+    let close = tokio::time::timeout(
+        Duration::from_millis(750),
+        fixture.with_client(move |peer| peer.release(&grant(), file)),
+    )
+    .await;
+    drop(busy);
+    close.expect("close waited for an unrelated slot").unwrap();
+    fixture.wait_released().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_close_bounds_stalled_cleanup_and_idle_returns_the_window() {
+    let fixture = fixture_with_commit_loss(
+        policy(DataMode::Hixl),
+        true,
+        MemorySource::new(content(), SLOT),
+        Arc::new(MemoryExports::new(SLOT, 2)),
+        SLOT,
+        Duration::from_secs(1),
+        Some(CommitLoss {
+            forward_commit: true,
+            stall_first_abort: AtomicBool::new(true),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let file = fixture
+        .with_open(libc::O_RDWR, |peer, file| {
+            assert_eq!(peer.write(&grant(), &file, 0, b"body").unwrap(), 4);
+            file
+        })
+        .await;
+    tokio::time::timeout(
+        Duration::from_millis(750),
+        fixture.with_client(move |peer| peer.release(&grant(), file)),
+    )
+    .await
+    .expect("close waited for a stalled cleanup RPC")
+    .unwrap();
+    fixture.wait_released().await;
+    let pool = fixture.reader.home_pool("node-a").unwrap();
+    assert!(pool.slots[0].lock().await.write_window.is_none());
+    assert_eq!(fixture.home_quarantines(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writer_returns_unconsumed_windows_on_read_close_and_idle() {
     for cleanup in ["read", "close", "idle"] {
         let park = if cleanup == "idle" {
@@ -2933,4 +3096,73 @@ async fn writer_returns_unconsumed_windows_on_read_close_and_idle() {
         assert!(slot.lock().await.write_window.is_none());
         assert_eq!(fixture.home_quarantines(), 0);
     }
+}
+
+#[tokio::test]
+async fn auto_open_prefetch_requires_snapshot_reads() {
+    for snapshot_reads in [false, true] {
+        let mut policy = batch_policy(DataMode::Auto);
+        policy.snapshot_reads = snapshot_reads;
+        let fixture = batch_fixture(policy, true).await;
+        fixture
+            .with_client(|client| open_path(&client, "d/f00"))
+            .await;
+        assert_eq!(
+            fixture.handler.disable_prefetch.load(Ordering::SeqCst),
+            !snapshot_reads
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_batch_parent_falls_back_to_open_handle() {
+    for (mode, expected_grpc_reads) in [(DataMode::Auto, 1), (DataMode::Hixl, 0)] {
+        let fixture = batch_fixture(batch_policy(mode), true).await;
+        let tree = fixture.source.tree.clone();
+        fixture
+            .with_client(move |client| {
+                let file = open_path(&client, "d/f00");
+                // Model a parent rename followed by replacement: the old path
+                // no longer names a directory, but the open file is still live.
+                tree.insert("d", vec![0]);
+                assert_eq!(
+                    read(&client, &file, 0, 2500).unwrap(),
+                    batch_content(0)[..2500]
+                );
+            })
+            .await;
+        assert_eq!(fixture.grpc_reads(), expected_grpc_reads);
+        assert_eq!(fixture.reads("batch_fallback"), 1);
+    }
+}
+
+#[tokio::test]
+async fn batch_parent_miss_does_not_mask_a_revoked_grant() {
+    let fixture = batch_fixture(batch_policy(DataMode::Auto), true).await;
+    let tree = fixture.source.tree.clone();
+    let error = fixture
+        .with_client(move |client| {
+            let file = open_path(&client, "d/f00");
+            tree.insert("d", vec![0]);
+            let mut revoked = grant();
+            revoked.fencing_token = "revoked".into();
+            let mut out = vec![0; 2500];
+            client.read(&revoked, &file, 0, &mut out).unwrap_err()
+        })
+        .await;
+    assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+    assert_eq!(fixture.grpc_reads(), 0);
+    assert_eq!(fixture.native_read_batches(), 0);
+}
+
+#[tokio::test]
+async fn batch_prepare_transport_error_does_not_fall_back_to_grpc() {
+    let fixture = batch_fixture(batch_policy(DataMode::Auto), true).await;
+    fixture
+        .lost_read_prepare_replies
+        .store(PREPARE_ATTEMPTS, Ordering::SeqCst);
+    let error = fixture.read_error("d/f00", 0, 2500).await;
+    assert_eq!(error.kind(), afs_error::ErrorKind::Unavailable);
+    assert_eq!(fixture.grpc_reads(), 0);
+    assert_eq!(fixture.native_read_batches(), 0);
 }

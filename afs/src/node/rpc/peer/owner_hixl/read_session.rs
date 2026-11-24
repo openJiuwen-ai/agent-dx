@@ -161,6 +161,7 @@ impl OwnerReadSession {
 
     pub(in crate::node::rpc::peer) fn allows_grpc_open_prefetch(&self) -> bool {
         self.reader.policy.mode == DataMode::Auto
+            && self.reader.policy.snapshot_reads
             && self.reader.policy.min_file_bytes > OPEN_PREFETCH_LIMIT
     }
 

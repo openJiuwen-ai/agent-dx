@@ -1377,7 +1377,7 @@ cargo test --locked -p afs --lib node::data_plane
 cargo test --locked -p afs --test config_contract --test node_health_contract
 ```
 
-组件测试也覆盖重启后同号会话拒绝旧 Close、默认按需读在同一 fd 上看到远端覆盖和追加，以及写等待者超时后迟到的设备完成不能触发 Commit。RoCE、HCCS、多 lane 和 FUSE 真挂载各需独立 Linux 运行证据。组件测试验证软件契约。
+组件测试也覆盖重启后同号会话拒绝旧 Close、默认按需读在同一 fd 上看到远端覆盖和追加，以及写等待者超时后迟到的设备完成不能触发 Commit。RoCE、HCCS、多 lane 和 FUSE 真挂载各需独立 Linux 运行证据。组件测试验证软件契约。HIXL 回归还覆盖释放 RPC 短暂失败后的重试、禁用快照读时的 Auto OPEN、批量目录路径失效、Commit 响应超时后回收回执，以及关闭文件时有界地清理写槽。
 
 无 CANN 的 Linux 环境可以用 `cargo test --locked -p afs-transport --features hixl` 检查模块加载错误和软件路径。
 有 SDK 且已准备 CANN 运行库时，运行

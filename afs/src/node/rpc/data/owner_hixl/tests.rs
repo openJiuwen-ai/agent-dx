@@ -1325,7 +1325,9 @@ fn batch_prepare_rejects_bad_requests_without_pinning_slots() {
     );
     let mut missing = batch_request(session_id, "b2", "", 2);
     missing.parent_path = b"nope".to_vec();
-    assert!(service.prepare_batch_blocking("node-b", missing).is_err());
+    let miss = service.prepare_batch_blocking("node-b", missing).unwrap();
+    assert!(miss.files.is_empty());
+    assert!(miss.slots.is_empty());
     let mut oversized = batch_request(session_id, "b3", "", 2);
     oversized.max_file_bytes = SLOT as u64 + 1;
     assert_eq!(

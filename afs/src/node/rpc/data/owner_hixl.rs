@@ -979,7 +979,8 @@ impl OwnerHixlService {
             if let Some(reply) = replay {
                 drop(registry);
                 // Replay still proves the grant is current.
-                self.batch_directory(peer, &access, &parent)?;
+                self.batch_directory(peer, &access, &parent)
+                    .map_err(error_to_status)?;
                 return Ok(reply);
             }
             let session = registry.admitting_session(request.session_id, peer)?;
@@ -1004,24 +1005,40 @@ impl OwnerHixlService {
             )
         };
 
-        let directory = self.batch_directory(peer, &access, &parent)?;
-        let names = self
-            .batch_directory_names(directory.as_ref(), &access, &parent)
-            .map_err(error_to_status)?;
-        // Without a complete sorted listing there is no safe continuation.
-        // An empty batch lets the reader use its ordinary file-read path.
-        let plan = names.map_or_else(BatchPlan::default, |names| {
-            plan_batch(
-                directory.as_ref(),
-                &names,
-                &request.anchor_name,
-                request.min_file_bytes,
-                request.max_file_bytes,
-                slot_bytes,
-                max_slots,
-            )
-        });
-        if plan.slots.is_empty() {
+        let (directory, plan) = match self.batch_directory(peer, &access, &parent) {
+            Ok(directory) => {
+                let names = self
+                    .batch_directory_names(directory.as_ref(), &access, &parent)
+                    .map_err(error_to_status)?;
+                // Without a complete sorted listing there is no safe continuation.
+                let plan = names.map_or_else(BatchPlan::default, |names| {
+                    plan_batch(
+                        directory.as_ref(),
+                        &names,
+                        &request.anchor_name,
+                        request.min_file_bytes,
+                        request.max_file_bytes,
+                        slot_bytes,
+                        max_slots,
+                    )
+                });
+                (Some(directory), plan)
+            }
+            Err(error)
+                if matches!(
+                    error.code(),
+                    afs_error::IO_NOT_FOUND
+                        | afs_error::IO_NOT_DIRECTORY
+                        | afs_error::NODE_VFS_NOT_FOUND
+                ) =>
+            {
+                // A rename can leave the batch path stale while the file's
+                // open handle is still valid. No slots have been exported.
+                (None, BatchPlan::default())
+            }
+            Err(error) => return Err(error_to_status(error)),
+        };
+        let Some(directory) = directory.filter(|_| !plan.slots.is_empty()) else {
             self.prepare_registry(peer, request.session_id, None)?
                 .session_mut(request.session_id, peer)?
                 .check_read_id(&request.read_id, Some(admitted_at))?;
@@ -1032,7 +1049,7 @@ impl OwnerHixlService {
                 next_name: plan.next,
                 ..Default::default()
             });
-        }
+        };
         let rollback_failed = Cell::new(false);
         let reply = self.fill_batch_and_export(
             peer,
@@ -1115,11 +1132,11 @@ impl OwnerHixlService {
         peer: &str,
         access: &PresentedRootAccess,
         parent: &OsStr,
-    ) -> Result<Box<dyn OwnerBatchDirectory>, Status> {
+    ) -> afs_error::Result<Box<dyn OwnerBatchDirectory>> {
         let started = Instant::now();
         let directory = self.source.batch_directory(peer, access, parent);
         self.observe(Operation::Authorize, started, directory.is_ok());
-        directory.map_err(error_to_status)
+        directory
     }
 
     /// Pins one export slot per planned slot, fills them concurrently on the

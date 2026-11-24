@@ -480,14 +480,14 @@ Home 排空超时后隔离 runtime 并保留未确认槽，返回 `NODE_TRANSFER
 HIXL 缓冲写默认关闭。两端启用 `ownerfs_buffered_writes` 并由 Home 确认能力后，才使用 HIXL 写入已打开文件。
 显式 HIXL 在可写或截断打开之前确认写能力，能力缺失时不向 Home 发送 `Open`。显式 HIXL 的 Create 与 `O_DIRECT` 返回不支持。
 默认每次读从 Home 获取当前数据，避免跨节点写入后重用旧字节或 EOF。只有数据不可变、打开期间授权稳定的
-部署才启用 `ownerfs_snapshot_reads`，允许只读句柄使用预读窗口和小文件目录批量。
+部署才启用 `ownerfs_snapshot_reads`，允许只读句柄使用预读窗口和小文件目录批量。带 HIXL 的 Auto 路径也只在此选项开启时允许 gRPC OPEN 预取。
 Auto 写在发送 `PrepareWriteHixl` 或复用已授予的写槽之前，按本次缓冲写的正文长度选择通道。
 `[hixl].ownerfs_min_write_bytes` 默认 `524288` 字节、有效范围 `0..=1048576`；达到阈值才尝试 HIXL，
 低于阈值走原有 RDMA/gRPC 路径，即使已持有写槽。`0` 对所有非空缓冲写尝试 HIXL；显式 HIXL 不受此阈值限制。
 Writer 以 `PrepareWriteHixl` 申请 Home 的注册目标槽，绑定授权、句柄、偏移、长度、写选项及正文摘要。写摘要沿用会话协商的槽校验算法：优先 CRC32C（4 字节小端），否则使用 BLAKE3。Writer 和 Home 分别校验传输前后的有效字节；请求重放指纹只覆盖控制消息。
 Writer 向槽提交 native `WRITE`，确认设备完成后以同一票据调用 `CommitWriteHixl`。Home 复验写授权、内容并执行文件写入，按实际 `written` 返回结果。
 读端未收到窗口或目录批量 Prepare 的回包时，可用本地会话、`read_id` 和代次报告 `NotSubmitted`。Home 回收已发布的槽，并拒绝同 ID 的迟到 Prepare。
-Commit 重试复用原会话及 `write_id`。设备 WRITE 已完成而 Commit 超时时，Writer 用同一票据向 Home 查询结果。Home 可回放已有回执（包括实际短写字节数），或封住尚未执行的 Commit 并回收槽。恢复请求本身不执行文件写入。无法取得确定回执时，应用仍得到写结果未知。本节点按 Home 和文件身份停用可复用的读数据，包括批量切片与 Open 预取；同一读句柄在 Home 延迟写入完成后能看到新字节。设备结果未知时隔离槽位。持久化仍由文件 `Fsync` 契约处理。
+Commit 重试复用原会话及 `write_id`。设备 WRITE 完成后，Writer 用剩余期限的一半重试 Commit，余下时间用于向 Home 查询同一票据的结果。Home 可回放已有回执（包括实际短写字节数），或封住尚未执行的 Commit 并回收槽。恢复请求本身不执行文件写入。无法取得确定回执时，应用仍得到写结果未知。关闭文件时，写槽清理跳过忙碌会话，等待总计最多 100 ms，并受请求超时配置约束。空闲回收继续处理剩余窗口。本节点按 Home 和文件身份停用可复用的读数据，包括批量切片与 Open 预取；同一读句柄在 Home 延迟写入完成后能看到新字节。设备结果未知时隔离槽位。持久化仍由文件 `Fsync` 契约处理。
 
 DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
 启用快照读后，预读组目标大小是 `ownerfs_read_group_bytes`（默认 32 MiB，即八个 4 MiB 窗口）。Home 在协商中公布
@@ -495,7 +495,7 @@ DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
 实际槽大小取两端窗口大小的较小值。同一打开认领窗口后，可复用其切片，本节点写入、setattr 或 `O_TRUNC` 打开使窗口失效。FUSE READ 完全落在窗口内时
 直接共享窗口内存，不再分配和拷贝。小文件另按目录批量取回：Home 用一次 `PrepareBatchHixl` 把
 同一目录下锚点之后的一串整文件装入导出槽（文件不跨槽），reader 按 file identity 与版本认领切片，
-认领四分之一后预取下一批。驻留批量合计不超过
+认领四分之一后预取下一批。父目录路径失效时按已打开的文件句柄继续读取。驻留批量合计不超过
 `max(4 × ownerfs_read_group_bytes, ownerfs_read_group_host_budget_bytes / 2)`：空间不足时只淘汰
 1 秒内无人读取的批量或未被认领的预取批量，不挤掉其他目录正在读的批量；被丢弃的预取批量让其目录
 回到锚点重来。已发出的共享切片仍占用进程字节预算，直到最后一个引用释放。每个 Home 默认
@@ -503,7 +503,7 @@ DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
 `ReleaseHixlRead`：释放停放在会话上，由该会话下一次 `PrepareReadHixl`／`PrepareBatchHixl` 的
 `prior_release` 携带，Home 在准入前先释放（被拒绝的 Prepare 同样生效，重放命中释放墓碑）。
 Home 发布导出槽时再次确认 read ID 的释放历史，回滚迟到重放自己占用的槽。
-10 ms 内没有下一次 Prepare，或会话要关闭时，reader 再单独发送。传输失败、校验失败等路径仍立即
+10 ms 内没有下一次 Prepare，或会话要关闭时，reader 再单独发送。单独发送的已完成票据会保留到 Home 确认，同一代的会话在释放确认前不会因续用而关闭。传输失败、校验失败等路径仍立即
 单独释放。批量不需要时可关闭 `ownerfs_batch_read`，此时与没有批量时路径相同。
 Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文件偏移经页缓存填充导出槽。
 reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。

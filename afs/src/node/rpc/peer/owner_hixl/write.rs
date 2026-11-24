@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
+const CLOSE_WRITE_WINDOW_BUDGET: Duration = Duration::from_millis(100);
+
 impl OwnerReadSession {
     /// Confirms a usable session before sending a potentially truncating Open.
     pub(in crate::node::rpc::peer) fn ensure_session_for_open(
@@ -68,17 +70,25 @@ impl OwnerReadSession {
                 .get(&self.home)
                 .cloned();
             if let Some(pool) = pool {
-                for slot in &pool.slots {
-                    let mut guard = slot.lock().await;
-                    if let Some(session) = guard.session.clone()
-                        && guard
-                            .write_window
-                            .as_ref()
-                            .is_some_and(|window| window.handle.opaque == handle)
-                    {
-                        let _ = guard.return_write_window(&session, reader.timeout).await;
+                let cleanup = async {
+                    for slot in &pool.slots {
+                        let Ok(mut guard) = slot.try_lock() else {
+                            continue;
+                        };
+                        if let Some(session) = guard.session.clone()
+                            && guard
+                                .write_window
+                                .as_ref()
+                                .is_some_and(|window| window.handle.opaque == handle)
+                        {
+                            let _ = guard.return_write_window(&session, reader.timeout).await;
+                        }
                     }
-                }
+                };
+                // The parked idle task still owns cleanup for a busy slot or a
+                // window whose return RPC exceeded this shared Close budget.
+                let budget = reader.timeout.min(CLOSE_WRITE_WINDOW_BUDGET);
+                let _ = tokio::time::timeout(budget, cleanup).await;
             }
             Ok::<(), afs_error::Error>(())
         });
@@ -123,13 +133,13 @@ impl OwnerReadSession {
         let deadline = request.deadline;
         let dispatch = Arc::new(WriteDispatch::default());
         let result = runtime.block_on(async {
-            let wait = remaining(deadline)?;
+            remaining(deadline)?;
             let worker = tokio::spawn(
                 reader
                     .write_inner(request, dispatch.clone())
                     .instrument(span),
             );
-            match tokio::time::timeout(wait, worker).await {
+            match tokio::time::timeout_at(deadline.into(), worker).await {
                 Ok(result) => result.map_err(write_worker_error)?,
                 Err(_) => Err(write_deadline_expired()),
             }
@@ -153,8 +163,10 @@ impl WriteDispatch {
     const COMMITTING: u8 = 1;
     const STOPPED: u8 = 2;
 
-    fn begin_commit(&self, deadline: Instant) -> afs_error::Result<()> {
-        remaining(deadline)?;
+    fn begin_commit(&self, deadline: Instant) -> afs_error::Result<Instant> {
+        // Stage the immutable Commit retries within half the time still
+        // available. The rest belongs to receipt recovery or fencing.
+        let commit_deadline = deadline - remaining(deadline)? / 2;
         self.0
             .compare_exchange(
                 Self::PENDING,
@@ -162,7 +174,7 @@ impl WriteDispatch {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|_| ())
+            .map(|_| commit_deadline)
             .map_err(|_| write_deadline_expired())
     }
 
@@ -316,17 +328,20 @@ impl OwnerHixlReader {
             Ok(Ok(())) => {
                 // Every retry carries the same Commit. Once an attempt is
                 // ambiguous, only Home's receipt or fence resolves the write.
-                if let Err(error) = dispatch.begin_commit(deadline) {
-                    if ticket.abort(false, self.write_deadline()?).await.is_ok() {
-                        ticket.resolved = true;
+                let commit_deadline = match dispatch.begin_commit(deadline) {
+                    Ok(commit_deadline) => commit_deadline,
+                    Err(error) => {
+                        if ticket.abort(false, self.write_deadline()?).await.is_ok() {
+                            ticket.resolved = true;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
+                };
                 let mut ambiguous = false;
                 let reply = write_rpc_with_retry_observing(
                     &ticket.lease.session.client,
                     &ticket.finish,
-                    deadline,
+                    commit_deadline,
                     |error| ambiguous |= commit_needs_recovery(error),
                     |mut client, command| async move { client.commit_write_hixl(command).await },
                 )
@@ -337,7 +352,7 @@ impl OwnerHixlReader {
                         if write_was_not_executed(&error) {
                             ticket.resolved = true;
                         } else {
-                            ticket.cancel_successor(self.timeout).await;
+                            ticket.cancel_successor(self.timeout);
                         }
                         return Err(error);
                     }
@@ -348,11 +363,11 @@ impl OwnerHixlReader {
                             }
                             Err(error) => error,
                         };
-                        if let Ok(outcome) = ticket.recover(self.write_deadline()?, length).await {
+                        if let Ok(outcome) = ticket.recover(deadline, length).await {
                             ticket.resolved = true;
                             return outcome.and_then(written_count);
                         }
-                        ticket.cancel_successor(self.timeout).await;
+                        ticket.cancel_successor(self.timeout);
                         return Err(afs_error::Error::coded(
                             afs_error::NODE_OWNER_WRITE_UNKNOWN,
                             format!("OwnerFs HIXL write outcome is unknown: {cause}"),
@@ -373,7 +388,7 @@ impl OwnerHixlReader {
                     ) {
                         ticket.lease.guard.write_window = Some(window);
                     } else {
-                        ticket.cancel_successor(self.timeout).await;
+                        ticket.cancel_successor(self.timeout);
                     }
                 }
                 return written_count(reply.written);
@@ -645,30 +660,36 @@ impl PendingWrite {
         }
     }
 
-    /// The immutable commit may still run. Tell Home that its successor can
-    /// never be used, without cancelling or replaying the file operation.
-    async fn cancel_successor(&self, timeout: Duration) {
+    /// Keep the lease while returning an unused successor in the background.
+    /// The cancellation cannot cancel or replay the immutable file operation.
+    fn cancel_successor(self, timeout: Duration) {
         if !self.finish.request_next {
             return;
         }
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            self.lease.session.poisoned.store(true, Ordering::Release);
-            return;
-        };
-        let request = OwnerAbortWriteHixlRequest {
-            session_id: self.finish.session_id,
-            write_id: self.finish.write_id.clone(),
-            engine_generation: self.finish.engine_generation,
-            unknown: false,
-            cancel_next: true,
-            recover_commit: None,
-        };
-        if send_abort(&self.lease.session, &request, deadline)
-            .await
-            .is_err()
-        {
-            self.lease.session.poisoned.store(true, Ordering::Release);
-        }
+        tokio::spawn(
+            async move {
+                let ticket = self;
+                let Some(deadline) = Instant::now().checked_add(timeout) else {
+                    ticket.lease.session.poisoned.store(true, Ordering::Release);
+                    return;
+                };
+                let request = OwnerAbortWriteHixlRequest {
+                    session_id: ticket.finish.session_id,
+                    write_id: ticket.finish.write_id.clone(),
+                    engine_generation: ticket.finish.engine_generation,
+                    unknown: false,
+                    cancel_next: true,
+                    recover_commit: None,
+                };
+                if send_abort(&ticket.lease.session, &request, deadline)
+                    .await
+                    .is_err()
+                {
+                    ticket.lease.session.poisoned.store(true, Ordering::Release);
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     async fn abort(&self, unknown: bool, deadline: Instant) -> afs_error::Result<()> {

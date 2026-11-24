@@ -60,9 +60,10 @@ impl OwnerPeerClient {
                     grant,
                 )?;
         }
-        let hixl_allows_prefetch = self
-            .hixl_read_session()
-            .is_none_or(|session| session.allows_grpc_open_prefetch());
+        let hixl_allows_prefetch = self.hixl_read_session().map_or(
+            self.data_mode == DataMode::Grpc,
+            owner_hixl::OwnerReadSession::allows_grpc_open_prefetch,
+        );
         Ok(hixl_allows_prefetch && self.ordinary_backend() == Backend::Grpc)
     }
 
