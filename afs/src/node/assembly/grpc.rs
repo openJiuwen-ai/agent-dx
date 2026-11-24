@@ -151,12 +151,8 @@ pub(super) fn start(
         },
     );
     #[cfg(feature = "ownerfs")]
-    let owner_hixl_source = super::hixl::serve_home(
-        cfg,
-        state,
-        &backends.metrics.owner_rpc,
-        services,
-    )?;
+    let owner_hixl_source =
+        super::hixl::serve_home(cfg, state, &backends.metrics.owner_rpc, services)?;
     #[cfg(feature = "ownerfs")]
     let owner_files = ownerfs::owner_files_server(
         cfg,

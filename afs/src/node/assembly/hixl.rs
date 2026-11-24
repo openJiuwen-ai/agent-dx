@@ -137,12 +137,10 @@ pub(super) fn serve_home(
     let (Some(runtime), Some(ownerfs)) = (&state.hixl_runtime, &state.ownerfs) else {
         return Ok(None);
     };
-    let mut source = rpc::data::owner_hixl::OwnerHixlService::new(
-        runtime.clone(),
-        ownerfs.peer_executor()?,
-    )
-    .with_owner_metrics(owner_metrics.clone())
-    .with_policy(&cfg.hixl.trusted_peers, cfg.hixl.ownerfs_buffered_writes);
+    let mut source =
+        rpc::data::owner_hixl::OwnerHixlService::new(runtime.clone(), ownerfs.peer_executor()?)
+            .with_owner_metrics(owner_metrics.clone())
+            .with_policy(&cfg.hixl.trusted_peers, cfg.hixl.ownerfs_buffered_writes);
     if let Some(metrics) = &state.hixl_metrics {
         source = source.with_metrics(metrics.clone());
     }

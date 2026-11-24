@@ -832,13 +832,19 @@ tls_server_name='node'
 [trusted_node_certs]
 peer='/tmp/peer.pem'";
     for peers in ["[]", "['other']", "['']"] {
-        let table = format!("engine_id='127.0.0.1:7920'
-trusted_peers={peers}");
+        let table = format!(
+            "engine_id='127.0.0.1:7920'
+trusted_peers={peers}"
+        );
         let error = resolve_hixl_table(prefix, &table).unwrap_err();
         assert!(error.message().contains("hixl.trusted_peers"));
     }
-    let cfg = resolve_hixl_table(prefix, "engine_id='127.0.0.1:7920'
-trusted_peers=['peer']").unwrap();
+    let cfg = resolve_hixl_table(
+        prefix,
+        "engine_id='127.0.0.1:7920'
+trusted_peers=['peer']",
+    )
+    .unwrap();
     assert_eq!(cfg.hixl.trusted_peers, ["peer"]);
     assert!(!cfg.hixl.ownerfs_buffered_writes);
     assert!(!cfg.hixl.ownerfs_snapshot_reads);

@@ -203,9 +203,7 @@ impl HixlConfig {
             return Err(invalid("data_mode = hixl is unsupported for DFS"));
         }
         if data_mode == DataMode::Hixl && !cfg!(feature = "ownerfs") {
-            return Err(invalid(
-                "HIXL requires an OwnerFs build",
-            ));
+            return Err(invalid("HIXL requires an OwnerFs build"));
         }
         self.validate_ownerfs()?;
         if !mutual_tls || !bound_peers {
@@ -406,9 +404,11 @@ pub(super) fn validate(role: Role, cfg: &super::Config) -> Result<()> {
     )?;
     if cfg.hixl.enabled(cfg.data_mode, cfg.ownerfs)
         && (cfg.hixl.trusted_peers.is_empty()
-            || cfg.hixl.trusted_peers.iter().any(|peer| {
-                peer.is_empty() || !cfg.trusted_node_certs.contains_key(peer)
-            }))
+            || cfg
+                .hixl
+                .trusted_peers
+                .iter()
+                .any(|peer| peer.is_empty() || !cfg.trusted_node_certs.contains_key(peer)))
     {
         return Err(invalid(
             "hixl.trusted_peers must name at least one node from trusted_node_certs",

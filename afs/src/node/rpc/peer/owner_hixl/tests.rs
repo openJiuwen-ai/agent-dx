@@ -47,6 +47,7 @@ struct MemoryReader {
     hold_read: AtomicBool,
     hold_read_at: AtomicUsize,
     reads_started: AtomicUsize,
+    read_deadlines: StdMutex<Vec<Instant>>,
     unknown_read: AtomicBool,
     unknown_write: AtomicBool,
     hold_write: AtomicBool,
@@ -74,9 +75,10 @@ impl TransferLane for MemoryReader {
         peer: &str,
         windows: &[(u64, usize)],
         mut output: Vec<u8>,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<HixlReadOutcome, HixlError> {
         assert_eq!(peer, self.peer_engine);
+        self.read_deadlines.lock().unwrap().push(deadline);
         let ordinal = self.reads_started.fetch_add(1, Ordering::SeqCst) + 1;
         while self.hold_read.load(Ordering::SeqCst)
             || self.hold_read_at.load(Ordering::SeqCst) == ordinal
@@ -485,6 +487,7 @@ fn memory_reader(
         hold_read: AtomicBool::new(false),
         hold_read_at: AtomicUsize::new(0),
         reads_started: AtomicUsize::new(0),
+        read_deadlines: StdMutex::default(),
         unknown_read: AtomicBool::new(false),
         unknown_write: AtomicBool::new(false),
         hold_write: AtomicBool::new(false),
@@ -1242,6 +1245,32 @@ async fn demand_hixl_reads_on_one_open_see_remote_overwrite_and_append() {
         .await;
     assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.native_read_batches(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_window_of_one_read_uses_the_same_deadline() {
+    let mut demand = policy(DataMode::Hixl);
+    demand.snapshot_reads = false;
+    let fixture = fixture_with_exports(
+        demand,
+        true,
+        MemorySource::new(content(), SLOT),
+        Arc::new(MemoryExports::new(SLOT, 1)),
+        SLOT,
+        RELEASE_PARK,
+    )
+    .await;
+    fixture
+        .with_open(libc::O_RDONLY, |peer, file| {
+            assert_eq!(
+                read(&peer, &file, 0, 2 * SLOT).unwrap(),
+                content()[..2 * SLOT]
+            );
+        })
+        .await;
+    let deadlines = fixture.native.read_deadlines.lock().unwrap();
+    assert_eq!(deadlines.len(), 2);
+    assert_eq!(deadlines[0], deadlines[1]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

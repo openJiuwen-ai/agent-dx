@@ -430,7 +430,9 @@ async fn read_only_home_does_not_admit_hixl_writes() {
     let home = home.with_policy(&["node-b".to_owned()], false);
     assert!(home.check_peer("node-b").is_ok());
     assert!(home.check_peer("other-node").is_err());
-    let session = home.negotiate_blocking("node-b", negotiate_request("root-a")).unwrap();
+    let session = home
+        .negotiate_blocking("node-b", negotiate_request("root-a"))
+        .unwrap();
     assert!(!session.buffered_write_supported);
     assert!(!session.write_checksum_negotiated);
     let reply = home
