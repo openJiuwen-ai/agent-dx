@@ -135,6 +135,30 @@ impl Inbox {
         Ok(current)
     }
 
+    /// Resolve the current subscription for an issued task, including after the
+    /// sandbox acknowledges receipt and the original batch payload is discarded.
+    pub(in crate::ingress::digitalmategateway) async fn task_binding(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<SubscriptionBinding>, Error> {
+        let client = self.pool.get().await.map_err(unavailable)?;
+        let row = client.query_opt(
+            "SELECT s.binding_json, b.generation FROM digitalmate_ingestion.batches b JOIN digitalmate_ingestion.subscriptions s ON s.subscription_id=b.subscription_id AND s.workspace_key=b.workspace_key AND s.generation=b.generation WHERE b.batch_id=$1 AND b.state IN ('ready','accepted') AND s.enabled",
+            &[&batch_id],
+        ).await.map_err(unavailable)?;
+        row.map(|row| {
+            let binding = decode(&row.get::<_, String>(0))?;
+            binding.validate()?;
+            if !binding.enabled
+                || generation(binding.subscription_generation)? != row.get::<_, i64>(1)
+            {
+                return Err(Error::Refused);
+            }
+            Ok(binding)
+        })
+        .transpose()
+    }
+
     #[cfg(test)]
     pub(super) fn pool(&self) -> &Pool {
         &self.pool

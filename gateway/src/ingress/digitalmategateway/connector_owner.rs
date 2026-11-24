@@ -151,6 +151,7 @@ pub struct ConnectorWorkloadIdentity {
     generation: String,
     grant_id: String,
     expires_at: i64,
+    delivery_connection: Option<String>,
 }
 impl ConnectorWorkloadIdentity {
     pub(super) async fn authenticate(
@@ -158,7 +159,8 @@ impl ConnectorWorkloadIdentity {
         headers: &HeaderMap,
     ) -> accounts::Result<Self> {
         let token = Zeroizing::new(bearer(headers)?.to_owned());
-        let (grant, grant_id, expires_at) = identity.owner_connector_grant(&token).await?;
+        let (grant, grant_id, expires_at, subscription) =
+            identity.owner_connector_grant(&token).await?;
         Ok(Self {
             identity,
             token,
@@ -168,6 +170,7 @@ impl ConnectorWorkloadIdentity {
             generation: grant.generation,
             grant_id,
             expires_at,
+            delivery_connection: subscription.map(|binding| binding.connection_id),
         })
     }
     pub fn tenant(&self) -> &str {
@@ -182,13 +185,20 @@ impl ConnectorWorkloadIdentity {
     pub fn binding_scope(&self) -> &Scope {
         &self.scope
     }
+    pub(super) fn delivery_connection(&self) -> Option<&str> {
+        self.delivery_connection.as_deref()
+    }
     pub async fn check(&self) -> accounts::Result<()> {
-        let (grant, id, _) = self.identity.owner_connector_grant(&self.token).await?;
+        let (grant, id, _, subscription) = self.identity.owner_connector_grant(&self.token).await?;
         if id != self.grant_id
             || grant.scope != self.scope
             || grant.user != self.user_id
             || grant.workspace != self.workspace
             || grant.generation != self.generation
+            || subscription
+                .as_ref()
+                .map(|binding| binding.connection_id.as_str())
+                != self.delivery_connection()
         {
             return Err(accounts::Error::Unauthorized);
         }

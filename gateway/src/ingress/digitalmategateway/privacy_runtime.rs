@@ -64,12 +64,15 @@ mod implementation {
             let listener =
                 tokio::net::TcpListener::from_std(listener).map_err(|_| Error::Unavailable)?;
             let signer = Arc::new(TokenSigner::new(root, tenant));
-            let identity = Arc::new(PrivacyIdentity::new(
-                config.template,
-                store.clone(),
-                bindings.clone(),
-                signer.clone(),
-            ));
+            let identity = Arc::new(
+                PrivacyIdentity::new(
+                    config.template,
+                    store.clone(),
+                    bindings.clone(),
+                    signer.clone(),
+                )
+                .with_inbox(inbox.clone()),
+            );
             let authorization_owner = owner
                 .map(|owner| {
                     super::super::connector_owner::OwnerAuthority::new(
@@ -92,6 +95,7 @@ mod implementation {
                 identity: identity.clone(),
                 model_configuration: config
                     .model_config_name
+                    .clone()
                     .map(|name| (name, center.clone() as Arc<dyn ConfigurationRegistry>)),
             });
             let delivery = inbox.map(|inbox| {
@@ -102,7 +106,7 @@ mod implementation {
             });
             let mut http = PrivacyHttp::new(center.clone(), identity.clone());
             if let Some(delivery) = &delivery {
-                http = http.with_ingestion(delivery.clone());
+                http = http.with_ingestion(delivery.clone(), config.model_config_name);
             }
             if let Some(owner) = &authorization_owner {
                 http = http.with_authorization_owner(owner.clone());

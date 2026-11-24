@@ -2,6 +2,7 @@
 
 use super::privacy_center::PrivacyCenter;
 use super::privacy_cipher::LegacyEnvelope;
+use super::privacy_grants::DELIVERY_TOKEN_HEADER;
 use crate::ingress::accounts::{Error, ExpectedRevision};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
@@ -68,6 +69,7 @@ pub(crate) struct PrivacyHttp {
     center: Arc<PrivacyCenter>,
     identity: Arc<super::privacy_grants::PrivacyIdentity>,
     ingestion: Option<Arc<super::privacy_grants::DeliveryIdentity>>,
+    model_config_name: Option<String>,
     authorization_owner: Option<Arc<super::connector_owner::OwnerAuthority>>,
 }
 impl PrivacyHttp {
@@ -79,6 +81,7 @@ impl PrivacyHttp {
             center,
             identity,
             ingestion: None,
+            model_config_name: None,
             authorization_owner: None,
         }
     }
@@ -86,8 +89,10 @@ impl PrivacyHttp {
     pub(crate) fn with_ingestion(
         mut self,
         ingestion: Arc<super::privacy_grants::DeliveryIdentity>,
+        model_config_name: Option<String>,
     ) -> Self {
         self.ingestion = Some(ingestion);
+        self.model_config_name = model_config_name;
         self
     }
 
@@ -170,7 +175,22 @@ impl PrivacyHttp {
         // revealing whether an optional owner is configured. This is only
         // protocol selection; the owning handler still verifies the signature,
         // original grant, scope and current authority.
+        let batch_header = if path == "/v1/ingestion/admit" {
+            let mut headers = request.headers().get_all(DELIVERY_TOKEN_HEADER).iter();
+            let token = headers
+                .next()
+                .map(|value| value.to_str())
+                .transpose()
+                .map_err(|_| Error::Unauthorized)?;
+            if headers.next().is_some() {
+                return Err(Error::Unauthorized);
+            }
+            token.map(|token| Zeroizing::new(token.to_owned()))
+        } else {
+            None
+        };
         let purpose_matches = match path.as_str() {
+            "/v1/ingestion/admit" if batch_header.is_some() => token.starts_with("dm-privacy-v1."),
             super::connector_owner::VERIFY_PATH => token.starts_with("dm-authorization-owner-v1."),
             "/v1/ingestion/admit" | "/v1/ingestion/bootstrap" => {
                 token.starts_with("dm-ingestion-v1.")
@@ -218,8 +238,11 @@ impl PrivacyHttp {
                 }
                 let ingestion = self.ingestion.as_ref().ok_or(Error::Unavailable)?;
                 if path == "/v1/ingestion/admit" {
-                    let admission = ingestion.verify(&token).await?;
-                    return Ok(response(StatusCode::OK, admission.json()));
+                    let body = match batch_header {
+                        Some(batch) => ingestion.verify_pair(&token, &batch).await?.paired_json(),
+                        None => ingestion.verify(&token).await?.json(),
+                    };
+                    return Ok(response(StatusCode::OK, body));
                 }
                 let Some(owner) = self.authorization_owner.as_ref() else {
                     // Preserve authentication failure precedence even when the
@@ -249,7 +272,15 @@ impl PrivacyHttp {
             "/v1/secret/get" => {
                 let input: GetRequest =
                     serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
-                let result = self.center.get(&token, &input.name).await?;
+                let result =
+                    if let Some(grant) = self.identity.delivery_config_grant(&token).await? {
+                        if self.model_config_name.as_deref() != Some(input.name.as_str()) {
+                            return Err(Error::Unauthorized);
+                        }
+                        self.center.read_owned(&grant, &input.name).await?
+                    } else {
+                        self.center.get(&token, &input.name).await?
+                    };
                 let body = match result {
                     Some(secret) => {
                         serde_json::json!({"revision":secret.revision,"value":secret.plaintext.as_ref().map(|value| STANDARD.encode(value.as_slice()))})

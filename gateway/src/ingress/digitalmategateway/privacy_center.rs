@@ -313,6 +313,9 @@ impl PrivacyCenter {
 
     async fn authorize(&self, token: &str) -> Result<StoredPrivacyGrant, Error> {
         let claims = self.signer.verify(token, false)?;
+        if claims.is_delivery() {
+            return Err(Error::Unauthorized);
+        }
         let grant = self
             .store
             .privacy_get_grant(&claims.id)
@@ -329,7 +332,7 @@ impl PrivacyCenter {
         self.read_owned(&grant, name).await
     }
 
-    async fn read_owned(
+    pub(super) async fn read_owned(
         &self,
         grant: &StoredPrivacyGrant,
         name: &str,

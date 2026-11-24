@@ -271,6 +271,11 @@ impl Scope {
         self.workload.as_deref()
     }
 
+    pub(in crate::ingress::digitalmategateway) fn delivery_connection(&self) -> Option<&str> {
+        self.workload_identity()
+            .and_then(|identity| identity.delivery_connection())
+    }
+
     pub(crate) async fn check_authentication(&self) -> crate::ingress::accounts::Result<()> {
         if let Some(identity) = &self.foreground {
             identity.check().await
