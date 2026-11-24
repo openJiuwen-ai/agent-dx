@@ -156,6 +156,9 @@ impl RootMeta for NativeHomeMeta {
                 .cloned()
                 .collect(),
             tombstones: Vec::new(),
+            // No durable prepare identity in this mock: a missing catalog record
+            // must still be refused here.
+            prepare_ids: Default::default(),
         })
     }
 

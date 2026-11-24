@@ -1357,6 +1357,9 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
         .unwrap()
         .into_inner();
     assert!(location.found);
+    // LookupRoot serves any authenticated node, so the home's private
+    // recovery evidence must not travel with the location.
+    assert_eq!(location.location.as_ref().unwrap().local_prepare_id, "");
     assert_eq!(location.location.unwrap().home_node_id, "node-a");
 
     let listed = owner_rpc
@@ -1369,6 +1372,9 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
         .into_inner();
     assert_eq!(listed.active_roots.len(), 1);
     assert_eq!(listed.active_roots[0].root_id, "workspace-a");
+    // ListOwnerRoots is bound to the authenticated home, so the home receives
+    // the durable prepare identity it needs for catalog-record recovery.
+    assert_eq!(listed.active_roots[0].local_prepare_id, "local-prepare-a");
     assert!(listed.pending_reservations.is_empty());
     assert!(listed.authority_revision > 0);
 
@@ -1687,6 +1693,7 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
         home_node_id: "node-a".into(),
         home_session_id: "session-a".into(),
         home_nfs_addr: String::new(),
+        local_prepare_id: String::new(),
     };
     let lookup = LookupRootReply {
         location: Some(location),

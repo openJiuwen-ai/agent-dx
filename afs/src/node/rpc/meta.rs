@@ -31,6 +31,8 @@ use afs_protocol::meta::{
     meta_client::MetaClient,
 };
 use afs_transport::grpc::{GrpcConfig, SecurityManager, TlsConfig};
+#[cfg(feature = "ownerfs")]
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]
@@ -539,17 +541,28 @@ impl RootMeta for GrpcRootMeta {
                 home_node_id: home_node_id.to_owned(),
             }))?
             .into_inner();
-        Ok(OwnerRootInventory {
-            active: reply
-                .active_roots
-                .into_iter()
-                .map(|value| RootLocation {
-                    id: RootId(value.root_id),
+        let mut prepare_ids = HashMap::new();
+        let active = reply
+            .active_roots
+            .into_iter()
+            .map(|value| {
+                let id = RootId(value.root_id);
+                // Startup recovery needs Meta's copy of the prepare identity to
+                // rebuild a local catalog record that was lost while the data
+                // directory survived.
+                if !value.local_prepare_id.is_empty() {
+                    prepare_ids.insert(id.clone(), value.local_prepare_id);
+                }
+                RootLocation {
+                    id,
                     epoch: value.root_epoch,
                     home_node_id: value.home_node_id,
                     home_session_id: value.home_session_id,
-                })
-                .collect(),
+                }
+            })
+            .collect();
+        Ok(OwnerRootInventory {
+            active,
             pending: reply
                 .pending_reservations
                 .into_iter()
@@ -574,6 +587,7 @@ impl RootMeta for GrpcRootMeta {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
+            prepare_ids,
         })
     }
 
