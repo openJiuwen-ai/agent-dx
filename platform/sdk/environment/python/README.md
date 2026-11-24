@@ -360,9 +360,10 @@ upload data renews the response-header processing window. Successful `2xx`
 responses finish that window at their headers; file/tar downloads, port-forwarded
 HTTP streams and SSE may continue past the initial deadline. Error response
 bodies retain the latest processing deadline.
-SDK read-inactivity timeouts and single-file Range retries still apply.
-The SDK defaults to 300 seconds for a data request and adds a configurable
-communication margin (30 seconds by default) to its HTTP timeout. Without the
+SDK read-inactivity timeouts and single-file Range retries still apply. Ordinary
+file copies share their download budget across retries. Other SDK data operations
+default to 300 seconds per request and add a configurable communication margin
+(30 seconds by default) to the HTTP timeout. Without the
 header, wake and route delivery share a 300-second default; existing forwarding
 and streaming lifetimes remain unchanged. Negative invoke timeouts omit the
 header and retain unbounded application HTTP waits.
@@ -706,6 +707,23 @@ before that chunk remains an error, allowing the SDK to retry or resume. Reads a
 bounded by the initial file size during concurrent appends. Range downloads retain their
 fixed-length resume contract and require a stable file; they do not provide a
 snapshot of a concurrently modified file. Downloads accept regular files only.
+
+For a direct ordinary-file copy, `ADX_DIRECT_DOWNLOAD_IDLE_TIMEOUT` defaults
+to 30 seconds of HTTP read inactivity. `ADX_DIRECT_DOWNLOAD_TIMEOUT` defaults
+to 300 seconds for the file transfer after the initial metadata lookup. A negative
+total disables the shared deadline while retaining the read-inactivity timeout.
+The SDK caps each request's phase timeouts and deferral retries using the remaining
+budget, and checks the deadline when it receives body chunks and before publishing
+the destination. A synchronous read already in progress returns according to its
+HTTPX timeout before the SDK can check the deadline again. Directory tar downloads
+and uploads use their existing timeouts.
+
+A `206` resume response must cover the requested offset through the end of the
+file, with a consistent total size and matching body length. A
+successful full `200` response restarts the partial file. Transfers write to a
+`.part` file until the response has completed and its declared lengths match.
+Applications downloading immutable archives should verify an expected checksum
+before unpacking them.
 
 ## Native filename/path search
 

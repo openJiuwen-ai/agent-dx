@@ -408,7 +408,7 @@ class Filesystem:
                     os.unlink(part_path)
             return
 
-        self._client.download_file_direct(self._sid, remote_path, local_path, timeout_or_default())
+        self._client.download_file_direct(self._sid, remote_path, local_path)
 
     @staticmethod
     def _entry(result: dict) -> EntryInfo:
