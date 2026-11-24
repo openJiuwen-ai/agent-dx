@@ -839,8 +839,29 @@ report `renewable: false` with both deadlines equal to access expiry, and renewa
 is refused. Consumers must verify these responses through the actual authority;
 client-side token decoding or a local file is not an authorization fact.
 
-The existing identity HTTPS listener also accepts `POST /v1/ingestion/bootstrap`
-with a valid delivery bearer and exactly `{}`. It rechecks the persisted current
+For each delivery request, Gateway waits for sandbox readiness and signs the
+following headers from the same current batch and Binding grant:
+
+- `Authorization: Bearer dm-privacy-v1.<…>` carries the sandbox identity for
+  this background task.
+- `X-DigitalMate-Delivery-Token: dm-ingestion-v1.<…>` identifies the exact
+  persisted batch, including its digest and wire size.
+
+The sandbox forwards both headers to the identity HTTPS listener at
+`POST /v1/ingestion/admit` with `{}` before acknowledging delivery. Gateway
+checks that the workload identity was issued for that batch and matches its
+current subscription, grant, user, workspace and Binding. The dual-header
+admission response includes `binding_generation` for the admitted Binding.
+Roll out this Gateway together with a sandbox receiver that supports both
+headers before enabling background ingestion.
+
+After admission, the sandbox uses the workload bearer for the same configuration,
+connector, Push and renewal operations as a foreground workload. The batch ID
+is used only to pair the two credentials at ingestion admission.
+
+For existing consumers, the identity HTTPS listener accepts the delivery bearer
+alone at `POST /v1/ingestion/admit` or `POST /v1/ingestion/bootstrap` with
+exactly `{}`. The legacy bootstrap rechecks the persisted current
 batch, enabled subscription, existing grant and complete current Binding. The
 response contains only `purpose: "ingestion.connector-bootstrap"`, `target`
 (tenant, user, workspace, template/ref, Binding ID/generation: seven logical
