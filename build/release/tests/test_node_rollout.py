@@ -60,7 +60,7 @@ class PlanTests(unittest.TestCase):
         self.pods["items"][0]["status"] = {"containerStatuses": [{
             "name": "adxlet", "containerID": "container-original", "restartCount": 0,
             "imageID": "opaque-runtime-content-id", "state": {"running": {"startedAt": "now"}}}]}
-        self.cap = dict(version=2, node_protocol_version=3, **{ key: True for key in rollout.CAPABILITIES})
+        self.cap = dict(version=2, node_protocol_version=3, **{key: True for key in rollout.CAPABILITIES})
         self.inspect = {"node_id": "adx-node", "node_session_id": "session-1",
                         "observed_pod_uid": "pod-uid",
                         "protocol_version": 3, "unknown": False,
