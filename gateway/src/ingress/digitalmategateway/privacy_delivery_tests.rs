@@ -128,28 +128,13 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         volumes: BTreeMap::new(),
         creation_attempts: BTreeMap::new(),
     })));
-    let inbox = Inbox::initialize(
-        pool.clone(),
-        InboxLimits {
-            max_pending_events: 100,
-            max_pending_bytes: 8_000_000,
-            per_subscription_events: 50,
-            debounce: Duration::ZERO,
-            dedupe_retention: Duration::from_secs(7 * 86400),
-        },
-    )
-    .await
-    .unwrap();
     let signer = Arc::new(TokenSigner::new(&[7; 32], "tenant-delivery"));
-    let identity = Arc::new(
-        PrivacyIdentity::new(
-            "digitalmate".into(),
-            accounts.clone(),
-            current.clone(),
-            signer.clone(),
-        )
-        .with_inbox(Some(inbox.clone())),
-    );
+    let identity = Arc::new(PrivacyIdentity::new(
+        "digitalmate".into(),
+        accounts.clone(),
+        current.clone(),
+        signer.clone(),
+    ));
     let credentials = identity.admit(&scope, &workspace, &user).await.unwrap();
     // This is the real random authorization record, not an incarnation alias:
     // reconnect reuses it; revocation rotates it without changing the Binding.
@@ -185,15 +170,18 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         )
         .await
         .unwrap();
-    center
-        .put(
-            &credentials,
-            "DIGITALMATE_MODEL_CONFIG",
-            br#"{"MODEL_ENDPOINT":"synthetic"}"#,
-            crate::ingress::accounts::ExpectedRevision::New,
-        )
-        .await
-        .unwrap();
+    let inbox = Inbox::initialize(
+        pool.clone(),
+        InboxLimits {
+            max_pending_events: 100,
+            max_pending_bytes: 8_000_000,
+            per_subscription_events: 50,
+            debounce: Duration::ZERO,
+            dedupe_retention: Duration::from_secs(7 * 86400),
+        },
+    )
+    .await
+    .unwrap();
     let mut binding = SubscriptionBinding {
         tenant: scope.tenant.clone(),
         user_id: user.clone(),
@@ -304,8 +292,8 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         }
         assert!(owner.delivery_target(&wrong).await.is_err(), "{field}");
     }
-    let mut http = PrivacyHttp::new(center.clone(), identity.clone())
-        .with_ingestion(delivery.clone(), Some("DIGITALMATE_MODEL_CONFIG".into()));
+    let mut http =
+        PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone());
     if bootstrap {
         http = http.with_authorization_owner(owner.clone());
     }
@@ -342,48 +330,20 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
             assert!(value.get("connector_token").is_none());
         }
     }
-    for (path, body, expected) in [
-        (
-            "/v1/secret/get",
-            br#"{"name":"DIGITALMATE_MODEL_CONFIG"}"#.as_slice(),
-            http::StatusCode::OK,
-        ),
-        (
-            "/v1/secret/get",
-            br#"{"name":"DIGITALMATE_CONFIG"}"#,
-            http::StatusCode::UNAUTHORIZED,
-        ),
-        (
-            "/v1/secret/stage",
-            br#"{"transaction":"task","name":"DIGITALMATE_MODEL_CONFIG","delete":true}"#,
-            http::StatusCode::UNAUTHORIZED,
-        ),
-    ] {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(path)
-            .header(http::header::AUTHORIZATION, workload)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(bytes::Bytes::copy_from_slice(body)))
-            .unwrap();
-        let response = http.handle(request).await;
-        assert_eq!(response.status(), expected, "{path}");
-        if expected == http::StatusCode::OK {
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(
-                STANDARD.decode(value["value"].as_str().unwrap()).unwrap(),
-                br#"{"MODEL_ENDPOINT":"synthetic"}"#,
-            );
-        }
-    }
-    let renewed = identity.renew(workload_token).await.unwrap();
-    let renewed = signer
-        .verify(renewed["token"].as_str().unwrap(), false)
+    let settings = center
+        .get(workload_token, "DIGITALMATE_CONFIG")
+        .await
+        .unwrap()
         .unwrap();
+    assert_eq!(
+        settings.plaintext.unwrap().as_slice(),
+        br#"{"TEST_USER_SETTING":"synthetic"}"#
+    );
     let original = signer.verify(workload_token, false).unwrap();
-    assert_eq!(renewed.recovery_until, original.recovery_until);
-    assert_eq!(renewed.task_batch_id, original.task_batch_id);
+    assert_eq!(
+        original.recovery_until,
+        signer.verify(&credentials, false).unwrap().recovery_until
+    );
     let grant_count: i64 = pool
         .get()
         .await
@@ -667,12 +627,8 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         Err(Error::Unauthorized)
     ));
     assert!(delivery.headers(&lease.batch).await.is_err());
-    assert!(identity.renew(workload_token).await.is_err());
-    assert!(identity
-        .delivery_config_grant(workload_token)
-        .await
-        .is_err());
-    assert!(identity.connector_identity(workload_token).await.is_err());
+    assert!(identity.renew(workload_token).await.is_ok());
+    assert!(identity.connector_identity(workload_token).await.is_ok());
     if bootstrap {
         assert!(delivery.bootstrap(token, &owner).await.is_err());
     }

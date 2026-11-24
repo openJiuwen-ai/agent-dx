@@ -240,7 +240,6 @@ impl ApplicationWsConfig {
             .keys()
             .filter(|name| {
                 name.as_str().starts_with("x-adx-")
-                    || name.as_str() == super::privacy_grants::DELIVERY_TOKEN_HEADER
                     || matches!(
                         name.as_str(),
                         "authorization"

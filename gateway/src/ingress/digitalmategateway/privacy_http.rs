@@ -69,7 +69,6 @@ pub(crate) struct PrivacyHttp {
     center: Arc<PrivacyCenter>,
     identity: Arc<super::privacy_grants::PrivacyIdentity>,
     ingestion: Option<Arc<super::privacy_grants::DeliveryIdentity>>,
-    model_config_name: Option<String>,
     authorization_owner: Option<Arc<super::connector_owner::OwnerAuthority>>,
 }
 impl PrivacyHttp {
@@ -81,7 +80,6 @@ impl PrivacyHttp {
             center,
             identity,
             ingestion: None,
-            model_config_name: None,
             authorization_owner: None,
         }
     }
@@ -89,10 +87,8 @@ impl PrivacyHttp {
     pub(crate) fn with_ingestion(
         mut self,
         ingestion: Arc<super::privacy_grants::DeliveryIdentity>,
-        model_config_name: Option<String>,
     ) -> Self {
         self.ingestion = Some(ingestion);
-        self.model_config_name = model_config_name;
         self
     }
 
@@ -272,15 +268,7 @@ impl PrivacyHttp {
             "/v1/secret/get" => {
                 let input: GetRequest =
                     serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
-                let result =
-                    if let Some(grant) = self.identity.delivery_config_grant(&token).await? {
-                        if self.model_config_name.as_deref() != Some(input.name.as_str()) {
-                            return Err(Error::Unauthorized);
-                        }
-                        self.center.read_owned(&grant, &input.name).await?
-                    } else {
-                        self.center.get(&token, &input.name).await?
-                    };
+                let result = self.center.get(&token, &input.name).await?;
                 let body = match result {
                     Some(secret) => {
                         serde_json::json!({"revision":secret.revision,"value":secret.plaintext.as_ref().map(|value| STANDARD.encode(value.as_slice()))})

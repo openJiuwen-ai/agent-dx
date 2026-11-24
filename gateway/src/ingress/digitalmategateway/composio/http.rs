@@ -149,9 +149,6 @@ async fn dispatch(
 ) -> Result<Value, Error> {
     match path.strip_prefix(PREFIX) {
         Some("/subscription") => {
-            if scope.delivery_connection().is_some() {
-                return Err(Error::Forbidden);
-            }
             let request: Validation = decode(bytes)?;
             reference(&request.connection_id)?;
             match gateway
@@ -169,12 +166,6 @@ async fn dispatch(
         Some("/validate") => {
             let request: Validation = decode(bytes)?;
             reference(&request.connection_id)?;
-            if scope
-                .delivery_connection()
-                .is_some_and(|id| id != request.connection_id)
-            {
-                return Err(Error::Forbidden);
-            }
             gateway
                 .validate_account(scope, &request.connection_id)
                 .await
@@ -194,11 +185,6 @@ async fn dispatch(
             let request: Mail = decode(bytes)?;
             let (connection_id, operation, access) = request.into_request();
             reference(&connection_id)?;
-            if scope.delivery_connection().is_some_and(|id| {
-                id != connection_id || !matches!(access, Some(ReadAccess::Subscription { .. }))
-            }) {
-                return Err(Error::Forbidden);
-            }
             let scope = match access {
                 Some(access) => scope
                     .clone()

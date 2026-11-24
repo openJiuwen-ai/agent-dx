@@ -21,7 +21,6 @@ pub(crate) const ACCESS_SECONDS: i64 = 300;
 const RECOVERY_SECONDS: i64 = 30 * 24 * 3600;
 const CLOCK_SKEW_SECONDS: i64 = 60;
 const DELIVERY_ACCESS_SECONDS: i64 = 60;
-const DELIVERY_TASK_SECONDS: i64 = 3600;
 pub(super) const DELIVERY_TOKEN_HEADER: &str = "x-digitalmate-delivery-token";
 
 #[cfg(test)]
@@ -58,14 +57,9 @@ pub(crate) struct Claims {
     /// Delivery-derived connector access cannot acquire a renewable lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bootstrap_until: Option<i64>,
+    /// Links the two credentials at delivery admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_batch_id: Option<String>,
-}
-
-impl Claims {
-    pub(super) fn is_delivery(&self) -> bool {
-        self.task_batch_id.is_some()
-    }
 }
 
 /// A delivery credential identifies a persisted batch, never a JSON-provided scope.
@@ -197,11 +191,6 @@ impl TokenSigner {
             || (!renewal && claims.exp <= current)
             || claims.exp > current.saturating_add(ACCESS_SECONDS + CLOCK_SKEW_SECONDS)
             || claims.exp > claims.recovery_until
-            || (claims.is_delivery()
-                && (prefix != "dm-privacy-v1"
-                    || claims.bootstrap_until.is_some()
-                    || claims.recovery_until
-                        > current + DELIVERY_TASK_SECONDS + CLOCK_SKEW_SECONDS))
             || claims.bootstrap_until.is_some_and(|until| {
                 prefix != "dm-connector-v1"
                     || until != claims.exp
@@ -229,7 +218,6 @@ pub(crate) struct PrivacyIdentity {
     store: AccountStore,
     bindings: Arc<dyn BindingReader>,
     signer: Arc<TokenSigner>,
-    inbox: Option<Inbox>,
 }
 
 impl PrivacyIdentity {
@@ -244,13 +232,7 @@ impl PrivacyIdentity {
             store,
             bindings,
             signer,
-            inbox: None,
         }
-    }
-
-    pub(super) fn with_inbox(mut self, inbox: Option<Inbox>) -> Self {
-        self.inbox = inbox;
-        self
     }
 
     pub fn targets(&self, template: &str) -> bool {
@@ -329,67 +311,27 @@ impl PrivacyIdentity {
     async fn connector_grant(
         &self,
         token: &str,
-    ) -> Result<(Claims, StoredPrivacyGrant, Option<SubscriptionBinding>), Error> {
-        let claims = self.signer.verify_connector(token, false)?;
-        let (grant, subscription) = self.workload_grant(&claims).await?;
-        Ok((claims, grant, subscription))
-    }
-
-    async fn workload_grant(
-        &self,
-        claims: &Claims,
-    ) -> Result<(StoredPrivacyGrant, Option<SubscriptionBinding>), Error> {
+        renewal: bool,
+    ) -> Result<(Claims, StoredPrivacyGrant), Error> {
+        let claims = self.signer.verify_connector(token, renewal)?;
         let grant = self
             .store
             .privacy_get_grant(&claims.id)
             .await?
             .ok_or(Error::Unauthorized)?;
-        if !self.targets(&grant.scope.template) || !TokenSigner::matches(claims, &grant) {
+        if !self.targets(&grant.scope.template) || !TokenSigner::matches(&claims, &grant) {
             return Err(Error::Unauthorized);
         }
-        let subscription = if let Some(batch_id) = &claims.task_batch_id {
-            let binding = self
-                .inbox
-                .as_ref()
-                .ok_or(Error::Unavailable)?
-                .task_binding(batch_id)
-                .await
-                .map_err(ingestion_error)?
-                .ok_or(Error::Unauthorized)?;
-            if !binding.enabled
-                || binding.authority_ref != claims.id
-                || binding_scope(&binding)? != grant.scope
-                || binding.user_id != grant.user
-                || binding.workspace != grant.workspace
-            {
-                return Err(Error::Unauthorized);
-            }
-            Some(binding)
-        } else {
-            None
-        };
         self.current_binding(&claims.id, &grant).await?;
-        Ok((grant, subscription))
+        Ok((claims, grant))
     }
 
     pub(super) async fn owner_connector_grant(
         &self,
         token: &str,
-    ) -> Result<(StoredPrivacyGrant, String, i64, Option<SubscriptionBinding>), Error> {
-        let (claims, grant, subscription) = self.connector_grant(token).await?;
-        Ok((grant, claims.id, claims.exp, subscription))
-    }
-
-    pub(super) async fn delivery_config_grant(
-        &self,
-        token: &str,
-    ) -> Result<Option<StoredPrivacyGrant>, Error> {
-        let claims = self.signer.verify(token, false)?;
-        if !claims.is_delivery() {
-            return Ok(None);
-        }
-        let (grant, _) = self.workload_grant(&claims).await?;
-        Ok(Some(grant))
+    ) -> Result<(StoredPrivacyGrant, String, i64), Error> {
+        let (claims, grant) = self.connector_grant(token, false).await?;
+        Ok((grant, claims.id, claims.exp))
     }
 
     pub(super) async fn owner_grant(&self, id: &str) -> Result<StoredPrivacyGrant, Error> {
@@ -429,7 +371,7 @@ impl PrivacyIdentity {
     /// Verified current workload identity. Connection/session permissions must
     /// still come from their actual owners before constructing a tool scope.
     pub async fn connector_identity(&self, token: &str) -> Result<serde_json::Value, Error> {
-        let (claims, grant, _) = self.connector_grant(token).await?;
+        let (claims, grant) = self.connector_grant(token, false).await?;
         Ok(serde_json::json!({
             "purpose":"connector.tool", "grant_ref":claims.id, "tenant":grant.scope.tenant,
             "user_id":grant.user, "workspace":grant.workspace,
@@ -444,12 +386,6 @@ impl PrivacyIdentity {
 
     pub async fn renew(&self, token: &str) -> Result<serde_json::Value, Error> {
         let mut claims = self.signer.verify(token, true)?;
-        if claims.is_delivery() {
-            self.workload_grant(&claims).await?;
-            claims.exp = (now()? + ACCESS_SECONDS).min(claims.recovery_until);
-            let token = self.signer.sign(&claims)?;
-            return Ok(serde_json::json!({"token":token.as_str(),"expires_at":claims.exp}));
-        }
         let grant = self
             .store
             .privacy_get_grant(&claims.id)
@@ -549,7 +485,7 @@ impl DeliveryIdentity {
             task_batch_id: None,
         };
         let connector = self.identity.signer.sign_connector_bootstrap(&claims)?;
-        self.identity.connector_grant(&connector).await?;
+        self.identity.connector_grant(&connector, false).await?;
         if owner.delivery_target(&admission.binding).await? != target {
             return Err(Error::Unauthorized);
         }
@@ -670,7 +606,7 @@ impl DeliveryAuthorization for DeliveryIdentity {
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
         let (token, admission) = self.issue(batch).await.map_err(delivery_failure)?;
         let current = now().map_err(delivery_failure)?;
-        let recovery_until = (current + DELIVERY_TASK_SECONDS).min(admission.grant_expires_at);
+        let recovery_until = admission.grant_expires_at;
         let claims = Claims {
             id: admission.claims.grant_id,
             tenant: admission.binding.tenant.clone(),

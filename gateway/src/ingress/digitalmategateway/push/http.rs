@@ -94,8 +94,7 @@ where
             .await
             .map_err(|_| not_sent(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request", false))?
             .to_bytes();
-        let report_user = scope.delivery_connection().map(|_| scope.user_id());
-        let huawei = huawei_request(&bytes, &gateway.category, report_user).map_err(failure)?;
+        let huawei = huawei_request(&bytes, &gateway.category).map_err(failure)?;
         let request = gateway
             .client
             .prepare(&scope, &huawei)
@@ -114,17 +113,8 @@ where
     }
 }
 
-fn huawei_request(bytes: &[u8], category: &str, report_user: Option<&str>) -> Result<Value, Error> {
+fn huawei_request(bytes: &[u8], category: &str) -> Result<Value, Error> {
     let request: SendRequest = serde_json::from_slice(bytes).map_err(|_| Error::InvalidRequest)?;
-    if let Some(user) = report_user {
-        let target = &request.click_target;
-        if target.get("principal").map(String::as_str) != Some(user)
-            || !target.contains_key("goal_id")
-            || !target.contains_key("mail_id")
-        {
-            return Err(Error::Forbidden);
-        }
-    }
     if request.event_id.is_empty()
         || request.event_id.len() > 64
         || !request
@@ -242,24 +232,8 @@ mod tests {
     }
 
     #[test]
-    fn delivery_workload_can_only_send_report_notifications_for_its_principal() {
-        let mut request = body();
-        assert!(matches!(
-            huawei_request(request.to_string().as_bytes(), "WORK", Some("user")),
-            Err(Error::Forbidden)
-        ));
-        request["click_target"]["goal_id"] = json!("goal");
-        request["click_target"]["mail_id"] = json!("mail");
-        assert!(huawei_request(request.to_string().as_bytes(), "WORK", Some("user")).is_ok());
-        assert!(matches!(
-            huawei_request(request.to_string().as_bytes(), "WORK", Some("other-user")),
-            Err(Error::Forbidden)
-        ));
-    }
-
-    #[test]
     fn builds_one_system_notification_with_a_fixed_click_action() {
-        let value = huawei_request(body().to_string().as_bytes(), "WORK", None).unwrap();
+        let value = huawei_request(body().to_string().as_bytes(), "WORK").unwrap();
         assert_eq!(value["target"]["token"], json!(["token-1234567890123456"]));
         assert_eq!(value["payload"]["notification"]["foregroundShow"], false);
         assert_eq!(
@@ -273,15 +247,15 @@ mod tests {
         let mut request = body();
         request["huawei"] = json!({});
         assert!(matches!(
-            huawei_request(request.to_string().as_bytes(), "WORK", None),
+            huawei_request(request.to_string().as_bytes(), "WORK"),
             Err(Error::InvalidRequest)
         ));
         let mut request = body();
         request["device_token"] = json!(["t1", "t2"]);
-        assert!(huawei_request(request.to_string().as_bytes(), "WORK", None).is_err());
+        assert!(huawei_request(request.to_string().as_bytes(), "WORK").is_err());
         let mut request = body();
         request["ttl_seconds"] = json!(3601);
-        assert!(huawei_request(request.to_string().as_bytes(), "WORK", None).is_err());
+        assert!(huawei_request(request.to_string().as_bytes(), "WORK").is_err());
     }
 }
 

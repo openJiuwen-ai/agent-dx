@@ -855,15 +855,9 @@ admission response includes `binding_generation` for the admitted Binding.
 Roll out this Gateway together with a sandbox receiver that supports both
 headers before enabling background ingestion.
 
-The background workload bearer can read the configured model record through
-`/v1/secret/get`, use an authorized subscription read for its own connection,
-and submit a report Push with the same principal and report target. The sandbox
-uses its authenticated device registry to resolve the recipient. The identity
-can renew via `/v1/identity/renew` while its original task window is open, including
-after the payload has been acknowledged. Gateway rechecks the durable batch,
-current enabled subscription and current Binding each time. The task window is
-bounded to one hour or the parent grant's expiration, whichever is earlier.
-Privacy writes and other records require an ordinary foreground workload grant.
+After admission, the sandbox uses the workload bearer for the same configuration,
+connector, Push and renewal operations as a foreground workload. The batch ID
+is used only to pair the two credentials at ingestion admission.
 
 For existing consumers, the identity HTTPS listener accepts the delivery bearer
 alone at `POST /v1/ingestion/admit` or `POST /v1/ingestion/bootstrap` with
