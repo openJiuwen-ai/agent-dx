@@ -1185,12 +1185,9 @@ Auto 在本机缺模块或运行库时使用现有回落路径。模块 ABI 不�
 返回错误。显式 HIXL 的 OPEN 不携带 gRPC 文件正文。若 `auto` 下 gRPC 是小文件的正文通道，
 仍可使用只读 OPEN 预取。
 
-旧 `[hixl].ownerfs_read_mode` 会触发未知字段错误。旧 `off` 加 gRPC 可改为 `data_mode = "grpc"`。
-旧 `preferred` 可改为 `data_mode = "auto"` 并配置 `engine_id`，此时只在明确不支持时回退，
-也可以按需配置 RDMA 候选。旧 `required` 可改为 `data_mode = "hixl"` 和 `fs = "ownerfs"`，
-远端缓冲读走 HIXL。两端均启用 `ownerfs_buffered_writes` 后才可协商缓冲写，读写授权分别校验。显式 HIXL 在远端可写或截断打开前确认写能力。协商失败时不发送 `Open`，文件保持原样。Create 和 `O_DIRECT` 打开返回不支持。支持写摘要协商时，HIXL 写复用读会话选择的算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。切换模式时移除旧键。
+配置 `data_mode = "hixl"` 和 `fs = "ownerfs"` 后，远端缓冲读走 HIXL。两端均启用 `ownerfs_buffered_writes` 后才可协商缓冲写，读写授权分别校验。显式 HIXL 在远端可写或截断打开前确认写能力。协商失败时不发送 `Open`，文件保持原样。Create 和 `O_DIRECT` 打开返回不支持。HIXL 写使用会话协商的槽校验算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。
 
-HIXL 线协议 v2 要求 Close 携带 Home 代际。v1 和 v2 在协商阶段明确报告不支持。
+HIXL 线协议 v2 要求 Close 携带 Home 代际。v1 与 v2 节点混用时，协商阶段明确报告不支持。
 滚动更新时，Auto 可按能力不足切换到 RDMA 或 gRPC，显式 HIXL 需要两端都升级。空代际
 Close 会被拒绝，未收尾会话由过期流程保守处理。原生 engine endpoint 被新进程复用时，已绑定旧代际的 reader 会拒绝复用连接，恢复前需退出旧 reader runtime。
 
@@ -1215,9 +1212,9 @@ native 清理和 C/C++ 退出处理器，阻塞耗尽预算时以 `124` 退出�
 | `"roce"` | `true` | RoCE，经中转池 |
 | `"hccs"` | `true` | HCCS，经中转池；要求两端为同一 super-pod 的受支持 A3 设备 |
 
-两端须使用同一 `transport`、相同的 `buffer_pool` 开关，以及启用中转池时相同的 `buffer_pool_count` 和 `buffer_pool_size_mib`。切换时同步更新配置和进程环境，再重启双方 Node。旧 `transport = "hccs-buffer-pool"` 改为 `transport = "hccs"` 和 `buffer_pool = true`。
+两端须使用同一 `transport`、相同的 `buffer_pool` 开关，以及启用中转池时相同的 `buffer_pool_count` 和 `buffer_pool_size_mib`。切换时同步更新配置和进程环境，再重启双方 Node。
 
-启用中转池时，只设置 `buffer_pool = true` 即可使用默认规格。`buffer_pool_count` 是每个设备池的块数，`buffer_pool_size_mib` 是每块的 MiB 数。每条 lane 有两个池，默认 `4 × 8 MiB × 2 = 64 MiB` HBM；Host 收发槽另算。要试更多小块，可在两端同时改为 `buffer_pool_count = 8`、`buffer_pool_size_mib = 4`，每条 lane 的预算仍为 64 MiB。[等预算对比方法](../testing/afs.md#hixl-pool-shapes)。
+启用中转池时，只设置 `buffer_pool = true` 即可使用默认规格。`buffer_pool_count` 是每个设备池的块数，`buffer_pool_size_mib` 是每块的 MiB 数。每条 lane 有两个池，默认 `4 × 8 MiB × 2 = 64 MiB` HBM；Host 收发槽另算。
 
 RoCE 启用中转池时，在两端启动 Node 前都设置以下环境变量，显式选择 RoCE 链路：
 
@@ -1254,14 +1251,13 @@ ownerfs_batch_max_file_bytes = 4194304
 ```
 
 - `ownerfs_read_group_bytes`：单次取回的目标字节数，`window_bytes` 的整数倍，默认 32 MiB（八个
-  4 MiB 窗口）。配置和 Home Prepare 统一接受最多 128 MiB，128 MiB 组的硬件吞吐待验收。实际容量取
+  4 MiB 窗口）。配置和 Home Prepare 统一接受最多 128 MiB。实际容量取
   `min(两端 window_bytes) × min(本地 receive_slots, 对端 export_slots / ownerfs_sessions_per_home, 64)`。
   每个打开最多占用 `组 × ownerfs_read_group_max_inflight` 的在途窗口，默认 1 GiB 预算支持约
   16 个并发打开；并发更多时按需调大预算或缩小组。
 - `receive_slots` / `export_slots`：两端各自的 Host 槽位数，各 1..=128，默认 16。所有 device lane
   的两个槽池合计受 `lane 数 × (receive_slots + export_slots) × window_bytes ≤ 1 GiB` 约束：单 lane
   可用 128/128，2 lane 用 64/64，4 lane 用 32/32；默认 16/16 支持最多 8 lane，16 lane 要降到 8/8。
-  这是为后续更高带宽预留的上限，尚未实测，小规模部署维持默认即可。
 - `ownerfs_snapshot_reads` 默认关闭。只有数据在打开期间保持不可变、授权持续有效的部署可开启。默认按需读，即使另一个节点更新文件，同一个 fd 也会再次从 Home 取数。窗口预读和目录批量仅在该选项开启时生效。
 - `ownerfs_buffered_writes` 默认关闭。两端确认该能力后，才启用窗口写和下一窗口复用。
 - `ownerfs_read_group_max_inflight` 为 1 或 2，默认 2。启用快照读时，2 在消费当前窗口时预取下一个。
@@ -1281,7 +1277,7 @@ ownerfs_batch_max_file_bytes = 4194304
 - `ownerfs_batch_read`：默认 `true`，把只读打开的小文件按目录批量取回；`ownerfs_batch_max_file_bytes`
   是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。连续翻页可复用有序文件名；Home 最多保留 8 个目录快照，每个快照的名字分配不超过 1 MiB。枚举时最多收集 4096 项；超过项数或字节预算即停止，不排序部分清单。该目录跳过批量预读，文件仍可单独读取。每页重新验证读授权，每个文件仍检查当前身份和版本。
 - 其余 HIXL runtime 设置包括 `device_id`、`engine_id`、
-  `device_listen_port`、`[[hixl.additional_devices]]`（最多 16 个逻辑设备）、`window_bytes`
+  `device_listen_port`、`[[hixl.additional_devices]]`（最多 15 个额外设备，含主设备共 16 个）、`window_bytes`
   （1..=4 MiB）。中转池参数为 `buffer_pool_count` 和 `buffer_pool_size_mib`。
 
 单卡部署仍使用原有的 `device_id`，无需新增 TOML 配置，也不会自动绑核。每条 lane 在启动时把 ACL 可见设备号转换成驱动逻辑号，通过 Host 驱动的 DSMI 查询 PCI 总线、设备和功能号，优先从 sysfs 中唯一匹配的 PCI 设备读取 `numa_node`。
@@ -1294,47 +1290,7 @@ Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文
 reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。
 
 并发目录读时按需调大 `ownerfs_read_group_host_budget_bytes`：默认 1 GiB 支持约 16 个目录各驻留
-一个 32 MiB 批量；更多目录同时读时按 `2 × 目录数 × ownerfs_read_group_bytes` 设置。会话数在
-1 MiB 档影响很小，4 MiB 及以上并发明显受益，最多 4 条。
-
-历史 A3 双机 OwnerFs 读组件基准（Home 主机，对端 reader 主机；当时的 `required` 模式、窗口 4 MiB、收发各 32 槽、32 MiB 组、
-默认 1 GiB 预算与每 Home 2 会话；单进程按名字顺序逐文件打开、4 MiB 块读取；同会话内 HIXL 与
-gRPC 交替 3 轮，HIXL 每项只起停一次节点，sha256 只在首轮校验。读回内容全部一致，不代表多机或
-生产规模）：
-
-| MiB/s，中位 [范围]，3 轮 | HIXL | gRPC | HIXL / gRPC |
-| --- | --- | --- | --- |
-| 1 MiB × 1024 | 303 [294–327] | 159 [155–170] | 1.91× |
-| 4 MiB × 256 | 802 [662–852] | 312 [290–378] | 2.57× |
-| 8 MiB × 128 | 630 [601–640] | 489 [406–501] | 1.29× |
-| 16 MiB × 64 | 1007 [829–1019] | 491 [469–572] | 2.05× |
-| 32 MiB × 32 | 1243 [1231–1465] | 571 [439–666] | 2.18× |
-| 64 MiB × 16 | 1842 [1811–1961] | 602 [564–627] | 3.06× |
-| 128 MiB × 8 | 2512 [2254–2535] | 551 [446–588] | 4.56× |
-| 1 GiB × 1 | 3600 [1973–3999] | 579 [546–649] | 6.22× |
-
-25 MiB 以下走窗口或目录批量，固定开销占比高；8 MiB 档每文件只有两个窗口，HIXL 与 gRPC 都
-接近各自的固定开销下限，因此领先幅度最小。1 GiB 档的 HIXL 范围较宽，是单文件冷读受宿主负载
-影响的结果。整轮 24 个 HIXL 单元合计占卡约 1100 秒（每项 18～63 秒，主要是节点启动与停止）；
-gRPC 单元不打开 NPU。
-
-同一对主机上的 NFS 对照（5 轮；NFS 服务端与客户端都在各自容器内，服务端用 `rpc.nfsd` 导出、
-客户端容器挂载；该组不打开 NPU，与上表不同会话，只做量级对照）：
-
-| MiB/s，中位 [范围]，5 轮 | NFS | NFS / gRPC | HIXL / NFS |
-| --- | --- | --- | --- |
-| 1 MiB × 1024 | 614 [490–678] | 3.06× | 0.49× |
-| 4 MiB × 256 | 1024 [929–1197] | 2.85× | 0.78× |
-| 8 MiB × 128 | 986 [940–1190] | 2.07× | 0.64× |
-| 16 MiB × 64 | 1350 [1143–1616] | 2.58× | 0.75× |
-| 32 MiB × 32 | 1336 [1306–1819] | 2.19× | 0.93× |
-| 64 MiB × 16 | 1623 [1424–1843] | 2.72× | 1.13× |
-| 128 MiB × 8 | 1465 [1364–1671] | 2.21× | 1.71× |
-| 1 GiB × 1 | 1573 [1327–1824] | 2.45× | 2.29× |
-
-16 MiB 及以下 NFS 更快（HIXL 是它的 0.49～0.78 倍），32 MiB 基本持平，64 MiB 起 HIXL 反超。
-这与小文件受元数据往返、大文件受传输带宽支配的既有结论一致。NFS 服务端放在容器内与放在源主机
-宿主机上得到的结果在噪声范围内相同。
+一个 32 MiB 批量；更多目录同时读时按 `2 × 目录数 × ownerfs_read_group_bytes` 设置。
 
 ## OwnerFs 运行时开关
 

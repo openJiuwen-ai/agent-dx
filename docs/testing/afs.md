@@ -1366,7 +1366,7 @@ See [the measurement boundary](../performance/afs-write-owned-admission.md#measu
 
 ### OwnerFs 正文选择与 HIXL 契约
 
-Linux 组件测试覆盖显式模式、Auto 优先顺序、旧配置拒绝和健康状态，以及普通窗口与目录批量
+Linux 组件测试覆盖显式模式、Auto 优先顺序和健康状态，以及普通窗口与目录批量
 所用的共用拉取路径。loopback 使用内存导出槽验证取消等待、释放合并、校验错误、打开版本与
 失效和 `Bytes` 切片。组件测试也覆盖显式 HIXL 的远端缓冲可写打开与直接 I/O 拒绝、尾部补读和缓存 EOF 命中的
 1 MiB 请求上限，以及窗口与目录批量 Prepare 的 128 MiB 上限。
@@ -1377,7 +1377,7 @@ cargo test --locked -p afs --lib node::data_plane
 cargo test --locked -p afs --test config_contract --test node_health_contract
 ```
 
-组件测试也覆盖重启后同号会话拒绝旧 Close、默认按需读在同一 fd 上看到远端覆盖和追加，以及写等待者超时后迟到的设备完成不能触发 Commit。RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需独立 Linux 运行证据。组件测试验证软件契约。
+组件测试也覆盖重启后同号会话拒绝旧 Close、默认按需读在同一 fd 上看到远端覆盖和追加，以及写等待者超时后迟到的设备完成不能触发 Commit。RoCE、HCCS、多 lane 和 FUSE 真挂载各需独立 Linux 运行证据。组件测试验证软件契约。
 
 无 CANN 的 Linux 环境可以用 `cargo test --locked -p afs-transport --features hixl` 检查模块加载错误和软件路径。
 有 SDK 且已准备 CANN 运行库时，运行
@@ -1387,17 +1387,10 @@ cargo test --locked -p afs --test config_contract --test node_health_contract
 
 单卡真机验收时，用 `npu-smi info` 核对所选 NPU 的 PCI 地址，并用对应的 `numa_node` 核对 `AFS_HIXL_NUMA` 的 `source=pci`。核对 `source=worker_cpu` 时，确认 PCI 节点不可用，并检查实际分配槽的 owner 线程（`/proc/<pid>/task/<tid>/status` 的 `Cpus_allowed_list`）允许的全部 CPU 是否同属日志所示节点；无可信节点时预期 `source=unknown node=-1`。另核对 `policy=preferred|inherited`。无需修改 TOML，AFS 也不会自动绑核。
 
-日志报告节点来源和首个接收槽的分配策略，不保证实际页落点。另用槽地址对应的 `/proc/<pid>/numa_maps` 核对页数；若 `/dev/davinci_manager` 映射未报告页数且 `move_pages` 查询返回 `-EFAULT`，将实际落点记为未知。吞吐对比使用相同窗口、槽数和工作负载，并记录两组实际生效的策略。
-
-<a id="hixl-pool-shapes"></a>
-
-**等预算比较中转池规格。** 在同一对节点、同一条链路上固定 `buffer_pool = true`，A 组使用默认的每池 4 块 × 8 MiB，B 组使用 8 块 × 4 MiB。每次两端使用同一组配置并重启；保存两端配置，从 `/health` 确认链路、启池状态和每条 lane 的 `relay_hbm_budget_bytes = 67108864`。两组预算相同，单看该指标不能区分块数。两端启用 `ownerfs_buffered_writes`，固定 `data_mode = "hixl"`、Host 槽、并发度、文件大小、请求大小和内存对齐；每组预热后交替运行至少三对，分别比较 `pwrite` 带宽、含 `fsync` 的带宽和单次 `pwrite` P99。读回并核对 Home 文件摘要，记录两端 HIXL 正文字节数。64 KiB 和 1 MiB 请求分别报告，以免混合均值掩盖差异。
+日志报告节点来源和首个接收槽的分配策略，不保证实际页落点。另用槽地址对应的 `/proc/<pid>/numa_maps` 核对页数；若 `/dev/davinci_manager` 映射未报告页数且 `move_pages` 查询返回 `-EFAULT`，将实际落点记为未知。
 
 写路径的硬件验收应分别在 HCCS 和 RoCE 双机上执行同一文件的顺序写、短写、追加、读回和 fsync。断链时检查目标槽隔离，Commit 回包丢失时以同一票据确认文件只追加一次。记录两端 SDK、设备型号、实际写入字节和读回摘要。
 
 **RoCE 遗留事项（待双机真机验证）**
 
 - 断链恢复和停机：建连后中断链路，等待 SDK 心跳摘除 peer，再分别验证同端点重新协商后的首次读，以及不重连直接停机时的资源释放。检查本地已连接记录是否掩盖 SDK 的 `NOT_CONNECTED`。涉及未确认完成的读仍须隔离槽位。
-- 同 lane 并发：固定读组大小和缓存状态，用 1、2、4 个并发 reader 记录吞吐、读延迟 p99、`afs_hixl_reader_owner_queue_seconds` 与 `afs_hixl_reader_sdk_transfer_seconds`。据此判断 `WAITING` 后的 1 ms 轮询及 owner 排队是否需要调整。
-
-以上是未完成的 RoCE 验证；HCCS 组件基准不能替代这两项结果。

@@ -456,17 +456,6 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 
 文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
-DFS FUSE 采用缓存的 write-through 模式，只读与可写打开都经过页缓存；`O_DIRECT` 打开和
-不兼容的固定打开视图仍回复 `FOPEN_DIRECT_IO`。内核预读把大的应用 read 拆成较小的请求
-（A3 实测约 1 MiB），顺序预读组把这些请求合并到组窗口。两种传输共享此策略，每个新 DFS
-请求仍重新验证相关 chunk，不跨请求缓存“验证通过”标记。入口指标
-`afs_fuse_callback_size_bytes{filesystem,operation}` 记录内核回调字节数的直方图，
-包含失败回调；其 sum 不是成功读取字节数，INIT 日志中的上限也不是实际请求分布。
-`afs_fuse_read_stage_seconds{filesystem,stage}` 按 front（回调入口到投递）、queue（等待
-dispatch 工作线程）、backend（直到回复字节就绪）、handoff（异步读等待回复线程）、reply
-（写回内核）记录每次读回调的墙钟，包含失败回调；同步读没有 handoff。front 中的写屏障
-（gate）和同步读选择投递队列（route）另行单独记录。
-
 Node 的 `data_mode` 选择正文通道，gRPC 始终承载控制 RPC。`auto` 按当前操作选已装配的候选，
 顺序为 HIXL、RDMA、gRPC。显式 HIXL 默认用于 OwnerFs 远端按需读，禁止 gRPC OPEN 携带正文。
 OwnerFs 继续通过 `RemoteFiles` 和 `OwnerPeerClient` 访问 Home。HIXL 客户端接入 OwnerFiles 的文件操作，
@@ -495,7 +484,7 @@ HIXL 缓冲写默认关闭。两端启用 `ownerfs_buffered_writes` 并由 Home 
 Auto 写在发送 `PrepareWriteHixl` 或复用已授予的写槽之前，按本次缓冲写的正文长度选择通道。
 `[hixl].ownerfs_min_write_bytes` 默认 `524288` 字节、有效范围 `0..=1048576`；达到阈值才尝试 HIXL，
 低于阈值走原有 RDMA/gRPC 路径，即使已持有写槽。`0` 对所有非空缓冲写尝试 HIXL；显式 HIXL 不受此阈值限制。
-Writer 以 `PrepareWriteHixl` 申请 Home 的注册目标槽，绑定授权、句柄、偏移、长度、写选项及正文摘要。支持写摘要协商的双方沿用读会话算法：优先 CRC32C（4 字节小端），否则使用 BLAKE3。Writer 和 Home 分别校验传输前后的有效字节；请求重放指纹只覆盖控制消息。
+Writer 以 `PrepareWriteHixl` 申请 Home 的注册目标槽，绑定授权、句柄、偏移、长度、写选项及正文摘要。写摘要沿用会话协商的槽校验算法：优先 CRC32C（4 字节小端），否则使用 BLAKE3。Writer 和 Home 分别校验传输前后的有效字节；请求重放指纹只覆盖控制消息。
 Writer 向槽提交 native `WRITE`，确认设备完成后以同一票据调用 `CommitWriteHixl`。Home 复验写授权、内容并执行文件写入，按实际 `written` 返回结果。
 读端未收到窗口或目录批量 Prepare 的回包时，可用本地会话、`read_id` 和代次报告 `NotSubmitted`。Home 回收已发布的槽，并拒绝同 ID 的迟到 Prepare。
 Commit 重试复用原会话及 `write_id`。设备 WRITE 已完成而 Commit 超时时，Writer 用同一票据向 Home 查询结果。Home 可回放已有回执（包括实际短写字节数），或封住尚未执行的 Commit 并回收槽。恢复请求本身不执行文件写入。无法取得确定回执时，应用仍得到写结果未知。本节点按 Home 和文件身份停用可复用的读数据，包括批量切片与 Open 预取；同一读句柄在 Home 延迟写入完成后能看到新字节。设备结果未知时隔离槽位。持久化仍由文件 `Fsync` 契约处理。
@@ -503,8 +492,7 @@ Commit 重试复用原会话及 `write_id`。设备 WRITE 已完成而 Commit �
 DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
 启用快照读后，预读组目标大小是 `ownerfs_read_group_bytes`（默认 32 MiB，即八个 4 MiB 窗口）。Home 在协商中公布
 各 lane 的总导出槽数，reader 按会话分摊，再与本地接收槽数和单次 64 个描述符的上限取最小值。
-实际槽大小取两端窗口大小的较小值。同一打开
-认领后复用其切片，本节点写入、setattr 或 `O_TRUNC` 打开使窗口失效。FUSE READ 完全落在窗口内时
+实际槽大小取两端窗口大小的较小值。同一打开认领窗口后，可复用其切片，本节点写入、setattr 或 `O_TRUNC` 打开使窗口失效。FUSE READ 完全落在窗口内时
 直接共享窗口内存，不再分配和拷贝。小文件另按目录批量取回：Home 用一次 `PrepareBatchHixl` 把
 同一目录下锚点之后的一串整文件装入导出槽（文件不跨槽），reader 按 file identity 与版本认领切片，
 认领四分之一后预取下一批。驻留批量合计不超过

@@ -179,8 +179,7 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # Buffered HIXL writes require opt-in on both sides.
 # ownerfs_buffered_writes = false
 # The two Host slot pools across all device lanes may reserve 1 GiB together;
-# one lane can take 128 + 128 slots of 4 MiB windows (the largest reservation),
-# kept for future higher-bandwidth links.
+# one lane can take 128 + 128 slots of 4 MiB windows (the largest reservation).
 # window_bytes = 4194304
 # receive_slots = 128
 # export_slots = 128
@@ -199,8 +198,7 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # With the relay enabled, each lane has two device pools. Defaults per pool:
 # buffer_pool_count = 4     # blocks per pool
 # buffer_pool_size_mib = 8  # MiB per block
-# For a same-budget comparison, set count=8 and size_mib=4 on both peers.
-# Both shapes use 64 MiB of HBM per lane; Host slots are budgeted separately.
+# The default uses 64 MiB of HBM per lane; Host slots are budgeted separately.
 # For RoCE with buffer_pool = true, set HCCL_INTRA_ROCE_ENABLE=1,
 # HCCL_INTRA_PCIE_ENABLE=0, and HCCL_INTER_HCCS_DISABLE=TRUE in both Node environments.
 # Host slots prefer the NPU PCI NUMA node. If unavailable, sched_getaffinity

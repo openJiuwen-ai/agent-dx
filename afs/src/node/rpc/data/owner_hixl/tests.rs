@@ -434,7 +434,6 @@ async fn read_only_home_does_not_admit_hixl_writes() {
         .negotiate_blocking("node-b", negotiate_request("root-a"))
         .unwrap();
     assert!(!session.buffered_write_supported);
-    assert!(!session.write_checksum_negotiated);
     let reply = home
         .prepare_write("node-b".to_owned(), Default::default())
         .await
@@ -913,10 +912,13 @@ fn slot_checksum_negotiation_falls_back_to_blake3() {
         SlotChecksum::Blake3
     );
     assert_eq!(SlotChecksum::negotiate(&[]), SlotChecksum::Blake3);
-    // A Home that predates the field leaves it unset; that is BLAKE3.
+    assert_eq!(
+        SlotChecksum::from_reply(HixlSlotChecksumAlgorithm::Blake3 as i32),
+        Some(SlotChecksum::Blake3)
+    );
     assert_eq!(
         SlotChecksum::from_reply(HixlSlotChecksumAlgorithm::Unspecified as i32),
-        Some(SlotChecksum::Blake3)
+        None
     );
     assert_eq!(
         SlotChecksum::from_reply(2),

@@ -501,11 +501,6 @@ impl PeerBatchDirectory {
         Ok(PeerBatchDirectoryVersion::from_metadata(&metadata))
     }
 
-    /// Entry names in byte order, without `.` and `..`.
-    pub fn names(&self) -> Result<Vec<OsString>> {
-        self.directory.read_dir().map_err(Error::from)
-    }
-
     /// Complete byte-sorted entry names, or `None` if either limit is exceeded.
     pub(crate) fn names_bounded(
         &self,
@@ -12743,8 +12738,12 @@ mod tests {
         let directory = local
             .peer_batch_directory("node-b", &access, OsStr::new(""))
             .unwrap();
+        let max_listing_bytes = 1024;
         let first_version = directory.version().unwrap();
-        let names = directory.names().unwrap();
+        let names = directory
+            .names_bounded(4, max_listing_bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(directory.version().unwrap(), first_version);
         assert_eq!(names, ["a", "b", "link", "sub"]);
         assert_eq!(directory.stat(OsStr::new("sub")).unwrap(), None);
@@ -12768,12 +12767,12 @@ mod tests {
             .set_times(physical, None, Some(UNIX_EPOCH))
             .unwrap();
         assert_ne!(directory.version().unwrap(), first_version);
-        assert!(
+        assert_eq!(
             directory
-                .names()
+                .names_bounded(5, max_listing_bytes)
                 .unwrap()
-                .iter()
-                .any(|name| name == "new-sub")
+                .unwrap(),
+            ["a", "b", "link", "new-sub", "sub"]
         );
         // The grant is validated for this peer, like any peer OPEN.
         assert!(

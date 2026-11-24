@@ -26,9 +26,7 @@ impl SlotChecksum {
     /// negotiation and means BLAKE3.
     pub(crate) fn from_reply(algorithm: i32) -> Option<Self> {
         match HixlSlotChecksumAlgorithm::try_from(algorithm) {
-            Ok(HixlSlotChecksumAlgorithm::Unspecified | HixlSlotChecksumAlgorithm::Blake3) => {
-                Some(Self::Blake3)
-            }
+            Ok(HixlSlotChecksumAlgorithm::Blake3) => Some(Self::Blake3),
             Ok(HixlSlotChecksumAlgorithm::Crc32c) => Some(Self::Crc32c),
             _ => None,
         }

@@ -10,9 +10,9 @@ use super::{
 use crate::node::storage::MAX_TRANSFER_BYTES;
 use crate::node::vfs::types::WriteOptions;
 use afs_protocol::node_data::{
-    HixlSlotChecksumAlgorithm, OwnerAbortWriteHixlReply, OwnerAbortWriteHixlRequest,
-    OwnerCommitWriteHixlReply, OwnerFinishWriteHixlRequest, OwnerPrepareWriteHixlReply,
-    OwnerPrepareWriteHixlRequest, OwnerWriteHixlFailure, owner_abort_write_hixl_reply::Recovery,
+    OwnerAbortWriteHixlReply, OwnerAbortWriteHixlRequest, OwnerCommitWriteHixlReply,
+    OwnerFinishWriteHixlRequest, OwnerPrepareWriteHixlReply, OwnerPrepareWriteHixlRequest,
+    OwnerWriteHixlFailure, owner_abort_write_hixl_reply::Recovery,
 };
 use prost::Message;
 use std::sync::{Arc, MutexGuard};
@@ -858,7 +858,7 @@ impl WriteInput {
     fn parse(
         request: &OwnerPrepareWriteHixlRequest,
         access: PresentedRootAccess,
-        negotiated: SlotChecksum,
+        checksum: SlotChecksum,
     ) -> Result<Self, Status> {
         let length = usize::try_from(request.length)
             .ok()
@@ -866,16 +866,11 @@ impl WriteInput {
             .ok_or_else(|| invalid_write("OwnerFs HIXL write length is invalid"))?;
         let lane = usize::try_from(request.lane_id)
             .map_err(|_| invalid_write("OwnerFs HIXL write lane overflows"))?;
-        let checksum =
-            if request.data_checksum_algorithm == HixlSlotChecksumAlgorithm::Unspecified as i32 {
-                SlotChecksum::Blake3
-            } else if request.data_checksum_algorithm == negotiated.wire() as i32 {
-                negotiated
-            } else {
-                return Err(invalid_write(
-                    "OwnerFs HIXL write digest algorithm differs from negotiation",
-                ));
-            };
+        if request.data_checksum_algorithm != checksum.wire() as i32 {
+            return Err(invalid_write(
+                "OwnerFs HIXL write digest algorithm differs from negotiation",
+            ));
+        }
         if request.data_checksum.len() != checksum.len() {
             return Err(invalid_write("OwnerFs HIXL write digest length is invalid"));
         }

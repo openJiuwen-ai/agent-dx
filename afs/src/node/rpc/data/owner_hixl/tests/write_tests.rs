@@ -63,6 +63,16 @@ async fn write_replays_one_append_and_preserves_the_actual_short_write() {
     source.append_writes.store(true, Ordering::SeqCst);
     let payload: Vec<u8> = (0..SLOT + 17).map(|byte| (byte % 251) as u8).collect();
     let request = request(session(&service), &payload);
+    let mut unspecified = request.clone();
+    unspecified.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Unspecified as i32;
+    assert_eq!(
+        service
+            .prepare_write("node-b".into(), unspecified)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
     let reply = prepare(&service, request.clone()).await;
     assert_eq!(reply.slots.len(), 2);
     assert_eq!(
@@ -215,7 +225,6 @@ async fn recovery_fences_late_commit_and_can_replay_the_fence() {
 async fn recovery_fences_reused_window_and_rejects_a_mismatched_binding() {
     let (service, exports, source) = fixture(0, 1);
     let mut first = request(session(&service), b"a");
-    first.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Unspecified as i32;
     let reply = prepare(&service, first.clone()).await;
     exports.write(reply.slots[0].address, b"a");
     let mut finish = commit(&reply);
@@ -395,7 +404,7 @@ async fn write_only_grant_negotiates_and_prepares_writes_but_cannot_prepare_read
         .await
         .unwrap()
         .into_inner();
-    assert!(reply.write_checksum_negotiated);
+    assert!(reply.buffered_write_supported);
     let error = service
         .prepare(
             "node-b".into(),
@@ -679,17 +688,21 @@ async fn negotiated_crc32c_detects_corruption_against_known_vector() {
     let mut valid = request(session_id, b"123456789");
     valid.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Crc32c as i32;
     valid.data_checksum = vec![0x83, 0x92, 0x06, 0xe3];
-    for value in [0, HixlSlotChecksumAlgorithm::Blake3 as i32, i32::MAX] {
+    for algorithm in [
+        HixlSlotChecksumAlgorithm::Unspecified as i32,
+        HixlSlotChecksumAlgorithm::Blake3 as i32,
+        i32::MAX,
+    ] {
         let mut invalid = valid.clone();
-        invalid.data_checksum_algorithm = value;
-        if value == HixlSlotChecksumAlgorithm::Blake3 as i32 {
-            invalid.data_checksum = SlotChecksum::Blake3.digest(b"123456789");
-        }
-        assert!(
+        invalid.data_checksum_algorithm = algorithm;
+        invalid.data_checksum = SlotChecksum::Blake3.digest(b"123456789");
+        assert_eq!(
             service
                 .prepare_write("node-b".into(), invalid)
                 .await
-                .is_err()
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
         );
     }
     let mut wrong_length = valid.clone();
@@ -719,16 +732,23 @@ async fn negotiated_crc32c_detects_corruption_against_known_vector() {
         reused: Some(valid),
         window_token: window.write_id,
     };
-    let mut mismatched = reused.clone();
-    let metadata = mismatched.reused.as_mut().unwrap();
-    metadata.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Blake3 as i32;
-    metadata.data_checksum = SlotChecksum::Blake3.digest(b"123456789");
-    assert!(
-        service
-            .commit_write("node-b".into(), mismatched)
-            .await
-            .is_err()
-    );
+    for algorithm in [
+        HixlSlotChecksumAlgorithm::Unspecified,
+        HixlSlotChecksumAlgorithm::Blake3,
+    ] {
+        let mut mismatched = reused.clone();
+        let metadata = mismatched.reused.as_mut().unwrap();
+        metadata.data_checksum_algorithm = algorithm as i32;
+        metadata.data_checksum = SlotChecksum::Blake3.digest(b"123456789");
+        assert_eq!(
+            service
+                .commit_write("node-b".into(), mismatched)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
     exports.write(window.slots[0].address, b"123456780");
     for _ in 0..2 {
         assert_eq!(
@@ -747,9 +767,7 @@ async fn negotiated_crc32c_detects_corruption_against_known_vector() {
 #[tokio::test]
 async fn unknown_abort_of_unused_successor_pins_window() {
     let (service, exports, source) = fixture(0, 1);
-    let mut legacy = request(session(&service), b"x");
-    legacy.data_checksum_algorithm = HixlSlotChecksumAlgorithm::Unspecified as i32;
-    let prepared = prepare(&service, legacy).await;
+    let prepared = prepare(&service, request(session(&service), b"x")).await;
     exports.write(prepared.slots[0].address, b"x");
     let mut first = commit(&prepared);
     first.request_next = true;

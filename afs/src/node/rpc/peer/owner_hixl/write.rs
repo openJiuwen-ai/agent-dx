@@ -282,11 +282,8 @@ impl OwnerHixlReader {
                 .await?;
         }
         lease.guard.write_tickets += 1;
-        // Legacy Homes ignore request_next and would interpret cancel_next as
-        // an ordinary Abort. Only ask for a grant with the updated protocol.
-        let request_next = request.keep_next
-            && lease.session.reply.write_checksum_negotiated
-            && lease.guard.write_tickets < MAX_SESSION_WRITE_TICKETS;
+        let request_next =
+            request.keep_next && lease.guard.write_tickets < MAX_SESSION_WRITE_TICKETS;
         let cached = lease.guard.write_window.take();
         let mut ticket = PendingWrite::new(lease, &prepare, &remote, request_next, cached.as_ref());
         let windows = if let Some(window) = cached {
@@ -414,9 +411,6 @@ fn body_checksum(
     reply: &super::OwnerNegotiateHixlReply,
     data: &[u8],
 ) -> afs_error::Result<(i32, Vec<u8>)> {
-    if !reply.write_checksum_negotiated {
-        return Ok((0, SlotChecksum::Blake3.digest(data)));
-    }
     let algorithm = SlotChecksum::from_reply(reply.slot_checksum_algorithm)
         .ok_or_else(|| protocol_error("OwnerFs HIXL write checksum is unsupported"))?;
     Ok((algorithm.wire() as i32, algorithm.digest(data)))
@@ -621,7 +615,6 @@ impl PendingWrite {
         }
     }
 
-    /// A legacy Home only cancels the successor and returns an empty reply.
     /// Only a typed receipt can establish execution or non-execution.
     async fn recover(
         &self,
@@ -879,12 +872,12 @@ mod tests {
     }
 
     #[test]
-    fn write_body_checksum_honors_negotiation_and_legacy_wire_shape() {
+    fn write_body_checksum_requires_a_negotiated_algorithm() {
         use afs_protocol::node_data::HixlSlotChecksumAlgorithm;
 
         let body = b"123456789";
         let mut reply = super::super::OwnerNegotiateHixlReply {
-            write_checksum_negotiated: true,
+            buffered_write_supported: true,
             slot_checksum_algorithm: HixlSlotChecksumAlgorithm::Crc32c as i32,
             ..Default::default()
         };
@@ -899,14 +892,12 @@ mod tests {
         let blake = blake3::hash(body).as_bytes().to_vec();
         assert_eq!(
             body_checksum(&reply, body).unwrap(),
-            (HixlSlotChecksumAlgorithm::Blake3 as i32, blake.clone())
+            (HixlSlotChecksumAlgorithm::Blake3 as i32, blake)
         );
-        reply.write_checksum_negotiated = false;
-        reply.slot_checksum_algorithm = HixlSlotChecksumAlgorithm::Crc32c as i32;
-        assert_eq!(
-            body_checksum(&reply, body).unwrap(),
-            (HixlSlotChecksumAlgorithm::Unspecified as i32, blake)
-        );
+        for algorithm in [HixlSlotChecksumAlgorithm::Unspecified as i32, i32::MAX] {
+            reply.slot_checksum_algorithm = algorithm;
+            assert!(body_checksum(&reply, body).is_err());
+        }
     }
 
     #[test]

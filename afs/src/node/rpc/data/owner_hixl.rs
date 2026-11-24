@@ -276,9 +276,9 @@ pub struct OwnerHixlService {
     owner_metrics: Option<OwnerRpcMetrics>,
     trusted_peers: Option<Arc<HashSet<String>>>,
     buffered_writes: bool,
-    /// Slot algorithms each reader offered, in negotiation order.
+    /// Slot algorithms from the most recent negotiation offer.
     #[cfg(test)]
-    offered_checksums: Arc<Mutex<Vec<Vec<i32>>>>,
+    offered_checksums: Arc<Mutex<Vec<i32>>>,
 }
 
 #[derive(Default)]
@@ -350,7 +350,7 @@ impl OwnerHixlService {
         self.offered_checksums
             .lock()
             .ok()
-            .and_then(|offers| offers.last().cloned())
+            .map(|offer| offer.clone())
             .unwrap_or_default()
     }
 
@@ -585,8 +585,8 @@ impl OwnerHixlService {
         )?;
         let checksum = SlotChecksum::negotiate(&request.slot_checksum_algorithms);
         #[cfg(test)]
-        if let Ok(mut offers) = self.offered_checksums.lock() {
-            offers.push(request.slot_checksum_algorithms.clone());
+        if let Ok(mut offer) = self.offered_checksums.lock() {
+            offer.clone_from(&request.slot_checksum_algorithms);
         }
 
         let mut registry = self.lock_registry()?;
@@ -648,7 +648,6 @@ impl OwnerHixlService {
             hccs_domain_id,
             lanes,
             slot_checksum_algorithm: checksum.wire() as i32,
-            write_checksum_negotiated: self.buffered_writes,
             buffered_write_supported: self.buffered_writes,
         })
     }

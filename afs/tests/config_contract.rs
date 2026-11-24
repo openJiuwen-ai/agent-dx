@@ -607,7 +607,6 @@ fn hixl_defaults_off_with_roce_transport_without_changing_existing_data_mode() {
     let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
     assert_eq!(cfg.data_mode, DataMode::Grpc);
     let printed = serde_json::to_value(&cfg).unwrap();
-    assert!(printed["hixl"].get("ownerfs_read_mode").is_none());
     assert_eq!(printed["hixl"]["transport"], "roce");
     assert_eq!(printed["hixl"]["buffer_pool_count"], 4);
     assert_eq!(printed["hixl"]["buffer_pool_size_mib"], 8);
@@ -631,19 +630,6 @@ fn disabled_hixl_table_is_accepted_without_native_dependencies() {
     assert_eq!(cfg.data_mode, DataMode::Grpc);
     let printed = serde_json::to_value(&cfg).unwrap();
     assert_eq!(printed["hixl"]["receive_slots"], 2);
-}
-
-#[test]
-fn the_removed_hixl_switch_is_rejected_as_an_unknown_field() {
-    for old_mode in ["off", "preferred", "required"] {
-        let error = resolve_hixl_table(
-            "data_mode='grpc'",
-            &format!("ownerfs_read_mode='{old_mode}'"),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown field"), "{error}");
-        assert!(error.to_string().contains("ownerfs_read_mode"), "{error}");
-    }
 }
 
 fn resolve_hixl_table(prefix: &str, table: &str) -> afs_error::Result<Config> {
@@ -883,7 +869,6 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
     );
     assert!(meta.non_product_options().is_empty());
     let printed = serde_json::to_value(&node).unwrap();
-    assert!(printed["hixl"].get("ownerfs_read_mode").is_none());
     assert_eq!(printed["hixl"]["transport"], "roce");
     for tls in [meta.tls_config(), node.tls_config()] {
         assert!(matches!(
