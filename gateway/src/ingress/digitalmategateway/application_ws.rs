@@ -42,6 +42,21 @@ impl Application {
             Self::DigitalMate => "digitalmate",
         }
     }
+    pub(super) fn binding_id(self, tenant: &str, user_id: &str) -> Result<String, Error> {
+        for value in [tenant, user_id] {
+            adx_agent_core::identifier(value, "application WebSocket identity")
+                .map_err(Error::Invalid)?;
+            if value.len() > 256 {
+                return Err(invalid());
+            }
+        }
+        let tuple = serde_json::to_vec(&[tenant, user_id]).map_err(|_| invalid())?;
+        Ok(format!(
+            "{}-{}",
+            self.name(),
+            hex::encode(Sha256::digest(tuple))
+        ))
+    }
 }
 
 impl ApplicationWsConfig {
@@ -51,23 +66,11 @@ impl ApplicationWsConfig {
         user_id: &str,
         application: Application,
     ) -> Result<Scope, Error> {
-        for value in [tenant, user_id] {
-            adx_agent_core::identifier(value, "application WebSocket identity")
-                .map_err(Error::Invalid)?;
-            if value.len() > 256 {
-                return Err(invalid());
-            }
-        }
-        let tuple = serde_json::to_vec(&[tenant, user_id]).map_err(|_| invalid())?;
         let scope = Scope {
             tenant: tenant.into(),
             template: self.template.clone(),
             template_ref: self.template_ref.parse().map_err(Error::Invalid)?,
-            binding_id: format!(
-                "{}-{}",
-                application.name(),
-                hex::encode(Sha256::digest(tuple))
-            ),
+            binding_id: application.binding_id(tenant, user_id)?,
         };
         scope.validate().map_err(Error::Invalid)?;
         Ok(scope)

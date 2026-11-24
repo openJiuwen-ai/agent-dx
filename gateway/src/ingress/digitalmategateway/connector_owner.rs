@@ -323,12 +323,13 @@ impl OwnerAuthority {
     pub(super) async fn delivery_target(
         &self,
         delivery: &super::ingestion::SubscriptionBinding,
+        workload_grant: &str,
     ) -> accounts::Result<serde_json::Value> {
         delivery
             .validate()
             .map_err(|_| accounts::Error::Unauthorized)?;
         let identity = self.identity.as_ref().ok_or(accounts::Error::Unavailable)?;
-        let grant = identity.owner_grant(&delivery.authority_ref).await?;
+        let grant = identity.owner_grant(workload_grant).await?;
         if !delivery.enabled
             || grant.scope != super::privacy_grants::binding_scope(delivery)?
             || grant.user != delivery.user_id

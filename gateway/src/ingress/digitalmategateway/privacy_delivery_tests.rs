@@ -214,7 +214,7 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
     let secret = b"synthetic-webhook-secret";
     let signature =
         STANDARD.encode(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), &signed).as_ref());
-    let headers = http::HeaderMap::from_iter([
+    let webhook_headers = http::HeaderMap::from_iter([
         (
             http::header::HeaderName::from_static("webhook-id"),
             http::HeaderValue::from_static("wh_test"),
@@ -232,15 +232,35 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         .receive(
             WebhookVerifier::new(&[secret])
                 .unwrap()
-                .verify(&headers, &raw, now().unwrap() as u64)
+                .verify(&webhook_headers, &raw, now().unwrap() as u64)
                 .unwrap(),
         )
         .await
         .unwrap();
     let lease = inbox.claim(Duration::from_secs(30)).await.unwrap().unwrap();
     let delivery = Arc::new(DeliveryIdentity::new(identity.clone(), inbox.clone()));
+    let account = pool.get().await.unwrap();
+    account
+        .execute(
+            "UPDATE adx_accounts.users SET status='disabled' WHERE user_id=$1",
+            &[&user],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        delivery.scope(&lease.batch).await,
+        Err(DeliveryFailure::Rejected)
+    ));
+    account
+        .execute(
+            "UPDATE adx_accounts.users SET status='active' WHERE user_id=$1",
+            &[&user],
+        )
+        .await
+        .unwrap();
+    drop(account);
     let headers = delivery
-        .headers(&lease.batch)
+        .headers(&lease.batch, "generation-one")
         .await
         .unwrap_or_else(|_| panic!("actual issuer refused current batch"));
     let workload = headers[http::header::AUTHORIZATION].to_str().unwrap();
@@ -263,12 +283,21 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
     );
     let normal_proof = identity.connector_identity(&credentials).await.unwrap();
     assert_eq!(normal_proof["grant_ref"], binding.authority_ref);
-    let target = owner.delivery_target(&binding).await.unwrap();
+    let target = owner
+        .delivery_target(&binding, &binding.authority_ref)
+        .await
+        .unwrap();
     assert_eq!(target["binding_generation"], "generation-one");
     assert!(target.get("environment_id").is_none());
     assert!(target.get("service_port").is_none());
     current.0.lock().await.current.environment_id = "replacement-execution".into();
-    assert_eq!(owner.delivery_target(&binding).await.unwrap(), target);
+    assert_eq!(
+        owner
+            .delivery_target(&binding, &binding.authority_ref)
+            .await
+            .unwrap(),
+        target
+    );
     for field in [
         "tenant",
         "user",
@@ -290,7 +319,13 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
             "authority" => wrong.authority_ref = "0".repeat(64),
             _ => wrong.enabled = false,
         }
-        assert!(owner.delivery_target(&wrong).await.is_err(), "{field}");
+        assert!(
+            owner
+                .delivery_target(&wrong, &wrong.authority_ref)
+                .await
+                .is_err(),
+            "{field}"
+        );
     }
     let mut http =
         PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone());
@@ -340,10 +375,7 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         br#"{"TEST_USER_SETTING":"synthetic"}"#
     );
     let original = signer.verify(workload_token, false).unwrap();
-    assert_eq!(
-        original.recovery_until,
-        signer.verify(&credentials, false).unwrap().recovery_until
-    );
+    assert_eq!(original.recovery_until, admission.grant_expires_at);
     let grant_count: i64 = pool
         .get()
         .await
@@ -626,7 +658,10 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
         delivery.verify(token).await,
         Err(Error::Unauthorized)
     ));
-    assert!(delivery.headers(&lease.batch).await.is_err());
+    assert!(delivery
+        .headers(&lease.batch, "generation-one")
+        .await
+        .is_err());
     assert!(identity.renew(workload_token).await.is_ok());
     assert!(identity.connector_identity(workload_token).await.is_ok());
     if bootstrap {
@@ -646,8 +681,46 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consum
     }
     let mut active = binding.clone();
     active.enabled = true;
+    active.subscription_generation += 1;
+    inbox.register(&active).await.unwrap();
+    let event = WebhookVerifier::new(&[secret])
+        .unwrap()
+        .verify(&webhook_headers, &raw, now().unwrap() as u64)
+        .unwrap();
+    inbox.receive(event).await.unwrap();
+    let stale = inbox.claim(Duration::from_secs(30)).await.unwrap().unwrap();
+    let before = delivery
+        .headers(&stale.batch, "generation-one")
+        .await
+        .ok()
+        .unwrap();
     current.0.lock().await.generation = "rebuilt-workspace".into();
-    assert!(owner.delivery_target(&active).await.is_err());
-    assert!(identity.connector_identity(&credentials).await.is_err());
+    // No foreground admission or registration after the rebuild.
+    assert!(delivery
+        .headers(&stale.batch, "generation-one")
+        .await
+        .is_err());
+    let after = delivery
+        .headers(&stale.batch, "rebuilt-workspace")
+        .await
+        .ok()
+        .expect("deliver the same queued batch after rebuild");
+    let bearer = after[http::header::AUTHORIZATION]
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap();
+    let rebuilt = delivery
+        .verify_pair(bearer, after[DELIVERY_TOKEN_HEADER].to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.binding_generation, "rebuilt-workspace");
+    assert_eq!(rebuilt.binding.authority_ref, active.authority_ref);
+    assert_eq!(rebuilt.claims.batch_id, stale.batch.batch_id);
+    assert!(identity.renew(&credentials).await.is_err());
+    assert!(delivery
+        .verify(before[DELIVERY_TOKEN_HEADER].to_str().unwrap())
+        .await
+        .is_err());
     pool.close();
 }

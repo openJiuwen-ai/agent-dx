@@ -123,7 +123,11 @@ impl DeliveryAuthorization for Purpose {
             binding_id: batch.binding.binding_id.clone(),
         })
     }
-    async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
+    async fn headers(
+        &self,
+        batch: &DeliveryBatch,
+        _: &str,
+    ) -> Result<http::HeaderMap, DeliveryFailure> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut result = http::HeaderMap::new();
         result.insert(

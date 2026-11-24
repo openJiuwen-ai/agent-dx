@@ -258,9 +258,15 @@ async fn delivery_bootstrap_target_requires_the_actual_identity_owner_grant() {
     // A caller-provided reference cannot select or manufacture an authorization.
     // Positive bootstrap/target and rebuild tests use the actual PostgreSQL owner
     // in privacy_delivery_tests, rather than a detached JSON projection.
-    assert!(owner.delivery_target(&record).await.is_err());
+    assert!(owner
+        .delivery_target(&record, &record.authority_ref)
+        .await
+        .is_err());
     bindings.0.lock().unwrap().current.environment_id = "replacement".into();
-    assert!(owner.delivery_target(&record).await.is_err());
+    assert!(owner
+        .delivery_target(&record, &record.authority_ref)
+        .await
+        .is_err());
 }
 
 #[tokio::test]

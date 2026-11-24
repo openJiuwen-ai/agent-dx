@@ -39,6 +39,9 @@ impl ServiceSelection {
     pub(crate) fn binding_scope(&self) -> &Scope {
         &self.scope
     }
+    pub(crate) fn binding_generation(&self) -> &str {
+        &self.generation
+    }
     pub(crate) fn workspace(&self) -> Option<&str> {
         self.workspace.as_deref()
     }
