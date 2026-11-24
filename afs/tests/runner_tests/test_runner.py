@@ -73,10 +73,12 @@ class AdmissionProtocolTests(unittest.TestCase):
 
 class UpgradeSelectionTests(unittest.TestCase):
     def test_legacy_root_command_is_separate_from_default_upgrade_and_rollback(self):
-        from tools.version_switch import selected_cases
+        from tools.version_switch import CATALOG_CASE, CATALOG_CASES, CATALOG_CONTROL, selected_cases
 
         self.assertEqual(selected_cases(None), (('ownerfs', 'upgrade_rollback'), ('dfs', 'upgrade_rollback')))
         self.assertEqual(selected_cases('ownerfs.version.old_root_command'), (('ownerfs', 'old_root_command'),))
+        self.assertEqual(selected_cases(CATALOG_CASE), CATALOG_CASES)
+        self.assertEqual(selected_cases(CATALOG_CASE, same_commit=True), CATALOG_CONTROL)
         with self.assertRaises(ValueError):
             selected_cases('unknown')
 

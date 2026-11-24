@@ -118,6 +118,7 @@ impl RootMeta for LossyActivation {
         epoch: u64,
         home: &str,
         session: &str,
+        retain_tombstone: bool,
     ) -> afs_error::Result<()> {
         if let Some(gate) = self.delete_gate.lock().unwrap().take() {
             let _ = gate.entered.send(());
@@ -129,7 +130,8 @@ impl RootMeta for LossyActivation {
                 "injected deactivation failure",
             ));
         }
-        self.inner.deactivate_root(id, epoch, home, session)?;
+        self.inner
+            .deactivate_root(id, epoch, home, session, retain_tombstone)?;
         if self.lose_deactivate_reply.swap(false, Ordering::SeqCst) {
             return Err(Error::coded(
                 afs_error::IO_UNAVAILABLE,
@@ -152,6 +154,23 @@ impl RootMeta for LossyActivation {
     }
     fn list_owner_roots(&self, home: &str) -> afs_error::Result<root::OwnerRootInventory> {
         self.inner.list_owner_roots(home)
+    }
+    fn mark_root_tombstones_isolated(
+        &self,
+        home: &str,
+        session: &str,
+        tombstones: &[root::RootTombstone],
+    ) -> afs_error::Result<()> {
+        self.inner
+            .mark_root_tombstones_isolated(home, session, tombstones)
+    }
+    fn clear_root_tombstones(
+        &self,
+        home: &str,
+        session: &str,
+        tombstones: &[root::RootTombstone],
+    ) -> afs_error::Result<()> {
+        self.inner.clear_root_tombstones(home, session, tombstones)
     }
     fn acquire_root(
         &self,
@@ -208,6 +227,14 @@ impl Fixture {
     }
 
     async fn with_node_address(address: &str) -> Self {
+        Self::configured(address, None).await
+    }
+
+    async fn with_timeout(timeout_ms: u64) -> Self {
+        Self::configured("http://127.0.0.1:9", Some(timeout_ms)).await
+    }
+
+    async fn configured(address: &str, timeout_ms: Option<u64>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let tls_path = directory.path().join("tls");
         std::fs::create_dir(&tls_path).unwrap();
@@ -342,7 +369,9 @@ impl Fixture {
         config.id = "entry".into();
         config.data_dir = directory.path().into();
         config.ownerfs_data_dir = directory.path().join("ownerfs");
-        config.timeout_ms = 500;
+        if let Some(timeout_ms) = timeout_ms {
+            config.timeout_ms = timeout_ms;
+        }
         config.outlet = Some(OutletConfig {
             public_root: directory.path().join("public"),
             import_root: directory.path().join("imports"),
@@ -356,7 +385,7 @@ impl Fixture {
                 &endpoint,
                 "entry".into(),
                 "session".into(),
-                Duration::from_millis(500),
+                Duration::from_millis(config.timeout_ms),
                 tls.clone(),
             )
             .unwrap(),
@@ -467,6 +496,9 @@ impl Fixture {
         let value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            eprintln!("{method} {uri}: {value}");
+        }
         (status, value)
     }
 }
@@ -594,7 +626,7 @@ async fn workspace_http_refuses_unready_outlet_and_recursively_deletes_active_da
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outlet_probes_wait_for_a_slot_within_the_request_deadline() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::with_timeout(500).await;
     let hold = || -> Vec<_> {
         (0..PROBES_PER_HOME)
             .map(|_| {
@@ -785,6 +817,44 @@ fn permanent_workspace_errors_do_not_advertise_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_workspace_keeps_a_tombstone_until_its_trash_is_collected() {
+    let fixture = Fixture::new().await;
+    fixture.prepare_workspace("reclaim").await;
+    let tombstones = || async {
+        fixture
+            .store
+            .scan_owner_roots_for_recovery("entry")
+            .await
+            .unwrap()
+            .tombstones
+    };
+    assert_eq!(
+        fixture
+            .request("DELETE", "/v1/workspaces/reclaim", Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let recorded = tombstones().await;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].root_epoch, 1);
+    assert_eq!(recorded[0].home_node_id, "entry");
+    let api = fixture.api.clone();
+    bridge::spawn_blocking(move || api.owner.maintain_workspace_deletions())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("ownerfs/.ownerfs-trash/root-7265636c61696d-e1")
+            .exists()
+    );
+    assert!(tombstones().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deep_cleanup_failure_does_not_block_logical_deletion_or_recreation() {
     let fixture = Fixture::new().await;
     fixture.prepare_workspace("deep").await;
@@ -873,15 +943,19 @@ async fn delete_after_lost_activation_reply_recovers_without_other_requests() {
     let fixture = Fixture::new().await;
     fixture.lose_activation.store(true, Ordering::SeqCst);
     let body = json!({"owner":"lost-delete", "uid":fixture.directory.path().metadata().unwrap().uid(), "gid":fixture.directory.path().metadata().unwrap().gid()});
-    assert_eq!(
-        fixture.request("POST", "/v1/workspaces", body).await.0,
-        StatusCode::SERVICE_UNAVAILABLE
+    let (status, body) = fixture.request("POST", "/v1/workspaces", body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("injected first recovery failure")),
+        "{body}"
     );
     assert!(fixture.roots.cached_local_roots().unwrap().is_empty());
-    let (status, _) = fixture
+    let (status, body) = fixture
         .request("DELETE", "/v1/workspaces/lost-delete", Value::Null)
         .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         !fixture
             .directory
@@ -979,7 +1053,7 @@ async fn post_after_lost_activation_reply_recovers_without_home_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_returns_snapshot_when_node_details_fail_or_exhaust_budget() {
     for (initial_delay, delay) in [(0, 0), (0, 1000), (350, 300)] {
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::with_timeout(500).await;
         fixture.prepare_workspace("alice").await;
         fixture.prepare_workspace("bob").await;
         for filter in [false, true] {

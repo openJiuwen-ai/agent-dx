@@ -219,8 +219,8 @@ pub(super) fn configure_readahead(
     Ok(())
 }
 
-/// Process-owned mount. A clean Node stop must use normal unmount and observe
-/// callback cleanup through join; upstream Drop is not a closure proof.
+/// Process-owned mount. A clean Node stop must unmount its own mount and
+/// observe callback cleanup through join. Upstream Drop is not a closure proof.
 #[derive(Debug)]
 pub struct MountedFuse {
     session: BackgroundSession,
@@ -265,6 +265,26 @@ impl MountedFuse {
     }
 
     pub fn join(self) -> Result<()> {
+        self.join_with_unmount(|path| {
+            // The upstream EPERM fallback can use lazy unmount. Require
+            // normal fusermount semantics for root and non-root alike.
+            let output = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg("--")
+                .arg(path)
+                .output()
+                .map_err(Error::from)?;
+            if !output.status.success() {
+                return Err(Error::from(io::Error::other(format!(
+                    "normal FUSE unmount failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ))));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn join_with_unmount(self, unmount: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         let unmounted = (|| {
             if let Some(id) = current_mount_id(&self.mount_path)? {
                 if id != self.mount_id {
@@ -272,20 +292,7 @@ impl MountedFuse {
                         "FUSE mount identity changed; refusing to unmount replacement",
                     )));
                 }
-                // The upstream EPERM fallback can use lazy unmount. Require
-                // normal fusermount semantics for root and non-root alike.
-                let output = std::process::Command::new("fusermount3")
-                    .arg("-u")
-                    .arg("--")
-                    .arg(&self.mount_path)
-                    .output()
-                    .map_err(Error::from)?;
-                if !output.status.success() {
-                    return Err(Error::from(io::Error::other(format!(
-                        "normal FUSE unmount failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ))));
-                }
+                unmount(&self.mount_path)?;
                 if current_mount_id(&self.mount_path)?.is_some() {
                     return Err(Error::from(io::Error::other(
                         "FUSE mount remains after normal unmount",

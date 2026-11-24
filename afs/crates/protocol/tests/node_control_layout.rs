@@ -41,6 +41,7 @@ fn node_control_rpcs_are_split_by_backend() {
             "WorkspaceDefaults",
             "DeleteWorkspace",
             "WorkspaceAttributes",
+            "WorkspaceOutletLayouts",
             "OwnerGetLock",
             "OwnerSetLock",
             "OwnerAckLockWait",
@@ -85,7 +86,10 @@ fn service_paths_keep_the_package() {
 /// Generation 10 carries the original mkdir caller in workspace preparation and
 /// restricts a differing requested owner to root callers, so mixed-version
 /// nodes must not interact.
+/// Generation 11 carries workspace deletion tombstones (`ListOwnerRoots`,
+/// `MarkRootTombstonesIsolated`, `ClearRootTombstones`) and covers
+/// `OwnerControl.WorkspaceOutletLayouts`, which joined the layout without a bump.
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 10);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 11);
 }

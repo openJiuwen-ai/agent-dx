@@ -127,6 +127,32 @@ fn request_key(caller_id: impl Into<String>, request_id: impl Into<String>) -> R
     RequestKey::new(caller_id, request_id)
 }
 
+fn root_tombstones_input(
+    meta: &super::Meta,
+    request: Request<afs_protocol::meta::RootTombstonesRequest>,
+) -> Result<super::owner_roots::RootTombstonesInput, Status> {
+    let authenticated = authenticated_node_id(meta, &request)?;
+    let request = request.into_inner();
+    require_text(&request.request_id, "request_id")?;
+    require_text(&request.home_node_id, "home_node_id")?;
+    require_text(&request.home_session_id, "home_session_id")?;
+    let mut tombstones = Vec::with_capacity(request.tombstones.len());
+    for tombstone in request.tombstones {
+        require_text(&tombstone.root_id, "tombstones.root_id")?;
+        tombstones.push(super::owner_roots::RootTombstoneRef {
+            root_id: tombstone.root_id,
+            root_epoch: tombstone.root_epoch,
+        });
+    }
+    Ok(super::owner_roots::RootTombstonesInput {
+        request_id: request.request_id,
+        home_node_id: request.home_node_id,
+        home_session_id: request.home_session_id,
+        tombstones,
+        authenticated_home_node_id: authenticated,
+    })
+}
+
 fn require_text(value: &str, field: &'static str) -> Result<(), Status> {
     if value.is_empty() {
         Err(invalid(format!("{field} is required")))
@@ -483,6 +509,7 @@ impl OwnerRootsService for OwnerRootsRpc {
                 home_session_id: request.home_session_id,
                 reason: request.reason,
                 authenticated_home_node_id: authenticated,
+                retain_tombstone: request.retain_tombstone,
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
@@ -513,6 +540,7 @@ impl OwnerRootsService for OwnerRootsRpc {
                     home_session_id: root.home_session_id,
                     reason: root.reason,
                     authenticated_home_node_id: authenticated,
+                    retain_tombstone: false,
                 },
                 requester_node_id: request.requester_node_id,
                 requester_session_id: request.requester_session_id,
@@ -520,6 +548,32 @@ impl OwnerRootsService for OwnerRootsRpc {
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(DeactivateRootReply {}))
+    }
+
+    async fn mark_root_tombstones_isolated(
+        &self,
+        request: Request<afs_protocol::meta::RootTombstonesRequest>,
+    ) -> Result<Response<afs_protocol::meta::RootTombstonesReply>, Status> {
+        let input = root_tombstones_input(&self.0, request)?;
+        self.0
+            .owner_roots
+            .mark_root_tombstones_isolated(input)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(afs_protocol::meta::RootTombstonesReply {}))
+    }
+
+    async fn clear_root_tombstones(
+        &self,
+        request: Request<afs_protocol::meta::RootTombstonesRequest>,
+    ) -> Result<Response<afs_protocol::meta::RootTombstonesReply>, Status> {
+        let input = root_tombstones_input(&self.0, request)?;
+        self.0
+            .owner_roots
+            .clear_root_tombstones(input)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(afs_protocol::meta::RootTombstonesReply {}))
     }
 
     async fn lookup_root(
@@ -595,6 +649,18 @@ impl OwnerRootsService for OwnerRootsRpc {
                 .map(wire_reservation)
                 .collect(),
             authority_revision: output.authority_revision.0,
+            tombstones: output
+                .tombstones
+                .into_iter()
+                .map(|tombstone| afs_protocol::meta::RootTombstone {
+                    root_id: tombstone.root_id,
+                    root_epoch: tombstone.root_epoch,
+                    home_node_id: tombstone.home_node_id,
+                    requester_node_id: tombstone.requester_node_id,
+                    deleted_at_unix_ms: tombstone.deleted_at_unix_ms,
+                    isolated: tombstone.isolated,
+                })
+                .collect(),
         }))
     }
 
