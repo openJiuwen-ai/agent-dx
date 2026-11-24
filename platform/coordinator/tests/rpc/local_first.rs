@@ -93,7 +93,6 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
         None,
         Duration::from_secs(2),
         Duration::from_millis(10),
-        tokio::time::Instant::now() + Duration::from_secs(60),
     )
     .await
     .unwrap();
@@ -2347,7 +2346,6 @@ async fn coordinator_restart_reclaims_unconfirmed_runtime_before_reassignment() 
             None,
             Duration::from_secs(2),
             Duration::from_millis(20),
-            tokio::time::Instant::now() + Duration::from_secs(60),
         )
         .await
         .unwrap();

@@ -572,7 +572,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_timeout = timeout.min(period);
     // Seed registration with measured capabilities. The durable session identity
     // must contain the first inventory before periodic, memory-only reports begin.
-    let (observed, latest) = tokio::sync::watch::channel(observations::Snapshot::new(o, valid));
+    let (observed, latest) = tokio::sync::watch::channel(observations::Snapshot::new(o));
     manager.update_runtime_classes(vec![])?;
     let (mounts, classes) =
         sample_capabilities(&runtime, config.storage_mounts.clone(), sample_timeout).await;
@@ -584,10 +584,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok((capacity, valid)) = result {
                 manager.update_capacity(capacity.capacity, valid)?;
                 manager.update_devices(capacity.devices.clone(), valid)?;
-                observed.send_modify(|snapshot| {
-                    snapshot.capacity = capacity;
-                    snapshot.valid_until = tokio::time::Instant::now() + valid;
-                });
+                observed.send_modify(|snapshot| snapshot.capacity = capacity);
             }
             Ok(())
         },
@@ -683,11 +680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // Read only published values; no resource observation is awaited here.
-            let valid_until = {
-                let snapshot = latest.borrow();
-                snapshot.apply(&mut last);
-                snapshot.valid_until
-            };
+            latest.borrow().apply(&mut last);
             // Startup and every reporting period use the same complete authority
             // cycle for every configured runtime. The cycle publishes readiness
             // immediately after success, before waiting for the next report tick.
@@ -698,7 +691,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 journal.as_deref(),
                 timeout,
                 Duration::from_secs(config.report_interval_seconds),
-                valid_until,
             )
             .await
             {

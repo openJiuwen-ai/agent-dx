@@ -9,15 +9,13 @@ use tokio::time::{Instant, MissedTickBehavior};
 #[derive(Clone)]
 pub struct Snapshot {
     pub capacity: Observation,
-    pub valid_until: Instant,
     pub storage_mounts: BTreeMap<String, StorageMount>,
     pub runtime_classes: Vec<String>,
 }
 impl Snapshot {
-    pub fn new(capacity: Observation, valid: Duration) -> Self {
+    pub fn new(capacity: Observation) -> Self {
         Self {
             capacity,
-            valid_until: Instant::now() + valid,
             storage_mounts: BTreeMap::new(),
             runtime_classes: vec![],
         }

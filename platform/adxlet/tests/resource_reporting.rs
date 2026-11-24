@@ -156,17 +156,14 @@ async fn unhealthy_sandboxd_keeps_heartbeats_and_known_runtime_inventory() {
 async fn capability_failure_preserves_runtime_admission_and_withdraws_storage() {
     let node = authority::manager(Arc::new(Runtime::default()));
     let mut fixture = authority::Fixture::new().await;
-    let (updates, samples) = watch::channel(Snapshot::new(
-        Observation {
-            capacity: Resources {
-                cpu_millis: 10000,
-                memory_bytes: 1 << 30,
-                disk_bytes: 0,
-            },
-            devices: vec![],
+    let (updates, samples) = watch::channel(Snapshot::new(Observation {
+        capacity: Resources {
+            cpu_millis: 10000,
+            memory_bytes: 1 << 30,
+            disk_bytes: 0,
         },
-        Duration::from_secs(30),
-    ));
+        devices: vec![],
+    }));
     let mounts = BTreeMap::from([(
         "shared".into(),
         StorageMount {
@@ -222,13 +219,10 @@ async fn stalled_sampler_keeps_reporting_expired_capacity_and_preserve_shutdown(
     };
     node.update_capacity(capacity, Duration::from_millis(1))
         .unwrap();
-    let (_updates, samples) = watch::channel(Snapshot::new(
-        Observation {
-            capacity,
-            devices: vec![],
-        },
-        Duration::from_millis(1),
-    ));
+    let (_updates, samples) = watch::channel(Snapshot::new(Observation {
+        capacity,
+        devices: vec![],
+    }));
     let entered = tokio::sync::Notify::new();
     let ready_to_shutdown = tokio::sync::Notify::new();
     let sampling = observe(
@@ -242,7 +236,9 @@ async fn stalled_sampler_keeps_reporting_expired_capacity_and_preserve_shutdown(
     let reporting = async {
         entered.notified().await;
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(samples.borrow().valid_until < tokio::time::Instant::now());
+        assert!(node
+            .metrics()
+            .contains("adx_node_resource_observation_fresh 0\n"));
         let first_sequence = fixture.registration.heartbeat_sequence;
         for _ in 0..3 {
             samples.borrow().apply(&mut fixture.registration);

@@ -163,7 +163,6 @@ pub async fn reconcile_node(
     journal: Option<&JournalSink>,
     timeout: Duration,
     report_interval: Duration,
-    _capacity_valid_until: Instant,
 ) -> Result<(), Status> {
     let was_live = *manager.lifecycle_ready.read().await;
     // Admission can close after a failed cleanup/report. That does not make

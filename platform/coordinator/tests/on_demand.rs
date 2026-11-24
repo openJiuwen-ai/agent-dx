@@ -850,7 +850,6 @@ async fn report(
         None,
         Duration::from_secs(2),
         period,
-        tokio::time::Instant::now() + period,
     )
     .await
 }
