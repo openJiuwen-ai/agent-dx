@@ -21,11 +21,11 @@ use super::hixl::{
 };
 use crate::config::DataMode;
 use crate::node::data_plane::hixl::{
-    Completion, ReadRuntime, ReadWindow, SlotChecksum, checked_slot_length, read_batch,
+    Completion, HixlMetrics, Operation, TransferRuntime, ReadWindow, SlotChecksum, checked_slot_length, observe_optional, read_batch,
 };
 use crate::node::rpc::OwnerRpcMetrics;
 use crate::node::rpc::hixl::{
-    HIXL_PROTOCOL_VERSION, HixlMetrics, Operation, is_unsupported, observe_optional,
+    HIXL_PROTOCOL_VERSION, is_unsupported,
 };
 use afs_protocol::node_data::{
     HixlLane, HixlReleaseOutcome, OwnerCloseHixlRequest, OwnerHandle, OwnerHixlSlot,
@@ -92,7 +92,7 @@ pub struct OwnerHixlPolicy {
 pub struct OwnerHixlReader {
     // Most nodes never see an indeterminate write; keep their read hot path lock-free here.
     uncertain_files: std::sync::OnceLock<StdMutex<UncertainFiles>>,
-    native: Arc<dyn ReadRuntime>,
+    native: Arc<dyn TransferRuntime>,
     node_id: String,
     policy: OwnerHixlPolicy,
     timeout: Duration,
@@ -156,7 +156,7 @@ impl OwnerHixlReader {
     }
 
     pub(super) fn from_runtime(
-        native: Arc<dyn ReadRuntime>,
+        native: Arc<dyn TransferRuntime>,
         node_id: String,
         policy: OwnerHixlPolicy,
         timeout: Duration,
@@ -196,7 +196,7 @@ impl OwnerHixlReader {
 
     fn operation_deadline(&self) -> afs_error::Result<Instant> {
         Instant::now()
-            .checked_add(crate::node::call_deadline::bounded(self.timeout))
+            .checked_add(self.timeout)
             .ok_or_else(|| protocol_error("OwnerFs HIXL deadline overflow"))
     }
 

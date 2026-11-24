@@ -6,7 +6,7 @@
 
 use crate::{
     config::{Config, DataMode},
-    node::rpc,
+    node::{data_plane, rpc},
     runtime::BoxError,
 };
 use std::{sync::Arc, time::Duration};
@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 pub(super) struct Hixl {
     runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>,
     reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
-    metrics: Option<rpc::hixl::HixlMetrics>,
+    metrics: Option<data_plane::hixl::HixlMetrics>,
 }
 
 impl Hixl {
@@ -46,16 +46,16 @@ impl Hixl {
                         afs_logging::warn!("ownerfs.hixl_startup_fallback"; "reason" => "local capability unsupported");
                         None
                     }
-                    Err(error) => return Err(rpc::hixl::runtime_error(error).into()),
+                    Err(error) => return Err(data_plane::hixl::runtime_error(error).into()),
                 }
             } else {
                 None
             };
             let metrics = if configured {
-                let metrics = rpc::hixl::HixlMetrics::register(&obs.registry)?;
+                let metrics = data_plane::hixl::HixlMetrics::register(&obs.registry)?;
                 match &self.runtime {
                     Some(runtime) => metrics.snapshot(&runtime.status()),
-                    None => metrics.observe(rpc::hixl::Operation::Fallback, Duration::ZERO, true),
+                    None => metrics.observe(data_plane::hixl::Operation::Fallback, Duration::ZERO, true),
                 }
                 Some(metrics)
             } else {
@@ -110,7 +110,7 @@ impl Hixl {
         self.reader.clone()
     }
 
-    pub(super) fn metrics(&self) -> Option<rpc::hixl::HixlMetrics> {
+    pub(super) fn metrics(&self) -> Option<data_plane::hixl::HixlMetrics> {
         self.metrics.clone()
     }
 
@@ -121,7 +121,7 @@ impl Hixl {
         };
         tokio::task::spawn_blocking(move || runtime.shutdown())
             .await?
-            .map_err(|error| rpc::hixl::runtime_error(error).into())
+            .map_err(|error| data_plane::hixl::runtime_error(error).into())
     }
 }
 

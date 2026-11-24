@@ -6,7 +6,7 @@ use super::{
     protocol_error, remaining, retries_prepare,
 };
 use crate::config::DataMode;
-use crate::node::rpc::hixl::runtime_error;
+use crate::node::data_plane::hixl::runtime_error;
 use crate::node::rpc::peer::{
     OwnerRuntime, file_handle, owner_dispatched_write_error, root_access,
 };

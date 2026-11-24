@@ -5,8 +5,8 @@
 
 use super::protocol_error;
 use crate::config::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
-use crate::node::data_plane::hixl::ReadRuntime;
-use crate::node::rpc::hixl::{TransportParameters, runtime_error, transport_parameters};
+use crate::node::data_plane::hixl::{TransferRuntime, runtime_error};
+use crate::node::rpc::hixl::{TransportParameters, transport_parameters};
 use afs_protocol::node_data::HixlLane;
 use afs_transport::hixl::EngineInfo;
 use std::collections::{HashMap, HashSet};
@@ -84,7 +84,7 @@ pub(super) fn lane_is_valid(
 
 /// Connects every local lane to its negotiated remote lane.
 pub(super) async fn connect_lanes(
-    native: Arc<dyn ReadRuntime>,
+    native: Arc<dyn TransferRuntime>,
     lanes: Vec<HixlLane>,
     deadline: Instant,
 ) -> afs_error::Result<()> {

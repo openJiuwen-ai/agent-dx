@@ -254,7 +254,6 @@ enum DataPeerClientInner {
 
 #[cfg(feature = "ownerfs")]
 struct PrefetchedOwnerRead {
-    #[cfg(feature = "dfs")]
     identity: Vec<u8>,
     bytes: Vec<u8>,
 }

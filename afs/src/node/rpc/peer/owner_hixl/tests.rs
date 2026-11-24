@@ -5,7 +5,7 @@
 use super::super::batch;
 use super::super::*;
 use super::*;
-use crate::node::data_plane::hixl::ReadLane;
+use crate::node::data_plane::hixl::TransferLane;
 use crate::node::rpc::data::owner_hixl::test_support::{
     HOME_ENGINE, MemoryExports, MemorySource, OPEN_HANDLE, tree_path,
 };
@@ -49,12 +49,13 @@ struct MemoryReader {
     reads_started: AtomicUsize,
     unknown_read: AtomicBool,
     unknown_write: AtomicBool,
+    hold_write: AtomicBool,
     corrupt_next_write: AtomicBool,
     writes: AtomicUsize,
     quarantines: AtomicUsize,
 }
 
-impl ReadLane for MemoryReader {
+impl TransferLane for MemoryReader {
     fn connect(&self, peer: &str, _deadline: Instant) -> Result<(), HixlError> {
         assert_eq!(peer, self.peer_engine);
         while self.hold_connect.load(Ordering::SeqCst) {
@@ -129,6 +130,9 @@ impl ReadLane for MemoryReader {
     ) -> Result<(), HixlError> {
         assert_eq!(peer, self.peer_engine);
         self.writes.fetch_add(1, Ordering::SeqCst);
+        while self.hold_write.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if self.unknown_write.load(Ordering::SeqCst) {
             return Err(HixlError {
                 read_may_be_in_flight: true,
@@ -155,7 +159,7 @@ impl ReadLane for MemoryReader {
 
 struct MemoryRuntime(Arc<MemoryReader>);
 
-impl ReadRuntime for MemoryRuntime {
+impl TransferRuntime for MemoryRuntime {
     fn info(&self) -> EngineInfo {
         self.0.info.clone()
     }
@@ -168,8 +172,8 @@ impl ReadRuntime for MemoryRuntime {
         1
     }
 
-    fn lane(&self, lane: usize) -> Option<Arc<dyn ReadLane>> {
-        (lane == 0).then(|| self.0.clone() as Arc<dyn ReadLane>)
+    fn lane(&self, lane: usize) -> Option<Arc<dyn TransferLane>> {
+        (lane == 0).then(|| self.0.clone() as Arc<dyn TransferLane>)
     }
 
     fn quarantine(&self) -> Result<(), HixlError> {
@@ -483,6 +487,7 @@ fn memory_reader(
         reads_started: AtomicUsize::new(0),
         unknown_read: AtomicBool::new(false),
         unknown_write: AtomicBool::new(false),
+        hold_write: AtomicBool::new(false),
         corrupt_next_write: AtomicBool::new(false),
         writes: AtomicUsize::new(0),
         quarantines: AtomicUsize::new(0),
@@ -1208,6 +1213,26 @@ async fn a_window_is_an_open_snapshot_until_this_node_changes_the_file() {
     assert_eq!(cached, content()[1000..2000]);
     assert_eq!(refreshed, vec![0xee; 1000]);
     assert_eq!(fixture.native_read_batches(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn demand_hixl_reads_on_one_open_see_remote_overwrite_and_append() {
+    let mut demand = policy(DataMode::Hixl);
+    demand.snapshot_reads = false;
+    let fixture = fixture(demand, true).await;
+    let source = fixture.source.clone();
+    fixture.with_open(libc::O_RDONLY, move |client, file| {
+        assert!(read(&client, &file, FILE_BYTES as u64, 4).unwrap().is_empty());
+        assert_eq!(read(&client, &file, 1000, 4).unwrap(), &content()[1000..1004]);
+        let mut body = source.data.lock().unwrap();
+        body[1000..1004].copy_from_slice(b"edit");
+        body.extend_from_slice(b"tail");
+        drop(body);
+        assert_eq!(read(&client, &file, FILE_BYTES as u64, 4).unwrap(), b"tail");
+        assert_eq!(read(&client, &file, 1000, 4).unwrap(), b"edit");
+    }).await;
+    assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.native_read_batches(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2461,6 +2486,22 @@ async fn writer_unknown_completion_quarantines_without_grpc_fallback() {
     assert_eq!(fixture.native.quarantines.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.home_quarantines(), 1);
     assert_eq!(fixture.exports.active(), 1);
+    assert_eq!(*fixture.source.data.lock().unwrap(), content());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_dma_cannot_dispatch_commit_after_the_write_waiter_times_out() {
+    let fixture = fixture(policy(DataMode::Hixl), true).await;
+    fixture.native.hold_write.store(true, Ordering::SeqCst);
+    let operation = fixture.with_open(libc::O_WRONLY, |client, file| {
+        client.write(&grant(), &file, FILE_BYTES as u64, b"late").unwrap_err()
+    });
+    let (error, _) = tokio::join!(operation, fixture.wait_until("write DMA started", |f| f.native_writes() == 1));
+    let retained_during_dma = fixture.exports.active();
+    fixture.native.hold_write.store(false, Ordering::SeqCst);
+    assert_eq!(error.code(), afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT);
+    assert_eq!(retained_during_dma, 1);
+    fixture.wait_released().await;
     assert_eq!(*fixture.source.data.lock().unwrap(), content());
 }
 

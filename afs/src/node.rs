@@ -75,7 +75,7 @@ pub struct Node {
     #[cfg(feature = "ownerfs")]
     pub hixl_runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>,
     #[cfg(feature = "ownerfs")]
-    pub hixl_metrics: Option<crate::node::rpc::hixl::HixlMetrics>,
+    pub hixl_metrics: Option<crate::node::data_plane::hixl::HixlMetrics>,
 }
 
 /// 组装并持有 Node 的所有入口。启动失败清理已经建立的资源，正常退出卸载本进程挂载。

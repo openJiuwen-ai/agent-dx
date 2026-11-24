@@ -1,6 +1,11 @@
-//! Native HIXL batch reads and slot integrity, independent of file leases.
+//! HIXL batch transfers, export ownership and slot integrity.
 
-use crate::node::rpc::hixl::{HixlMetrics, Operation, observe_optional, runtime_error};
+mod export;
+mod metrics;
+
+pub(crate) use export::{ExportProvider, PendingExport, runtime_export_provider};
+pub use metrics::HixlMetrics;
+pub(crate) use metrics::{Operation, observe_optional, runtime_error};
 use afs_transport::hixl::{
     EngineInfo, HixlError, HixlErrorKind, HixlReadOutcome, HixlRuntime, HixlRuntimeGroup,
 };
@@ -9,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Native calls are the only replaceable boundary in the reader control path.
-pub(crate) trait ReadLane: Send + Sync {
+pub(crate) trait TransferLane: Send + Sync {
     fn connect(&self, peer: &str, deadline: Instant) -> Result<(), HixlError>;
     /// Allocates the private output for one native multi-window batch.
     fn prepare_read_batch_buffer(&self, length: usize) -> Result<Vec<u8>, HixlError>;
@@ -34,15 +39,15 @@ pub(crate) trait ReadLane: Send + Sync {
 }
 
 /// The engine view the reader uses; windows and batches share one implementation.
-pub(crate) trait ReadRuntime: Send + Sync {
+pub(crate) trait TransferRuntime: Send + Sync {
     fn info(&self) -> EngineInfo;
     fn infos(&self) -> Vec<EngineInfo>;
     fn lane_count(&self) -> usize;
-    fn lane(&self, lane: usize) -> Option<Arc<dyn ReadLane>>;
+    fn lane(&self, lane: usize) -> Option<Arc<dyn TransferLane>>;
     fn quarantine(&self) -> Result<(), HixlError>;
 }
 
-impl ReadRuntime for HixlRuntimeGroup {
+impl TransferRuntime for HixlRuntimeGroup {
     fn info(&self) -> EngineInfo {
         self.info()
     }
@@ -55,8 +60,8 @@ impl ReadRuntime for HixlRuntimeGroup {
         self.len()
     }
 
-    fn lane(&self, lane: usize) -> Option<Arc<dyn ReadLane>> {
-        self.lane(lane).map(|runtime| runtime as Arc<dyn ReadLane>)
+    fn lane(&self, lane: usize) -> Option<Arc<dyn TransferLane>> {
+        self.lane(lane).map(|runtime| runtime as Arc<dyn TransferLane>)
     }
 
     fn quarantine(&self) -> Result<(), HixlError> {
@@ -64,7 +69,7 @@ impl ReadRuntime for HixlRuntimeGroup {
     }
 }
 
-impl ReadLane for HixlRuntime {
+impl TransferLane for HixlRuntime {
     fn connect(&self, peer: &str, deadline: Instant) -> Result<(), HixlError> {
         HixlRuntime::connect(self, peer, deadline)
     }
@@ -107,6 +112,13 @@ impl SlotChecksum {
         match self {
             Self::Blake3 => blake3::OUT_LEN,
             Self::Crc32c => std::mem::size_of::<u32>(),
+        }
+    }
+
+    fn matches(self, bytes: &[u8], expected: &[u8]) -> bool {
+        match self {
+            Self::Blake3 => blake3::hash(bytes).as_bytes() == expected,
+            Self::Crc32c => crate::node::chunk_crc32c::checksum(bytes).to_le_bytes() == expected,
         }
     }
 
@@ -193,7 +205,7 @@ fn worker_error(error: tokio::task::JoinError) -> afs_error::Error {
     afs_error::Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string())
 }
 
-async fn quarantine(runtime: &Arc<dyn ReadRuntime>) {
+async fn quarantine(runtime: &Arc<dyn TransferRuntime>) {
     let runtime = runtime.clone();
     let _ = tokio::task::spawn_blocking(move || runtime.quarantine()).await;
 }
@@ -201,7 +213,7 @@ async fn quarantine(runtime: &Arc<dyn ReadRuntime>) {
 /// The caller must let the owned operation finish if it stops waiting.
 /// Native completion is reported separately from checksum validation.
 pub(crate) async fn read_batch(
-    runtime: &Arc<dyn ReadRuntime>,
+    runtime: &Arc<dyn TransferRuntime>,
     metrics: Option<&HixlMetrics>,
     lane_id: usize,
     engine: String,
@@ -210,7 +222,7 @@ pub(crate) async fn read_batch(
     deadline: Instant,
 ) -> Result<Vec<u8>, ReadFailure> {
     let bad_length =
-        || ReadFailure::before_submit(protocol_error("OwnerFs HIXL read length overflow"));
+        || ReadFailure::before_submit(protocol_error("HIXL read length overflow"));
     let windows = slots
         .iter()
         .map(|slot| {
@@ -224,7 +236,7 @@ pub(crate) async fn read_batch(
         .try_fold(0_usize, |total, (_, length)| total.checked_add(*length))
         .ok_or_else(bad_length)?;
     let native = runtime.lane(lane_id).ok_or_else(|| {
-        ReadFailure::before_submit(protocol_error("OwnerFs HIXL local lane disappeared"))
+        ReadFailure::before_submit(protocol_error("HIXL local lane disappeared"))
     })?;
     let buffer = native
         .prepare_read_batch_buffer(read)
@@ -283,7 +295,7 @@ pub(crate) async fn read_batch(
     if !validated {
         return Err(ReadFailure::after_completion(afs_error::Error::coded(
             afs_error::NODE_TRANSFER_CORRUPT_DATA,
-            "OwnerFs HIXL slot checksum differs",
+            "HIXL slot checksum differs",
         )));
     }
     if let Some(metrics) = metrics {
@@ -316,7 +328,7 @@ fn validate_slots(slots: &[ReadWindow], bytes: &[u8], checksum: SlotChecksum) ->
     let valid = AtomicBool::new(true);
     let check = |index: usize| {
         let (data, expected) = ranges[index];
-        if checksum.digest(data).as_slice() != expected {
+        if !checksum.matches(data, expected) {
             valid.store(false, Ordering::Release);
         }
     };

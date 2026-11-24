@@ -507,7 +507,6 @@ impl PeerBatchDirectory {
     }
 
     /// Complete byte-sorted entry names, or `None` if either limit is exceeded.
-    #[cfg(feature = "dfs")]
     pub(crate) fn names_bounded(
         &self,
         max_entries: usize,

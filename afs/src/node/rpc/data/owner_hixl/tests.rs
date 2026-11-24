@@ -419,6 +419,35 @@ fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
 }
 
 #[test]
+fn a_late_close_cannot_close_a_reused_session_id_or_quarantine_its_windows() {
+    let (previous, _, _) = fixture(SLOT, 2);
+    let previous_id = session(&previous);
+    let (home, exports, _) = fixture(SLOT, 2);
+    let mut negotiation = negotiate_request("root-a");
+    negotiation.access.as_mut().unwrap().home_session_id = "new-home".to_owned();
+    let current = home.negotiate_blocking("node-b", negotiation).unwrap();
+    assert_eq!(current.session_id, previous_id);
+
+    let mut prepare = prepare_request(current.session_id, "current-read", 0, SLOT as u64);
+    prepare.access.as_mut().unwrap().home_session_id = current.home_session_id.clone();
+    let window = home.prepare_blocking("node-b", prepare).unwrap();
+    for old_generation in ["home-session-a", ""] {
+        assert!(home.close_blocking("node-b", OwnerCloseHixlRequest {
+            session_id: previous_id,
+            home_session_id: old_generation.to_owned(),
+        }).is_err());
+    }
+    assert_eq!(exports.active(), 1);
+    assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
+    assert!(!home.lock_registry().unwrap().sessions[&previous_id].closed);
+    home.release_blocking("node-b", release_request(&window, HixlReleaseOutcome::Completed)).unwrap();
+    assert!(home.close_blocking("node-b", OwnerCloseHixlRequest {
+        session_id: current.session_id,
+        home_session_id: current.home_session_id,
+    }).unwrap().drained);
+}
+
+#[test]
 fn a_prior_release_frees_its_slots_before_the_next_prepare_is_admitted() {
     let (service, exports, _) = fixture(SLOT * 4, 4);
     let session_id = session(&service);

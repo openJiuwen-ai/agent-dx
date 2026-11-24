@@ -426,7 +426,7 @@ pub struct LocalDirectory {
 impl LocalDirectory {
     /// Return the complete byte-sorted listing, or `None` when the next
     /// entry would exceed either budget. No partial listing is returned.
-    #[cfg(any(test, all(feature = "ownerfs", feature = "dfs")))]
+    #[cfg(any(test, feature = "ownerfs"))]
     pub(crate) fn read_dir_bounded(
         &self,
         max_entries: usize,
@@ -453,7 +453,7 @@ impl LocalDirectory {
 
 /// Count the name vector and the allocation of each retained name. Grow the
 /// vector only when it can fit, and stop polling the iterator on overflow.
-#[cfg(any(test, all(feature = "ownerfs", feature = "dfs")))]
+#[cfg(any(test, feature = "ownerfs"))]
 pub(crate) fn collect_directory_names_bounded(
     entries: impl IntoIterator<Item = io::Result<OsString>>,
     max_entries: usize,

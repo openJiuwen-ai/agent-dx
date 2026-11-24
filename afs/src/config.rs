@@ -30,7 +30,7 @@ mod tls;
 
 pub use outlet::{DEFAULT_MOUNT_OPTIONS, OutletConfig};
 
-#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[cfg(feature = "ownerfs")]
 pub(crate) use hixl::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
 pub use hixl::{HixlConfig, HixlDeviceConfig, HixlTransport};
 pub use tls::read_certificate_der;

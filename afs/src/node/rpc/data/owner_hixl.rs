@@ -28,14 +28,13 @@ use afs_transport::hixl::{EngineInfo, HixlRuntimeGroup, MAX_BATCH_WINDOWS};
 use tonic::{Response, Status};
 
 use super::hixl::{
-    ExportProvider, PendingExport, negotiated_lanes, next_session_id, runtime_export_provider,
-    runtime_status, validate_client_engine, validate_transport_request,
+    negotiated_lanes, next_session_id, runtime_status, validate_client_engine, validate_transport_request,
 };
 use super::{presented_access, remote_file_for_handle, time_ns};
 use crate::config::MAX_OWNERFS_HIXL_READ_GROUP_BYTES;
-use crate::node::data_plane::hixl::SlotChecksum;
+use crate::node::data_plane::hixl::{ExportProvider, HixlMetrics, Operation, PendingExport, SlotChecksum, runtime_export_provider};
 use crate::node::rpc::OwnerRpcMetrics;
-use crate::node::rpc::hixl::{HIXL_PROTOCOL_VERSION, HixlMetrics, Operation};
+use crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION;
 use crate::node::vfs::ownerfs::files::RemoteFile;
 use crate::node::vfs::ownerfs::root::{PresentedRootAccess, RootId};
 use crate::node::vfs::ownerfs::{
