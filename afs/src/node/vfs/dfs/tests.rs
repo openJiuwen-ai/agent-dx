@@ -489,6 +489,7 @@ impl DfsMeta for RecordingMeta {
         _: u64,
         inode_id: &InodeId,
         _: Option<(&InodeId, &[u8])>,
+        _: bool,
     ) -> Result<super::OpenedForRead> {
         let Some((registered, meta_term, writer_elsewhere)) =
             self.open_read_replies.lock().unwrap().pop_front()
@@ -1197,6 +1198,7 @@ impl ReadSourceProvider for CurrentExternalFixture {
                                 fence: 1,
                                 token: "test-token".into(),
                             },
+                            holder_grant: None,
                         }],
                     })
                 })

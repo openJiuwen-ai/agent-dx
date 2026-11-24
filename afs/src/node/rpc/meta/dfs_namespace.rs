@@ -472,6 +472,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         reader: u64,
         inode_id: &crate::dfs::InodeId,
         name: Option<(&crate::dfs::InodeId, &[u8])>,
+        share_read_cache: bool,
     ) -> afs_error::Result<crate::node::vfs::dfs::OpenedForRead> {
         self.read_diagnostic(
             crate::node::metrics::read_timing::ReadDiagnosticStage::MetaGetInode,
@@ -490,6 +491,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                                 parent_inode_id:
                                     name.map(|(parent, _)| parent.0.clone()).unwrap_or_default(),
                                 name: name.map(|(_, name)| name.to_vec()).unwrap_or_default(),
+                                share_read_cache,
                             },
                         ),
                     ))?

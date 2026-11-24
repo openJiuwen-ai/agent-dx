@@ -517,6 +517,7 @@ impl DistributedFs {
             branch = "readonly_version", cached = tracing::field::Empty);
         if let Some(cached) = self.versions.get(version_id)? {
             span.record("cached", true);
+            self.attach_shared_layout(&cached);
             return Ok(cached);
         }
         span.record("cached", false);
@@ -535,7 +536,9 @@ impl DistributedFs {
                 barrier.wait();
             }
         }
-        self.versions.admit(version_id, cached)
+        let admitted = self.versions.admit(version_id, cached)?;
+        self.attach_shared_layout(&admitted);
+        Ok(admitted)
     }
 
     /// Admit this Node's committed write base into the readonly version cache

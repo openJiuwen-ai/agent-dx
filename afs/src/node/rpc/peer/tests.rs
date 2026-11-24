@@ -458,6 +458,7 @@ pub(super) fn disk_stream_batch(
                     fence: 1,
                     token: "test-token".into(),
                 },
+                holder_grant: None,
             },
         }],
     }
@@ -2642,6 +2643,9 @@ fn range_request() -> DfsReadRangesRequest {
                 destination_offset: u64::from(index),
                 source_copy_id: format!("copy-{index}"),
                 grant: None,
+                holder_grant: None,
+                wait_ms: 0,
+                fetch_if_absent: false,
             })
             .collect(),
     }
@@ -3966,6 +3970,9 @@ mod dfs_rdma_tests {
                 destination_offset: 0,
                 source_copy_id: "copy".into(),
                 grant: None,
+                holder_grant: None,
+                wait_ms: 0,
+                fetch_if_absent: false,
             }],
         };
         let reply = afs_protocol::node_data::DfsReadRangesRdmaReply {
@@ -4057,6 +4064,7 @@ mod dfs_rdma_tests {
                             fence: 1,
                             token: "fixture".into(),
                         },
+                        holder_grant: None,
                     },
                 })
                 .collect(),

@@ -186,6 +186,56 @@ impl crate::node::read::engine::ReadSourceProvider for GrpcDfsMeta {
         })
     }
 
+    fn version_holders_async(
+        &self,
+        request: crate::dfs::DfsVersionHoldersRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, Vec<crate::dfs::VersionHolder>> {
+        Box::pin(async move {
+            self.record_read_rpc("get_version_holders");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_version_holders(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetDfsVersionHoldersRequest {
+                        caller_id: request.caller_id,
+                        namespace_id: request.namespace_id.0,
+                        file_version_id: request.file_version_id.0,
+                        layout_root_id: request.layout_root_id.0,
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "version holder lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            reply
+                .holders
+                .into_iter()
+                .map(|holder| {
+                    Ok(crate::dfs::VersionHolder {
+                        node_id: holder.node_id,
+                        node_epoch: holder.node_epoch,
+                        data_endpoint: holder.data_endpoint,
+                        grant: holder
+                            .grant
+                            .ok_or_else(|| {
+                                afs_error::Error::coded(
+                                    afs_error::CLIENT_PROTOCOL_VIOLATION,
+                                    "DfsVersionHolder.grant is missing",
+                                )
+                            })?
+                            .into(),
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn sources_for_async(
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,

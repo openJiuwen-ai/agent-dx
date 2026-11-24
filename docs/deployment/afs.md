@@ -371,6 +371,9 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_read_cache_queue_bytes` | 调优 | Node | `268435456` | 仅开启 `dfs_read_cache_bytes` 时生效：等待安装的读缓存正文字节上限，`4194304..=1073741824`；计入读者内存（见下方内存说明）。FUSE 读从不等待，满了丢弃并计 `dropped_queue_full` |
 | `dfs_read_cache_partial_bytes` | 调优 | Node | `33554432` | 仅开启 `dfs_read_cache_bytes` 时生效：由多次读拼装中的部分 chunk 正文字节上限，`0` 或 `4194304..=1073741824`；0 不拼装；计入读者内存，满了先挤出最旧的部分块 |
 | `dfs_source_single_ttl_ms` | 调优 | Node | `500` | 仅在本 Node 开启 `dfs_read_cache_bytes` 时生效：某 chunk 的候选只有一个远端 Node 时，来源缓存时长取此值与 `dfs_source_cache_max_ms` 的较小者，不超过 60000；0 表示沿用 `dfs_source_cache_max_ms` |
+| `dfs_read_share_concurrent` | 调优 | Node | `false` | 仅在本 Node 开启 `dfs_read_cache_bytes`、原生 DFS 时生效：只读打开登记为共享读者，同时打开同一版本的其他读者可以读本 Node 已安装的读缓存副本，本 Node 也会读它们的；默认关 |
+| `dfs_holder_ttl_ms` | 调优 | Node | `250` | 开启 `dfs_read_share_concurrent` 时，读者缓存某版本持有者名单的时长，50..=5000 |
+| `dfs_holder_wait_ms` | 调优 | Node | `30` | 开启 `dfs_read_share_concurrent` 时，读者请持有者等它正在取的块的时长，0..=500；只对该块上权重高于本读者的持有者生效。0 不请求等待，持有者只供已安装的块。默认 30：3 个以上读者同时开读时保留大部分共享、吞吐不低于不共享；代价是 2 个读者完全同步时吞吐比关共享低约 1/3 |
 | `dfs_source_lookahead_chunks` | 调优 | Node | `64` | 来源元数据前瞻 chunk 数，不超过 128 |
 | `dfs_source_cache_bytes` | 调优 | Node | `4194304` | 来源元数据缓存字节上限，不超过 4 MiB |
 | `allow_volatile_meta` | 测试专用 | Node | `false` | 允许 Node 在 Meta 为 `memory` 时报告就绪；不在 `--help` 中显示，启用时打 WARN |
@@ -436,6 +439,12 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 5. 用**同一版本**的二进制先启动 Meta，再启动全部 Node。
 
 回滚只能用旧二进制配旧的完整数据目录与旧桶，不得让旧二进制打开新目录。
+
+#### 协议 11→12（DFS 版本持有者）
+
+协议 12 只改线协议：共享读者登记带共享标志、Meta 新增 `GetVersionHolders`／`ValidateHolderGrant`、`ReadRanges`
+带持有者形态，Meta 与 Node 的持久格式不变。按上文步骤整集群停机替换，Meta 数据目录与 Node 存储根原样沿用；
+回滚到协议 11 时换回旧二进制即可。共享默认关闭（`dfs_read_share_concurrent = false`）。
 
 #### 协议 10→11（workspace 删除 tombstone）
 
@@ -609,6 +618,9 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_read_cache_queue_bytes` | `268435456`（256MiB） | `4194304..=1073741824`；读缓存等待安装的正文上限，FUSE读路径只尝试占用、不等待，满则丢弃计数；管理面预取在后台按自身期限等待。开启`dfs_read_cache_bytes`的读者最坏多占约 256MiB（队列）+32MiB（部分块）+16MiB（在途段）=304MiB；盘后端实测队列峰值192MiB。未开启读缓存时为0 |
 | `dfs_read_cache_partial_bytes` | `33554432`（32MiB） | `0`或`4194304..=1073741824`；拼装中的部分chunk正文上限，0不拼装；FUSE交给后台拼装的在途段另以其一半为上限；2 s未拼完的部分chunk被释放 |
 | `dfs_source_single_ttl_ms` | `500` | `0..=60000`；仅开启`dfs_read_cache_bytes`的Node生效：候选只含一个远端Node的chunk（含前瞻chunk）按此时长缓存，使他人新发布的读缓存副本在此时限内可见；0沿用`dfs_source_cache_max_ms` |
+| `dfs_read_share_concurrent` | `false` | 需要`dfs_read_cache_bytes`与原生DFS：只读打开向Meta登记为共享读者；Meta只把持有者名单给同样在读该版本的Node，并签发版本级持有者授权；持有者对每个请求先向Meta验证授权（结果最多缓存2 s）、再按该版本的layout查范围，块正在取且读者请求了等待时最多等500 ms（读者默认请求 30 ms，见`dfs_holder_wait_ms`），否则回`NODE_TRANSFER_NOT_READY`；每块只问权重最高的一个持有者，它回`NOT_READY`就直接读已发布副本或持久副本 |
+| `dfs_holder_ttl_ms` | `250` | `50..=5000`；持有者名单的缓存时长；同一版本同一时刻只查一次，查询期间其他读沿用上一张名单（最多再用一个时长）或本次不带持有者 |
+| `dfs_holder_wait_ms` | `30` | `0..=500`；读者请权重更高的持有者等待正在取的块的时长，0不请求等待 |
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |

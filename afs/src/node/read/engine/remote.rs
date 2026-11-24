@@ -44,6 +44,26 @@ const MAX_REFRESH_WAIT: Duration = Duration::from_millis(250);
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(5);
 const BUSY_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
+tokio::task_local! {
+    /// In-flight marks of the Chunks this read fetched from a copy, kept
+    /// until the read has staged them (review/18 a1).
+    static FETCHED: std::cell::RefCell<Vec<crate::node::read::holders::InFlightGuard>>;
+}
+
+/// Runs `read` with a scope that keeps the in-flight marks of the Chunks it
+/// fetches until it ends.
+pub(super) async fn keeping_fetched<T>(read: impl std::future::Future<Output = T>) -> T {
+    FETCHED
+        .scope(std::cell::RefCell::new(Vec::new()), read)
+        .await
+}
+
+/// Keeps `marks` until the enclosing [`keeping_fetched`] scope ends, or
+/// drops them now outside one.
+fn keep_fetched(marks: Vec<crate::node::read::holders::InFlightGuard>) {
+    let _ = FETCHED.try_with(move |kept| kept.borrow_mut().extend(marks));
+}
+
 impl DfsReadEngine {
     pub(super) async fn read_remote_ranges_async(
         &self,
@@ -197,7 +217,29 @@ impl DfsReadEngine {
             .map(|&i| progress.candidates[i].len() - progress.next[i])
             .min()
             .unwrap_or(1);
+        // review/18 a1: in flight only while fetched from a copy that is not
+        // a holder (a holder may itself be waiting for this reader).
+        let marks: Vec<_> = match &self.distributed_cache {
+            Some(cache)
+                if attempt
+                    .operations
+                    .iter()
+                    .all(|item| item.source.holder_grant.is_none()) =>
+            {
+                attempt
+                    .operations
+                    .iter()
+                    .map(|item| cache.in_flight.begin(&item.op.chunk_id))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let result = self.try_peer_before(round.deadline, choices, fetch).await;
+        if result.is_ok() {
+            keep_fetched(marks);
+        } else {
+            drop(marks);
+        }
         match result {
             Ok(()) => {
                 if attempt
@@ -227,6 +269,37 @@ impl DfsReadEngine {
                 Ok(())
             }
             Err(error) => {
+                // H2 step 2: a version holder that has no current copy, or no
+                // longer accepts this read, is skipped; it is not a failed
+                // copy and does not end the read.
+                if attempt
+                    .operations
+                    .iter()
+                    .all(|item| item.source.holder_grant.is_some())
+                {
+                    let not_ready = crate::node::fault::classify::peer_not_ready(&error);
+                    let denied = crate::node::fault::classify::read_authority_rejected(&error);
+                    // A holder out of validation or read slots is busy, not a
+                    // bad copy: skip it without demotion and keep this read's
+                    // sources (code review S2, N5).
+                    let busy = crate::node::fault::classify::retryable_backpressure(&error);
+                    if not_ready || denied || busy {
+                        if not_ready {
+                            self.local
+                                .record_read_cache_event("holder_answered_not_ready");
+                        } else if busy {
+                            self.local.record_read_cache_event("holder_answered_busy");
+                        } else if let Some(lists) = &self.holder_lists {
+                            lists.forget(round.version, &batch.layout_root_id);
+                        }
+                        progress.last_error = Some(error);
+                        for &index in group {
+                            progress.next[index] += 1;
+                            progress.pending.push(index);
+                        }
+                        return Ok(());
+                    }
+                }
                 self.invalidate_native_batch_on_error(batch, &error);
                 if crate::node::fault::classify::read_authority_rejected(&error) {
                     // A cache holder refuses a grant once its copy is retired
@@ -584,6 +657,7 @@ impl DfsReadEngine {
     /// fan-out shows who supplied whom without inferring it from senders.
     pub(super) fn record_source_bytes(&self, source: &SourceCandidate, bytes: u64) {
         let role = match source.role {
+            _ if source.holder_grant.is_some() => "peer_holder",
             CopyRole::VerifiedCache => "verified_cache",
             _ => "durable",
         };

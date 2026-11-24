@@ -919,6 +919,7 @@ fn domain_dfs_source_candidate(
             value.read_grant,
             "DfsSourceCandidate.read_grant",
         )?),
+        holder_grant: None,
     })
 }
 

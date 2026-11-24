@@ -356,7 +356,8 @@ fn peer_connections(
     #[cfg(feature = "dfs")]
     let peer_connections = peer_connections
         .with_read_work_metrics(storage.dfs.read_work_metrics.clone())
-        .with_read_crc_mode(cfg.dfs_read_crc_mode);
+        .with_read_crc_mode(cfg.dfs_read_crc_mode)
+        .with_holder_wait_ms(cfg.dfs_holder_wait_ms);
     #[cfg(not(feature = "dfs"))]
     let _ = storage;
     Ok(Arc::new(peer_connections))

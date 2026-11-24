@@ -167,10 +167,7 @@ async fn register_node_refuses_other_protocol_versions_before_writing() {
         store.clone(),
     ));
     let supported = afs::format::version::NODE_META_PROTOCOL;
-    assert_eq!(
-        supported, 11,
-        "generation 10 lacks workspace deletion tombstones"
-    );
+    assert_eq!(supported, 12, "generation 11 lacks DFS version holders");
     for found in [0, 1, supported - 1, supported + 1] {
         let mut request = request("session-old");
         request.protocol_version = found;

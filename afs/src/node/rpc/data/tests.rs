@@ -1523,6 +1523,7 @@ async fn grpc_unknown_repair_fixture() -> (
         DfsChunkTransportResources {
             rdma_sessions: super::super::control::RdmaSessionRegistry::new(None),
             payload_metrics: Some(metrics),
+            holders: None,
         },
     );
     let target_server = tokio::spawn(async move {
@@ -2098,6 +2099,9 @@ async fn memory_read_authority_fixture() -> (
                 fence: grant.fence,
                 token: grant.token.clone(),
             }),
+            holder_grant: None,
+            wait_ms: 0,
+            fetch_if_absent: false,
         }],
     };
     (meta, local, temp, request)
@@ -2503,6 +2507,7 @@ async fn dfs_replica_posted_rdma_deadline_has_unknown_outcome() {
         DfsChunkTransportResources {
             rdma_sessions: rdma_registry.clone(),
             payload_metrics: Some(metrics.clone()),
+            holders: None,
         },
     );
     let server = tokio::spawn(async move {
@@ -2840,6 +2845,7 @@ async fn dfs_product_rdma_replica_and_read_real_verbs_with_mode(
                 server_rdma.then(|| device.clone()),
             ),
             payload_metrics: Some(metrics.clone()),
+            holders: None,
         },
     );
     let server = tokio::spawn(async move {
@@ -2925,6 +2931,7 @@ async fn dfs_product_rdma_replica_and_read_real_verbs_with_mode(
                     fence: wire.fence,
                     token: wire.token.clone(),
                 },
+                holder_grant: None,
             },
         }],
     };
@@ -3085,6 +3092,9 @@ fn dfs_read_request(chunk_id: String, length: u64) -> DfsReadRangesRequest {
                 fence: 1,
                 token: "fixture-grant".into(),
             }),
+            holder_grant: None,
+            wait_ms: 0,
+            fetch_if_absent: false,
         }],
     }
 }
@@ -3464,6 +3474,7 @@ fn dfs_reuse_test_service(
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: None,
         suspect_reviews: Default::default(),
+        holders: None,
     }
 }
 
@@ -4096,6 +4107,7 @@ async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: None,
         suspect_reviews: Default::default(),
+        holders: None,
     };
     assert!(
         denied
@@ -4117,6 +4129,7 @@ async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: None,
         suspect_reviews: Default::default(),
+        holders: None,
     };
     let mut stream = allowed
         .read_ranges(Request::new(request))
@@ -4305,6 +4318,7 @@ async fn dfs_replica_receive_admission_waits_for_a_slot_until_the_deadline() {
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: Some(DfsPayloadMetrics::register(&registry).unwrap()),
         suspect_reviews: Default::default(),
+        holders: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -4420,6 +4434,7 @@ async fn dfs_replica_sender_retries_receiver_backpressure_within_its_deadline() 
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: Some(DfsPayloadMetrics::register(&registry).unwrap()),
         suspect_reviews: Default::default(),
+        holders: None,
     };
     let server = tokio::spawn(async move {
         Server::builder()
@@ -4470,3 +4485,6 @@ async fn dfs_replica_sender_retries_receiver_backpressure_within_its_deadline() 
 
 #[cfg(feature = "dfs")]
 mod opposite_replica;
+
+#[cfg(feature = "dfs")]
+mod holder_serve;

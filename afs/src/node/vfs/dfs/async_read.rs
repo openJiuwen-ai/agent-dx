@@ -95,6 +95,7 @@ impl DistributedFs {
         {
             return Err(invalid("readonly version belongs to a different inode"));
         }
+        self.attach_shared_layout(&version);
         Ok(version)
     }
 

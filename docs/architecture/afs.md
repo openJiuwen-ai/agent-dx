@@ -504,7 +504,7 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   停机升级后所有 Node 都是新 session，旧记录不会再被重放比对。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 11（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开，9 为 OwnerFs Workspace API RPCs，10 为 workspace 准备携带调用者身份、请求内 `uid`/`gid` 仅 root 可作为不同属主，11 为 workspace 删除 tombstone：`ListOwnerRoots` 返回 tombstone、新增 `MarkRootTombstonesIsolated` 与 `ClearRootTombstones`，同时覆盖 Node 间新增的 `OwnerControl.WorkspaceOutletLayouts`），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 12（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开，9 为 OwnerFs Workspace API RPCs，10 为 workspace 准备携带调用者身份、请求内 `uid`/`gid` 仅 root 可作为不同属主，11 为 workspace 删除 tombstone：`ListOwnerRoots` 返回 tombstone、新增 `MarkRootTombstonesIsolated` 与 `ClearRootTombstones`，同时覆盖 Node 间新增的 `OwnerControl.WorkspaceOutletLayouts`，12 为 DFS 版本持有者：共享读者登记、持有者授权与 `ReadRanges` 的持有者形态），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局或节点间消息语义变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。

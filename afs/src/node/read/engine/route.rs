@@ -188,11 +188,18 @@ impl ReplicatedSources<'_> {
         let sources = self
             .checked_sources(&remote_batch, deadline, lifetime)
             .await?;
-        self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
-            .await?;
-        self.engine
-            .cache_completed_ranges(&remote_batch, &sources, out);
-        Ok(())
+        // H2 step 2 (review/18 a1): a Chunk counts as in flight here only
+        // while it is fetched from a copy that is not a holder; the marks the
+        // attempts leave in this scope last until the Chunks are staged for
+        // installation (queued installs keep their own mark).
+        super::remote::keeping_fetched(async {
+            self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
+                .await?;
+            self.engine
+                .cache_completed_ranges(&remote_batch, &sources, out);
+            Ok(())
+        })
+        .await
     }
 
     pub(super) async fn checked_sources(
@@ -230,6 +237,22 @@ impl ReplicatedSources<'_> {
         deadline: Option<Instant>,
     ) -> Result<()> {
         let object_bytes = || batch.ops.iter().map(|op| op.length).sum::<u64>();
+        // H2 step 2: other readers sharing this version join the candidates.
+        let with_holders;
+        let sources = if self.engine.holder_lists.is_some() {
+            with_holders = self
+                .engine
+                .with_version_holders(
+                    batch,
+                    sources,
+                    deadline
+                        .unwrap_or_else(|| Instant::now() + self.engine.read_pipeline_timeout()),
+                )
+                .await;
+            &with_holders[..]
+        } else {
+            sources
+        };
         if final_owned
             && FanoutSource(self.engine)
                 .read(batch, sources, out, deadline)

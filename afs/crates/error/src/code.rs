@@ -46,6 +46,7 @@ catalog! {
     NODE_TRANSFER_UNAVAILABLE = 0x02040003 => Unavailable;
     NODE_TRANSFER_INVALID = 0x02040004 => InvalidArgument;
     NODE_TRANSFER_INTERNAL = 0x02040005 => Internal;
+    NODE_TRANSFER_NOT_READY = 0x02040006 => Unavailable;
     NODE_STORAGE_INVALID = 0x02070001 => InvalidArgument;
     NODE_STORAGE_NOT_FOUND = 0x02070002 => NotFound;
     NODE_STORAGE_UNSAFE_TYPE = 0x02070003 => FailedPrecondition;

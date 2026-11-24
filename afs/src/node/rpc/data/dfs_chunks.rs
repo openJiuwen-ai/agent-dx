@@ -70,6 +70,8 @@ impl DfsPayloadMetrics {
 pub struct DfsChunkTransportResources {
     pub rdma_sessions: super::super::control::RdmaSessionRegistry,
     pub payload_metrics: Option<DfsPayloadMetrics>,
+    /// H2 step 2: serve holder-form reads (`None`: refuse them).
+    pub holders: Option<Arc<super::dfs_holder_serve::HolderServe>>,
 }
 
 // Existing constructors remain wrappers passing a disabled registry and no
@@ -91,6 +93,8 @@ pub struct DfsChunksService {
     pub(super) rdma_sessions: super::super::control::RdmaSessionRegistry,
     pub(super) payload_metrics: Option<DfsPayloadMetrics>,
     pub(super) suspect_reviews: Arc<crate::node::fault::suspect::SuspectReviewGate>,
+    /// H2 step 2: answers holder-form reads when this Node shares versions.
+    pub(super) holders: Option<Arc<super::dfs_holder_serve::HolderServe>>,
 }
 
 #[cfg(all(feature = "dfs", test))]
@@ -128,6 +132,7 @@ pub fn make_dfs_chunks_server_with_replication(
         DfsChunkTransportResources {
             rdma_sessions: super::super::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            holders: None,
         },
     )
 }
@@ -156,6 +161,7 @@ pub fn make_dfs_chunks_server_with_transport(
         rdma_sessions: resources.rdma_sessions,
         payload_metrics: resources.payload_metrics,
         suspect_reviews: Default::default(),
+        holders: resources.holders,
     })
 }
 
@@ -709,6 +715,17 @@ impl DfsChunks for DfsChunksService {
         let authenticated_peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
         let crc_mode = requested_crc_read_mode(request.metadata())?;
         let request = request.into_inner();
+        // H2 step 2: any holder grant selects the holder path, which refuses
+        // a request that mixes it with per-copy grants (R4).
+        if request
+            .operations
+            .iter()
+            .any(|op| op.holder_grant.is_some())
+        {
+            return self
+                .read_holder_ranges(authenticated_peer, crc_mode, request)
+                .await;
+        }
         if let Some(local) = &self.local_chunks {
             local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
         }
@@ -814,6 +831,196 @@ impl DfsChunks for DfsChunksService {
 }
 
 #[cfg(feature = "dfs")]
+#[cfg(feature = "dfs")]
+impl DfsChunksService {
+    /// H2 step 2: a read served as a version holder, in the order of
+    /// `dfs_holder_serve` (plan/15 v3 §1.3). Steps 1–3 fail with one denial,
+    /// whatever this Node holds.
+    async fn read_holder_ranges(
+        &self,
+        peer: String,
+        crc_mode: crate::config::DfsReadCrcMode,
+        request: DfsReadRangesRequest,
+    ) -> Result<Response<<Self as DfsChunks>::ReadRangesStream>, Status> {
+        use super::dfs_holder_serve::{
+            REVALIDATE_MARGIN, holder_denied, holder_not_ready, wait_budget,
+        };
+        let (Some(holders), Some(local)) = (self.holders.clone(), self.local_chunks.clone()) else {
+            return Err(holder_denied());
+        };
+        let event = |name: &'static str| local.record_read_cache_event(name);
+        let denied = |status: Status| {
+            if status.code() == tonic::Code::PermissionDenied {
+                event("holder_denied");
+            }
+            status
+        };
+        local.ensure_peer_serve_open().map_err(error_to_status)?;
+        // 1. one kind of grant, this Node, this peer, the request's version
+        let grant = holders.check_request(&peer, &request).map_err(denied)?;
+        // 2. Meta, outside the read slots
+        let mut authorized = holders
+            .authorize(&peer, &grant, false)
+            .await
+            .map_err(denied)?;
+        // 3. ranges inside the version's layout
+        if let Err(status) = holders.check_ranges(&grant, &request.operations) {
+            if status.code() == tonic::Code::PermissionDenied {
+                return Err(denied(status));
+            }
+            event("holder_not_ready");
+            return Err(status);
+        }
+        // 4. present, or wait (bounded) for Chunks being fetched here. Only
+        // the in-memory catalog is consulted (no file is opened or hashed
+        // before a slot, code review S1), and only for Chunks still missing.
+        let mut missing: Vec<crate::dfs::ChunkId> = Vec::new();
+        for op in &request.operations {
+            let chunk = crate::dfs::ChunkId::new(op.chunk_id.clone());
+            if !local.has_servable_record(&chunk) && !missing.contains(&chunk) {
+                missing.push(chunk);
+            }
+        }
+        if !missing.is_empty() {
+            let budget = wait_budget(&request);
+            // Wait only when every missing Chunk is expected (review N2).
+            let all_in_flight = |missing: &[crate::dfs::ChunkId]| {
+                missing
+                    .iter()
+                    .all(|chunk| holders.in_flight.contains(chunk))
+            };
+            if budget.is_zero() || !all_in_flight(&missing) {
+                event("holder_not_ready");
+                return Err(holder_not_ready());
+            }
+            let Some(_slot) = holders.wait_slot(&peer) else {
+                event("holder_wait_rejected");
+                return Err(holder_not_ready());
+            };
+            event("holder_waited");
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                let changed = holders.in_flight.changed();
+                missing.retain(|chunk| !local.has_servable_record(chunk));
+                if missing.is_empty() {
+                    break;
+                }
+                // The version may stop being shared while this waits (S3).
+                if !holders.registry.is_shared(&grant.file_version_id) || !all_in_flight(&missing) {
+                    event("holder_not_ready");
+                    return Err(holder_not_ready());
+                }
+                if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                    missing.retain(|chunk| !local.has_servable_record(chunk));
+                    if missing.is_empty() {
+                        break;
+                    }
+                    event("holder_wait_timeout");
+                    return Err(holder_not_ready());
+                }
+            }
+            // Ranges again after the wait: the version may have stopped being
+            // shared (code review S3).
+            if let Err(status) = holders.check_ranges(&grant, &request.operations) {
+                if status.code() == tonic::Code::PermissionDenied {
+                    return Err(denied(status));
+                }
+                event("holder_not_ready");
+                return Err(status);
+            }
+        }
+        // 5. re-validate before a slot when the authorization ran short (R5)
+        if authorized.until <= std::time::Instant::now() + REVALIDATE_MARGIN {
+            authorized = holders
+                .authorize(&peer, &grant, true)
+                .await
+                .map_err(denied)?;
+        }
+        // 6. a fresh admission deadline after any wait (R2), then a slot
+        let admission_deadline = local.peer_serve_deadline();
+        let permit = match self.read_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(admission_deadline),
+                self.read_permits.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| Status::resource_exhausted("DFS peer read admission deadline exceeded"))?
+            .map_err(|_| Status::unavailable("DFS peer read admission is closed"))?,
+        };
+        local.ensure_peer_serve_open().map_err(error_to_status)?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let metrics = self.payload_metrics.clone();
+        let until = authorized.until;
+        let registry = holders.registry.clone();
+        let version = grant.file_version_id.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        crate::node::bridge::spawn_blocking(move || {
+            let _permit = permit;
+            // 7. inside the slot: the deadline only, no Meta; and the version
+            // must still be shared here (code review S3)
+            if std::time::Instant::now() >= until {
+                let _ = started.send(Err(holder_denied()));
+                return;
+            }
+            if !registry.is_shared(&version) {
+                local.record_read_cache_event("holder_not_ready");
+                let _ = started.send(Err(holder_not_ready()));
+                return;
+            }
+            if started.send(Ok(())).is_err() || sender.is_closed() {
+                return;
+            }
+            local.record_read_cache_event("holder_served");
+            // 8. serve
+            if let Err(error) = stream_dfs_ranges_until(
+                &local,
+                &request,
+                &sender,
+                metrics.as_ref(),
+                admission_deadline,
+                crc_mode,
+            ) {
+                let _ = sender.blocking_send(Err(error));
+            }
+        });
+        ready
+            .await
+            .map_err(|_| Status::internal("DFS holder read producer stopped"))??;
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
+    }
+}
+
+/// The per-frame re-check while serving: a holder-form request (every
+/// operation carries a holder grant, none a per-copy grant) must still be in
+/// shape and within its grant's deadline; any other request takes
+/// [`validate_dfs_read_request`].
+#[cfg(feature = "dfs")]
+pub(super) fn validate_served_read(request: &DfsReadRangesRequest) -> Result<(), Status> {
+    let holder_form = request
+        .operations
+        .iter()
+        .all(|op| op.grant.is_none() && op.holder_grant.is_some());
+    if !holder_form {
+        return validate_dfs_read_request(request);
+    }
+    let now = crate::clock::now_unix_ms();
+    if request.operations.is_empty()
+        || request.operations.iter().any(|op| {
+            op.holder_grant.as_ref().is_none_or(|grant| {
+                grant.expires_at_unix_ms <= now
+                    || grant.file_version_id != request.file_version_id
+                    || grant.layout_root_id != request.layout_root_id
+            })
+        })
+    {
+        return Err(super::dfs_holder_serve::holder_denied());
+    }
+    Ok(())
+}
+
 pub(super) fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Status> {
     if request.read_id.is_empty()
         || request.attempt_id.is_empty()
@@ -837,6 +1044,13 @@ pub(super) fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Resul
             .grant
             .as_ref()
             .ok_or_else(|| Status::permission_denied("DFS read operation has no grant"))?;
+        // A holder grant is served only by the gRPC holder path; per-copy
+        // entries (gRPC and RDMA) refuse any operation carrying one (R4, T11).
+        if op.holder_grant.is_some() {
+            return Err(Status::permission_denied(
+                "DFS read operation carries a holder grant",
+            ));
+        }
         if grant.namespace_id.is_empty()
             || grant.file_version_id != request.file_version_id
             || grant.layout_root_id != request.layout_root_id

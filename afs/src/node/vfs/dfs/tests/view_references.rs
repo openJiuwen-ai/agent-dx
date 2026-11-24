@@ -2,6 +2,7 @@
 // commit moves open handles to the new version only once that version has a
 // reference; the replaced reference stays until the last read using it ends.
 use super::*;
+use crate::node::read::holders::HolderRange;
 
 #[derive(Default)]
 struct RecordingGc {
@@ -616,4 +617,114 @@ fn a_created_handle_meta_did_not_register_pins_itself() {
         .unwrap();
     assert_eq!(fx.gc.retained.lock().unwrap().len(), before + 1);
     fx.fs.release(&context(), created.handle).unwrap();
+}
+
+/// H2 step 2 T8: a version read through a shared open is indexed for
+/// holders whether its read-only view came from the cache (the open loaded it
+/// first) or was loaded by the read (cache capacity 0); evicting the view
+/// from the VFS cache does not touch the holder registry, and only the last
+/// shared reader's close removes the version.
+#[test]
+fn h2_t8_shared_version_index_ignores_the_version_cache() {
+    for capacity in [None, Some(0)] {
+        let (temp, meta, fs) = test_fs();
+        let gc = Arc::new(RecordingGc::default());
+        let references = crate::node::gc::GcReferences::new(gc.clone());
+        let fs = fs
+            .with_gc_references(Some(references.clone()))
+            .with_read_sharing(true);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let v1 = publish_external_version_with_bytes(&meta, &fs, "h2-t8", b"version-one");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        if let Some(capacity) = capacity {
+            fs.versions.set_capacity(capacity);
+        }
+        let (_, layout) = meta.get_file_version(&v1).unwrap();
+        let extent = layout.inline_extents[0].clone();
+        let holders = references.holders();
+        let check = || {
+            holders.check(
+                &v1,
+                &layout.id,
+                &extent.chunk_id,
+                extent.chunk_offset,
+                extent.length,
+            )
+        };
+        meta.open_read_replies
+            .lock()
+            .unwrap()
+            .push_back((true, 1, false));
+        let handle = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(read_all(&fs, handle), b"version-one");
+        assert!(holders.is_shared(&v1), "{capacity:?}");
+        assert_eq!(check(), HolderRange::Covered, "{capacity:?}");
+        // The VFS cache forgets every view; the registry keeps its own.
+        fs.versions.set_capacity(0);
+        assert_eq!(check(), HolderRange::Covered, "{capacity:?}");
+        fs.release(&context(), handle).unwrap();
+        references.flush().unwrap();
+        assert!(!holders.is_shared(&v1), "{capacity:?}");
+        assert_eq!(check(), HolderRange::NotReady);
+        drop(temp);
+    }
+}
+
+/// T8, per call site: the layout of a shared version is indexed by each of
+/// the three places a read-only view is obtained, without the others. The
+/// version is registered as shared directly, after the view was (or was
+/// not) cached, so only the call site under test can index it.
+fn t8_shared(fx: &Fixture) -> (Arc<crate::node::read::holders::HolderRegistry>, LayoutRoot) {
+    let holders = fx.references.holders();
+    holders.retain(&fx.v1, 99);
+    let (_, layout) = fx.meta.get_file_version(&fx.v1).unwrap();
+    (holders, layout)
+}
+
+fn t8_check(
+    fx: &Fixture,
+    holders: &crate::node::read::holders::HolderRegistry,
+    layout: &LayoutRoot,
+) -> HolderRange {
+    let extent = &layout.inline_extents[0];
+    holders.check(
+        &fx.v1,
+        &layout.id,
+        &extent.chunk_id,
+        extent.chunk_offset,
+        extent.length,
+    )
+}
+
+#[test]
+fn h2_t8_cached_view_indexes_a_shared_version() {
+    let fx = fixture();
+    fx.fs.load_readonly_version(Some(&fx.v1)).unwrap();
+    let (holders, layout) = t8_shared(&fx);
+    assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::NotReady);
+    // A cache hit.
+    fx.fs.load_readonly_version(Some(&fx.v1)).unwrap();
+    assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::Covered);
+}
+
+#[test]
+fn h2_t8_loaded_view_indexes_a_shared_version() {
+    let fx = fixture();
+    fx.fs.versions.set_capacity(0);
+    let (holders, layout) = t8_shared(&fx);
+    // Nothing cached: loaded from Meta.
+    fx.fs.load_readonly_version(Some(&fx.v1)).unwrap();
+    assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::Covered);
+}
+
+#[test]
+fn h2_t8_async_read_view_indexes_a_shared_version() {
+    let fx = fixture();
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let (holders, layout) = t8_shared(&fx);
+    assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::NotReady);
+    // The read itself obtains the view (the asynchronous native read).
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::Covered);
+    fx.fs.release(&context(), handle).unwrap();
 }

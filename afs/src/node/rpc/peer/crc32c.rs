@@ -126,7 +126,20 @@ impl GrpcChunkTransfer {
                 length: item.op.length,
                 destination_offset: item.op.output_offset as u64,
                 source_copy_id: item.source.copy_id.0.clone(),
-                grant: Some(wire_dfs_read_grant(&item.source.read_grant)),
+                // H2 step 2: a version holder gets its holder grant, never a
+                // per-copy one (plan/15 R4; code review P1).
+                grant: item
+                    .source
+                    .holder_grant
+                    .is_none()
+                    .then(|| wire_dfs_read_grant(&item.source.read_grant)),
+                holder_grant: item.source.holder_grant.clone().map(Into::into),
+                wait_ms: crate::node::read::engine::holder_wait_ms(
+                    &batch.file_version_id,
+                    item,
+                    self.peers.holder_wait_ms,
+                ),
+                fetch_if_absent: false,
             }],
         };
         let timeout = deadline
@@ -598,6 +611,9 @@ mod tests {
                 destination_offset: 0,
                 source_copy_id: "copy".into(),
                 grant: None,
+                holder_grant: None,
+                wait_ms: 0,
+                fetch_if_absent: false,
             }],
         };
         let expected = bytes[offset..offset + length].to_vec();

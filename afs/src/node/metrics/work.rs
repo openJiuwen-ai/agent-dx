@@ -264,6 +264,8 @@ const READ_RPC_METHODS: &[&str] = &[
     "get_chunk_sources",
     "validate_read_grants",
     "peer_read_ranges",
+    "get_version_holders",
+    "validate_holder_grant",
 ];
 #[cfg(feature = "dfs")]
 const SOURCE_CACHE_RESOURCES: &[&str] = &["entries", "bytes", "peak_bytes", "limit_bytes"];
@@ -304,13 +306,29 @@ pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
     "crc_table_reused",
     "crc_table_built",
     "denied_reauthorized",
+    // H2 step 2: what this Node answered as a version holder.
+    "holder_served",
+    "holder_waited",
+    "holder_wait_timeout",
+    "holder_wait_rejected",
+    "holder_not_ready",
+    "holder_denied",
+    // H2 step 2: what this Node met as a reader of a holder.
+    "holder_answered_not_ready",
+    "holder_answered_busy",
 ];
 /// Where a native read's bytes came from: this Node, a durable replica, or
 /// another reader's verified cache copy.
 #[cfg(feature = "dfs")]
 /// `object`: BLAKE3 whole-object paths (fan-out fills and the peer disk
 /// cache), which do not report which copy served them; never CRC objects.
-pub(crate) const READ_SOURCE_ROLES: &[&str] = &["local", "durable", "verified_cache", "object"];
+pub(crate) const READ_SOURCE_ROLES: &[&str] = &[
+    "local",
+    "durable",
+    "verified_cache",
+    "object",
+    "peer_holder",
+];
 /// Read cache body bytes held off the FUSE path (D1-6): staged for install,
 /// and partial Chunks being assembled, each with its peak and its limit.
 #[cfg(feature = "dfs")]
@@ -1636,6 +1654,8 @@ impl ReadWorkMetrics {
                 | "get_chunk_sources"
                 | "validate_read_grants"
                 | "peer_read_ranges"
+                | "get_version_holders"
+                | "validate_holder_grant"
         ) {
             self.core.read_rpc_calls.with_label_values(&[method]).inc();
         }
@@ -2171,6 +2191,8 @@ mod tests {
             "get_chunk_sources",
             "validate_read_grants",
             "peer_read_ranges",
+            "get_version_holders",
+            "validate_holder_grant",
         ] {
             metrics.read_rpc(method);
             assert_eq!(
@@ -2184,7 +2206,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
             .unwrap();
-        assert_eq!(calls.get_metric().len(), 5);
+        assert_eq!(calls.get_metric().len(), 7);
     }
 
     #[test]

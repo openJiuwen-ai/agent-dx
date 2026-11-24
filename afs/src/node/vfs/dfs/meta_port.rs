@@ -82,6 +82,7 @@ pub trait DfsMeta: Send + Sync {
         _reader: u64,
         inode_id: &InodeId,
         name: Option<(&InodeId, &[u8])>,
+        _share_read_cache: bool,
     ) -> Result<OpenedForRead> {
         let inode = match name {
             Some((parent, name)) => self
