@@ -862,13 +862,17 @@ pub(super) fn unavailable(message: impl Into<String>) -> Error {
 /// The error each request of a failed log group receives. A fencing refusal
 /// keeps `META_LOG_FENCED` (nothing was written; a newer writer owns the
 /// log); every other failure stays unavailable, as before.
+///
+/// The detail is taken without its prefix: the failures reaching here come
+/// from the log layer, which already marks them `Meta operation log: `, and
+/// nesting a second copy would bury the actual cause.
 fn group_failure(context: &str, error: &Error) -> Error {
     let code = if error.code() == afs_error::META_LOG_FENCED {
         afs_error::META_LOG_FENCED
     } else {
         afs_error::IO_UNAVAILABLE
     };
-    Error::coded(code, format!("{context}: {error}"))
+    Error::coded(code, format!("{context}: {}", journal::log_detail(error)))
 }
 
 impl MetaStore for Store {

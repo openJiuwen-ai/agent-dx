@@ -242,7 +242,14 @@ fn replay_segment(
                 // where the data ends. Stopping would be a guess, so it stays
                 // an error; a tail that was merely written short is caught by
                 // the size check below instead, which does prove incompleteness.
-                return Err(corrupt_log(format!("{name} offset {offset}: {error}")));
+                //
+                // The detail is taken without the prefix: `frame_length`
+                // already returns a log error, so formatting it here would put
+                // "Meta operation log:" inside a message that adds its own.
+                return Err(corrupt_log(format!(
+                    "{name} offset {offset}: {}",
+                    log_detail(&error)
+                )));
             }
         };
         if size as u64 > length - offset {

@@ -1209,8 +1209,8 @@ mod tests {
     /// A damaged checkpoint image is not a tail problem: recovery refuses, and
     /// the collected per-image detail must not restate the shared prefix. This
     /// path collects each failure as text before wrapping them in one message,
-    /// so it is the one place where the prefix could still appear twice even
-    /// though `log_context` was fixed.
+    /// which is a shape that doubles the prefix if the text comes from
+    /// `Display` rather than from `log_detail`.
     #[tokio::test]
     async fn a_damaged_checkpoint_refuses_with_a_single_log_prefix() {
         use super::super::local_log::{LocalLog, LocalLogOptions};
@@ -1524,5 +1524,45 @@ mod tests {
                 (result, _) => panic!("terms {terms:?}: {:?}", result.map(|r| r.tip)),
             }
         }
+    }
+
+    /// `log_detail` is the only correct way to embed one log error in another.
+    ///
+    /// Wrapping with `Display` emits the prefix plus a `0x… Kind:` decoration,
+    /// and `message()` also keeps the prefix, so both double it. Every wrapper
+    /// the store has — `log_context`, `corrupt_log`, `select_checkpoint`'s
+    /// collected details and `group_failure` — must go through this function.
+    /// Checking them together stops the pattern from being fixed one call site
+    /// at a time and reappearing at the next one.
+    #[test]
+    fn embedding_a_log_error_never_repeats_its_prefix() {
+        let inner = invalid_log("frame length outside record bound");
+        assert_eq!(inner.message().matches(LOG_ERROR_PREFIX).count(), 1);
+
+        // The two shapes that used to double the prefix.
+        assert_eq!(log_detail(&inner), "frame length outside record bound");
+        let wrapped = log_context(invalid_log("inner detail"), "wal-1.log offset 8");
+        assert_eq!(wrapped.message().matches(LOG_ERROR_PREFIX).count(), 1);
+        assert_eq!(wrapped.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
+
+        // Damage rebranding keeps the code and one prefix.
+        let rebranded = corrupt_log(format!("wal-1.log offset 8: {}", log_detail(&inner)));
+        assert_eq!(rebranded.code(), afs_error::META_LOG_CORRUPT);
+        assert_eq!(rebranded.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
+        assert!(
+            rebranded
+                .to_string()
+                .contains("frame length outside record bound")
+        );
+
+        // `corrupt_log` also tolerates a message that already carries it.
+        let tolerant = corrupt_log(inner.message().to_owned());
+        assert_eq!(tolerant.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
+
+        // An error from another layer has no prefix, so it must pass through.
+        let foreign = unavailable("task join failed");
+        assert_eq!(log_detail(&foreign), "task join failed");
+        let mixed = invalid_log(format!("WAL health: {}", log_detail(&foreign)));
+        assert_eq!(mixed.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
     }
 }

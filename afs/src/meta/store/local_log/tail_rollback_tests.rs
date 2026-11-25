@@ -484,6 +484,13 @@ async fn an_invalid_length_prefix_is_refused_even_with_rollback() {
         let (code, text) = refusal(dir.path(), rollback);
         assert_eq!(code, afs_error::META_LOG_CORRUPT);
         assert!(text.contains("frame length outside record bound"), "{text}");
+        // The detail comes from a log error that already carries the prefix;
+        // embedding it with `Display` would emit the prefix twice.
+        assert_eq!(
+            text.matches("Meta operation log: ").count(),
+            1,
+            "the log prefix must appear exactly once: {text}"
+        );
         assert_eq!(
             file_len(dir.path()),
             declared + junk.len() as u64,
