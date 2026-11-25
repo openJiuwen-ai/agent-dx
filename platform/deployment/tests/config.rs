@@ -376,6 +376,28 @@ fn worker_profile_requires_an_explicit_cluster_node_id() {
 }
 
 #[test]
+fn api_profiles_render_wildcard_host_paths_and_preserve_explicit_overrides() {
+    let root = tempfile::tempdir().unwrap();
+    for profile in ["standalone", "standalone-external-redis", "ingress-api"] {
+        for (case, fields, expected) in [
+            ("default", "", json!(["*"])),
+            ("deny", "service_overrides:\n  apiserver:\n    config:\n      allowed_host_paths: []\n", json!([])),
+            ("restricted", "service_overrides:\n  apiserver:\n    config:\n      allowed_host_paths: ['/mnt/workspaces']\n", json!(["/mnt/workspaces"])),
+        ] {
+            let path = root.path().join(format!("{profile}-{case}.yaml"));
+            std::fs::write(&path, format!("schema_version: 1\nprofile: {profile}\n{fields}")).unwrap();
+            let deployment = Deployment::load(&path).unwrap();
+            let output = root.path().join(format!("{profile}-{case}"));
+            deployment.render(&output).unwrap();
+            let api: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(output.join("apiserver.json")).unwrap(),
+            ).unwrap();
+            assert_eq!(api["allowed_host_paths"], expected, "{profile}/{case}");
+        }
+    }
+}
+
+#[test]
 fn every_minimal_profile_resolves_to_its_expected_roles() {
     let root = tempfile::tempdir().unwrap();
     for (profile, extra, roles) in [

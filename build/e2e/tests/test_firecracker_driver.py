@@ -159,6 +159,8 @@ class FirecrackerEvidenceTests(unittest.TestCase):
                 capture_output=True,
             )
             deployment = json.loads((base / 'run/deployment.yaml').read_text())
+            api = next(s for s in deployment['services'] if s['role'] == 'apiserver')
+            self.assertEqual(api['config']['allowed_host_paths'], ['*'])
             coordinator = next(s for s in deployment['services'] if s['role'] == 'coordinator')
             credentials = coordinator['config']['bootstrap_credentials']
             administrators = [c for c in credentials if c['administrator']]

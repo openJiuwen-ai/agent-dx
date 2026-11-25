@@ -7,6 +7,7 @@
   "rpc_timeout_seconds": 90,
   "cache_entries": 10000,
   "auth_cache_ttl_seconds": 10,
+  "allowed_host_paths": ["*"],
   "agent_address": "",
   "ingress_mode": "standalone",
   "discovery": {

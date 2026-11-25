@@ -1233,11 +1233,30 @@ components:
     Mount:
       type: object
       additionalProperties: false
+      description: |
+        Caller-supplied Local source paths are checked against the API Server's
+        allowed_host_paths policy before creation. A denied source
+        rejects the whole request with HTTP 403 PERMISSION_DENIED. An omitted or
+        empty policy denies inline Local mounts.
+        An exact "*" policy entry permits every valid source path; shipped
+        deployment profiles explicitly configure ["*"]. Path syntax validation
+        still applies, and explicit policy lists replace the deployment default.
+        Entries match the source path itself and descendants by path components.
+        Worker filesystem symlinks and deployment-policy mounts are outside this
+        lexical request check.
       required: [type, target]
       properties:
         type: {type: string, enum: [bind, erofs, tmpfs]}
         target: {type: string, pattern: "^/"}
         options: {type: array, items: {type: string, minLength: 1}}
+        host_path:
+          type: string
+          pattern: "^/"
+          description: Absolute node-local source path; subject to allowed_host_paths. Cannot be combined with another mount source.
+        hostPath:
+          type: string
+          pattern: "^/"
+          description: Accepted spelling of host_path with identical authorization.
         image_url: {type: string}
         s3_config: {$ref: "#/components/schemas/S3Source"}
     DataPlanePolicy:

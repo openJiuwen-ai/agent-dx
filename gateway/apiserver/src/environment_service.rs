@@ -205,7 +205,40 @@ impl EnvironmentService {
                 ));
             }
         }
+        self.validate_host_mounts(&spec)?;
         Ok(spec)
+    }
+
+    fn validate_host_mounts(&self, spec: &pb::EnvironmentSpec) -> Result<(), Status> {
+        for mount in spec
+            .execution
+            .iter()
+            .flat_map(|execution| &execution.mounts)
+        {
+            let Some(pb::mount_spec::MountSource::Source(source)) = &mount.mount_source else {
+                continue;
+            };
+            let Some(pb::storage_source::Source::Local(path)) = &source.source else {
+                continue;
+            };
+            if !contract::canonical_local_path(path) {
+                return Err(Status::invalid_argument(
+                    "host_path must be an absolute path without traversal",
+                ));
+            }
+            if !self
+                .clients
+                .config
+                .allowed_host_paths
+                .iter()
+                .any(|allowed| allowed == "*" || Path::new(path).starts_with(allowed))
+            {
+                return Err(Status::permission_denied(
+                    "host_path is not permitted by allowed_host_paths",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Shared admission for HTTP and in-process callers; accepts no Agent-specific types.
@@ -320,6 +353,8 @@ impl EnvironmentService {
         request_id: &str,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
+        self.validate_host_mounts(&spec)
+            .inspect_err(|error| self.creation_metrics.rejection(error))?;
         let trace = adx_observability::trace::Trace::child("environment.create");
         trace.attribute("environment.id", spec.id.clone());
         // Single writer for the terminal outcome: `finish` records the actual
