@@ -608,6 +608,7 @@ catalog、epoch等）容许max(1%×元数据总量, 64页)。任一超限时再�
 | `variant` | 变体标签（默认`V0`）；有作用于环境`roles`中Node的`node_overrides`或声明了副本设置时必须不是`V0`（只指向环境里没有的角色的override不算变体）。`bench.summary`记录`variant`、`backend`、该case集群实际生效的`node_overrides`、`variant_applied`、`replication`、`arrival` |
 | `readers` | fan-out读者数1–4，依次为B、C、D、E；环境须为每个读者提供独立host项 |
 | `fanout_arrival` | `{"mode": "together"}`（默认，所有读者同时读）或`{"mode": "stagger", "seed": "B", "gap_ms": 15000}`：种子读者（须是本次读者之一，读者≥2）先单独读完，等`gap_ms`（0–600000）后其余读者同时读。两段各记一行（`phase`为`seed`/`followers`，同时到达为`all`），汇总按`phase`分组；每段按自己的指标窗口记`phase_send`、`local_read`并单独定层名，followers段另记`prewarm`（种子在该段送出的字节`seed_sent_bytes`）；整轮的指标差值、字节核对、日志事件与OOM窗口记在最后一段（`evidence.scope = "whole_round"`） |
+| `progress_interval_ms` | 可选，100–2000。设了就让elbencho按此间隔把各读者已读字节写入扩展live CSV（`--livecsv --livecsvex --liveint`），每段读记`result.reader_timing.progress`：各读者第一次有进度与读满全文件的采样时刻（`first_progress_ms`、`done_ms`，后者没有采样到读满时为`null`）、同一采样时刻最快与最慢读者的最大字节差（`max_lead_bytes`、`max_lead_at_ms`、`max_lead_fraction`，只用所有读者都在场的采样），以及各读者第一次有进度的时刻差（`first_progress_spread_ms`）；分辨率就是采样间隔。省略时不采样，elbencho参数只多`--svcelapsed` |
 | `log_events` | 追加统计的Node日志事件（每项1–200字符的单行子串）；默认已含`dfs.read_cache_install_failed`、`dfs.read_cache_reconcile_retry`、`DFS peer read admission deadline exceeded`、`peer stayed busy` |
 
 followers 段保留 seed 读后的缓存状态，层名为 `remote_post_seed`（内存后端为
@@ -624,6 +625,19 @@ DFS远端读前后Meta与每个Node的`/metrics`差值（`evidence.metrics.<角�
 读者可能持有本地副本时只记录不判定（`ok=null`）。此时读者侧证据为各读者`afs_dfs_crc32c_read_bytes_total{stage="range_receive"|"trusted_segments_receive"}`
 的差值（`evidence.local_read`，未从peer收到的字节记为本地读）：送出之和小于N·S、两类计数都完整且读者确有本地读时，层名加后缀`_local_replica`
 （如`remote_cold_local_replica`）；计数缺失、重置，或送出不足却没有读者侧证据时加`_unattributed`；两者都不与远端冷读合计。默认单副本配置无需加这两种后缀。
+`evidence.supply`（fan-out各段另记`phase_supply`）按各读者`afs_dfs_read_source_bytes_total{role}`差值记录每个读者从哪类来源收到多少字节
+（`received_by_reader`、`received_by_role`），以及写者送出占N·S的比例`writer_share`（即R_A）与其余Node送出之和`readers_sent`。
+`local`、`durable`、`object`之外的来源角色都算读者之间的供数（`peer_received`），新增的读者间来源角色无需改框架即被计入。
+写者持有唯一副本且送出计数完整时核对两件事：读者收到的`durable`字节等于写者送出，`peer_received`等于其余Node送出，结果记为`ok`；
+任一读者的来源计数缺失或重置、缺写者窗口、或有`object`字节（整对象路径不区分由谁供数，记`unattributed`）时只记录不判定（`ok=null`），不使该轮失败。
+fan-out每段另记`result.reader_timing.completion`：elbencho `--svcelapsed`给出的各读者完成时间（毫秒，`by_reader`）及首末、中位与首末差（`spread_ms`）；
+控制台缺这一行或服务对不上时记`status: unavailable`，不使该轮失败。`evidence.kernel_groups`列出按内核（boot id）分组的角色，不记录boot id本身；角色落在哪台机器由环境文件的host项决定。
+`evidence.peer_locality`只在拓扑能唯一推断时判定读者之间的流量是否跨机：所有读者同在一个内核为`same_kernel`，
+每个内核至多一个读者为`cross_kernel`，只有一个读者为`no_peer`；其余分组（如B/C共用一个内核、D/E共用另一个）记`undetermined`，
+即无法判定跨机——此时"B↔C、D↔E"与"B↔D、C↔E"给出相同的分组、逐节点送出与逐读者来源字节，`supply.ok`只说明字节守恒，
+不说明流量走向。产品没有按发送者、接收者配对的字节计数，框架也不推算；需要时随2b/2c的产品计数补。
+开启`progress_interval_ms`时，进度CSV读不到（文件缺失、读取失败）或格式不对（缺列、短行或多字段、数值非法）都记
+`result.reader_timing.progress.status: unavailable`及原因，不使该轮失败。
 每轮（从写入前到远端读结束）统计各Node日志（`<角色>.log`）中含各事件的行数（`evidence.log_events`），日志被截断时从头计并标`rotated`。
 
 每轮写入`checks.json`的`bench.round`，含工具自身报告的字节数与耗时（fio、elbencho的JSON），
