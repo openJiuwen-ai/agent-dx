@@ -1914,6 +1914,60 @@ impl RootManager {
         self.validate_peer_root_access_with_right(presented, authenticated_peer_node_id, None)
     }
 
+    /// Cache-only peer validation: never asks Meta. `Ok(None)` means the
+    /// grant is not cached yet, so the caller must use the blocking path,
+    /// which validates against Meta and caches the authoritative grant.
+    pub fn validate_peer_root_access_cached(
+        &self,
+        presented: &PresentedRootAccess,
+        authenticated_peer_node_id: &str,
+        right: RootRight,
+    ) -> Result<Option<RootGrant>> {
+        self.check_presented_shape(presented, authenticated_peer_node_id)?;
+        if !self.control_valid.load(Ordering::Acquire) {
+            return Err(unavailable_grant("Meta control session is invalid"));
+        }
+        let root = self
+            .roots
+            .read()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?
+            .get(&presented.id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::coded(
+                    afs_error::NODE_OWNER_GRANT_UNAVAILABLE,
+                    "home root grant not cached",
+                )
+            })?;
+        let key = PeerGrantKey::from_presented(presented);
+        let state = root
+            .state
+            .lock()
+            .map_err(|_| invalid_grant("root grant lock poisoned"))?;
+        self.check_presented_against_home(&state, presented)?;
+        self.check_peer_not_fenced(&state, presented)?;
+        let Some(cached) = state.validated_peer_grants.get(&key) else {
+            return Ok(None);
+        };
+        self.check_authoritative_matches_presented(cached, presented)?;
+        self.check_grant_right(cached, right)?;
+        Ok(Some(cached.clone()))
+    }
+
+    /// Test hook: force the next peer validation to miss the grant cache.
+    #[cfg(test)]
+    pub(super) fn clear_peer_grants_for_test(&self, root_id: &RootId) {
+        if let Some(root) = self
+            .roots
+            .read()
+            .ok()
+            .and_then(|roots| roots.get(root_id).cloned())
+            && let Ok(mut state) = root.state.lock()
+        {
+            state.validated_peer_grants.clear();
+        }
+    }
+
     fn validate_peer_root_access_with_right(
         &self,
         presented: &PresentedRootAccess,

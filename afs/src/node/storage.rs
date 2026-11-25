@@ -164,6 +164,12 @@ pub enum RenameMode {
 /// `sync_all`, so native close/write paths do not accidentally become fsync-heavy.
 pub trait FileHandle: Send + Sync {
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize>;
+    /// Read only what is already in the page cache, without waiting for
+    /// storage. `Ok(None)` means the caller must use [`Self::read_at`]: the
+    /// data is not fully cached, or this handle cannot tell.
+    fn read_cached_at(&self, _offset: u64, _buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
+        Ok(None)
+    }
     fn write_at(&self, offset: u64, buffer: &[u8]) -> std::io::Result<usize>;
     fn metadata(&self) -> std::io::Result<fs::Metadata>;
     fn set_len(&self, size: u64) -> std::io::Result<()>;
