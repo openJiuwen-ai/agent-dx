@@ -68,16 +68,19 @@ pub struct LocalLogOptions {
     /// Soft rotation target; an atomic batch is never split between segments.
     pub segment_bytes: u64,
     pub segments_max: usize,
-    /// Roll an active segment's tail back to the newest declared position that
-    /// actually exists on disk, then cut the file there, instead of refusing to
-    /// open. A tail slot is written after the frames it declares and both are
-    /// made durable by one `sync_data`, so a power loss can leave a slot
-    /// pointing past the file end; nothing behind that end was ever written,
-    /// which is why rolling back keeps every stored byte.
+    /// Roll a damaged active segment's tail back to the last frame the chain
+    /// verifies, then cut the file there, instead of refusing to open.
     ///
-    /// Damage that is not a tail — a changed sealed segment, a middle segment
-    /// gap, a corrupted CURRENT or IDENTITY, or no reachable tail slot at all —
-    /// is still refused.
+    /// The frame chain is the anchor, not the tail slots: each frame carries
+    /// `base_sequence`, the previous frame's hash and its own CRC, so the chain
+    /// locates the durable prefix even when every slot points past the file end
+    /// (a deep `truncate`) or when the cut lands on a frame boundary. The slots
+    /// only bound the scan when one of them still fits.
+    ///
+    /// Damage the chain cannot place at the tail is still refused: a complete
+    /// frame that fails verification with readable records behind it, an
+    /// unreadable length prefix, a changed sealed segment, a damaged CURRENT or
+    /// IDENTITY, or a rollback point below the installed checkpoint.
     pub tolerate_tail_rollback: bool,
 }
 impl Default for LocalLogOptions {
@@ -212,6 +215,10 @@ struct LocalState {
     manifest: Current,
     revision: StoreRevision,
     wal_bytes: u64,
+    /// What this handle's opening dropped, kept so a test can assert the
+    /// decision rather than the log line that reports it.
+    #[cfg(test)]
+    rollback: Option<TailRollback>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct Tail {
@@ -299,6 +306,7 @@ impl LocalLog {
             "next writer term durable in CURRENT; handle not returned",
         );
         replay.recovered.term = manifest.term;
+        report_tail_rollback(replay.rollback.as_ref());
         let wal_bytes = wal_budget(&dir, limits, 0, 0, &manifest.retired_segments)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -319,6 +327,8 @@ impl LocalLog {
                     manifest,
                     revision: replay.revision,
                     wal_bytes,
+                    #[cfg(test)]
+                    rollback: replay.rollback,
                 }),
             }),
         })
@@ -333,6 +343,15 @@ impl LocalLog {
             .state
             .lock()
             .map_or(0, |state| state.manifest.term)
+    }
+    /// Test-only: what this handle's opening dropped, if anything.
+    #[cfg(test)]
+    pub(super) fn rollback(&self) -> Option<TailRollback> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.rollback.clone())
     }
     /// Test-only: drop this handle's directory lock while keeping the handle,
     /// modelling a writer that lost its local exclusivity so a newer writer
@@ -1014,3 +1033,25 @@ mod format_golden_tests;
 
 #[cfg(test)]
 mod format_version_tests;
+
+/// Announce what recovery dropped. The decision itself lives in
+/// `TailRollback`, which the tests assert; this only reports it, and reports
+/// every case including one where the file boundary already expressed the
+/// loss, because that is the signal an external `truncate` leaves behind.
+fn report_tail_rollback(rollback: Option<&TailRollback>) {
+    let Some(rollback) = rollback else {
+        return;
+    };
+    afs_logging::warn!("meta.log.tail_rolled_back";
+        "action" => "tail_rolled_back",
+        "segment" => %rollback.segment,
+        "anchor" => rollback.anchor,
+        "declared_end" => rollback.declared_end,
+        "declared_sequence" => rollback.declared_sequence,
+        "actual_len" => rollback.actual_len,
+        "rolled_back_to" => rollback.rolled_back_to,
+        "dropped_undeclared_bytes" => rollback.dropped_bytes,
+        "dropped_acknowledged_records" => rollback.dropped_records,
+        "recovered_sequence" => rollback.recovered_sequence,
+        "preserved" => if rollback.preserved { "incomplete-tail" } else { "none" });
+}

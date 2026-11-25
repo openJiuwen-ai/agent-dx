@@ -178,6 +178,75 @@ async fn shortened_active_tail_still_refuses_without_rollback() {
     );
 }
 
+/// A cut that lands exactly on a frame boundary leaves no bytes to drop, so
+/// nothing is truncated and no evidence file appears — but the newest slot
+/// still declares an acknowledged record that the file no longer holds. That
+/// loss must be reported, with the numbers taken from the superseded slot and
+/// not from the older one replay selected, or an external `truncate` would be
+/// completely silent.
+#[tokio::test]
+async fn a_frame_aligned_cut_reports_the_records_it_drops() {
+    let (dir, _tip) = seeded(6).await;
+    let (newest, previous) = read_slots(dir.path());
+    assert!(previous.end < newest.end, "fixture needs two distinct ends");
+    // `previous.end` is a declared position, so it is a frame boundary: replay
+    // reaches exactly the end of the shortened file.
+    cut(dir.path(), previous.end);
+
+    let log = LocalLog::open(dir.path(), options(true)).expect("rollback must open the log");
+    let recovered = log.recover().await.unwrap();
+
+    let rollback = log
+        .rollback()
+        .expect("a cut that drops an acknowledged record must be reported");
+    assert_eq!(
+        rollback.dropped_records,
+        newest.tip.sequence - previous.tip.sequence,
+        "the reported loss must be measured from the superseded slot"
+    );
+    assert_eq!(
+        rollback.declared_sequence, newest.tip.sequence,
+        "the report must name what the writer claimed, not what replay selected"
+    );
+    assert_eq!(rollback.recovered_sequence, recovered.tip.sequence);
+    assert_eq!(rollback.actual_len, previous.end);
+    assert_eq!(
+        rollback.dropped_bytes, 0,
+        "a frame-aligned cut has no bytes to drop"
+    );
+    assert!(
+        !rollback.preserved,
+        "there is nothing on disk to preserve when the file already ends at the cut"
+    );
+    assert_eq!(file_len(dir.path()), previous.end, "the file is untouched");
+}
+
+/// A clean log must not report a rollback at all: the commit claims recovery
+/// leaves intact data byte-for-byte alone, and a spurious report would make
+/// every restart look like data loss.
+#[tokio::test]
+async fn clean_data_reports_no_rollback() {
+    let (dir, tip) = seeded(6).await;
+    let before = snapshot(dir.path());
+    let (slot_a, slot_b) = read_slots(dir.path());
+    let generation_before = slot_a.generation.max(slot_b.generation);
+
+    let log = LocalLog::open(dir.path(), options(true)).expect("clean log must open");
+    let recovered = log.recover().await.unwrap();
+
+    assert!(
+        log.rollback().is_none(),
+        "intact data must not report a rollback"
+    );
+    assert_eq!(recovered.tip, tip, "recovery keeps every record");
+    assert_eq!(snapshot(dir.path()), before, "no file may change");
+    let (newest_after, _) = read_slots(dir.path());
+    assert!(
+        newest_after.generation == generation_before,
+        "a clean open must not rewrite a tail slot"
+    );
+}
+
 /// Both slots declare past the file end. The chain still locates the last
 /// complete record, so recovery succeeds where a slot-only anchor would give up.
 #[tokio::test]

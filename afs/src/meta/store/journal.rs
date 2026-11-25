@@ -305,31 +305,41 @@ pub(super) fn invalid_log(message: impl Into<String>) -> Error {
         format!("Meta operation log: {}", message.into()),
     )
 }
-/// The stored log contradicts its own durable declaration: a shortened active
-/// tail, a missing or altered segment, or an unreadable checkpoint.
+/// The stored log contradicts its own durable declaration: a frame whose CRC
+/// or hash does not match, a gap in the frame chain, a segment header whose
+/// hash no longer matches, or a segment shorter than its own header.
 ///
 /// Kept apart from `invalid_log` (configuration and caller mistakes) and from
 /// `STORAGE_FORMAT_INCOMPATIBLE` (this binary cannot read the format at all).
 /// A format mismatch may be the right data for another build, and a
 /// configuration mistake is never repaired by touching the directory, so only
 /// this code describes damage to the bytes on disk.
+///
+/// `CURRENT`, `IDENTITY` and the checkpoint directory are deliberately *not*
+/// reported under this code. They answer "whose data is this and where should
+/// replay start"; if that is unknown, cutting the WAL is a guess, and a guess
+/// on a directory that may belong to another store destroys someone else's
+/// data. Those stay `CONFIG_INVALID` so the operator checks the mount before
+/// anything is written.
 pub(super) fn corrupt_log(message: impl Into<String>) -> Error {
     Error::coded(
         afs_error::META_LOG_CORRUPT,
         format!("Meta operation log: {}", message.into()),
     )
 }
-/// Adds `context` (file, offset) to a log error. A format incompatibility
-/// keeps `STORAGE_FORMAT_INCOMPATIBLE` so operators can tell a binary/data
-/// mismatch from damage, and damaged content keeps `META_LOG_CORRUPT` so the
-/// tail rollback can recognise what it may act on; every other error stays an
-/// invalid log, as before.
+/// Adds `context` (file, offset) to a log error, keeping the code so a caller
+/// can tell a format mismatch from damage. The message is appended rather than
+/// formatted through `Display`, which would repeat the existing prefix and the
+/// `0x… DataLoss:` decoration.
 pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Error {
     let code = error.code();
     if code == afs_error::STORAGE_FORMAT_INCOMPATIBLE || code == afs_error::META_LOG_CORRUPT {
-        Error::coded(code, format!("Meta operation log: {context}: {error}"))
+        Error::coded(
+            code,
+            format!("Meta operation log: {context}: {}", error.message()),
+        )
     } else {
-        invalid_log(format!("{context}: {error}"))
+        invalid_log(format!("{context}: {}", error.message()))
     }
 }
 pub(super) fn unavailable(message: impl Into<String>) -> Error {

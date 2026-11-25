@@ -9,6 +9,36 @@ pub(super) struct Replay {
     pub(super) generation: u64,
     pub(super) revision: StoreRevision,
     pub(super) manifest: Current,
+    /// Set when recovery had to drop history to make the log startable.
+    pub(super) rollback: Option<TailRollback>,
+}
+
+/// What one recovery dropped, in the terms an operator needs.
+///
+/// It exists as data rather than only as a log line so the decision can be
+/// asserted: a rollback that silently discards acknowledged records is the one
+/// failure mode this whole path must not have, and a log line that is only
+/// ever formatted is never checked for being emitted at all.
+#[derive(Clone, Debug)]
+pub(crate) struct TailRollback {
+    pub(crate) segment: String,
+    /// `tail_slot` when a reachable slot bounded the replay, `frame_chain` when
+    /// the chain alone located the end.
+    pub(crate) anchor: &'static str,
+    /// Where the writer claimed to have written, which is what the loss is
+    /// measured from. It may be past the file end.
+    pub(crate) declared_end: u64,
+    pub(crate) declared_sequence: u64,
+    pub(crate) actual_len: u64,
+    pub(crate) rolled_back_to: u64,
+    /// Bytes that were on disk but not declared durable.
+    pub(crate) dropped_bytes: u64,
+    /// Records the writer had acknowledged and recovery could not keep.
+    pub(crate) dropped_records: u64,
+    pub(crate) recovered_sequence: u64,
+    /// Whether the dropped bytes were copied to an `incomplete-tail-*` file.
+    /// A loss that the file boundary already expressed leaves nothing to keep.
+    pub(crate) preserved: bool,
 }
 
 /// Reject hidden suffixes before replay can truncate or advance any active WAL.
@@ -120,6 +150,10 @@ struct ScannedSegment {
     /// The tail slot replay used as an upper bound, when one was reachable.
     /// `None` means the frame chain alone located the end.
     declared: Option<Tail>,
+    /// The newest slot on disk, reachable or not: what the writer claimed had
+    /// become durable, and therefore the position lost history is measured
+    /// from when a rollback drops records it had acknowledged.
+    newest: Option<Tail>,
     offset: u64,
     length: u64,
 }
@@ -160,6 +194,10 @@ fn replay_segment(
         }
         None => Some(header(&mut file, identity, segment.base)?),
     };
+    // The writer's own claim, kept for the rollback report: it is the position
+    // lost history is measured from, and it can be past the file end, which is
+    // exactly the case `declared` refuses to select.
+    let newest = newest_tail(&mut file, identity, segment.base)?;
     if let (Some((tail, _)), Some(declared)) = (segment.sealed, declared)
         && (declared != tail || length != tail.end)
     {
@@ -280,6 +318,7 @@ fn replay_segment(
         name,
         file,
         declared,
+        newest,
         offset,
         length,
     })
@@ -293,11 +332,12 @@ fn finish_active_segment(
     scanned: ScannedSegment,
     cursor: &ReplayCursor<'_>,
     prepared_segment: Option<LogTip>,
-) -> Result<(File, u64, u64)> {
+) -> Result<(File, u64, u64, Option<TailRollback>)> {
     let ScannedSegment {
         name,
         mut file,
         declared,
+        newest,
         offset,
         length,
     } = scanned;
@@ -320,39 +360,59 @@ fn finish_active_segment(
             "unlisted empty WAL is not the recovered next segment",
         ));
     }
-    // A rollback must leave a slot the strict read selects, otherwise the
-    // newest generation still describes a position the file no longer holds.
-    // `declared` is the slot this replay chose: when it is not the newest slot
-    // on disk, the newest one contradicts the file and must be superseded.
-    let superseded = match declared {
-        Some(tail) => newest_slot_generation(&mut file)? > tail.generation,
-        None => true,
+    // The writer's own claim, which is what a rollback drops history relative
+    // to. `reachable_tail` picked where replay could stop; this is where the
+    // writer said it had written. They differ whenever the newest slot points
+    // past the file end, and the difference is acknowledged history.
+    let superseded = match (declared, newest) {
+        (Some(chosen), Some(latest)) => latest.generation > chosen.generation,
+        (None, Some(_)) => true,
+        (None, None) => true,
+        (Some(_), None) => false,
     };
     let changed = offset != length || declared.is_some_and(|tail| tip != tail.tip) || superseded;
-    if offset != length {
-        // Every byte after `offset` was refused by the chain, so none of it can
-        // carry an acknowledged record. Keep it as evidence, then cut.
-        preserve_tail(dir, &mut file, offset, length)?;
-        file.set_len(offset)?;
-        afs_logging::warn!("meta.log.tail_rolled_back";
-            "action" => "tail_rolled_back",
-            "segment" => %name,
-            "declared_end" => declared.map_or(0, |tail| tail.end),
-            "declared_sequence" => declared.map_or(0, |tail| tail.tip.sequence),
-            "rolled_back_to" => offset,
-            "actual_len" => length,
-            "dropped_undeclared_bytes" => length - offset,
-            "recovered_sequence" => tip.sequence,
-            "anchor" => if declared.is_some() { "tail_slot" } else { "frame_chain" },
-            "preserved" => "incomplete-tail");
-    }
+    // A rollback drops acknowledged history whenever the recovered tip is
+    // behind the newest slot's, and that is true whether or not bytes remain
+    // to cut: when the file happens to stop on a frame boundary the chain
+    // reaches its end and `offset == length`, so the cut is invisible while
+    // the loss is not. Both paths report, and both report against the newest
+    // slot rather than the one replay selected, so the numbers describe the
+    // records that were actually lost.
+    let lost_records = newest.map_or(0, |tail| tail.tip.sequence.saturating_sub(tip.sequence));
+    let cut = offset != length;
+    let rollback = if cut || lost_records > 0 {
+        if cut {
+            // Every byte after `offset` was refused by the chain, so none of it
+            // can carry an acknowledged record. Keep it as evidence, then cut.
+            preserve_tail(dir, &mut file, offset, length)?;
+            file.set_len(offset)?;
+        }
+        Some(TailRollback {
+            segment: name.clone(),
+            anchor: if declared.is_some() {
+                "tail_slot"
+            } else {
+                "frame_chain"
+            },
+            declared_end: newest.map_or(0, |tail| tail.end),
+            declared_sequence: newest.map_or(0, |tail| tail.tip.sequence),
+            actual_len: length,
+            rolled_back_to: offset,
+            dropped_bytes: length - offset,
+            dropped_records: lost_records,
+            recovered_sequence: tip.sequence,
+            preserved: cut,
+        })
+    } else {
+        None
+    };
     let generation = if changed {
         let base = match declared {
             Some(tail) => tail.generation,
             // No slot described a reachable position, so the chain decided.
             // Start past whatever the slots still hold so the rewritten
             // declaration wins the "newest generation" comparison.
-            None => newest_slot_generation(&mut file)?,
+            None => newest.map_or(0, |tail| tail.generation),
         };
         let generation = base
             .checked_add(1)
@@ -369,25 +429,13 @@ fn finish_active_segment(
     } else {
         declared.map_or(0, |tail| tail.generation)
     };
-    // Confirm complete but previously unacknowledged same-kernel pages.
-    file.sync_all()?;
-    Ok((file, offset, generation))
-}
-
-/// The highest generation either slot holds, readable or not.
-fn newest_slot_generation(file: &mut File) -> Result<u64> {
-    use std::io::{Read, Seek};
-    let mut bytes = [0u8; LOG_HEADER_BYTES as usize];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut bytes)?;
-    let mut newest = 0u64;
-    for index in 0..2 {
-        let start = STATIC_BYTES + index * SLOT_BYTES;
-        if let Some(tail) = parse_tail(&bytes[start..start + SLOT_BYTES])? {
-            newest = newest.max(tail.generation);
-        }
+    // Confirm complete but previously unacknowledged same-kernel pages. Only
+    // this recovery's own writes need it: a clean segment was already made
+    // durable by the writer that left it behind.
+    if changed || cut {
+        file.sync_all()?;
     }
-    Ok(newest)
+    Ok((file, offset, generation, rollback))
 }
 
 pub(super) fn replay(
@@ -447,7 +495,7 @@ pub(super) fn replay(
             )?);
         }
     }
-    let (file, end, generation) =
+    let (file, end, generation, rollback) =
         active.ok_or_else(|| invalid_log("missing active WAL segment"))?;
     // Before any later GC, confirm the root selector itself, not just data pages.
     if dir.join(CURRENT).try_exists()? {
@@ -472,5 +520,6 @@ pub(super) fn replay(
         generation,
         revision,
         manifest,
+        rollback,
     })
 }

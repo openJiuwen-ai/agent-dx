@@ -562,6 +562,14 @@ subsystem = "Store"
 description = "Meta 输入队列持续满（等待 3 秒仍无容量）；请求未执行，可稍后重试，Node 映射为 EAGAIN"
 
 [[error]]
+name = "META_LOG_CORRUPT"
+value = "0x03020004"
+kind = "DataLoss"
+component = "Meta"
+subsystem = "Store"
+description = "Meta 操作日志内容损坏：帧 CRC/哈希不符、帧链序列断裂、段头哈希不符或段文件短于自身头部。已应答的前缀仍在磁盘上，可回退到帧链验证通过的最后一条完整记录；与配置错误 CONFIG_INVALID、版本不匹配 STORAGE_FORMAT_INCOMPATIBLE 区分"
+
+[[error]]
 name = "META_NODE_PROTOCOL_VERSION"
 value = "0x03050001"
 kind = "FailedPrecondition"

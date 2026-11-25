@@ -217,6 +217,30 @@ pub(super) fn reachable_tail(
     }
 }
 
+/// The newest slot on disk, reachable or not.
+///
+/// `reachable_tail` answers "where may replay stop"; this answers "where did
+/// the writer say it had got to", which is what a rollback must report. When
+/// the file stops short of that position — a `truncate`, or a power loss that
+/// let the slot reach the disk after its frames — the difference is exactly
+/// the acknowledged history the rollback drops, so it has to be visible in
+/// the log rather than inferred.
+pub(super) fn newest_tail(
+    file: &mut File,
+    identity: StoreIdentity,
+    base: LogTip,
+) -> Result<Option<Tail>> {
+    let (a, b) = read_tail_slots(file, identity, base)?;
+    Ok(match (a, b) {
+        (Some(a), Some(b)) if a.generation == b.generation && a != b => {
+            return Err(invalid_log("WAL conflicting equal tail generations"));
+        }
+        (Some(a), Some(b)) => Some(if a.generation >= b.generation { a } else { b }),
+        (Some(tail), None) | (None, Some(tail)) => Some(tail),
+        (None, None) => None,
+    })
+}
+
 pub(super) fn read_tail_slots(
     file: &mut File,
     identity: StoreIdentity,
@@ -313,7 +337,12 @@ pub(super) fn preserve_tail(dir: &Path, file: &mut File, start: u64, end: u64) -
         }
     }
     if count >= EVIDENCE_LIMIT {
-        return Err(full("tail evidence slots exhausted; original WAL retained"));
+        // Not a space problem: the directory is accumulating one preserved tail
+        // per failed start, which means recovery is not converging. Report it
+        // as damage so the operator looks at the data, not at free space.
+        return Err(corrupt_log(format!(
+            "tail evidence slots exhausted after {count} preserved tails; the segment keeps being re-damaged, original WAL retained — inspect the incomplete-tail-* files before deleting any"
+        )));
     }
     let mut evidence = open_file(&path, true)?;
     evidence.write_all(&bytes)?;
