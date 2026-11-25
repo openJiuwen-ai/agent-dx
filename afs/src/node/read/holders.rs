@@ -10,8 +10,9 @@
 //! arrives); a holder then answers `NOT_READY`, never more.
 //!
 //! The registry also holds the byte intervals each shared version exposes,
-//! computed with the same [`crate::dfs::read_chunk_intervals`] Meta signs
-//! grants with. A holder grant does not name Chunks, so this is where a
+//! computed with the same function Meta signs grants with
+//! ([`crate::dfs::chunk_extent_intervals`], the core of
+//! [`crate::dfs::read_chunk_intervals`]). A holder grant does not name Chunks, so this is where a
 //! holder replaces Meta's per-Chunk range check: a version that is not
 //! shared here, or whose layout is not (completely) known yet, serves nothing.
 use std::collections::{BTreeSet, HashMap};
@@ -40,13 +41,21 @@ impl HolderLayout {
     /// are therefore exactly Meta's (pinned by a test), and a served range can
     /// never pass the end of the holder's own Chunk body anyway.
     fn build(layout: &LayoutRoot) -> Option<Self> {
-        let mut chunks = BTreeSet::new();
+        #[cfg(test)]
+        if let Some(hook) = BUILD_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        // One pass over the extents, grouped by Chunk (!318 P2-1); each
+        // group then goes through Meta's own interval function.
+        let mut chunks: HashMap<&ChunkId, Vec<&crate::dfs::Extent>> = HashMap::new();
         for extent in &layout.inline_extents {
-            chunks.insert(extent.chunk_id.clone());
+            #[cfg(test)]
+            crate::dfs::count_interval_extent_visit();
+            chunks.entry(&extent.chunk_id).or_default().push(extent);
         }
         let mut intervals = HashMap::with_capacity(chunks.len());
-        for id in chunks {
-            let chunk = ChunkObject::from_content_addressed_id(&id).unwrap_or(ChunkObject {
+        for (id, extents) in chunks {
+            let chunk = ChunkObject::from_content_addressed_id(id).unwrap_or(ChunkObject {
                 id: id.clone(),
                 length: u64::MAX,
                 content_digest: crate::dfs::ContentDigest {
@@ -55,14 +64,22 @@ impl HolderLayout {
                 },
                 encoding: crate::dfs::ChunkEncoding::Raw,
             });
-            let ranges = crate::dfs::read_chunk_intervals(layout, &chunk).ok()?;
-            intervals.insert(id, ranges);
+            let ranges =
+                crate::dfs::chunk_extent_intervals(layout.file_length, extents, &chunk).ok()?;
+            intervals.insert(id.clone(), ranges);
         }
         Some(Self {
             layout_root_id: layout.id.clone(),
             intervals,
         })
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once inside the next [`HolderLayout::build`] on this thread.
+    static BUILD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Default)]
@@ -126,7 +143,20 @@ impl HolderRegistry {
     /// The checked layout of `version` is known: index it once, only while
     /// the version is shared. `layout` must be the one `ReadOnlyVersion::checked`
     /// bound to `version`.
+    ///
+    /// The index is built outside the registry lock (!318 P2-1), so other
+    /// versions are checked, joined and released meanwhile; it is published
+    /// only if the version is still shared and still unindexed. A version
+    /// whose last reader left during the build publishes nothing.
     pub(crate) fn attach(&self, version: &FileVersionId, layout: &LayoutRoot) {
+        let wanted = self
+            .lock()
+            .get(version)
+            .is_some_and(|shared| shared.layout.is_none() && !shared.incomplete);
+        if !wanted {
+            return;
+        }
+        let built = HolderLayout::build(layout);
         let mut inner = self.lock();
         let Some(shared) = inner.get_mut(version) else {
             return;
@@ -134,7 +164,7 @@ impl HolderRegistry {
         if shared.layout.is_some() || shared.incomplete {
             return;
         }
-        match HolderLayout::build(layout) {
+        match built {
             Some(index) => shared.layout = Some(Arc::new(index)),
             None => shared.incomplete = true,
         }
@@ -354,6 +384,145 @@ mod tests {
         assert_eq!(
             registry.check(&broken, &id, &short.id, 0, 1),
             HolderRange::NotReady
+        );
+    }
+
+    /// !318 P2-1: indexing a version looks at each extent once (one pass
+    /// grouping by Chunk), not once per distinct Chunk.
+    #[test]
+    fn holder_layout_index_visits_each_extent_once() {
+        let chunks: Vec<ChunkObject> = (0..256u32)
+            .map(|i| StagedChunk::new(OperationId::new("visits"), i.to_le_bytes().repeat(4)).chunk)
+            .collect();
+        let extents: Vec<(&ChunkObject, u64, u64, u64)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| (chunk, 16 * i as u64, 0, 16))
+            .collect();
+        let root = layout("l", 16 * chunks.len() as u64, &extents);
+        let registry = HolderRegistry::default();
+        let _ = crate::dfs::take_interval_extent_visits();
+        let version = shared(&registry, "v", 1, &root);
+        let visits = crate::dfs::take_interval_extent_visits();
+        assert!(
+            visits <= root.inline_extents.len() as u64,
+            "{visits} extent visits for {} extents",
+            root.inline_extents.len()
+        );
+        assert_eq!(
+            registry.check(&version, &root.id, &chunks[255].id, 0, 16),
+            HolderRange::Covered
+        );
+    }
+
+    /// !318 P2-1: the one-pass index gives exactly Meta's intervals (trimmed
+    /// at the file length, overlaps merged, several extents per Chunk), and
+    /// an inconsistent extent still leaves the version incomplete.
+    #[test]
+    fn holder_layout_index_matches_meta_for_every_chunk() {
+        let a = chunk(64, 1);
+        let b = chunk(64, 2);
+        let id = ChunkId::new(format!("crc32c-v2-{}-{}", "3".repeat(32), "4".repeat(32)));
+        let crc = ChunkObject {
+            id: id.clone(),
+            length: 4096,
+            content_digest: crate::dfs::ContentDigest {
+                algorithm: crate::dfs::DigestAlgorithm::Crc32cSegmentsV1,
+                bytes: [7; 32],
+            },
+            encoding: crate::dfs::ChunkEncoding::Raw,
+        };
+        let root = layout(
+            "l",
+            300,
+            &[
+                (&a, 0, 0, 32),
+                (&b, 32, 8, 16),
+                (&a, 48, 16, 40),
+                (&crc, 88, 1000, 100),
+                (&b, 188, 40, 24),
+                (&crc, 212, 1050, 200),
+                (&a, 412, 0, 10),
+            ],
+        );
+        let registry = HolderRegistry::default();
+        let version = shared(&registry, "v", 1, &root);
+        for object in [&a, &b, &crc] {
+            let meta = crate::dfs::read_chunk_intervals(&root, object).unwrap();
+            let end = meta.iter().map(|(s, l)| s + l).max().unwrap_or(0) + 2;
+            for offset in 0..end {
+                for length in [1, 7, 16, 50] {
+                    let expected = if crate::dfs::read_range_covered(&meta, offset, length) {
+                        HolderRange::Covered
+                    } else {
+                        HolderRange::Denied
+                    };
+                    assert_eq!(
+                        registry.check(&version, &root.id, &object.id, offset, length),
+                        expected,
+                        "{} {offset}+{length}",
+                        object.id.0
+                    );
+                }
+            }
+        }
+        let short = chunk(4, 5);
+        let broken = shared(
+            &registry,
+            "broken",
+            2,
+            &layout("l2", 16, &[(&a, 0, 0, 8), (&short, 8, 0, 8)]),
+        );
+        assert_eq!(
+            registry.check(&broken, &LayoutRootId::new("l2"), &a.id, 0, 8),
+            HolderRange::NotReady
+        );
+    }
+
+    /// !318 P2-1: a version's index is built outside the registry lock, so
+    /// another version is checked meanwhile; and a version whose last reader
+    /// leaves during the build publishes nothing (a later reader of it starts
+    /// from an unknown layout again).
+    #[test]
+    fn holder_layout_is_built_outside_the_lock_and_dropped_when_unshared() {
+        let registry = Arc::new(HolderRegistry::default());
+        let a = chunk(16, 1);
+        let b = chunk(16, 2);
+        let other = shared(&registry, "other", 7, &layout("lo", 16, &[(&b, 0, 0, 16)]));
+        let version = FileVersionId::new("v");
+        registry.retain(&version, 1);
+        let seen = Arc::new(Mutex::new(None));
+        {
+            let registry = registry.clone();
+            let seen = seen.clone();
+            let other = other.clone();
+            let version = version.clone();
+            BUILD_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // Never block here: a build under the lock would deadlock.
+                    let unlocked = registry.inner.try_lock().is_ok();
+                    let mut answer = None;
+                    if unlocked {
+                        answer =
+                            Some(registry.check(&other, &LayoutRootId::new("lo"), &b.id, 0, 16));
+                        registry.release(&version, 1);
+                    }
+                    *seen.lock().unwrap() = Some((unlocked, answer));
+                }))
+            });
+        }
+        registry.attach(&version, &layout("l", 16, &[(&a, 0, 0, 16)]));
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some((true, Some(HolderRange::Covered))),
+            "built under the registry lock"
+        );
+        assert!(!registry.is_shared(&version));
+        registry.retain(&version, 2);
+        assert_eq!(
+            registry.check(&version, &LayoutRootId::new("l"), &a.id, 0, 16),
+            HolderRange::NotReady,
+            "a layout built for the old readers was published"
         );
     }
 }

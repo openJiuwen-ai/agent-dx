@@ -1564,15 +1564,32 @@ pub fn read_chunk_intervals(
     layout: &LayoutRoot,
     chunk: &ChunkObject,
 ) -> afs_error::Result<Vec<(u64, u64)>> {
+    chunk_extent_intervals(
+        layout.file_length,
+        layout.inline_extents.iter().filter(|extent| {
+            #[cfg(test)]
+            count_interval_extent_visit();
+            extent.chunk_id == chunk.id
+        }),
+        chunk,
+    )
+}
+
+/// [`read_chunk_intervals`] over `extents`, which must be exactly the
+/// layout's extents of `chunk` (in any order): the same trimming at
+/// `file_length`, overflow and length checks, and merging. A caller that
+/// indexes every Chunk of a layout groups the extents once and calls this
+/// per Chunk instead of scanning the layout per Chunk (!318 P2-1).
+pub fn chunk_extent_intervals<'a>(
+    file_length: u64,
+    extents: impl IntoIterator<Item = &'a Extent>,
+    chunk: &ChunkObject,
+) -> afs_error::Result<Vec<(u64, u64)>> {
     let mut intervals = Vec::new();
-    for extent in layout
-        .inline_extents
-        .iter()
-        .filter(|extent| extent.chunk_id == chunk.id)
-    {
+    for extent in extents {
         let length = extent
             .length
-            .min(layout.file_length.saturating_sub(extent.file_offset));
+            .min(file_length.saturating_sub(extent.file_offset));
         let end = extent
             .chunk_offset
             .checked_add(length)
@@ -1600,6 +1617,24 @@ pub fn read_chunk_intervals(
         .into_iter()
         .map(|(start, end)| (start, end - start))
         .collect())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Extents examined while computing read intervals on this thread (review
+    /// !318 P2-1: a holder index must look at each extent once).
+    static INTERVAL_EXTENT_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_interval_extent_visit() {
+    INTERVAL_EXTENT_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+/// Extents examined on this thread since the last call (tests).
+#[cfg(test)]
+pub(crate) fn take_interval_extent_visits() -> u64 {
+    INTERVAL_EXTENT_VISITS.with(|visits| visits.replace(0))
 }
 
 /// Whether `[offset, offset + length)` lies inside one interval of
