@@ -8,6 +8,7 @@ use adx_agent_store::{
 };
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     sync::{
@@ -374,7 +375,7 @@ async fn iac_drafts_prepare_from_the_published_template_without_deployment_seed_
     assert_ne!(calls[0].2.volume.id, calls[1].2.volume.id);
     let (actual_tenant, _, seed) = &calls[0];
     assert_eq!(actual_tenant, &tenant);
-    assert_eq!(seed.execution.env[GOLDEN_PHASE], "seed");
+    assert!(!seed.execution.env.contains_key(GOLDEN_PHASE));
     assert!(!seed.execution.env.contains_key("API_KEY"));
     assert_eq!(seed.execution.readiness_probe, input.readiness_probe);
     assert_eq!(seed.execution.service, input.service);
@@ -431,7 +432,12 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     );
     let recipe = completed.prewarm_recipe.as_ref().unwrap();
     assert_eq!(recipe.snapshot_id, "snapshot-ready");
-    assert_eq!(recipe.restore_env[GOLDEN_PHASE], "restore");
+    assert_eq!(recipe.handoff_contract_version, "3");
+    assert!(recipe.restore_env.is_empty());
+    assert_ne!(
+        recipe.restore_profile_digest,
+        version_two_digest(&completed)
+    );
     assert_eq!(
         author
             .publish_with_id("tenant", &input, Some("version-a"))
@@ -445,7 +451,7 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     assert_eq!(calls[0], calls[1]);
     let seed = &calls[0].2;
     assert!(!seed.execution.env.contains_key("API_KEY"));
-    assert_eq!(seed.execution.env[GOLDEN_PHASE], "seed");
+    assert!(!seed.execution.env.contains_key(GOLDEN_PHASE));
     assert_eq!(
         seed.execution.env["DIGITALMATE_CRYPTO_WORKSPACE"],
         seed.volume.id
@@ -461,13 +467,7 @@ async fn unsupported_target_settings_are_rejected_before_publication() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Platform::default());
     let author = Activator::new(state, platform.clone());
-    for (key, value) in [
-        ("API_KEY", "private"),
-        ("MODEL_ENDPOINT", "${model_url}"),
-        ("MODEL_ENDPOINT", "https://user:password@example.test"),
-        ("DIGITALMATE_GOLDEN_PHASE", "seed"),
-        ("GOLDEN_PHASE", "seed"),
-    ] {
+    for (key, value) in [("MODEL_ENDPOINT", "${model_url}"), ("GOLDEN_PHASE", "seed")] {
         let mut input = draft(true);
         input.env.insert(key.into(), value.into());
         assert!(matches!(
@@ -497,6 +497,42 @@ async fn unsupported_target_settings_are_rejected_before_publication() {
             .version,
         "1"
     );
+
+    let mut business = draft(true);
+    business.env.insert(
+        "DIGITALMATE_CRYPTO_CA_PEM".into(),
+        "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".into(),
+    );
+    business
+        .env
+        .insert("API_KEY".into(), "publisher-owned-shared-key".into());
+    business.env.insert(
+        "MODEL_ENDPOINT".into(),
+        "https://example.test/v1?api-version=1".into(),
+    );
+    business.env.insert(
+        "DIGITALMATE_KEENABLE_API_KEY".into(),
+        "fixture-search-key".into(),
+    );
+    let published = author.publish("tenant", &business).await.unwrap();
+    assert_eq!(published.env, business.env);
+    author.reconcile_snapshot_preparations().await.unwrap();
+    let calls = platform.calls.lock().await;
+    let seed = &calls.last().unwrap().2;
+    assert_eq!(
+        seed.execution.env["DIGITALMATE_CRYPTO_CA_PEM"],
+        business.env["DIGITALMATE_CRYPTO_CA_PEM"]
+    );
+    assert_eq!(
+        seed.execution.env["DIGITALMATE_KEENABLE_API_KEY"],
+        "fixture-search-key"
+    );
+    for (key, value) in &business.env {
+        if key != "DIGITALMATE_CRYPTO_WORKSPACE" {
+            assert_eq!(seed.execution.env.get(key), Some(value));
+        }
+    }
+    assert!(!seed.execution.env.contains_key(GOLDEN_PHASE));
 }
 
 #[tokio::test]
@@ -834,6 +870,171 @@ async fn activate(
     .binding
 }
 
+fn version_two_digest(template: &adx_agent_core::TemplateVersion) -> String {
+    let normalized =
+        serde_json::to_vec(&("2", ExecutionSpec::from(template), &template.volumes)).unwrap();
+    format!("sha256:{:x}", Sha256::digest(normalized))
+}
+
+async fn replace_fixture_record(repo: &MemoryRepository, key: Key, value: serde_json::Value) {
+    let previous = repo.get(&key).await.unwrap().unwrap();
+    let write = adx_agent_store::Put {
+        key: key.clone(),
+        record: Record::new(&value).unwrap(),
+    };
+    assert!(repo
+        .commit(
+            &Transaction::new(
+                vec![Check {
+                    key,
+                    expected: Some(previous.revision)
+                }],
+                vec![write]
+            )
+            .unwrap()
+        )
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn version_two_preparation_keeps_protection_without_new_golden_allocations() {
+    let repo = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repo.clone());
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    let published = activator.publish("tenant", &draft(true)).await.unwrap();
+    let (_, mut job) = state.preparation_jobs(None).await.unwrap().pop().unwrap();
+    // Reproduce the durable job written before the phase-free contract upgrade.
+    job.recipe.handoff_contract_version = "2".into();
+    job.recipe.restore_profile_digest = version_two_digest(&published);
+    job.recipe
+        .restore_env
+        .insert(GOLDEN_PHASE.into(), "restore".into());
+    job.seed
+        .execution
+        .env
+        .insert(GOLDEN_PHASE.into(), "seed".into());
+    let key = Key::new(
+        "snapshot-preparation",
+        &["tenant", "digitalmate", &published.version],
+    )
+    .unwrap();
+    replace_fixture_record(&repo, key, serde_json::to_value(&job).unwrap()).await;
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    let restarted = Activator::new(AgentState::new(repo), platform.clone());
+    restarted.reconcile_snapshot_preparations().await.unwrap();
+    let template = restarted
+        .template("tenant", "digitalmate", &published.version)
+        .await
+        .unwrap();
+    assert_eq!(
+        template.snapshot_preparation,
+        Some(SnapshotPreparation::Ready)
+    );
+    assert_eq!(
+        template
+            .prewarm_recipe
+            .as_ref()
+            .unwrap()
+            .handoff_contract_version,
+        "2"
+    );
+    assert!(platform
+        .references
+        .lock()
+        .await
+        .iter()
+        .any(|change| matches!(
+            change,
+            SnapshotChange::Acquire {
+                owner: SnapshotOwner::Template { .. }
+            }
+        )));
+    let binding = activate(
+        &restarted,
+        &scope("new-user", TemplateRef::Version(published.version)),
+        "w-new",
+    )
+    .await;
+    assert!(binding.current.snapshot_id.is_none());
+    assert!(!platform
+        .creations
+        .lock()
+        .await
+        .last()
+        .unwrap()
+        .execution
+        .env
+        .contains_key(GOLDEN_PHASE));
+}
+
+#[tokio::test]
+async fn committed_version_two_binding_keeps_its_snapshot_and_restore_environment() {
+    let repo = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repo.clone());
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    let published = activator.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    activator.reconcile_snapshot_preparations().await.unwrap();
+    let scope = scope(
+        "existing-user",
+        TemplateRef::Version(published.version.clone()),
+    );
+    platform.block_creation.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        activator
+            .activate_with_parameters(
+                &scope,
+                None,
+                adx_agent_core::unix_time_millis() + 30_000,
+                true,
+                Some(b"workspace=w-existing")
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    let committed = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(
+        committed.current.snapshot_id.as_deref(),
+        Some("snapshot-ready")
+    );
+    // Restore the old durable recipe beside its already committed Binding decision.
+    let key = Key::new(
+        "snapshot-preparation-result",
+        &["tenant", "digitalmate", &published.version],
+    )
+    .unwrap();
+    let mut result = repo.get(&key).await.unwrap().unwrap().value;
+    result["recipe"]["handoff_contract_version"] = json!("2");
+    result["recipe"]["restore_profile_digest"] = json!(version_two_digest(&published));
+    result["recipe"]["restore_env"] = json!({"GOLDEN_PHASE":"restore"});
+    replace_fixture_record(&repo, key, result).await;
+    platform.block_creation.store(false, Ordering::Relaxed);
+    platform.unavailable.store(true, Ordering::Relaxed);
+    let restarted = Activator::new(AgentState::new(repo), platform.clone());
+    let retried = activate(&restarted, &scope, "w-existing").await;
+    assert_eq!(retried.current, committed.current);
+    let creations = platform.creations.lock().await;
+    let request = creations.last().unwrap();
+    assert_eq!(request.id, committed.current.environment_id);
+    assert_eq!(request.execution.snapshot_id, committed.current.snapshot_id);
+    assert_eq!(request.execution.env[GOLDEN_PHASE], "restore");
+}
+
 #[tokio::test]
 async fn automatic_golden_is_protected_before_backfill_and_used_without_product_eligibility() {
     let platform = Arc::new(Platform::default());
@@ -916,7 +1117,7 @@ async fn automatic_golden_is_protected_before_backfill_and_used_without_product_
             .find(|request| request.id == binding.current.environment_id)
             .unwrap();
         assert_eq!(request.execution.snapshot_id, binding.current.snapshot_id);
-        assert_eq!(request.execution.env[GOLDEN_PHASE], "restore");
+        assert!(!request.execution.env.contains_key(GOLDEN_PHASE));
         assert_eq!(
             request.execution.env["DIGITALMATE_CRYPTO_WORKSPACE"],
             workspace

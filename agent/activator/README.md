@@ -12,7 +12,7 @@ Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，
 
 独立进程同时配置自身的 HTTP 监听和连接 API Server 所需的字段，示例见 [local.json](examples/local.json)。入口服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN`。`environment_url` 指向 API Server（示例端口 8081 须与其 `listen` 配置一致），`environment_api_key_envs` 将租户映射到保存该租户 Platform API Key 的环境变量名，例如 `{"tenant":"ADX_PLATFORM_TENANT_API_KEY"}`。这里的 Platform API Key 用于 Environment 管理，与最终用户的模型 API Key 无关。凭据内容不写入 JSON；未配置租户的查询返回 NotFound，创建/删除在提交请求前返回 Unavailable。每项 key 必须属于对应租户，不能使用跨租户管理员 key；现有查询响应不含租户字段，Activator 无法独立验证配置归属。HTTP 明文必须显式允许，否则客户端需要 TLS 和受信任 CA。
 
-模板发布者通过 `auto_prepare_snapshot: true` 启动 Golden 制备。独立与嵌入式 Activator 都基于不可变模板版本构造匿名制备任务，通过原生 Environment 接口提交给 API Server 和 Coordinator。版本与入队使用同一事务，后台扫描持久任务并沿原 UUID 重试，取得 Platform 制品保护后回填对应版本。新 Environment 的 Golden 选择按版本和已提交的决议执行。部署需同步更新使用 Agent 模板类型的 Gateway 和 Activator，启用嵌入式 Activator 时同步更新承载它的 API Server。业务镜像须支持 `GOLDEN_PHASE` 和模板声明的就绪契约。
+模板发布者通过 `auto_prepare_snapshot: true` 启动 Golden 制备。独立与嵌入式 Activator 都基于不可变模板版本构造匿名制备任务，通过原生 Environment 接口提交给 API Server 和 Coordinator。版本与入队使用同一事务，后台扫描持久任务并沿原 UUID 重试，取得 Platform 制品保护后回填对应版本。新 Environment 的 Golden 选择按版本和已提交的决议执行。部署需同步更新使用 Agent 模板类型的 Gateway 和 Activator，启用嵌入式 Activator 时同步更新承载它的 API Server。业务镜像须遵守模板声明的就绪契约，并在首次认证连接后绑定真实工作区。新制备的版本 3 契约不注入 `GOLDEN_PHASE`，且 `restore_env` 必须为空；版本 2 配方不用于新分配，已有 Binding 的固定决议仍保留原配方环境。升级前在途任务完成时仍先取得制品保护。使用版本 3 Golden 需发布新模板版本。模板发布者负责可进入种子和快照的环境配置，Activator 不按变量名或内容实施 Golden 专属过滤。
 
 内部端点统一为 POST `/internal/adx/v1/`：
 
