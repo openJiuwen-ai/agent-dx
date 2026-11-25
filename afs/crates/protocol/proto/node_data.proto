@@ -191,6 +191,31 @@ message DfsReadRangesRdmaReply {
   uint64 transferred_bytes = 4;
 }
 
+enum HixlTransport {
+  HIXL_TRANSPORT_UNSPECIFIED = 0;
+  HIXL_TRANSPORT_ROCE = 1;
+  HIXL_TRANSPORT_HCCS = 2;
+}
+
+message HixlLane {
+  uint32 lane_id = 1;
+  string engine_id = 2;
+  uint64 engine_generation = 3;
+  uint64 window_bytes = 4;
+  // Total lane export pool. The reader divides it across its Home sessions
+  // and applies the native batch descriptor limit to each request.
+  uint32 export_slots = 5;
+}
+
+enum HixlReleaseOutcome {
+  HIXL_RELEASE_OUTCOME_UNSPECIFIED = 0;
+  HIXL_RELEASE_OUTCOME_COMPLETED = 1;
+  // The reader could not tell whether the native READ completed.
+  HIXL_RELEASE_OUTCOME_UNKNOWN = 3;
+  // The authenticated reader proves this window never entered native READ.
+  HIXL_RELEASE_OUTCOME_NOT_SUBMITTED = 4;
+}
+
 message DfsPutReplicaReply {
   repeated DfsReplicaAck durable_acks = 1;
 }
@@ -312,6 +337,18 @@ service OwnerFiles {
   rpc ReleaseDir(OwnerReleaseDirRequest) returns (OwnerReleaseDirReply);
   rpc Symlink(OwnerSymlinkRequest) returns (OwnerSymlinkReply);
   rpc Link(OwnerLinkRequest) returns (OwnerLinkReply);
+  // Optional HIXL read-ahead windows for read-only remote opens.
+  rpc NegotiateHixl(OwnerNegotiateHixlRequest) returns (OwnerNegotiateHixlReply);
+  rpc PrepareReadHixl(OwnerPrepareReadHixlRequest) returns (OwnerPrepareReadHixlReply);
+  rpc ReleaseHixlRead(OwnerReleaseHixlReadRequest) returns (OwnerReleaseHixlReadReply);
+  rpc CloseHixl(OwnerCloseHixlRequest) returns (OwnerCloseHixlReply);
+  // The writer pushes into Home staging slots, then commits to the file once.
+  rpc PrepareWriteHixl(OwnerPrepareWriteHixlRequest) returns (OwnerPrepareWriteHixlReply);
+  rpc CommitWriteHixl(OwnerFinishWriteHixlRequest) returns (OwnerCommitWriteHixlReply);
+  rpc AbortWriteHixl(OwnerAbortWriteHixlRequest) returns (OwnerAbortWriteHixlReply);
+  // Packs whole regular files of one directory, in sorted name order from the
+  // anchor, into exported slots. Release reuses OwnerReleaseHixlReadRequest.
+  rpc PrepareBatchHixl(OwnerPrepareBatchHixlRequest) returns (OwnerPrepareBatchHixlReply);
 }
 
 // RootAccess 是一次 OwnerFs 远端访问的防陈旧身份。
@@ -701,6 +738,238 @@ message OwnerReleaseRequest {
 }
 
 message OwnerReleaseReply {}
+
+// HIXL slot digests. Values 1 and 3 match the original protocol.
+enum HixlSlotChecksumAlgorithm {
+  HIXL_SLOT_CHECKSUM_ALGORITHM_UNSPECIFIED = 0;
+  HIXL_SLOT_CHECKSUM_ALGORITHM_BLAKE3 = 1;
+  reserved 2;
+  HIXL_SLOT_CHECKSUM_ALGORITHM_CRC32C = 3;
+}
+
+// OwnerFs HIXL read-ahead windows. The session is only a transport lease that
+// the authenticated peer opened with one valid RootAccess; every prepare
+// carries its own RootAccess and open handle and is authorized like Read.
+// Transport, lane and release types are shared by the transport layer.
+message OwnerNegotiateHixlRequest {
+  RootAccess access = 1;
+  string client_engine_id = 2;
+  uint64 client_engine_generation = 3;
+  uint32 protocol_version = 4;
+  HixlTransport transport = 5;
+  // Both pool dimensions are zero for direct transfer, positive for relay.
+  uint32 buffer_pool_count = 6;
+  uint32 buffer_pool_size_mib = 7;
+  optional uint64 hccs_domain_id = 8;
+  uint32 lane_count = 9;
+  // Slot digests the reader can verify. Home picks CRC32C when offered and
+  // falls back to BLAKE3; an empty list means BLAKE3 only.
+  repeated HixlSlotChecksumAlgorithm slot_checksum_algorithms = 10;
+}
+
+// A negotiated session supports buffered reads and writes; each operation still
+// checks its own grant and file handle.
+message OwnerNegotiateHixlReply {
+  uint64 session_id = 1;
+  string home_session_id = 2;
+  uint32 protocol_version = 3;
+  HixlTransport transport = 4;
+  // Both pool dimensions are zero for direct transfer, positive for relay.
+  uint32 buffer_pool_count = 5;
+  uint32 buffer_pool_size_mib = 6;
+  optional uint64 hccs_domain_id = 7;
+  repeated HixlLane lanes = 8;
+  // Algorithm of every slot checksum on this session: BLAKE3 or CRC32C.
+  HixlSlotChecksumAlgorithm slot_checksum_algorithm = 9;
+  reserved 10, 11;
+  reserved "write_checksum_negotiated";
+  bool buffered_write_supported = 12;
+}
+
+// read_id is reader-generated and stays identical across transport retries of
+// one attempt; Home replays the admitted reply for an identical request.
+message OwnerPrepareReadHixlRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  RootAccess access = 3;
+  OwnerHandle handle = 4;
+  uint64 offset = 5;
+  uint64 length = 6;
+  uint32 lane_id = 7;
+  // Slot size both engines can READ: the smaller of the reader window and the
+  // Home lane window. Home cuts every slot to at most this many bytes.
+  uint64 slot_bytes = 8;
+  // Release of the previous read on this session, applied before this prepare
+  // is admitted and with ReleaseHixlRead semantics. It must name this session.
+  OwnerReleaseHixlReadRequest prior_release = 9;
+}
+
+// One exported Host slot. Window slots are contiguous in file order; a batch
+// slot holds whole files back to back, located by OwnerBatchFile.
+message OwnerHixlSlot {
+  uint64 slot_id = 1;
+  uint64 slot_generation = 2;
+  uint64 address = 3;
+  uint64 length = 4;
+  // Digest of the exported slot bytes, in the session's negotiated algorithm:
+  // 32-byte BLAKE3, or little-endian CRC32C.
+  bytes checksum = 5;
+}
+
+message OwnerPrepareReadHixlReply {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint32 lane_id = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+  // Bytes read at prepare time; read < length means EOF was reached.
+  uint64 read = 6;
+  bool eof = 7;
+  repeated OwnerHixlSlot slots = 8;
+}
+
+// A batch of small files of one directory. Home lists the directory in byte
+// order and packs regular files with min_file_bytes < size <= max_file_bytes,
+// starting at the first name >= anchor_name, whole files only and never across
+// a slot, until max_bytes, the file limit or the scan limit.
+message OwnerPrepareBatchHixlRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  RootAccess access = 3;
+  // Root-relative directory path; empty is the root directory.
+  bytes parent_path = 4;
+  bytes anchor_name = 5;
+  uint32 lane_id = 6;
+  uint64 slot_bytes = 7;
+  uint64 max_bytes = 8;
+  uint64 min_file_bytes = 9;
+  uint64 max_file_bytes = 10;
+  // Same as OwnerPrepareReadHixlRequest.prior_release.
+  OwnerReleaseHixlReadRequest prior_release = 11;
+}
+
+// One packed file. Its bytes are slots[slot_index][offset_in_slot ..][..size],
+// read from an open whose fstat matched identity, size, mtime_ns and ctime_ns.
+message OwnerBatchFile {
+  bytes name = 1;
+  FileIdentity identity = 2;
+  uint64 size = 3;
+  uint64 mtime_ns = 4;
+  uint64 ctime_ns = 5;
+  uint32 slot_index = 6;
+  uint64 offset_in_slot = 7;
+}
+
+message OwnerPrepareBatchHixlReply {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint32 lane_id = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+  // Sum of the slot lengths; a slot is its used prefix.
+  uint64 bytes = 6;
+  repeated OwnerHixlSlot slots = 7;
+  // In name order. A file that failed while filling is zeroed and omitted.
+  repeated OwnerBatchFile files = 8;
+  // First directory entry after the packed range; empty at end of directory.
+  bytes next_name = 9;
+}
+
+message OwnerReleaseHixlReadRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint64 engine_generation = 3;
+  HixlReleaseOutcome outcome = 4;
+  bool content_validated = 5;
+}
+
+message OwnerReleaseHixlReadReply {
+  bool consumed = 1;
+  bool already_released = 2;
+  // The issued session for this engine generation was retired without live exports.
+  // The client must not use that session again.
+  bool session_retired = 3;
+}
+
+// The digest binds immutable source bytes and file parameters to this write.
+// Replays use the same authenticated session and write_id even for append.
+message OwnerPrepareWriteHixlRequest {
+  uint64 session_id = 1;
+  string write_id = 2;
+  RootAccess access = 3;
+  OwnerHandle handle = 4;
+  uint64 offset = 5;
+  uint32 length = 6;
+  bool kill_suidgid = 7;
+  bytes data_checksum = 8;
+  uint32 lane_id = 9;
+  uint64 slot_bytes = 10;
+  // Required and must match the negotiated slot checksum algorithm.
+  HixlSlotChecksumAlgorithm data_checksum_algorithm = 11;
+}
+
+message OwnerPrepareWriteHixlReply {
+  uint64 session_id = 1;
+  string write_id = 2;
+  uint32 lane_id = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+  repeated OwnerHixlSlot slots = 6;
+}
+
+message OwnerFinishWriteHixlRequest {
+  uint64 session_id = 1;
+  string write_id = 2;
+  uint64 engine_generation = 3;
+  // Request a single-use successor for this file on the same lane.
+  bool request_next = 4;
+  // Present only when committing a WRITE into a previously granted window.
+  OwnerPrepareWriteHixlRequest reused = 5;
+  string window_token = 6;
+}
+
+message OwnerCommitWriteHixlReply {
+  uint32 written = 1;
+  // The descriptor's write_id identifies the successor grant, not the file operation.
+  OwnerPrepareWriteHixlReply next_window = 2;
+}
+
+message OwnerAbortWriteHixlRequest {
+  uint64 session_id = 1;
+  string write_id = 2;
+  uint64 engine_generation = 3;
+  // Unknown device completion pins the target slots: never recycle them.
+  bool unknown = 4;
+  // Decline an unreceived successor; never cancel the file write itself.
+  bool cancel_next = 5;
+  // Requires cancel_next for safe fallback on older Homes. Resolve this exact
+  // Commit without starting a file write; fences it if it has not started.
+  OwnerFinishWriteHixlRequest recover_commit = 6;
+}
+
+message OwnerAbortWriteHixlReply {
+  // An empty reply is not execution evidence.
+  oneof recovery {
+    uint32 written = 1;
+    OwnerWriteHixlFailure failure = 2;
+  }
+}
+
+message OwnerWriteHixlFailure {
+  int32 grpc_code = 1;
+  string message = 2;
+  // The original structured gRPC status details, if present.
+  bytes details = 3;
+}
+
+message OwnerCloseHixlRequest {
+  uint64 session_id = 1;
+  string home_session_id = 2;
+}
+
+message OwnerCloseHixlReply {
+  bool drained = 2;
+}
 
 message OwnerOpendirRequest {
   RootAccess access = 1;

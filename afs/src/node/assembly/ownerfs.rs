@@ -16,6 +16,7 @@ use crate::{
     node::{Node, api, bridge, fuse, rpc, storage, vfs},
     runtime::{BoxError, Services, cancelled},
 };
+use afs_protocol::node_data::owner_files_server::OwnerFilesServer;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// B-side slow-path connector. The root grant and Home location stay in the
@@ -32,6 +33,9 @@ struct OwnerFilesFactory {
     rdma_device: Option<String>,
     timeout: std::time::Duration,
     rdma_admission: Arc<tokio::sync::Semaphore>,
+    /// HIXL read-ahead windows; `None` keeps every read on gRPC.
+    hixl_reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
+    hixl_trusted_peers: std::collections::HashSet<String>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -84,16 +88,23 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
             &self.runtime,
             self.peers.long_wait_channel(home_node_id, node_epoch, &uri),
         )?;
-        Ok(Arc::new(
-            rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
-                channel,
-                self.runtime.clone(),
-                Some(self.metrics.clone()),
-            )
-            .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
-            .with_rdma_admission(self.rdma_admission.clone())
-            .with_long_wait_channel(long_wait_channel),
-        ))
+        let client = rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
+            channel,
+            self.runtime.clone(),
+            Some(self.metrics.clone()),
+        )
+        .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
+        .with_rdma_admission(self.rdma_admission.clone())
+        .with_long_wait_channel(long_wait_channel);
+        let client = match self
+            .hixl_reader
+            .as_ref()
+            .filter(|_| self.hixl_trusted_peers.contains(home_node_id))
+        {
+            Some(reader) => client.with_hixl(reader.clone(), home_node_id.to_owned()),
+            None => client,
+        };
+        Ok(Arc::new(client))
     }
 }
 
@@ -117,6 +128,7 @@ pub(super) async fn assemble(
     startup: &Startup<'_>,
     peer_connections: &Arc<rpc::peer::PeerConnectionPool>,
     owner_rpc_metrics: &rpc::OwnerRpcMetrics,
+    hixl: &super::hixl::Hixl,
 ) -> Result<OwnerFsAssembly, BoxError> {
     let meta_endpoint = startup.meta_endpoint;
     let session_id = &startup.session_id;
@@ -145,11 +157,10 @@ pub(super) async fn assemble(
             .into());
         }
         #[cfg(feature = "rdma")]
-        if owner_data_mode == rpc::peer::DataMode::Rdma {
-            let device = cfg
-                .rdma_device
-                .clone()
-                .expect("OwnerFs RDMA checked rdma_device");
+        if (owner_data_mode == rpc::peer::DataMode::Rdma
+            || (owner_data_mode == rpc::peer::DataMode::Auto && !cfg.dfs))
+            && let Some(device) = cfg.rdma_device.clone()
+        {
             crate::node::bridge::spawn_blocking(move || {
                 afs_transport::rdma::RdmaEndpoint::open(&device)
             })
@@ -169,6 +180,8 @@ pub(super) async fn assemble(
             rdma_admission: Arc::new(tokio::sync::Semaphore::new(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
+            hixl_reader: hixl.reader(),
+            hixl_trusted_peers: cfg.hixl.trusted_peers.iter().cloned().collect(),
         });
         let recovery_root_meta = root_meta.clone();
         let roots = Arc::new(
@@ -321,10 +334,8 @@ pub(super) fn owner_files_server(
     state: &Node,
     owner_rpc_metrics: &rpc::OwnerRpcMetrics,
     owner_rdma_sessions: &rpc::control::RdmaSessionRegistry,
-) -> Result<
-    afs_protocol::node_data::owner_files_server::OwnerFilesServer<rpc::data::OwnerFilesService>,
-    BoxError,
-> {
+    hixl_source: Option<&Arc<rpc::data::owner_hixl::OwnerHixlService>>,
+) -> Result<OwnerFilesServer<rpc::data::OwnerFilesService>, BoxError> {
     let owner_files = if let Some(ownerfs) = state.ownerfs.as_ref() {
         let trusted = cfg
             .trusted_node_certs
@@ -335,12 +346,14 @@ pub(super) fn owner_files_server(
             .collect::<afs_error::Result<Vec<_>>>()?;
         let authenticator = Arc::new(rpc::data::MtlsPeerAuthenticator::new(trusted)?);
         let handler = rpc::data::make_owner_files_handler(ownerfs.peer_executor()?);
-        rpc::data::make_owner_files_server_with_handler_metrics_and_rdma(
-            handler,
-            authenticator,
-            owner_rpc_metrics.clone(),
-            owner_rdma_sessions.clone(),
-        )
+        let service = rpc::data::OwnerFilesService::new(handler, authenticator)
+            .with_metrics(owner_rpc_metrics.clone())
+            .with_rdma_sessions(owner_rdma_sessions.clone());
+        let service = match hixl_source {
+            Some(source) => service.with_hixl(source.clone()),
+            None => service,
+        };
+        OwnerFilesServer::new(service)
     } else {
         rpc::data::make_owner_files_server()
     };

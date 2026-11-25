@@ -9,6 +9,8 @@ meta_endpoint = "https://127.0.0.1:7400"
 # with it set logs config.test_only_option_enabled at WARN.
 # peer_endpoint = "https://127.0.0.1:7500"
 fs = "all"
+# Payload mode: grpc, rdma, hixl, or auto. Explicit hixl requires fs = "ownerfs".
+# HIXL buffered writes use an existing file handle; Home acknowledges the file write.
 data_mode = "grpc"
 data_dir = "/opt/adx/data/afs/node-a"
 uds_path = "/opt/adx/run/afs/node-a.sock"
@@ -166,3 +168,43 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # [dfs_peer_cache]
 # directory = "/opt/adx/cache/afs/peer"
 # capacity_bytes = 268435456
+
+[hixl]
+# HIXL handles eligible OwnerFs buffered reads in auto mode with an engine_id,
+# or in explicit hixl mode. It requires a native HIXL build, mTLS, and an
+# explicit list of peers with administrator-managed trusted_node_certs.
+# trusted_peers = ["node-b"]
+# Enable only when opened data is immutable and read authorization stays valid.
+# ownerfs_snapshot_reads = false
+# Buffered HIXL writes require opt-in on both sides.
+# ownerfs_buffered_writes = false
+# The two Host slot pools across all device lanes may reserve 1 GiB together;
+# one lane can take 128 + 128 slots of 4 MiB windows (the largest reservation).
+# window_bytes = 4194304
+# receive_slots = 128
+# export_slots = 128
+# ownerfs_read_group_bytes = 33554432 # default; up to 128 MiB
+# ownerfs_min_file_bytes = 1048576 # Auto read-window threshold: file size at Open.
+# Auto write threshold: payload bytes in each request, checked before Prepare
+# or write slot reuse. Smaller writes use the existing RDMA/gRPC policy.
+# Valid range: 0..=1048576; 0 tries HIXL for every non-empty buffered write.
+# Explicit data_mode = "hixl" ignores this write threshold.
+# ownerfs_min_write_bytes = 524288 # default (512 KiB)
+# session_idle_ms = 20000 # reader session reuse limit, 1..=20000
+# Match transport, pool enablement, and enabled pool sizing on both nodes.
+# Restart both nodes after switching.
+# transport = "roce" # default; "hccs" requires an A3 pair in the same super-pod
+# buffer_pool = false # default; RoCE may use true, HCCS requires true
+# With the relay enabled, each lane has two device pools. Defaults per pool:
+# buffer_pool_count = 4     # blocks per pool
+# buffer_pool_size_mib = 8  # MiB per block
+# The default uses 64 MiB of HBM per lane; Host slots are budgeted separately.
+# For RoCE with buffer_pool = true, set HCCL_INTRA_ROCE_ENABLE=1,
+# HCCL_INTRA_PCIE_ENABLE=0, and HCCL_INTER_HCCS_DISABLE=TRUE in both Node environments.
+# Host slots prefer the NPU PCI NUMA node. If unavailable, sched_getaffinity
+# reads the allocating owner thread's allowed CPUs; all must map to one NUMA node.
+# No candidate or an existing non-default policy means the original policy is inherited.
+# AFS_HIXL_NUMA reports source=pci|worker_cpu|unknown and policy=preferred|inherited.
+# This is a memory preference, not a page-placement guarantee. No extra key or CPU pinning.
+# device_id = 0  # ACL-visible NPU ID.
+# engine_id = "192.0.2.10:7920" # replace with this node's reachable IP:port

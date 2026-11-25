@@ -1,11 +1,11 @@
 //! Node shutdown sequence (段 23–25). The order is a contract, pinned by
 //! `node::shutdown_order_tests`; the code below runs in exactly this order:
 //!
-//! 1. Close admission (`close_admission`, run by `Services` right before it
-//!    broadcasts stop): DFS `shutting_down`, DFS write admission, ChunkStore
+//! 1. Arm the process deadline and close DFS admission (`close_admission`):
+//!    DFS `shutting_down`, DFS write admission, ChunkStore
 //!    catalog/sidecar/Peer-serve admission (the catalog itself stays open for
 //!    step 6), outboard range work, the DFS read authority, Peer-cache
-//!    admission, the object fetcher; then the caller's trigger.
+//!    admission and the object fetcher. Drain Home HIXL while gRPC is serving.
 //! 2. `Services` stops: stop broadcast, 10 s drain, abort on timeout.
 //! 3. The OwnerFs MountManager stops.
 //! 4. The DFS FUSE session is joined, then the OwnerFs one, so no kernel
@@ -24,6 +24,7 @@
 use super::common::{Backends, FuseMounts};
 #[cfg(feature = "dfs")]
 use super::dfs::{DfsAssembly, DfsReadAdmission, DfsStorage};
+use super::grpc::GrpcShutdown;
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use crate::node::fuse;
 #[cfg(feature = "dfs")]
@@ -42,6 +43,7 @@ pub(super) struct ShutdownResources<'a> {
     pub(super) backends: Backends,
     pub(super) mounts: FuseMounts,
     pub(super) local: api::local::LocalApiServer,
+    pub(super) grpc: GrpcShutdown,
 }
 
 /// Serve until a signal or a fatal service exit, then run steps 1–9.
@@ -49,19 +51,24 @@ pub(super) async fn serve_until_shutdown(
     cfg: &Config,
     services: Services,
     resources: ShutdownResources<'_>,
-    on_shutdown: impl FnOnce(),
+    on_shutdown: impl FnOnce() -> std::time::Instant,
 ) -> Result<(), BoxError> {
     let ShutdownResources {
         state,
         backends,
         mounts,
         local,
+        grpc,
     } = resources;
-    // Close read admission at the same lifecycle boundary that broadcasts
-    // shutdown. A cached object must not outlive a known Node/session stop.
-    let on_shutdown = || {
+    let pre_stop = async {
+        let deadline = on_shutdown();
         close_admission(state, &backends);
-        on_shutdown();
+        // Leave Services its existing graceful and abort waits. A late signal
+        // observation may leave no time to wait for exports before quarantine.
+        let home_deadline = deadline
+            .checked_sub(Services::STOP_BUDGET)
+            .unwrap_or_else(std::time::Instant::now);
+        grpc.drain_home(home_deadline).await
     };
     let mut shutdown_error = {
         // Deployment identity: every test must confirm the running binary matches
@@ -75,7 +82,7 @@ pub(super) async fn serve_until_shutdown(
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
         #[cfg(test)]
         record_shutdown_stage("serving");
-        services.run_with_shutdown(on_shutdown).await.err()
+        services.run_with_pre_stop(pre_stop).await.err()
     };
     #[cfg(feature = "dfs")]
     if let Err(error) = backends.dfs.connectors.stop().await {
@@ -129,7 +136,7 @@ pub(super) async fn serve_until_shutdown(
     Ok(())
 }
 
-/// Step 1. Runs inside `Services::run_with_shutdown`, before the stop broadcast.
+/// Step 1. Runs inside `Services::run_with_pre_stop`, before the stop broadcast.
 fn close_admission(state: &Node, backends: &Backends) {
     #[cfg(feature = "dfs")]
     let DfsAssembly {

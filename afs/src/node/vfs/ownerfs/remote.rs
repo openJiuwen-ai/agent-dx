@@ -40,6 +40,7 @@ pub(crate) fn write_was_not_executed(error: &Error) -> bool {
             | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE
             | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
             | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM
     )
 }
 
@@ -106,6 +107,12 @@ pub trait RemoteFiles: Send + Sync {
     fn release_lock_session(&self, _: &RootGrant, _: &str) -> Result<()> {
         Err(lock_unsupported())
     }
+
+    /// Called after a new `grant` arrives so an implementation can establish
+    /// its Home data transport in the background. It must not block the
+    /// caller or report failure; later operations establish transport as
+    /// needed.
+    fn warm(&self, _: &RootGrant) {}
 
     fn lookup(
         &self,
@@ -349,6 +356,20 @@ pub trait RemoteFiles: Send + Sync {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize>;
+    /// Owned reply for one FUSE READ. Implementations that cache verified
+    /// windows may return a shared slice instead of filling a new buffer.
+    fn read_reply(
+        &self,
+        grant: &RootGrant,
+        file: &RemoteFile,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        let mut out = vec![0; size];
+        let read = self.read(grant, file, offset, &mut out)?;
+        out.truncate(read);
+        Ok(out.into())
+    }
     /// A dispatched write with no conclusive reply reports
     /// `NODE_OWNER_WRITE_UNKNOWN`. The open handle retains the error across
     /// writes, flush and fsync. Release still cleans up the remote handle.

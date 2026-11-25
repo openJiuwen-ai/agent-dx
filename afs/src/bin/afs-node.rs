@@ -28,7 +28,7 @@ fn main() -> Result<(), BoxError> {
     // processctl's default stop wait is 20s. Leave a margin for the caller
     // to observe failure. Register the independent signal observer before the
     // business executor so its polling cannot delay arming the process budget.
-    let deadline = runtime::ShutdownDeadline::for_process(std::time::Duration::from_secs(15))?;
+    let deadline = runtime::ShutdownDeadline::for_process(afs::node::SHUTDOWN_BUDGET)?;
     let trigger = deadline.trigger();
     let executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -66,6 +66,11 @@ fn main() -> Result<(), BoxError> {
     #[cfg(all(target_os = "linux", feature = "node-jemalloc"))]
     allocator::report("shutdown");
     drop(guards);
+    // Native libraries can still block in C/C++ exit handlers after main
+    // returns. Keep the armed watchdog and its senders alive until process exit.
+    #[cfg(feature = "hixl")]
+    std::mem::forget(deadline);
+    #[cfg(not(feature = "hixl"))]
     deadline.complete();
     result
 }

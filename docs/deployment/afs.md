@@ -298,7 +298,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `tls_server_name` | 产品差异 | 两者 | 无 | 校验对端证书用的服务名 |
 | `trusted_node_certs` | 产品差异 | 两者 | `{}` | Node ID 到证书的绑定表。仅 TOML |
 | `fs` | 产品差异 | 两者 | 全部已编译后端 | `ownerfs`、`dfs` 或 `all`；`--print-config` 把它展开成 `ownerfs`、`dfs` 两个布尔值 |
-| `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
+| `data_mode` | 产品差异 | Node | `grpc` | Node 间正文通道，取值 `grpc`、`rdma`、`hixl`、`auto`。显式设备模式要求对应的编译 feature |
 | `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |
 | `dfs_rdma_require_server_generation` | 产品差异 | Node | `false` | DFS RDMA 强围栏。开启后拒绝旧客户端请求和旧服务端返回的空代际会话。滚动升级期间允许兼容会话时，留意服务端重启后的旧会话 ID 复用风险及 `afs_dfs_rdma_unbound_sessions`、`afs_dfs_rdma_unbound_server_replies_total` |
 | `data_dir` | 产品差异 | 两者 | `/tmp/afs-<id>/data` | 数据目录，必须是绝对路径；默认值只适合临时运行 |
@@ -1158,6 +1158,151 @@ uid/gid/mode。
 
 回退：命名与旧实现不兼容，只能回退二进制并重置 AFS 环境；不要期望新二进制读取
 旧的 `root-*` 数据目录。
+
+## OwnerFs HIXL 预读窗口与目录批量
+
+部署 HIXL 需要开启 `hixl` feature 的 `afs-node`、配套的 `libafs_hixl.so` 和 CANN 运行环境。
+模块默认从 `afs-node` 实际二进制所在目录加载，也可用进程环境变量 `AFS_HIXL_MODULE` 指定绝对路径。
+请将模块和 CANN 库放在受部署方管理的目录。主程序可在普通 Linux 上编译，只有构建模块需要 CANN SDK。
+配置 gRPC 时不加载模块。配置显式 HIXL 时，缺模块或缺运行库会报出缺失信息。
+Auto 在本机缺模块或运行库时使用现有回落路径。模块 ABI 不匹配、符号损坏和本机初始化失败仍会报错。
+
+`data_mode` 选择 Node 发起的远端正文通道。控制 RPC、元数据和释放回执继续使用 gRPC。
+
+| 模式 | OwnerFs 远端读 | OwnerFs 远端写 | DFS |
+| --- | --- | --- | --- |
+| `grpc`（默认） | gRPC | gRPC | gRPC |
+| `rdma` | RDMA | RDMA | RDMA |
+| `hixl` | HIXL 缓冲读 | 默认不支持。两端启用缓冲写后使用 HIXL | Node 启动配置拒绝 |
+| `auto` | 符合文件策略时优先 HIXL，其后为 RDMA、gRPC | 默认 RDMA、gRPC。两端启用缓冲写且达到阈值时优先 HIXL | RDMA、gRPC |
+
+`rdma` 需要 `rdma` feature 和 `rdma_device`。`hixl` 需要 `hixl` feature、`fs = "ownerfs"`
+和显式的 `[hixl].engine_id`。HIXL 要求 mTLS，并要求在 `[hixl].trusted_peers` 中列出
+允许使用同一注册内存池的节点 ID。每个 ID 都须出现在 `trusted_node_certs`。两端分别配置对端，
+设备网络只向这些受信节点开放。普通 Release 只释放软件槽位占用，native 注册仍在。
+在双机验证超时隔绝、保留与槽复用前保持生产 HIXL 关闭。`auto` 仅尝试配置了设备且支持对应文件操作的候选。
+本地或对端明确报告不支持时可以选择下一候选。鉴权、协议、校验失败、临时资源不足和提交结果未知
+返回错误。显式 HIXL 的 OPEN 不携带 gRPC 文件正文。`auto` 回落到普通 gRPC 且本机没有 HIXL 适配器时，
+保留 gRPC 的只读 OPEN 预取。配置了 HIXL 适配器时，仅在启用 `ownerfs_snapshot_reads` 且 gRPC 是
+小文件的正文通道时允许预取。
+
+配置 `data_mode = "hixl"` 和 `fs = "ownerfs"` 后，远端缓冲读走 HIXL。两端均启用 `ownerfs_buffered_writes` 后才可协商缓冲写，读写授权分别校验。显式 HIXL 在远端可写或截断打开前确认写能力。协商失败时不发送 `Open`，文件保持原样。Create 和 `O_DIRECT` 打开返回不支持。HIXL 写使用会话协商的槽校验算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。
+
+同一客户端通过其他句柄写入或截断时，会按文件身份清理 gRPC OPEN 预取，即使当前没有 HIXL 适配器。
+若 OPEN 等待期间发生失效，客户端丢弃回复中的预取正文，后续读重新从 Home 取数。
+前台返回未知写后，客户端保留原票据和会话租约，继续查询 Home 的回执或围栏尚未执行的 Commit。
+后台预算取 2 秒和常规 I/O 超时的一半中较小的值，为等待同一会话的后续读取留出时间。
+如果 Home 正在提交原写入，恢复查询立即返回可重试状态，由客户端在当前预算内间隔查询。
+后台仅收尾原票据，不重放正文或修改应用已经收到的结果。仍无法确认时，旧会话和未释放的槽继续按原规则隔离。
+
+HIXL 线协议 v2 要求 Close 携带 Home 代际。v1 与 v2 节点混用时，协商阶段明确报告不支持。
+滚动更新时，Auto 可按能力不足切换到 RDMA 或 gRPC，显式 HIXL 需要两端都升级。空代际
+Close 会被拒绝，未收尾会话由过期流程保守处理。原生 engine endpoint 被新进程复用时，已绑定旧代际的 reader 会拒绝复用连接，恢复前需退出旧 reader runtime。
+
+Home 最多同时接受 64 个活跃的 OwnerFs HIXL 会话。已关闭且已排空的会话仅保留有界的重试记录，不占活跃名额。
+读槽已归还但回执丢失时，客户端保留票据。若原会话已从注册表退役，Home 可以对同一引擎代际、曾分配的
+会话返回退役确认，客户端随后重建会话。仍有在途槽的会话不会走这条路径。
+已完成并校验的读槽会依票据安排一次后台发送流程。临时失败时，客户端在 20 秒总预算内退避补发，每次
+RPC 最多 1 秒。预算用尽仍保留票据。若 30 秒后 Home 仍有未确认的槽，继续按原规则隔离资源。
+
+`/health` 的 `checks.hixl.data_mode` 报告配置模式。`startup_fallback` 表示 Auto 已配置的 HIXL
+候选在本地报告不支持，后续正文仍按对应操作的候选选择。
+
+停机时，Home 在 gRPC 退场前停止新协商和新 Prepare，继续处理 `ReleaseHixlRead` 和 Prepare
+携带的 `prior_release`。已发布导出槽等待释放，已准入的 Prepare 等待完成或回滚。排空使用同一个
+15 秒进程预算，为现有服务停止和中止等待保留 12 秒。正常收到 SIGTERM 就开始排空时，Home 最多等待
+约 3 秒。排空超时返回 `NODE_TRANSFER_DRAIN_INCOMPLETE` 并隔离 runtime，未确认的槽保持保留。
+Node 在服务与挂载收尾后等待 native HIXL 清理。清理返回失败时记录
+`ownerfs.hixl_shutdown_failed`，停机以失败状态结束。HIXL 构建的 15 秒进程停机预算覆盖
+native 清理和 C/C++ 退出处理器，阻塞耗尽预算时以 `124` 退出。
+
+`[hixl].transport` 选择链路，`buffer_pool` 单独控制 HIXL 中转池。有效组合如下：
+
+| `transport` | `buffer_pool` | 正文路径 |
+| --- | --- | --- |
+| `"roce"`（默认） | `false`（默认） | RoCE 直传，注册 Host 窗口 |
+| `"roce"` | `true` | RoCE，经中转池 |
+| `"hccs"` | `true` | HCCS，经中转池；要求两端为同一 super-pod 的受支持 A3 设备 |
+
+两端须使用同一 `transport`、相同的 `buffer_pool` 开关，以及启用中转池时相同的 `buffer_pool_count` 和 `buffer_pool_size_mib`。切换时同步更新配置和进程环境，再重启双方 Node。
+
+启用中转池时，只设置 `buffer_pool = true` 即可使用默认规格。`buffer_pool_count` 是每个设备池的块数，`buffer_pool_size_mib` 是每块的 MiB 数。每条 lane 有两个池，默认 `4 × 8 MiB × 2 = 64 MiB` HBM；Host 收发槽另算。
+
+RoCE 启用中转池时，在两端启动 Node 前都设置以下环境变量，显式选择 RoCE 链路：
+
+```sh
+export HCCL_INTRA_ROCE_ENABLE=1
+export HCCL_INTRA_PCIE_ENABLE=0
+export HCCL_INTER_HCCS_DISABLE=TRUE
+```
+
+HCCS 中转池要求 `HCCL_INTER_HCCS_DISABLE` 未设置或为 `FALSE`，且 `HCCL_INTRA_ROCE_ENABLE` 未设置或为 `0`。使用服务管理器启动 Node 时，将变量设置在服务进程环境中。
+
+以下示例在已配置 mTLS 和 `trusted_node_certs` 的 Node 上设置 Auto。将 `engine_id` 替换为本 Node
+可达地址。
+
+```toml
+data_mode = "auto"
+
+[hixl]
+engine_id = "192.0.2.10:7920"
+trusted_peers = ["node-b"] # 已登记证书的对端 ID
+transport = "roce"
+buffer_pool = false
+window_bytes = 4194304
+receive_slots = 128
+export_slots = 128
+ownerfs_read_group_bytes = 33554432
+ownerfs_read_group_max_inflight = 2
+ownerfs_read_group_host_budget_bytes = 1073741824
+ownerfs_min_file_bytes = 1048576
+ownerfs_min_write_bytes = 524288
+ownerfs_sessions_per_home = 2
+ownerfs_batch_read = true
+ownerfs_batch_max_file_bytes = 4194304
+```
+
+- `ownerfs_read_group_bytes`：单次取回的目标字节数，`window_bytes` 的整数倍，默认 32 MiB（八个
+  4 MiB 窗口）。配置和 Home Prepare 统一接受最多 128 MiB。实际容量取
+  `min(两端 window_bytes) × min(本地 receive_slots, 对端 export_slots / ownerfs_sessions_per_home, 64)`。
+  每个打开最多占用 `组 × ownerfs_read_group_max_inflight` 的在途窗口，默认 1 GiB 预算支持约
+  16 个并发打开；并发更多时按需调大预算或缩小组。
+- `receive_slots` / `export_slots`：两端各自的 Host 槽位数，各 1..=128，默认 16。所有 device lane
+  的两个槽池合计受 `lane 数 × (receive_slots + export_slots) × window_bytes ≤ 1 GiB` 约束：单 lane
+  可用 128/128，2 lane 用 64/64，4 lane 用 32/32；默认 16/16 支持最多 8 lane，16 lane 要降到 8/8。
+- `ownerfs_snapshot_reads` 默认关闭。只有数据在打开期间保持不可变、授权持续有效的部署可开启。默认按需读，即使另一个节点更新文件，同一个 fd 也会再次从 Home 取数。窗口预读和目录批量仅在该选项开启时生效。
+- `ownerfs_buffered_writes` 默认关闭。两端确认该能力后，才启用窗口写和下一窗口复用。
+- `ownerfs_read_group_max_inflight` 为 1 或 2，默认 2。启用快照读时，2 在消费当前窗口时预取下一个。
+- `ownerfs_read_group_host_budget_bytes`：缓存窗口、在途预取和目录批量共用的进程级预算，默认
+  1 GiB。共享切片和 FUSE 回复持有的分配计费到最后一个引用释放。批量索引另受
+  `max(4 × ownerfs_read_group_bytes, 预算 / 2)` 限制。预算不足时按需单次取回仍可服务当前请求。
+- `ownerfs_min_file_bytes`：`auto` 下打开时文件大小达到该值才选 HIXL 窗口读取，默认 1 MiB。启用快照读时，更小的文件可使用
+  目录批量，普通读路径按 RDMA、gRPC 选择。
+- `ownerfs_min_write_bytes`：`auto` 下 OwnerFs 单次远端缓冲写的正文长度阈值，默认 `524288` 字节（512 KiB），
+  有效范围 `0..=1048576`。在发送 `PrepareWriteHixl` 或复用已授予的写槽之前比较；达到阈值才尝试 HIXL，
+  小于阈值沿用普通 RDMA/gRPC 策略。`0` 对所有非空缓冲写尝试 HIXL。默认从 512 KiB 到单次写上限 1 MiB 均符合大小条件。
+  显式 `data_mode = "hixl"` 不受此写阈值限制。
+- `ownerfs_sessions_per_home`：每个 Home 的控制会话数，1..=4，默认 2。每个会话同时只准入一次
+  取回；成功取回的释放由同一会话的下一次 Prepare 携带，空闲 10 ms 后才单独发送。调大后每个窗口
+  可用的导出槽按比例减少，因此组大小必须满足上面的槽位约束。
+- `session_idle_ms`：reader 复用空闲会话的期限，默认 20000，范围 1..=20000。Home 会话过期仍为 30 秒。
+- `ownerfs_batch_read`：默认 `true`，把只读打开的小文件按目录批量取回；`ownerfs_batch_max_file_bytes`
+  是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。连续翻页可复用有序文件名；Home 最多保留 8 个目录快照，每个快照的名字分配不超过 1 MiB。枚举时最多收集 4096 项；超过项数或字节预算即停止，不排序部分清单。该目录跳过批量预读，文件仍可单独读取。每页重新验证读授权，每个文件仍检查当前身份和版本。
+- 其余 HIXL runtime 设置包括 `device_id`、`engine_id`、
+  `device_listen_port`、`[[hixl.additional_devices]]`（最多 15 个额外设备，含主设备共 16 个）、`window_bytes`
+  （1..=4 MiB）。中转池参数为 `buffer_pool_count` 和 `buffer_pool_size_mib`。
+
+单卡部署仍使用原有的 `device_id`，无需新增 TOML 配置，也不会自动绑核。每条 lane 在启动时把 ACL 可见设备号转换成驱动逻辑号，通过 Host 驱动的 DSMI 查询 PCI 总线、设备和功能号，优先从 sysfs 中唯一匹配的 PCI 设备读取 `numa_node`。
+
+如果无法确定 PCI NUMA 节点（例如驱动未提供拓扑、PCI 地址跨域重名或 `numa_node` 未知），就在实际分配接收槽和导出槽的 owner 线程上调用 `sched_getaffinity`。只有 CPU 掩码非空，且其中所有允许 CPU 都能确认属于同一个 NUMA 节点时，才用该节点作为回退。若没有可信节点、线程已有非默认内存策略或内核拒绝设置优先策略，则沿用原策略；否则仅在 `aclrtMallocHost` 和首次触页期间使用 Linux `MPOL_PREFERRED`，随后恢复原策略。优先节点内存不足时 Linux 可从其他节点分配，因此不保证页落点。
+
+启动日志 `AFS_HIXL_NUMA` 的 `device` 是 ACL 可见设备号。`source=pci` 表示选用 PCI 节点，`source=worker_cpu` 表示选用 owner 线程允许 CPU 共同所属的节点，`source=unknown` 和 `node=-1` 表示未选出节点。独立的 `policy=preferred|inherited` 记录首个接收槽分配时是采用临时优先策略还是沿用原策略；节点来源不代表策略已应用，也不代表实际页落点。
+
+Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文件偏移经页缓存填充导出槽。
+reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。
+
+并发目录读时按需调大 `ownerfs_read_group_host_budget_bytes`：默认 1 GiB 支持约 16 个目录各驻留
+一个 32 MiB 批量；更多目录同时读时按 `2 × 目录数 × ownerfs_read_group_bytes` 设置。
 
 ## OwnerFs 运行时开关
 

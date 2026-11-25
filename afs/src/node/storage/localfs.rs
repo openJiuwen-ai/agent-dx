@@ -349,6 +349,18 @@ pub struct LocalFile {
     file: File,
 }
 
+impl LocalFile {
+    /// A second descriptor for the same open file. Positional reads through it
+    /// need no lock of the owning handle and stay valid after that handle is
+    /// closed, so a caller can copy while others close or flush.
+    #[cfg(feature = "ownerfs")]
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+        })
+    }
+}
+
 impl FileHandle for LocalFile {
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         self.file.read_at(buffer, offset)
@@ -410,6 +422,80 @@ impl FileHandle for LocalFile {
 #[derive(Debug)]
 pub struct LocalDirectory {
     dir: File,
+}
+
+impl LocalDirectory {
+    /// Return the complete byte-sorted listing, or `None` when the next
+    /// entry would exceed either budget. No partial listing is returned.
+    #[cfg(any(test, feature = "ownerfs"))]
+    pub(crate) fn read_dir_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<OsString>>> {
+        let names = fs::read_dir(proc_fd_path(&self.dir))?.filter_map(|entry| match entry {
+            Ok(entry) => {
+                let name = entry.file_name();
+                (name != "." && name != "..").then_some(Ok(name))
+            }
+            Err(error) => Some(Err(error)),
+        });
+        collect_directory_names_bounded(names, max_entries, max_bytes)
+    }
+
+    /// Attributes of a direct child without following a final symlink.
+    #[cfg(feature = "ownerfs")]
+    pub(crate) fn child_metadata(&self, name: &OsStr) -> io::Result<fs::Metadata> {
+        if name.is_empty() || Path::new(name).components().count() != 1 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        fs::symlink_metadata(proc_child(&self.dir, name))
+    }
+}
+
+/// Count the name vector and the allocation of each retained name. Grow the
+/// vector only when it can fit, and stop polling the iterator on overflow.
+#[cfg(any(test, feature = "ownerfs"))]
+pub(crate) fn collect_directory_names_bounded(
+    entries: impl IntoIterator<Item = io::Result<OsString>>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> io::Result<Option<Vec<OsString>>> {
+    let entry_bytes = std::mem::size_of::<OsString>();
+    let mut names = Vec::new();
+    let mut remaining = max_bytes;
+    for entry in entries {
+        let name = entry?;
+        if names.len() == max_entries {
+            return Ok(None);
+        }
+        let Some(after_name) = remaining.checked_sub(name.capacity()) else {
+            return Ok(None);
+        };
+        remaining = after_name;
+        if names.len() == names.capacity() {
+            let additional = names
+                .len()
+                .max(4)
+                .min(max_entries - names.len())
+                .min(remaining / entry_bytes);
+            if additional == 0 {
+                return Ok(None);
+            }
+            let previous = names.capacity();
+            names
+                .try_reserve_exact(additional)
+                .map_err(io::Error::other)?;
+            let growth = (names.capacity() - previous).saturating_mul(entry_bytes);
+            let Some(after_growth) = remaining.checked_sub(growth) else {
+                return Ok(None);
+            };
+            remaining = after_growth;
+        }
+        names.push(name);
+    }
+    names.sort_unstable();
+    Ok(Some(names))
 }
 
 impl DirectoryHandle for LocalDirectory {
@@ -958,6 +1044,34 @@ fn proc_fd_path(file: &File) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_listing_only_returns_complete_byte_sorted_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalFs::open(temp.path()).unwrap();
+        let names = [
+            OsString::from("z"),
+            OsString::from_vec(vec![0x80]),
+            OsString::from("a"),
+        ];
+        for name in &names {
+            fs::write(temp.path().join(name), []).unwrap();
+        }
+        let directory = local.open_dir(&StoragePath::root()).unwrap();
+        assert_eq!(directory.read_dir_bounded(2, 1024).unwrap(), None);
+        assert_eq!(
+            directory
+                .read_dir_bounded(3, 3 * std::mem::size_of::<OsString>() + 2)
+                .unwrap(),
+            None
+        );
+        let sorted = vec![names[2].clone(), names[0].clone(), names[1].clone()];
+        assert_eq!(
+            directory.read_dir_bounded(3, 1024).unwrap(),
+            Some(sorted.clone())
+        );
+        assert_eq!(directory.read_dir().unwrap(), sorted);
+    }
 
     #[test]
     fn statvfs_reports_capacity_from_open_root_fd() {

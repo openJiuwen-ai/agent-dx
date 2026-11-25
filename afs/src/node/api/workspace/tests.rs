@@ -438,6 +438,10 @@ impl Fixture {
             ownerfs: Some(owner),
             #[cfg(feature = "dfs")]
             dfs: None,
+            #[cfg(feature = "ownerfs")]
+            hixl_runtime: None,
+            #[cfg(feature = "ownerfs")]
+            hixl_metrics: None,
         });
         let peers = Arc::new(PeerConnectionPool::new(Default::default(), tls, 4).unwrap());
         let api = WorkspaceApi::new(node, meta, peers).unwrap();

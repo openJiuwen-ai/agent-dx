@@ -45,6 +45,9 @@ use crate::node::storage::{
 pub(in crate::node) mod bind_mount;
 pub mod catalog;
 pub mod files;
+
+/// Largest read-only file that can return its contents with OPEN.
+pub(crate) const OPEN_PREFETCH_LIMIT: u64 = 4096;
 pub(crate) mod fuse_policy;
 mod mount_manager;
 mod native_home;
@@ -430,6 +433,128 @@ pub struct OwnerFsPeerExecutor {
     local: Arc<LocalOwnerFs>,
 }
 
+/// A Home directory opened for one OwnerFs HIXL batch prepare. It keeps the
+/// root admitted until dropped, so a root drain waits for the prepare.
+pub struct PeerBatchDirectory {
+    directory: crate::node::storage::localfs::LocalDirectory,
+    _root_use: root::RootUse,
+}
+
+/// Change stamp of the directory descriptor opened for a batch prepare.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PeerBatchDirectoryVersion {
+    device: u64,
+    inode: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl PeerBatchDirectoryVersion {
+    #[cfg(test)]
+    pub(crate) fn for_test(version: usize) -> Self {
+        Self {
+            device: 0,
+            inode: version as u64,
+            mtime: (0, 0),
+            ctime: (0, 0),
+        }
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// Identity and version of a regular file a batch packs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerBatchEntry {
+    pub identity: files::FileIdentity,
+    pub size: u64,
+    pub mtime: std::time::SystemTime,
+    pub ctime: std::time::SystemTime,
+}
+
+impl PeerBatchEntry {
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Option<Self>> {
+        if kind_from_metadata(metadata)? != FileKind::Regular {
+            return Ok(None);
+        }
+        let attributes = attributes_from_metadata(metadata.clone())?;
+        Ok(Some(Self {
+            identity: identity_from_metadata(metadata)?,
+            size: attributes.size,
+            mtime: attributes.mtime,
+            ctime: attributes.ctime,
+        }))
+    }
+}
+
+impl PeerBatchDirectory {
+    /// Read the stamp from the same descriptor used for listing and opening children.
+    pub(crate) fn version(&self) -> Result<PeerBatchDirectoryVersion> {
+        let metadata = self.directory.metadata().map_err(Error::from)?;
+        Ok(PeerBatchDirectoryVersion::from_metadata(&metadata))
+    }
+
+    /// Complete byte-sorted entry names, or `None` if either limit is exceeded.
+    pub(crate) fn names_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<OsString>>> {
+        self.directory
+            .read_dir_bounded(max_entries, max_bytes)
+            .map_err(Error::from)
+    }
+
+    /// The entry without following a final symlink; `None` unless it is a
+    /// regular file.
+    pub fn stat(&self, name: &OsStr) -> Result<Option<PeerBatchEntry>> {
+        let metadata = self.directory.child_metadata(name).map_err(Error::from)?;
+        PeerBatchEntry::from_metadata(&metadata)
+    }
+
+    /// Opens a regular file read-only. The leaf is never followed and a FIFO
+    /// that replaced the file cannot block the open.
+    pub fn open(&self, name: &OsStr) -> Result<PeerBatchFile> {
+        let file = LocalFs::open_child_in(
+            &self.directory,
+            name,
+            OpenSpec::new(libc::O_RDONLY | libc::O_NONBLOCK, 0),
+        )
+        .map_err(Error::from)?;
+        let metadata = file.metadata().map_err(Error::from)?;
+        let entry = PeerBatchEntry::from_metadata(&metadata)?.ok_or_else(|| {
+            Error::coded(
+                afs_error::NODE_VFS_INVALID,
+                "batch entry is no longer a regular file",
+            )
+        })?;
+        Ok(PeerBatchFile { file, entry })
+    }
+}
+
+/// One regular file opened by a batch prepare, with the version of the open.
+pub struct PeerBatchFile {
+    file: crate::node::storage::localfs::LocalFile,
+    entry: PeerBatchEntry,
+}
+
+impl PeerBatchFile {
+    pub fn entry(&self) -> &PeerBatchEntry {
+        &self.entry
+    }
+
+    pub fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize> {
+        self.file.read_at(offset, out).map_err(Error::from)
+    }
+}
+
 impl OwnerFsPeerExecutor {
     pub(crate) fn delete_workspace(
         &self,
@@ -507,6 +632,20 @@ impl OwnerFsPeerExecutor {
             return Err(stale("outlet Home session changed during lookup"));
         }
         Ok(afs_protocol::node_control::WorkspaceOutletLayoutsReply { roots: layouts })
+    }
+
+    /// A peer read the caller may copy concurrently; see
+    /// [`LocalOwnerFs::peer_read_positional`].
+    pub fn peer_read_positional(
+        &self,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        file: &files::RemoteFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        self.local
+            .peer_read_positional(peer_node_id, access, file, offset, out)
     }
 
     /// Prepare and activate a reserved workspace on this Home, then request
@@ -927,6 +1066,18 @@ impl OwnerFsPeerExecutor {
             .peer_read(peer_node_id, access, file, offset, out)
     }
 
+    /// Opens a root-relative directory for an OwnerFs HIXL batch prepare,
+    /// validating the presented grant for reading once.
+    pub fn peer_batch_directory(
+        &self,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        parent: &OsStr,
+    ) -> Result<PeerBatchDirectory> {
+        self.local
+            .peer_batch_directory(peer_node_id, access, parent)
+    }
+
     pub fn write(
         &self,
         peer_node_id: &str,
@@ -1284,6 +1435,16 @@ impl Backend for OwnerFs {
         out: &mut [u8],
     ) -> Result<usize> {
         self.require_local()?.read(handle, offset, out)
+    }
+
+    fn read_reply(
+        &self,
+        _: &RequestContext,
+        handle: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        self.require_local()?.read_reply(handle, offset, size)
     }
 
     fn write(
@@ -3604,7 +3765,6 @@ impl LocalOwnerFs {
         // peer_read would repeat grant validation and a handle-table lookup.
         // A failed or short speculative read only disables prefetch; OPEN
         // itself still succeeds and the caller can issue a normal READ.
-        const OPEN_PREFETCH_LIMIT: u64 = 4096;
         let prefetched_data = if flags & libc::O_ACCMODE == libc::O_RDONLY
             && flags & (libc::O_PATH | libc::O_DIRECT) == 0
             && attributes.size <= OPEN_PREFETCH_LIMIT
@@ -3664,6 +3824,63 @@ impl LocalOwnerFs {
         let handle = decode_file_handle(file)?;
         self.check_peer_file_handle(handle, peer_node_id, access, &file.identity)?;
         self.read(handle, offset, out)
+    }
+
+    /// A peer read for callers that copy the bytes themselves: the same
+    /// validation as `peer_read`, but a local open is duplicated under its
+    /// lock and read through the duplicate afterwards, so one window's slots
+    /// can be copied concurrently. Remote opens keep the locked path.
+    pub fn peer_read_positional(
+        &self,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        file: &files::RemoteFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        self.validate_peer(access, peer_node_id, RootRight::Read)?;
+        check_remote_file_scope(access, file)?;
+        let handle = decode_file_handle(file)?;
+        self.check_peer_file_handle(handle, peer_node_id, access, &file.identity)?;
+        let slot = self.open_file_handle(handle)?;
+        let _root_use = self.native_home_file_handle_guard(&slot, RootRight::Read)?;
+        let duplicate = {
+            let slot = slot.lock().map_err(|_| poisoned())?;
+            slot.ensure_open()?;
+            match &slot.file {
+                OpenFileHandle::Local(open) => {
+                    Some(open.handle.file.try_clone().map_err(Error::from)?)
+                }
+                OpenFileHandle::Remote(_) => None,
+            }
+        };
+        match duplicate {
+            Some(file) => file.read_at(offset, out).map_err(Error::from),
+            None => self.read(handle, offset, out),
+        }
+    }
+
+    /// Opens `parent` below the presented root for a batch prepare. Reading
+    /// any file of the root needs exactly the grant a peer OPEN for reading
+    /// needs, so one validation covers every file the batch packs.
+    fn peer_batch_directory(
+        &self,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        parent: &OsStr,
+    ) -> Result<PeerBatchDirectory> {
+        self.validate_peer(access, peer_node_id, RootRight::Read)?;
+        let relative = storage_path_from_os(parent)?;
+        let root_use = self.roots.enter_root(&access.id, RootRight::Read)?;
+        let physical = root_use
+            .data_dir()
+            .join_path(&relative)
+            .map_err(Error::from)?;
+        let directory = self.disk.open_dir(&physical).map_err(Error::from)?;
+        Ok(PeerBatchDirectory {
+            directory,
+            _root_use: root_use,
+        })
     }
 
     fn peer_write_with_options(
@@ -4630,6 +4847,36 @@ impl LocalOwnerFs {
                 file.handle.file.read_at(offset, out).map_err(Error::from)
             }
             OpenFileHandle::Remote(file) => file.files.read(&file.grant, &file.handle, offset, out),
+        }
+    }
+
+    /// FUSE reply for one READ. A remote open may answer from a cached window
+    /// without copying; a local open fills a fresh buffer as before.
+    fn read_reply(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        let file = self.open_file_handle(handle)?;
+        let _root_use = self.native_home_file_handle_guard(&file, RootRight::Read)?;
+        let file = file.lock().map_err(|_| poisoned())?;
+        file.ensure_open()?;
+        match &file.file {
+            OpenFileHandle::Local(file) => {
+                let mut out = vec![0; size];
+                let read = file
+                    .handle
+                    .file
+                    .read_at(offset, &mut out)
+                    .map_err(Error::from)?;
+                out.truncate(read);
+                Ok(out.into())
+            }
+            OpenFileHandle::Remote(file) => {
+                file.files
+                    .read_reply(&file.grant, &file.handle, offset, size)
+            }
         }
     }
 
@@ -6087,11 +6334,15 @@ impl LocalOwnerFs {
         // A request that started before the recreation may arrive with the
         // superseded grant after a refresh published the new one; never
         // roll the cache back.
-        if cache
+        let published = cache
             .get(id)
-            .is_none_or(|current| current.grant.epoch <= remote.grant.epoch)
-        {
+            .is_none_or(|current| current.grant.epoch <= remote.grant.epoch);
+        if published {
             cache.insert(id.clone(), remote.clone());
+        }
+        drop(cache);
+        if published {
+            remote.files.warm(&remote.grant);
         }
         Ok(remote)
     }
@@ -8994,6 +9245,7 @@ mod tests {
         release_calls: AtomicUsize,
         lock_session_release_calls: AtomicUsize,
         lose_write_reply_once: AtomicBool,
+        reject_checksum_once: AtomicBool,
         fail_flush_once: AtomicBool,
         fail_fsync_once: AtomicBool,
         fail_lock_session_release: AtomicBool,
@@ -9014,6 +9266,7 @@ mod tests {
                 release_calls: AtomicUsize::new(0),
                 lock_session_release_calls: AtomicUsize::new(0),
                 lose_write_reply_once: AtomicBool::new(false),
+                reject_checksum_once: AtomicBool::new(false),
                 fail_flush_once: AtomicBool::new(false),
                 fail_fsync_once: AtomicBool::new(false),
                 fail_lock_session_release: AtomicBool::new(false),
@@ -9305,6 +9558,12 @@ mod tests {
             self.observe_active_write();
             std::thread::sleep(self.write_delay);
             self.active_writes.fetch_sub(1, Ordering::SeqCst);
+            if self.reject_checksum_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM,
+                    "fixture: Home rejected checksum before writing",
+                ));
+            }
             if self.lose_write_reply_once.swap(false, Ordering::SeqCst) {
                 return Err(Error::coded(
                     afs_error::NODE_OWNER_WRITE_UNKNOWN,
@@ -12373,6 +12632,163 @@ mod tests {
     }
 
     #[test]
+    fn peer_read_positional_matches_the_locked_peer_read() {
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.mkdir(&ctx, root, OsStr::new("job-a"), 0o755).unwrap();
+        let created = fs
+            .create(
+                &ctx,
+                workspace.inode,
+                OsStr::new("data"),
+                0o644,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let content = (0..64 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs.write(&ctx, created.handle, 0, &content).unwrap();
+        let local = fs.require_local().unwrap();
+        let access = presented(&test_grant(
+            root::root_id_from_name(OsStr::new("job-a")).unwrap(),
+        ));
+        let file = {
+            let slot = local.open_file_handle(created.handle).unwrap();
+            let mut slot = slot.lock().unwrap();
+            let OpenFileHandle::Local(open) = &mut slot.file else {
+                unreachable!()
+            };
+            let identity = open.handle.identity.clone();
+            open.handle.peer = Some(files::PeerOpenScope {
+                node_id: "node-b".to_owned(),
+                access: access.clone(),
+            });
+            remote_file(&access, identity, created.handle)
+        };
+        let mut locked = vec![0; 24 * 1024];
+        let mut positional = vec![0; 24 * 1024];
+        assert_eq!(
+            local
+                .peer_read("node-b", &access, &file, 8 * 1024, &mut locked)
+                .unwrap(),
+            24 * 1024
+        );
+        assert_eq!(
+            local
+                .peer_read_positional("node-b", &access, &file, 8 * 1024, &mut positional)
+                .unwrap(),
+            24 * 1024
+        );
+        assert_eq!(positional, locked);
+        assert_eq!(positional, content[8 * 1024..32 * 1024]);
+        let offset = (content.len() - 7) as u64;
+        assert_eq!(
+            local
+                .peer_read_positional("node-b", &access, &file, offset, &mut positional)
+                .unwrap(),
+            7
+        );
+        assert_eq!(positional[..7], content[content.len() - 7..]);
+
+        // A positional read must apply the same peer validation as a locked read.
+        let locked_error = local
+            .peer_read("node-c", &access, &file, 0, &mut locked)
+            .unwrap_err()
+            .code();
+        assert_eq!(
+            local
+                .peer_read_positional("node-c", &access, &file, 0, &mut positional)
+                .unwrap_err()
+                .code(),
+            locked_error,
+        );
+        let mut foreign = file.clone();
+        foreign.identity = files::FileIdentity(vec![0]);
+        assert_eq!(
+            local
+                .peer_read_positional("node-b", &access, &foreign, 0, &mut positional)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE,
+        );
+        fs.release(&ctx, created.handle).unwrap();
+    }
+
+    #[test]
+    fn peer_batch_directory_lists_and_opens_only_regular_files() {
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.mkdir(&ctx, root, OsStr::new("job-a"), 0o755).unwrap();
+        for (name, length) in [("b", 300_usize), ("a", 200)] {
+            let created = fs
+                .create(&ctx, workspace.inode, OsStr::new(name), 0o644, libc::O_RDWR)
+                .unwrap();
+            fs.write(&ctx, created.handle, 0, &vec![name.as_bytes()[0]; length])
+                .unwrap();
+            fs.release(&ctx, created.handle).unwrap();
+        }
+        fs.mkdir(&ctx, workspace.inode, OsStr::new("sub"), 0o755)
+            .unwrap();
+        fs.symlink(&ctx, workspace.inode, OsStr::new("link"), OsStr::new("a"))
+            .unwrap();
+        let local = fs.require_local().unwrap();
+        let access = presented(&test_grant(
+            root::root_id_from_name(OsStr::new("job-a")).unwrap(),
+        ));
+
+        let directory = local
+            .peer_batch_directory("node-b", &access, OsStr::new(""))
+            .unwrap();
+        let max_listing_bytes = 1024;
+        let first_version = directory.version().unwrap();
+        let names = directory
+            .names_bounded(4, max_listing_bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(directory.version().unwrap(), first_version);
+        assert_eq!(names, ["a", "b", "link", "sub"]);
+        assert_eq!(directory.stat(OsStr::new("sub")).unwrap(), None);
+        assert_eq!(directory.stat(OsStr::new("link")).unwrap(), None);
+        assert!(directory.open(OsStr::new("link")).is_err());
+        let entry = directory.stat(OsStr::new("b")).unwrap().unwrap();
+        assert_eq!(entry.size, 300);
+        let file = directory.open(OsStr::new("b")).unwrap();
+        assert_eq!(*file.entry(), entry);
+        let mut out = vec![0; 300];
+        assert_eq!(file.read_at(0, &mut out).unwrap(), 300);
+        assert!(out.iter().all(|byte| *byte == b'b'));
+        // Metadata comes from the opened directory and reflects name changes.
+        fs.mkdir(&ctx, workspace.inode, OsStr::new("new-sub"), 0o755)
+            .unwrap();
+        // Pin a distinct mtime so the assertion is independent of the backing
+        // filesystem timestamp granularity.
+        let physical = directory._root_use.data_dir();
+        local
+            .disk
+            .set_times(physical, None, Some(UNIX_EPOCH))
+            .unwrap();
+        assert_ne!(directory.version().unwrap(), first_version);
+        assert_eq!(
+            directory
+                .names_bounded(5, max_listing_bytes)
+                .unwrap()
+                .unwrap(),
+            ["a", "b", "link", "new-sub", "sub"]
+        );
+        // The grant is validated for this peer, like any peer OPEN.
+        assert!(
+            local
+                .peer_batch_directory("node-c", &access, OsStr::new(""))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn home_handle_is_bound_to_its_peer_root_session_and_identity() {
         let (_temp, fs, ctx) = fixture();
         let root = BackendInode {
@@ -12651,6 +13067,23 @@ mod tests {
         );
         assert!(remote.last_write_killpriv.load(Ordering::SeqCst));
         fs.release(&ctx, handle).unwrap();
+    }
+
+    #[test]
+    fn checksum_rejection_does_not_leave_a_fatal_sync_error_on_the_fd() {
+        let (_temp, fs, ctx) = fixture();
+        let root_id = root::root_id_from_name(OsStr::new("job-42")).unwrap();
+        let remote = Arc::new(SlowRemoteFiles::new(root_id, Duration::ZERO));
+        remote.reject_checksum_once.store(true, Ordering::SeqCst);
+        let handle = insert_slow_remote_handle(&fs, remote.clone(), 1);
+        assert_eq!(
+            fs.write(&ctx, handle, 0, b"bad").unwrap_err().code(),
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM
+        );
+        assert_eq!(fs.write(&ctx, handle, 0, b"good").unwrap(), 4);
+        fs.flush(&ctx, handle).unwrap();
+        fs.fsync(&ctx, handle, SyncMode::Full).unwrap();
+        assert_eq!(remote.fsync_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
