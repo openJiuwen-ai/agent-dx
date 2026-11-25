@@ -912,7 +912,10 @@ impl DfsChunksService {
             let waiting = std::time::Instant::now();
             let deadline = tokio::time::Instant::now() + budget;
             loop {
+                // Wakes on any in-flight change, and when a version stops
+                // being shared (!318 P3-3): both armed before the checks.
                 let changed = holders.in_flight.changed();
+                let unshared = holders.registry.unshared();
                 missing.retain(|chunk| !local.has_servable_record(chunk));
                 if missing.is_empty() {
                     break;
@@ -923,7 +926,14 @@ impl DfsChunksService {
                     timed(&|t| t.holder_wait("not_ready", waiting.elapsed()));
                     return Err(holder_not_ready());
                 }
-                if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                let woke = tokio::time::timeout_at(deadline, async {
+                    tokio::select! {
+                        () = changed => {}
+                        () = unshared => {}
+                    }
+                })
+                .await;
+                if woke.is_err() {
                     missing.retain(|chunk| !local.has_servable_record(chunk));
                     if missing.is_empty() {
                         break;
@@ -952,6 +962,8 @@ impl DfsChunksService {
                 .map_err(denied)?;
         }
         // 6. a fresh admission deadline after any wait (R2), then a slot
+        #[cfg(test)]
+        holders.reach(super::dfs_holder_serve::TestPoint::SlotQueue);
         let slot_wait = std::time::Instant::now();
         let admission_deadline = local.peer_serve_deadline();
         let permit = match self.read_permits.clone().try_acquire_owned() {
@@ -972,6 +984,8 @@ impl DfsChunksService {
         let registry = holders.registry.clone();
         let version = grant.file_version_id.clone();
         let (started, ready) = tokio::sync::oneshot::channel();
+        #[cfg(test)]
+        let hooks = holders.clone();
         crate::node::bridge::spawn_blocking(move || {
             let _permit = permit;
             // 7. inside the slot: the deadline only, no Meta; and the version
@@ -989,6 +1003,8 @@ impl DfsChunksService {
                 return;
             }
             local.record_read_cache_event("holder_served");
+            #[cfg(test)]
+            hooks.reach(super::dfs_holder_serve::TestPoint::Serve);
             let serving = std::time::Instant::now();
             // 8. serve
             let served = stream_dfs_ranges_until(

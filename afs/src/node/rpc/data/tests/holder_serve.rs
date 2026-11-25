@@ -848,6 +848,22 @@ async fn h2_t1_local_grant_checks_refuse_without_meta_or_a_slot() {
     drop(slots);
 }
 
+/// Polls `ready` until it holds, failing after 5 s.
+async fn until(what: &str, ready: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+fn holder_serve(h: &Holder) -> Arc<crate::node::rpc::data::HolderServe> {
+    h.service.holders.clone().unwrap()
+}
+
 /// S3 (code review): the version stops being shared while a request waits:
 /// the request ends not ready, even though the Chunk then arrives. Every
 /// read slot stays taken, so only the check before the slot can answer
@@ -871,15 +887,17 @@ async fn h2_s3_version_unshared_during_the_wait_is_not_served() {
         let service = service.clone();
         tokio::spawn(async move { read(&service, holder_request(vec![op])).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let serve = holder_serve(&h);
+    until("the request to wait", || serve.waiting() == 1).await;
     h.registry.release(&h.version, 1);
     h.local.put(h.absent.clone()).unwrap();
     drop(fetching);
     not_ready(task.await.unwrap());
 }
 
-/// S3 (code review): a wakeup after the version stopped being shared ends
-/// the wait at once, while the Chunk is still in flight.
+/// S3 (code review), !318 P3-3: the version's last shared reader leaves
+/// while a request waits for a Chunk still in flight: the release itself
+/// wakes the wait, which ends at once (nothing else changes meanwhile).
 #[tokio::test]
 async fn h2_s3_wakeup_after_unsharing_ends_the_wait() {
     let h = holder(30_000);
@@ -888,16 +906,25 @@ async fn h2_s3_wakeup_after_unsharing_ends_the_wait() {
     let mut op = holder_op(0, &h.absent.chunk.id.0, 0, 4096, &g);
     op.wait_ms = 500;
     let service = Arc::new(h.service.clone());
-    let started = std::time::Instant::now();
     let task = {
         let service = service.clone();
         tokio::spawn(async move { read(&service, holder_request(vec![op])).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let serve = holder_serve(&h);
+    until("the request to wait", || serve.waiting() == 1).await;
+    let released = std::time::Instant::now();
     h.registry.release(&h.version, 1);
-    h.in_flight.notify();
-    not_ready(task.await.unwrap());
-    assert!(started.elapsed() < std::time::Duration::from_millis(300));
+    not_ready(
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the wait ends")
+            .unwrap(),
+    );
+    assert!(
+        released.elapsed() < std::time::Duration::from_millis(300),
+        "the release did not wake the wait: {:?}",
+        released.elapsed()
+    );
 }
 
 /// S3 (code review): the version stops being shared while the request
@@ -913,17 +940,23 @@ async fn h2_s3_version_unshared_before_the_slot_is_not_served() {
         .acquire_many_owned(8)
         .await
         .unwrap();
+    let (queued, at_slot) = tokio::sync::oneshot::channel();
+    holder_serve(&h).on(
+        crate::node::rpc::data::HolderTestPoint::SlotQueue,
+        move || {
+            let _ = queued.send(());
+        },
+    );
     let op = holder_op(0, &h.present.chunk.id.0, 0, 4096, &g);
     let service = Arc::new(h.service.clone());
     let task = {
         let service = service.clone();
         tokio::spawn(async move { read(&service, holder_request(vec![op])).await })
     };
-    // Validated (step 2); steps 3-6 up to the slot queue do not wait.
-    while h.meta.calls.load(Ordering::SeqCst) == 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), at_slot)
+        .await
+        .expect("the request reaches the slot queue")
+        .unwrap();
     h.registry.release(&h.version, 1);
     drop(slots);
     not_ready(task.await.unwrap());

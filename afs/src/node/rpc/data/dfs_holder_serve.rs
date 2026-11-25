@@ -128,10 +128,27 @@ pub struct HolderServe {
     flights: Mutex<HashMap<String, Arc<Flight>>>,
     validations: Arc<tokio::sync::Semaphore>,
     waiters: Mutex<Waiters>,
+    /// Tests: one-shot callbacks at fixed points of a holder read.
+    #[cfg(test)]
+    hooks: Mutex<Vec<TestHook>>,
 }
 
-/// The request validating a grant: publishes the outcome and retires the
-/// flight, also when the request is cancelled (its waiters then ask again).
+#[cfg(test)]
+type TestHook = (TestPoint, Box<dyn FnOnce() + Send>);
+
+/// Points of a holder read where a test can act (`HolderServe::on`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestPoint {
+    /// Steps 1–5 passed; the request is about to queue for a read slot.
+    SlotQueue,
+    /// Inside the slot, every check passed; serving starts next.
+    Serve,
+}
+
+/// The task validating a grant: publishes the outcome and retires the
+/// flight, also when the task itself is dropped before Meta answers (the
+/// runtime shutting down; its waiters then ask again).
 struct Lead<'a> {
     serve: &'a HolderServe,
     flight: Arc<Flight>,
@@ -210,7 +227,29 @@ impl HolderServe {
             flights: Mutex::default(),
             validations: Arc::new(tokio::sync::Semaphore::new(MAX_VALIDATIONS)),
             waiters: Mutex::default(),
+            #[cfg(test)]
+            hooks: Mutex::default(),
         })
+    }
+
+    /// Tests: run `hook` once, the next time a holder read reaches `point`.
+    #[cfg(test)]
+    pub(crate) fn on(&self, point: TestPoint, hook: impl FnOnce() + Send + 'static) {
+        self.hooks.lock().unwrap().push((point, Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reach(&self, point: TestPoint) {
+        let hook = {
+            let mut hooks = self.hooks.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(at, _)| *at == point)
+                .map(|index| hooks.remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Step 1 for the holder form: every operation carries a holder grant and

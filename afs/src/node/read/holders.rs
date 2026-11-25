@@ -107,6 +107,8 @@ pub(crate) enum HolderRange {
 #[derive(Debug, Default)]
 pub(crate) struct HolderRegistry {
     inner: Mutex<HashMap<FileVersionId, Shared>>,
+    /// Notified whenever a version stops being shared (!318 P3-3).
+    unshared: tokio::sync::Notify,
 }
 
 impl HolderRegistry {
@@ -136,8 +138,18 @@ impl HolderRegistry {
             shared.readers.remove(&reader);
             if shared.readers.is_empty() {
                 inner.remove(version);
+                drop(inner);
+                // A holder request waiting for this version ends now.
+                self.unshared.notify_waiters();
             }
         }
+    }
+
+    /// A future that completes when a version next stops being shared.
+    /// Create it before checking [`Self::is_shared`], so no release between
+    /// the two is missed.
+    pub(crate) fn unshared(&self) -> tokio::sync::futures::Notified<'_> {
+        self.unshared.notified()
     }
 
     /// The checked layout of `version` is known: index it once, only while
