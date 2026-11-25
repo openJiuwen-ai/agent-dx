@@ -410,6 +410,44 @@ async fn an_unreadable_tail_slot_is_refused() {
     assert!(text.contains("ambiguous tail"), "{text}");
 }
 
+/// One damaged slot is enough: the other one cannot be trusted as a fallback
+/// because nothing says which generation is newer, so a single bad CRC refuses
+/// just like two. The older slot is the one broken here, which is the case a
+/// two-slot fixture cannot distinguish.
+#[tokio::test]
+async fn a_single_unreadable_tail_slot_is_refused() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let (dir, _tip) = seeded(4).await;
+    let (_newest, previous) = read_slots(dir.path());
+    {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(wal_path(dir.path()))
+            .unwrap();
+        let mut bytes = [0u8; LOG_HEADER_BYTES as usize];
+        file.read_exact(&mut bytes).unwrap();
+        let offset = slot_offset(previous.generation);
+        bytes[offset + SLOT_BYTES - 1] ^= 0xFF;
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+    let before = snapshot(dir.path());
+    let (code, text) = refusal(dir.path(), true);
+    assert_eq!(
+        code,
+        afs_error::CONFIG_INVALID,
+        "a single damaged slot is still ambiguous"
+    );
+    assert!(text.contains("ambiguous tail"), "{text}");
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "a refusal must not touch bytes"
+    );
+}
+
 /// A torn trailing frame is already handled by the pre-existing cut and must
 /// keep working with the rollback on.
 #[tokio::test]

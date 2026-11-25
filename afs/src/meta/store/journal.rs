@@ -965,6 +965,17 @@ mod tests {
                 expected,
                 "refusal code must match the kind of damage"
             );
+            // Wrapping an error in a context must not restate the shared
+            // prefix: `{error}` formatting once produced
+            // "Meta operation log: <ctx>: 0x… DataLoss: Meta operation log: …".
+            // Every case here goes through that wrapper, so one assertion
+            // guards all of them. (`Display` adds the code/kind decoration for
+            // every error in the workspace; that is not what this checks.)
+            assert_eq!(
+                message.matches("Meta operation log: ").count(),
+                1,
+                "the log prefix must appear exactly once: {message}"
+            );
             assert!(message.contains(file), "{message}");
             for marker in markers {
                 assert!(message.contains(marker), "missing {marker}: {message}");

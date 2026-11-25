@@ -1058,26 +1058,31 @@ expected 只作约束，不能抬高分配值；水位与 reservation/原结果�
 
 | 情况 | 错误码 | 日志/错误 |
 | --- | --- | --- |
-| 帧内容损坏（CRC 或记录哈希不符），且断点后仍有完整记录 | `META_LOG_CORRUPT` | `offset ... after sequence ...: frame CRC mismatch` |
+| 帧内容损坏（CRC 或记录哈希不符）——**含最后一帧**，无论其后是否还有记录 | `META_LOG_CORRUPT` | `offset ... after sequence ...: frame CRC mismatch` |
 | 非法长度前缀（无法证明是尾部） | `META_LOG_CORRUPT` | `frame length outside record bound` |
 | 段文件短于自身的 4096 字节头部 | `META_LOG_CORRUPT` | `shorter than its 4096 byte header` |
 | 回退点早于 checkpoint 覆盖位置 | `META_LOG_CORRUPT` | `recovered tail precedes the selected checkpoint` |
 | 证据份数已满（2 份） | `META_LOG_CORRUPT` | `tail evidence slots exhausted after ...` |
-| 单次回退尾部超过 128MiB | `IO_CAPACITY` | `incomplete tail exceeds evidence budget` |
+| 单次回退尾部超过 128MiB | `IO_CAPACITY` | `incomplete tail of ... bytes exceeds the 134217728 byte evidence budget` |
 | **帧链字段断裂**（`sequence`/`base`/`previous_hash` 不符） | `CONFIG_INVALID` | `... sequence ...` / `... base ...` / `... previous-hash ...` |
-| 两个 tail 槽的 CRC 都无效 | `CONFIG_INVALID` | `WAL declared tail CRC/format; ambiguous tail is not discarded` |
+| **任一 tail 槽不可读**（CRC/格式不符，单个即可） | `CONFIG_INVALID` | `WAL declared tail CRC/format; ambiguous tail is not discarded` |
+| 段 base/revision 与清单不符、封口段与声明不符 | `META_LOG_CORRUPT` | `WAL segment base/revision gap`、`sealed/declared durable content missing or changed` |
 | `CURRENT` 损坏或其身份与本机不符 | `CONFIG_INVALID` | `CURRENT format/hash/CRC` |
 | `IDENTITY` 损坏或与本机不符 | `CONFIG_INVALID` | `IDENTITY format/hash/CRC` |
 | 两个 checkpoint 都无法读取 | `CONFIG_INVALID` | `CURRENT has no valid checkpoint` |
 
 **两类码的区别**：
 
-- `META_LOG_CORRUPT`（`DataLoss`）＝**字节本身坏了**（CRC、记录哈希、段头哈希、
-  段长不足、回退越过 checkpoint）。已声明的前缀仍在磁盘上，排查方向是核对数据。
+- `META_LOG_CORRUPT`（`DataLoss`）＝**字节本身坏了**（帧 CRC、记录哈希、段头哈希、
+  段长不足、回退越过 checkpoint、证据耗尽），或**清单与磁盘内容不符**（段 base/revision、
+  封口段长度/尾部）。已声明的前缀仍在磁盘上，排查方向是核对数据。
 - `CONFIG_INVALID`＝**无法确定这份数据属于谁、该从哪里回放**。包括 `CURRENT`／`IDENTITY`
   损坏、checkpoint 全坏、tail 槽自述不可信，以及**帧链字段断裂**——后者看起来像损坏，
   但字段不符同样可能是「换了一个二进制／挂了另一个 store 的盘」，与 CRC 不符的确定性不同，
   所以保守地归入这一类。
+
+两者共用 `CONFIG_INVALID` 的还有真正的配置写错；这一类是灰色地带（"清单与磁盘不一致"
+既可能是损坏也可能是换了数据目录），本表按当前实现如实列出，不声称边界绝对清晰。
 
 后者**绝不能自动改盘**：如果盘属于别人，改盘就毁掉了别人的数据。先检查挂载与配置，
 再考虑还原备份。`CONFIG_INVALID` 与真正的配置写错同名，遇到时优先排查 `data_dir`
