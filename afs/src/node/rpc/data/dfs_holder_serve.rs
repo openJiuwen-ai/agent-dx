@@ -91,7 +91,7 @@ enum Outcome {
     Pending,
     /// Meta's answer, a denial or an error included, for every waiter.
     Done(Result<Instant, Status>),
-    /// The validating request was cancelled before an answer: ask again.
+    /// The validating task ended before an answer: ask again.
     Abandoned,
 }
 
@@ -256,8 +256,13 @@ impl HolderServe {
     /// One validation per grant is in flight; concurrent requests for the
     /// same grant wait for its answer, a denial or an error included, at most
     /// [`MAX_VALIDATION_WAITERS`] of them (more are refused as busy).
+    ///
+    /// The validation runs as its own task, which keeps the flight and its
+    /// permit until Meta answers (!318 P2-2): the request that started it is
+    /// only its first waiter, so cancelling that request (or any waiter)
+    /// gives up its own wait and never starts a second Meta call.
     pub(crate) async fn authorize(
-        &self,
+        self: &Arc<Self>,
         peer: &str,
         grant: &DfsHolderGrant,
         fresh: bool,
@@ -284,45 +289,52 @@ impl HolderServe {
                     }
                 }
             };
-            if lead {
-                let lead = Lead {
-                    serve: self,
-                    flight,
-                    done: false,
-                };
-                let result = self.validate(peer, grant).await;
-                lead.finish(&result);
-                return result.map(|until| AuthorizedHolderRead { until });
-            }
-            // Another grant under the same token can only be a forgery of one
-            // of the two: validate it on its own, outside the flight.
-            if flight.grant != *grant {
+            // Subscribe before the validation can answer.
+            let mut outcome = flight.outcome.subscribe();
+            let _waiting = if lead {
+                let serve = self.clone();
+                let peer = peer.to_owned();
+                let grant = grant.clone();
+                let flight = flight.clone();
+                tokio::spawn(async move {
+                    let lead = Lead {
+                        serve: &serve,
+                        flight,
+                        done: false,
+                    };
+                    let result = serve.validate(&peer, &grant).await;
+                    lead.finish(&result);
+                });
+                None
+            } else if flight.grant != *grant {
+                // Another grant under the same token can only be a forgery of
+                // one of the two: validate it on its own, outside the flight.
                 return self
                     .validate(peer, grant)
                     .await
                     .map(|until| AuthorizedHolderRead { until });
-            }
-            if flight
-                .waiters
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                >= MAX_VALIDATION_WAITERS
-            {
-                flight
+            } else {
+                if flight
                     .waiters
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                return Err(Status::resource_exhausted(
-                    "DFS holder grant validation has too many waiters",
-                ));
-            }
-            let waiting = Waiting(flight);
-            let mut outcome = waiting.0.outcome.subscribe();
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    >= MAX_VALIDATION_WAITERS
+                {
+                    flight
+                        .waiters
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(Status::resource_exhausted(
+                        "DFS holder grant validation has too many waiters",
+                    ));
+                }
+                Some(Waiting(flight.clone()))
+            };
             let settled = outcome
                 .wait_for(|outcome| !matches!(outcome, Outcome::Pending))
                 .await
                 .map(|outcome| outcome.clone());
             match settled {
                 // A re-validation needs an answer Meta gave after it asked.
-                Ok(Outcome::Done(result)) if !fresh || waiting.0.started >= asked => {
+                Ok(Outcome::Done(result)) if !fresh || flight.started >= asked => {
                     return result.map(|until| AuthorizedHolderRead { until });
                 }
                 _ => continue,
@@ -748,34 +760,161 @@ mod tests {
         assert_eq!(meta.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// Q1: the request validating a grant is cancelled before Meta answers:
-    /// its waiters do not hang, one of them asks Meta again.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn h2_q1_waiters_ask_again_when_the_validating_request_is_cancelled() {
-        let meta = Arc::new(Slow(Default::default()));
-        let serve = serve_with(meta.clone());
-        let grant = sample_grant();
-        let first = {
-            let serve = serve.clone();
-            let grant = grant.clone();
-            tokio::spawn(async move { serve.authorize("reader", &grant, false).await.map(|_| ()) })
-        };
-        while meta.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+    /// Meta held at a gate: counts calls and the most validations running at
+    /// once; answers (or panics) only once the gate opens.
+    #[derive(Default)]
+    struct Gated {
+        calls: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        open: std::sync::Mutex<bool>,
+        opened: std::sync::Condvar,
+        panic: bool,
+    }
+    impl Gated {
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl DfsHolderGrantValidator for Gated {
+        fn validate(
+            &self,
+            request: ValidateDfsHolderGrant,
+        ) -> afs_error::Result<DfsAuthorizedHolderRead> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            let now = self.active.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            // Bounded: a test that never opens the gate fails, it does not hang.
+            let open = self.open.lock().unwrap();
+            let _open = self
+                .opened
+                .wait_timeout_while(open, Duration::from_secs(10), |open| !*open)
+                .unwrap();
+            self.active.fetch_sub(1, SeqCst);
+            assert!(!self.panic, "injected validator panic");
+            Ok(DfsAuthorizedHolderRead {
+                grant: request.grant,
+                expires_at_unix_ms: crate::clock::now_unix_ms() + 30_000,
+            })
+        }
+    }
+
+    /// Polls `ready` until it holds, failing after 5 s.
+    async fn until(what: &str, ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let waiter = {
-            let serve = serve.clone();
-            let grant = grant.clone();
-            tokio::spawn(async move { serve.authorize("reader", &grant, false).await.map(|_| ()) })
-        };
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        first.abort();
-        tokio::time::timeout(Duration::from_secs(2), waiter)
-            .await
-            .expect("the waiter does not hang")
+    }
+
+    fn flight_waiters(serve: &HolderServe, grant: &DfsHolderGrant) -> Option<usize> {
+        serve
+            .flights
+            .lock()
             .unwrap()
-            .expect("authorized by its own validation");
-        assert_eq!(meta.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+            .get(&grant.token)
+            .map(|flight| flight.waiters.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn spawn_authorize(
+        serve: &Arc<HolderServe>,
+        grant: &DfsHolderGrant,
+    ) -> tokio::task::JoinHandle<Result<(), Status>> {
+        let serve = serve.clone();
+        let grant = grant.clone();
+        tokio::spawn(async move { serve.authorize("reader", &grant, false).await.map(|_| ()) })
+    }
+
+    /// !318 P2-2 (replaces the Q1 "ask again" case): the request leading a
+    /// validation is cancelled while Meta still works on it. The validation
+    /// keeps its flight and permit until Meta answers: waiters, also ones
+    /// arriving after the cancellation, get that one answer, and Meta never
+    /// runs two validations of the grant at once. A cancelled waiter only
+    /// leaves its own place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_pr318_cancelled_leader_keeps_the_validation_single() {
+        let meta = Arc::new(Gated::default());
+        let serve = serve_with(meta.clone());
+        let grant = sample_grant();
+        let leader = spawn_authorize(&serve, &grant);
+        until("the first validation", || meta.calls() == 1).await;
+        let early = spawn_authorize(&serve, &grant);
+        until("the early waiter", || {
+            flight_waiters(&serve, &grant) == Some(1)
+        })
+        .await;
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        let late = spawn_authorize(&serve, &grant);
+        let leaving = spawn_authorize(&serve, &grant);
+        until("the late waiters or a second validation", || {
+            meta.calls() > 1 || flight_waiters(&serve, &grant) == Some(3)
+        })
+        .await;
+        leaving.abort();
+        assert!(leaving.await.unwrap_err().is_cancelled());
+        meta.release();
+        for waiter in [early, late] {
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a waiter hangs")
+                .unwrap()
+                .expect("authorized by the one validation");
+        }
+        assert_eq!(meta.peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(meta.calls(), 1);
+        until("the flight to retire", || {
+            flight_waiters(&serve, &grant).is_none()
+        })
+        .await;
+        assert_eq!(serve.validations.available_permits(), MAX_VALIDATIONS);
+        // Cached: the next request does not ask Meta.
+        serve.authorize("reader", &grant, false).await.unwrap();
+        assert_eq!(meta.calls(), 1);
+    }
+
+    /// !318 P2-2: a validation that panics, or is refused, answers every
+    /// waiter and gives back its flight, its permit and the waiter places.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_pr318_a_failed_validation_releases_flight_permit_and_waiters() {
+        let meta = Arc::new(Gated {
+            panic: true,
+            ..Default::default()
+        });
+        let serve = serve_with(meta.clone());
+        let grant = sample_grant();
+        let leader = spawn_authorize(&serve, &grant);
+        until("the validation", || meta.calls() == 1).await;
+        let waiters: Vec<_> = (0..3).map(|_| spawn_authorize(&serve, &grant)).collect();
+        until("the waiters", || flight_waiters(&serve, &grant) == Some(3)).await;
+        meta.release();
+        for task in std::iter::once(leader).chain(waiters) {
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("a request hangs")
+                .unwrap();
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+        assert_eq!(meta.calls(), 1);
+        until("the flight to retire", || {
+            flight_waiters(&serve, &grant).is_none()
+        })
+        .await;
+        assert_eq!(serve.validations.available_permits(), MAX_VALIDATIONS);
+        // Not cached: a later request validates again (and the waiter
+        // places of the failed flight are free).
+        let meta = Scripted::new(0, true);
+        let serve = serve_with(meta.clone());
+        let results = concurrently(&serve, &grant, MAX_VALIDATION_WAITERS).await;
+        assert!(results.iter().all(|r| r.is_err()));
+        assert!(serve.flights.lock().unwrap().is_empty());
+        assert_eq!(serve.validations.available_permits(), MAX_VALIDATIONS);
     }
 
     /// T3 (global): at most MAX_WAITERS across callers, MAX_WAITERS_PER_PEER
