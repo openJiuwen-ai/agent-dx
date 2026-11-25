@@ -8,6 +8,7 @@ use adx_agent_store::{
 };
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     sync::{
@@ -431,7 +432,12 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     );
     let recipe = completed.prewarm_recipe.as_ref().unwrap();
     assert_eq!(recipe.snapshot_id, "snapshot-ready");
+    assert_eq!(recipe.handoff_contract_version, "3");
     assert!(recipe.restore_env.is_empty());
+    assert_ne!(
+        recipe.restore_profile_digest,
+        version_two_digest(&completed)
+    );
     assert_eq!(
         author
             .publish_with_id("tenant", &input, Some("version-a"))
@@ -862,6 +868,171 @@ async fn activate(
     .await
     .unwrap()
     .binding
+}
+
+fn version_two_digest(template: &adx_agent_core::TemplateVersion) -> String {
+    let normalized =
+        serde_json::to_vec(&("2", ExecutionSpec::from(template), &template.volumes)).unwrap();
+    format!("sha256:{:x}", Sha256::digest(normalized))
+}
+
+async fn replace_fixture_record(repo: &MemoryRepository, key: Key, value: serde_json::Value) {
+    let previous = repo.get(&key).await.unwrap().unwrap();
+    let write = adx_agent_store::Put {
+        key: key.clone(),
+        record: Record::new(&value).unwrap(),
+    };
+    assert!(repo
+        .commit(
+            &Transaction::new(
+                vec![Check {
+                    key,
+                    expected: Some(previous.revision)
+                }],
+                vec![write]
+            )
+            .unwrap()
+        )
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn version_two_preparation_keeps_protection_without_new_golden_allocations() {
+    let repo = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repo.clone());
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    let published = activator.publish("tenant", &draft(true)).await.unwrap();
+    let (_, mut job) = state.preparation_jobs(None).await.unwrap().pop().unwrap();
+    // Reproduce the durable job written before the phase-free contract upgrade.
+    job.recipe.handoff_contract_version = "2".into();
+    job.recipe.restore_profile_digest = version_two_digest(&published);
+    job.recipe
+        .restore_env
+        .insert(GOLDEN_PHASE.into(), "restore".into());
+    job.seed
+        .execution
+        .env
+        .insert(GOLDEN_PHASE.into(), "seed".into());
+    let key = Key::new(
+        "snapshot-preparation",
+        &["tenant", "digitalmate", &published.version],
+    )
+    .unwrap();
+    replace_fixture_record(&repo, key, serde_json::to_value(&job).unwrap()).await;
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    let restarted = Activator::new(AgentState::new(repo), platform.clone());
+    restarted.reconcile_snapshot_preparations().await.unwrap();
+    let template = restarted
+        .template("tenant", "digitalmate", &published.version)
+        .await
+        .unwrap();
+    assert_eq!(
+        template.snapshot_preparation,
+        Some(SnapshotPreparation::Ready)
+    );
+    assert_eq!(
+        template
+            .prewarm_recipe
+            .as_ref()
+            .unwrap()
+            .handoff_contract_version,
+        "2"
+    );
+    assert!(platform
+        .references
+        .lock()
+        .await
+        .iter()
+        .any(|change| matches!(
+            change,
+            SnapshotChange::Acquire {
+                owner: SnapshotOwner::Template { .. }
+            }
+        )));
+    let binding = activate(
+        &restarted,
+        &scope("new-user", TemplateRef::Version(published.version)),
+        "w-new",
+    )
+    .await;
+    assert!(binding.current.snapshot_id.is_none());
+    assert!(!platform
+        .creations
+        .lock()
+        .await
+        .last()
+        .unwrap()
+        .execution
+        .env
+        .contains_key(GOLDEN_PHASE));
+}
+
+#[tokio::test]
+async fn committed_version_two_binding_keeps_its_snapshot_and_restore_environment() {
+    let repo = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repo.clone());
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    let published = activator.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    activator.reconcile_snapshot_preparations().await.unwrap();
+    let scope = scope(
+        "existing-user",
+        TemplateRef::Version(published.version.clone()),
+    );
+    platform.block_creation.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        activator
+            .activate_with_parameters(
+                &scope,
+                None,
+                adx_agent_core::unix_time_millis() + 30_000,
+                true,
+                Some(b"workspace=w-existing")
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    let committed = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(
+        committed.current.snapshot_id.as_deref(),
+        Some("snapshot-ready")
+    );
+    // Restore the old durable recipe beside its already committed Binding decision.
+    let key = Key::new(
+        "snapshot-preparation-result",
+        &["tenant", "digitalmate", &published.version],
+    )
+    .unwrap();
+    let mut result = repo.get(&key).await.unwrap().unwrap().value;
+    result["recipe"]["handoff_contract_version"] = json!("2");
+    result["recipe"]["restore_profile_digest"] = json!(version_two_digest(&published));
+    result["recipe"]["restore_env"] = json!({"GOLDEN_PHASE":"restore"});
+    replace_fixture_record(&repo, key, result).await;
+    platform.block_creation.store(false, Ordering::Relaxed);
+    platform.unavailable.store(true, Ordering::Relaxed);
+    let restarted = Activator::new(AgentState::new(repo), platform.clone());
+    let retried = activate(&restarted, &scope, "w-existing").await;
+    assert_eq!(retried.current, committed.current);
+    let creations = platform.creations.lock().await;
+    let request = creations.last().unwrap();
+    assert_eq!(request.id, committed.current.environment_id);
+    assert_eq!(request.execution.snapshot_id, committed.current.snapshot_id);
+    assert_eq!(request.execution.env[GOLDEN_PHASE], "restore");
 }
 
 #[tokio::test]

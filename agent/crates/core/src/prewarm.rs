@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const GOLDEN_PHASE: &str = "GOLDEN_PHASE";
-pub const TEMPLATE_HANDOFF_VERSION: &str = "2";
+/// Template-derived handoff without seed/restore phase environment overrides.
+pub const TEMPLATE_HANDOFF_VERSION: &str = "3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +32,10 @@ impl PrewarmRecipe {
                 .is_none_or(|(_, digest)| digest != self.image_digest)
         {
             return Err("invalid fixed Golden restore input".into());
+        }
+        if self.handoff_contract_version == TEMPLATE_HANDOFF_VERSION && !self.restore_env.is_empty()
+        {
+            return Err("phase-free Golden handoff does not accept restore-only variables".into());
         }
         if self.restore_env.len() > 16 {
             return Err("too many restore-only variables".into());
@@ -64,6 +69,7 @@ pub fn template_golden(template: &crate::TemplateVersion) -> Option<&PrewarmReci
         template.auto_prepare_snapshot
             && template.snapshot_preparation == Some(SnapshotPreparation::Ready)
             && recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION
+            && recipe.restore_env.is_empty()
     })
 }
 

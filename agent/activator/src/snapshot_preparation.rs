@@ -250,27 +250,26 @@ impl Activator {
         job: &PreparationJob,
         recipe: PrewarmRecipe,
     ) -> Result<std::result::Result<PrewarmRecipe, String>> {
-        if recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION {
-            use adx_agent_core::environment::{SnapshotChange, SnapshotOwner};
-            let owner = SnapshotOwner::Template {
-                name: job.template.clone(),
-                version: job.version.clone(),
-            };
-            match self
-                .environment
-                .update_snapshot_reference(
-                    &job.tenant,
-                    &recipe.snapshot_id,
-                    &SnapshotChange::Acquire { owner },
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => {
-                    return Ok(Err("Golden snapshot is retiring".into()))
-                }
-                Err(error) => return Err(error.into()),
+        use adx_agent_core::environment::{SnapshotChange, SnapshotOwner};
+        let owner = SnapshotOwner::Template {
+            name: job.template.clone(),
+            version: job.version.clone(),
+        };
+        // Durable jobs from an earlier handoff still need Catalog protection.
+        match self
+            .environment
+            .update_snapshot_reference(
+                &job.tenant,
+                &recipe.snapshot_id,
+                &SnapshotChange::Acquire { owner },
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => {
+                return Ok(Err("Golden snapshot is retiring".into()))
             }
+            Err(error) => return Err(error.into()),
         }
         Ok(Ok(recipe))
     }

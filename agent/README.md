@@ -28,6 +28,8 @@ Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 
 
 `prewarm_recipe` 由服务端回填到 `TemplateVersion`。发布请求中的 `TemplateDraft` 携带该字段时，`POST /api/agent/v2/templates` 返回 HTTP 400。
 
+新自动制备使用 `handoff_contract_version: "3"`，不注入 `GOLDEN_PHASE`，配方的 `restore_env` 必须为空。恢复合同摘要包含该契约版本。版本 2 的阶段标记配方不会被新的 Binding 或 Alias 升级候选选作 Golden；这些新分配走普通启动。已有 Binding 的启动决议仍按其固定快照和原配方重放，包括原有 `restore_env`；升级前在途制备任务完成时仍须取得 Catalog 退役保护。已发布模板不会因升级原地重制备，使用新契约需要发布新模板版本。
+
 自动制备任务从发布起有 15 分钟制备窗口。同一任务重启后沿用原 UUID 和截止时间。过期时，Platform 拒绝首次登记，但已启动的任务仍须按原 UUID 对账。Coordinator 先持久化种子卷规格和清理意图，再建立卷持有。种子卷失败由 Coordinator 记录终态并清理。到期仍为 Registered 的 Agent 制备先关闭启动，再清理可能残留的卷持有。超时未确认制品时，模板查询显示失败，内部跟踪记录仍保留。若随后确认制品，Activator 先持久化退役意图，待 Catalog 接受退役后再结束跟踪。截止前已持久化的制品继续按原决议登记。Coordinator 会清理已失败并已完成源沙箱清理的过期 Agent 制备家族，以及制品已实际回收的 Agent 制备家族。
 
 匿名源 Environment 清理确认后释放其专用 Volume owner。快照仍引用卷时保留定义，快照回收后移除无引用定义。Volume 清理不删除外部存储目录中的数据。
