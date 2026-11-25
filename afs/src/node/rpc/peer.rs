@@ -423,11 +423,28 @@ impl OwnerPeerClient {
         self
     }
 
-    fn invalidate_owner_snapshots(&self, identity: &[u8]) {
+    fn invalidate_owner_body(&self, identity: &[u8]) {
         self.prefetched_reads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, entry| entry.identity != identity);
+        if let Some(session) = self.hixl_read_session() {
+            session.invalidate(identity);
+        }
+    }
+
+    fn body_write_finished(&self, file: &RemoteFile, result: &PeerResult<usize>) {
+        let identity = &file.identity.0;
+        match result {
+            Ok(written) if *written > 0 => self.invalidate_owner_body(identity),
+            Err(error) if error.code() == afs_error::NODE_OWNER_WRITE_UNKNOWN => {
+                if let Some(session) = self.hixl_read_session() {
+                    session.mark_uncertain_write(identity);
+                }
+                self.invalidate_owner_body(identity);
+            }
+            _ => {}
+        }
     }
 
     pub fn with_rdma_admission(mut self, admission: Arc<tokio::sync::Semaphore>) -> Self {
@@ -1222,8 +1239,9 @@ impl RemoteFiles for OwnerPeerClient {
                 caller: Some(owner_caller(ctx)),
             }
         );
-        self.invalidate_hixl(expected_identity.or(file.map(|file| &file.identity)));
-        owner_entry(grant, reply.attr)
+        let entry = owner_entry(grant, reply.attr)?;
+        self.invalidate_owner_body(&entry.identity.0);
+        Ok(entry)
     }
 
     fn getxattr(
@@ -1348,7 +1366,7 @@ impl RemoteFiles for OwnerPeerClient {
             .ok_or_else(|| protocol_error("OwnerCreateReply missing handle"))?;
         // Creating an existing file with O_TRUNC truncates it.
         if flags & libc::O_TRUNC != 0 {
-            self.invalidate_hixl(Some(&entry.identity));
+            self.invalidate_owner_body(&entry.identity.0);
         }
         if let Some(session) = self.hixl_read_session() {
             session.track_writer(&handle.opaque, flags);
@@ -1546,6 +1564,9 @@ impl RemoteFiles for OwnerPeerClient {
                         bytes,
                     },
                 );
+        }
+        if flags & libc::O_TRUNC != 0 {
+            self.invalidate_owner_body(&identity.opaque);
         }
         self.body_opened(
             grant,

@@ -1,8 +1,8 @@
 //! OwnerFiles client hooks for the optional HIXL body transport.
 
 use super::{
-    Backend, DataMode, FileAttributes, FileIdentity, OwnerPeerClient, PeerError, PeerResult,
-    RemoteFile, RootGrant, WriteOptions, owner_hixl, owner_hixl_direct_unsupported,
+    Backend, DataMode, FileAttributes, OwnerPeerClient, PeerError, PeerResult, RemoteFile,
+    RootGrant, WriteOptions, owner_hixl, owner_hixl_direct_unsupported,
     owner_hixl_write_unsupported, select,
 };
 use std::{ffi::OsStr, sync::Arc};
@@ -23,13 +23,6 @@ impl OwnerPeerClient {
         self.read_session
             .as_ref()
             .filter(|_| select(self.data_mode, true, false) == Backend::Hixl)
-    }
-
-    pub(super) fn invalidate_hixl(&self, identity: Option<&FileIdentity>) {
-        if let (Some(hixl), Some(identity)) = (self.hixl_read_session(), identity) {
-            self.invalidate_owner_snapshots(&identity.0);
-            hixl.invalidate(&identity.0);
-        }
     }
 
     pub(super) fn warm_body_transport(&self, grant: &RootGrant) {
@@ -76,12 +69,6 @@ impl OwnerPeerClient {
         attributes: &FileAttributes,
     ) {
         if let Some(hixl) = self.hixl_read_session() {
-            // A truncating open changed the file; earlier opens drop their
-            // windows like after a write.
-            if flags & libc::O_TRUNC != 0 {
-                self.invalidate_owner_snapshots(identity);
-                hixl.invalidate(identity);
-            }
             hixl.opened(grant, path, handle, identity, flags, attributes);
         }
     }
@@ -164,7 +151,9 @@ impl OwnerPeerClient {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.invalidate_hixl(Some(&file.identity));
+                    if error.code() != afs_error::NODE_OWNER_WRITE_UNKNOWN {
+                        self.invalidate_owner_body(&file.identity.0);
+                    }
                     return Err(PeerError(error));
                 }
             }
@@ -173,20 +162,6 @@ impl OwnerPeerClient {
             return Err(PeerError(owner_hixl_write_unsupported()));
         }
         Ok(None)
-    }
-
-    pub(super) fn body_write_finished(&self, file: &RemoteFile, result: &PeerResult<usize>) {
-        if match result {
-            Ok(written) => *written > 0,
-            Err(error) => error.code() == afs_error::NODE_OWNER_WRITE_UNKNOWN,
-        } {
-            if result.is_err()
-                && let Some(session) = self.hixl_read_session()
-            {
-                session.mark_uncertain_write(&file.identity.0);
-            }
-            self.invalidate_hixl(Some(&file.identity));
-        }
     }
 
     pub(super) fn body_released(&self, handle: &[u8]) {

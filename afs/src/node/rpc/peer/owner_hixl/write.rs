@@ -31,6 +31,9 @@ use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 const CLOSE_WRITE_WINDOW_BUDGET: Duration = Duration::from_millis(100);
+const BACKGROUND_WRITE_RECOVERY_BUDGET: Duration = Duration::from_secs(2);
+const BACKGROUND_WRITE_RECOVERY_ROUND: Duration = Duration::from_millis(500);
+const BACKGROUND_WRITE_RECOVERY_BACKOFF: Duration = Duration::from_millis(250);
 
 impl OwnerReadSession {
     /// Confirms a usable session before sending a potentially truncating Open.
@@ -367,7 +370,7 @@ impl OwnerHixlReader {
                             ticket.resolved = true;
                             return outcome.and_then(written_count);
                         }
-                        ticket.cancel_successor(self.timeout);
+                        ticket.recover_in_background(length, self.timeout);
                         return Err(afs_error::Error::coded(
                             afs_error::NODE_OWNER_WRITE_UNKNOWN,
                             format!("OwnerFs HIXL write outcome is unknown: {cause}"),
@@ -658,6 +661,36 @@ impl PendingWrite {
             }
             _ => Err(protocol_error("OwnerFs HIXL recovery has no valid receipt")),
         }
+    }
+
+    /// Resolve the original ticket while its lease still prevents session
+    /// replacement. Home returns its receipt or fences the Commit before I/O.
+    fn recover_in_background(self, length: u32, timeout: Duration) {
+        // A follow-up request may need this same pool to observe the write.
+        // Leave at least half of its I/O budget for admission and file I/O.
+        let budget = BACKGROUND_WRITE_RECOVERY_BUDGET.min(timeout / 2);
+        let deadline = Instant::now() + budget;
+        tokio::spawn(
+            async move {
+                let mut ticket = self;
+                while remaining(deadline).is_ok() {
+                    let round_deadline =
+                        (Instant::now() + BACKGROUND_WRITE_RECOVERY_ROUND).min(deadline);
+                    match ticket.recover(round_deadline, length).await {
+                        Ok(_) => {
+                            ticket.resolved = true;
+                            return;
+                        }
+                        Err(error) if retries_prepare(&error) || transport_cancelled(&error) => {}
+                        Err(_) => return,
+                    }
+                    let next = (Instant::now() + BACKGROUND_WRITE_RECOVERY_BACKOFF).min(deadline);
+                    tokio::time::sleep_until(next.into()).await;
+                }
+                // Dropping an unresolved ticket still poisons the session.
+            }
+            .in_current_span(),
+        );
     }
 
     /// Keep the lease while returning an unused successor in the background.

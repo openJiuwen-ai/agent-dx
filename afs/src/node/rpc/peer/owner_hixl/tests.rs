@@ -18,7 +18,6 @@ use crate::node::rpc::hixl::test_support::{engine, native_error, negotiations, o
 use crate::node::rpc::peer::{
     OwnerPeerClient, owner_files_client_from_channel_with_runtime_and_metrics,
 };
-use crate::node::vfs::ownerfs::files::FileIdentity;
 use crate::node::vfs::ownerfs::remote::RemoteFiles;
 use crate::node::vfs::ownerfs::root::{RootId, RootRight};
 use afs_protocol::node_data::{
@@ -535,6 +534,7 @@ struct CommitLoss {
     forward_commit: bool,
     stall_commit_reply: bool,
     stall_first_abort: AtomicBool,
+    control_outage: Option<Arc<AtomicBool>>,
 }
 
 struct LateCommit {
@@ -635,6 +635,15 @@ async fn fixture_with_commit_loss(
                                 .into_http());
                             }
                             if let Some(loss) = lost_commits {
+                                if loss
+                                    .control_outage
+                                    .as_ref()
+                                    .is_some_and(|outage| outage.load(Ordering::SeqCst))
+                                    && (request.uri().path().ends_with("/CommitWriteHixl")
+                                        || request.uri().path().ends_with("/AbortWriteHixl"))
+                                {
+                                    return std::future::pending().await;
+                                }
                                 if request.uri().path().ends_with("/AbortWriteHixl") {
                                     if loss.stall_first_abort.swap(false, Ordering::SeqCst) {
                                         return std::future::pending().await;
@@ -1460,7 +1469,7 @@ async fn a_window_is_an_open_snapshot_until_this_node_changes_the_file() {
             read(&client, &file, 0, 1000).unwrap();
             source.data.lock().unwrap()[..SLOT].fill(0xee);
             let cached = read(&client, &file, 1000, 1000).unwrap();
-            client.invalidate_hixl(Some(&FileIdentity(b"identity-a".to_vec())));
+            client.invalidate_owner_body(b"identity-a");
             let refreshed = read(&client, &file, 2000, 1000).unwrap();
             (cached, refreshed)
         })
@@ -2917,6 +2926,59 @@ async fn writer_distinguishes_fenced_lost_requests_from_unreachable_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_retires_original_slot_after_recovery_outlives_the_call() {
+    let outage = Arc::new(AtomicBool::new(true));
+    let fixture = fixture_with_commit_loss(
+        policy(DataMode::Auto),
+        true,
+        MemorySource::new(content(), SLOT),
+        Arc::new(MemoryExports::new(SLOT, 2)),
+        SLOT,
+        RELEASE_PARK,
+        Some(CommitLoss {
+            control_outage: Some(outage.clone()),
+            forward_commit: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let started = Instant::now();
+    let error = fixture
+        .with_open(libc::O_WRONLY | libc::O_APPEND, |peer, file| {
+            peer.write(&grant(), &file, content().len() as u64, b"lost")
+                .unwrap_err()
+        })
+        .await;
+    assert_eq!(error.code(), afs_error::NODE_OWNER_WRITE_UNKNOWN);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(fixture.native_writes(), 1);
+    assert_eq!(fixture.exports.active(), 1);
+    assert_eq!(*fixture.source.data.lock().unwrap(), content());
+    outage.store(false, Ordering::SeqCst);
+
+    fixture.wait_released().await;
+    let written = fixture
+        .with_open(libc::O_WRONLY | libc::O_APPEND, |peer, file| {
+            peer.write(&grant(), &file, content().len() as u64, b"next")
+                .unwrap()
+        })
+        .await;
+    assert_eq!(written, 4);
+    assert_eq!(fixture.native_writes(), 2);
+    assert_eq!(fixture.handler.grpc_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.home_quarantines(), 0);
+    assert_eq!(
+        *fixture.source.data.lock().unwrap(),
+        [content(), b"next".to_vec()].concat()
+    );
+    fixture.wait_released().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_after_unknown_commit_observes_late_home_write() {
     assert_late_commit_is_visible("file", false).await;
 }
@@ -3323,6 +3385,58 @@ async fn auto_without_a_hixl_adapter_preserves_grpc_open_prefetch() {
         .await;
     assert!(!fixture.handler.disable_prefetch.load(Ordering::SeqCst));
     assert_eq!(fixture.grpc_reads(), 0);
+    assert_eq!(fixture.native_read_batches(), 0);
+}
+
+#[tokio::test]
+async fn auto_grpc_open_prefetch_is_invalidated_by_another_handle_write() {
+    assert_auto_grpc_open_prefetch_invalidation(false).await;
+}
+
+#[tokio::test]
+async fn auto_grpc_open_prefetch_is_invalidated_by_truncating_open() {
+    assert_auto_grpc_open_prefetch_invalidation(true).await;
+}
+
+async fn assert_auto_grpc_open_prefetch_invalidation(truncate: bool) {
+    const OLD: &[u8] = b"old bytes";
+    const NEW: &[u8] = b"new bytes";
+    let mut fixture = fixture_with(
+        policy(DataMode::Auto),
+        false,
+        MemorySource::new(OLD.to_vec(), SLOT),
+    )
+    .await;
+    Arc::get_mut(&mut fixture.client).unwrap().read_session = None;
+    fixture
+        .handler
+        .provide_open_prefetch
+        .store(true, Ordering::SeqCst);
+    let reader = fixture
+        .with_open(libc::O_RDONLY, |peer, file| {
+            assert_eq!(read(&peer, &file, 0, OLD.len()).unwrap(), OLD);
+            file
+        })
+        .await;
+    assert_eq!(fixture.grpc_reads(), 0);
+    let observed = fixture
+        .with_client(move |peer| {
+            let flags = if truncate {
+                libc::O_WRONLY | libc::O_TRUNC
+            } else {
+                libc::O_WRONLY
+            };
+            let writer = open(&peer, flags);
+            assert_ne!(reader.handle, writer.handle);
+            assert_eq!(reader.identity, writer.identity);
+            if !truncate {
+                assert_eq!(peer.write(&grant(), &writer, 0, NEW).unwrap(), NEW.len());
+            }
+            read(&peer, &reader, 0, OLD.len()).unwrap()
+        })
+        .await;
+    assert_eq!(observed, if truncate { &[][..] } else { NEW });
+    assert_eq!(fixture.grpc_reads(), 1);
     assert_eq!(fixture.native_read_batches(), 0);
 }
 
