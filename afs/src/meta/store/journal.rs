@@ -501,6 +501,8 @@ pub(super) fn decode_frame(
         Record::check_schema(record)?;
     }
     let (envelope, tail): (Envelope, _) = postcard::take_from_bytes(payload)
+        // `{e}` is safe here: a postcard error has no `Meta operation log: `
+        // prefix. A log error in this position would need `log_detail`.
         .map_err(|e| invalid_log(format!("decode envelope: {e}")))?;
     if !tail.is_empty()
         || envelope.version != VERSION

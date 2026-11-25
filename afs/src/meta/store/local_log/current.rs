@@ -215,6 +215,9 @@ pub(super) fn read_current(dir: &Path, identity: StoreIdentity) -> Result<Option
         return Err(invalid_log("CURRENT format/hash/CRC"));
     }
     let (current, tail): (Current, _) = postcard::take_from_bytes(&bytes[6..hash_start])
+        // `{error}` is safe here: this is a postcard decode error, not one of
+        // our log errors, so it carries no `Meta operation log: ` prefix. A log
+        // error in this position would need `log_detail`.
         .map_err(|error| invalid_log(format!("CURRENT decode: {error}")))?;
     if !tail.is_empty() || current.identity != identity {
         return Err(invalid_log("CURRENT identity/trailing bytes"));
