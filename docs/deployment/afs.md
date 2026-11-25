@@ -373,7 +373,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_source_single_ttl_ms` | 调优 | Node | `500` | 仅在本 Node 开启 `dfs_read_cache_bytes` 时生效：某 chunk 的候选只有一个远端 Node 时，来源缓存时长取此值与 `dfs_source_cache_max_ms` 的较小者，不超过 60000；0 表示沿用 `dfs_source_cache_max_ms` |
 | `dfs_read_share_concurrent` | 调优 | Node | `false` | 仅在本 Node 开启 `dfs_read_cache_bytes`、原生 DFS 时生效：只读打开登记为共享读者，同时打开同一版本的其他读者可以读本 Node 已安装的读缓存副本，本 Node 也会读它们的；默认关 |
 | `dfs_holder_ttl_ms` | 调优 | Node | `250` | 开启 `dfs_read_share_concurrent` 时，读者缓存某版本持有者名单的时长，50..=5000 |
-| `dfs_holder_wait_ms` | 调优 | Node | `30` | 开启 `dfs_read_share_concurrent` 时，读者请持有者等它正在取的块的时长，0..=500；只对该块上权重高于本读者的持有者生效。0 不请求等待，持有者只供已安装的块。默认 30：3 个以上读者同时开读时保留大部分共享、吞吐不低于不共享；代价是 2 个读者完全同步时吞吐比关共享低约 1/3 |
+| `dfs_holder_wait_ms` | 调优 | Node | `30` | 开启 `dfs_read_share_concurrent` 时，读者请持有者等它正在取的块的时长，0..=500；只对该块上权重高于本读者的持有者生效。0 不请求等待，持有者只供已安装的块。默认 30 只是可调的起点。已有测量只覆盖一种形态：内存后端，写者与读者分在两台机器、所有读者在同一台机器，每节点 2 CPU，512 MiB 文件、1 MiB 读、每读者 1 个线程。在这一形态下，4 个读者同时开读，合计吞吐是关共享的 1.14 倍；2 个读者完全同步，是关共享的 0.79 倍（逐轮 0.67–0.93 倍）。其他读者数、并发度、后端和部署形态没有测过 |
 | `dfs_source_lookahead_chunks` | 调优 | Node | `64` | 来源元数据前瞻 chunk 数，不超过 128 |
 | `dfs_source_cache_bytes` | 调优 | Node | `4194304` | 来源元数据缓存字节上限，不超过 4 MiB |
 | `allow_volatile_meta` | 测试专用 | Node | `false` | 允许 Node 在 Meta 为 `memory` 时报告就绪；不在 `--help` 中显示，启用时打 WARN |
