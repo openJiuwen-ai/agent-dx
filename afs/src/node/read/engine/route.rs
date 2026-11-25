@@ -185,11 +185,11 @@ impl ReplicatedSources<'_> {
         let remote_batch = remote.remote_batch(batch);
         let deadline =
             deadline.unwrap_or_else(|| Instant::now() + self.engine.read_pipeline_timeout());
-        let looked_up = Instant::now();
+        let looking_up = self.engine.time_route("sources");
         let sources = self
             .checked_sources(&remote_batch, deadline, lifetime)
             .await?;
-        self.engine.time_route("sources", looked_up);
+        drop(looking_up);
         // H2 step 2 (review/18 a1): a Chunk counts as in flight here only
         // while it is fetched from a copy that is not a holder; the marks the
         // attempts leave in this scope last until the Chunks are staged for
@@ -199,14 +199,13 @@ impl ReplicatedSources<'_> {
             .windows(2)
             .all(|pair| pair[0].chunk_id == pair[1].chunk_id);
         super::remote::keeping_fetched(one_chunk, async {
-            let reading = Instant::now();
+            let reading = self.engine.time_route("remote");
             self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
                 .await?;
-            self.engine.time_route("remote", reading);
-            let staging = Instant::now();
+            drop(reading);
+            let _staging = self.engine.time_route("staging");
             self.engine
                 .cache_completed_ranges(&remote_batch, &sources, out);
-            self.engine.time_route("staging", staging);
             Ok(())
         })
         .await
@@ -250,7 +249,7 @@ impl ReplicatedSources<'_> {
         // H2 step 2: other readers sharing this version join the candidates.
         let with_holders;
         let sources = if self.engine.holder_lists.is_some() {
-            let listing = Instant::now();
+            let listing = self.engine.time_route("holder_list");
             with_holders = self
                 .engine
                 .with_version_holders(
@@ -260,7 +259,7 @@ impl ReplicatedSources<'_> {
                         .unwrap_or_else(|| Instant::now() + self.engine.read_pipeline_timeout()),
                 )
                 .await;
-            self.engine.time_route("holder_list", listing);
+            drop(listing);
             &with_holders[..]
         } else {
             sources

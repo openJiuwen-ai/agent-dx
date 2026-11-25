@@ -1991,3 +1991,123 @@ async fn h2_pr318_chunk_evicted_while_served_is_not_ready_not_a_bad_holder() {
     };
     assert_eq!(event("holder_answered_not_ready"), 1);
 }
+
+/// !318 P3-2: holder request stages are timed whatever their end. A denied
+/// authorization, a slot wait that ends busy, a request cancelled in the
+/// slot queue and a wait cancelled by its caller each leave a sample, and
+/// the re-validation before a slot is timed as `authorize` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_pr318_holder_stages_are_timed_on_failure_and_cancellation() {
+    let count = |h: &Holder, name: &str, label: &str| histogram_count(&h.metrics, name, label);
+    let stage = |h: &Holder, stage: &str| {
+        count(
+            h,
+            "afs_dfs_read_holder_request_seconds",
+            &format!("stage=\"{stage}\""),
+        )
+    };
+    // Denied by Meta.
+    let h = holder(30_000);
+    *h.meta.genuine.lock().unwrap() = None;
+    let g = grant("v", "l");
+    denied(
+        read(
+            &h.service,
+            holder_request(vec![holder_op(0, &h.present.chunk.id.0, 0, 4096, &g)]),
+        )
+        .await,
+    );
+    assert_eq!(stage(&h, "authorize"), 1, "denied authorization");
+    // Busy: every slot taken past the admission deadline.
+    let h = holder(30_000);
+    let slots = h
+        .service
+        .read_permits
+        .clone()
+        .acquire_many_owned(8)
+        .await
+        .unwrap();
+    let busy = read(
+        &h.service,
+        holder_request(vec![holder_op(0, &h.present.chunk.id.0, 0, 4096, &g)]),
+    )
+    .await;
+    assert_eq!(busy.unwrap_err().code(), tonic::Code::ResourceExhausted);
+    assert_eq!(stage(&h, "slot"), 1, "slot wait that ended busy");
+    // Cancelled in the slot queue.
+    let (queued, at_slot) = tokio::sync::oneshot::channel();
+    holder_serve(&h).on(
+        crate::node::rpc::data::HolderTestPoint::SlotQueue,
+        move || {
+            let _ = queued.send(());
+        },
+    );
+    let task = {
+        let service = Arc::new(h.service.clone());
+        let op = holder_op(0, &h.present.chunk.id.0, 0, 4096, &g);
+        tokio::spawn(async move { read(&service, holder_request(vec![op])).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), at_slot)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    // Cancelled, or (on a slow machine) busy first: a sample either way.
+    let _ = task.await;
+    assert_eq!(stage(&h, "slot"), 2, "cancelled slot wait");
+    drop(slots);
+    // A wait cancelled by its caller.
+    let fetching = h.in_flight.begin(&h.absent.chunk.id);
+    let task = {
+        let service = Arc::new(h.service.clone());
+        let mut op = holder_op(0, &h.absent.chunk.id.0, 0, 4096, &g);
+        op.wait_ms = 500;
+        tokio::spawn(async move { read(&service, holder_request(vec![op])).await })
+    };
+    let serve = holder_serve(&h);
+    until("the request to wait", || serve.waiting() == 1).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        count(
+            &h,
+            "afs_dfs_read_holder_wait_seconds",
+            "outcome=\"cancelled\""
+        ),
+        1
+    );
+    drop(fetching);
+    // Re-validated before the slot: two authorizations, both timed.
+    let h = holder(50);
+    let served = read(
+        &h.service,
+        holder_request(vec![holder_op(0, &h.present.chunk.id.0, 0, 4096, &g)]),
+    )
+    .await;
+    assert!(served.is_ok(), "{served:?}");
+    assert_eq!(h.meta.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(stage(&h, "authorize"), 2, "re-validation timed");
+}
+
+/// !318 P3-2: a reader's read cancelled while it waits on a holder leaves a
+/// `cancelled` attempt and a `remote` stage sample.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_pr318_cancelled_reads_are_timed_at_the_reader() {
+    let temp = tempfile::tempdir().unwrap();
+    let staged = review_chunk(5);
+    let (holder, _silent) = silent_holder().await;
+    let reader = review_reader(temp.path(), std::slice::from_ref(&staged), &holder, 0).await;
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        read_within(&reader, &staged, std::time::Duration::from_secs(10)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the read was not cancelled");
+    let count = |name: &str, label: &str| histogram_count(&reader.metrics, name, label);
+    assert_eq!(
+        count("afs_dfs_read_peer_attempt_seconds", "outcome=\"cancelled\""),
+        1
+    );
+    assert_eq!(count("afs_dfs_read_route_seconds", "stage=\"remote\""), 1);
+    assert_eq!(count("afs_dfs_read_route_seconds", "stage=\"sources\""), 1);
+}

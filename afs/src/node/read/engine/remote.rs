@@ -97,11 +97,15 @@ pub(crate) fn holder_wait_allowed() -> bool {
 }
 
 impl DfsReadEngine {
-    /// Measurement only (review/18 §8.3): one remote read stage since `since`.
-    pub(super) fn time_route(&self, stage: &'static str, since: Instant) {
-        if let Some(metrics) = self.local.read_work_metrics() {
-            metrics.share.route(stage, since.elapsed());
-        }
+    /// Measurement only (review/18 §8.3): times one remote read stage until
+    /// the returned timer drops, whatever the stage's end (!318 P3-2).
+    pub(super) fn time_route(
+        &self,
+        stage: &'static str,
+    ) -> Option<crate::node::metrics::work::ShareTimer> {
+        self.local
+            .read_work_metrics()
+            .map(|metrics| metrics.share.route(stage))
     }
 
     pub(super) async fn read_remote_ranges_async(
@@ -278,7 +282,21 @@ impl DfsReadEngine {
             }
             _ => Vec::new(),
         };
-        let attempted = Instant::now();
+        let role = {
+            let source = &attempt.operations[0].source;
+            if source.holder_grant.is_some() {
+                "peer_holder"
+            } else if source.role == CopyRole::VerifiedCache {
+                "verified_cache"
+            } else {
+                "durable"
+            }
+        };
+        // Recorded as `cancelled` if this read is dropped during the attempt.
+        let timer = self
+            .local
+            .read_work_metrics()
+            .map(|metrics| metrics.share.peer_attempt(role));
         let holder = attempt
             .operations
             .iter()
@@ -286,15 +304,7 @@ impl DfsReadEngine {
         let result = self
             .try_peer_before(round.deadline, choices, holder, fetch)
             .await;
-        if let Some(metrics) = self.local.read_work_metrics() {
-            let source = &attempt.operations[0].source;
-            let role = if source.holder_grant.is_some() {
-                "peer_holder"
-            } else if source.role == CopyRole::VerifiedCache {
-                "verified_cache"
-            } else {
-                "durable"
-            };
+        if let Some(timer) = timer {
             let outcome = match &result {
                 Ok(()) => "ok",
                 Err(error) if crate::node::fault::classify::peer_not_ready(error) => "not_ready",
@@ -304,9 +314,7 @@ impl DfsReadEngine {
                 }
                 Err(_) => "error",
             };
-            metrics
-                .share
-                .peer_attempt(role, outcome, attempted.elapsed());
+            timer.end(outcome);
         }
         if result.is_ok() {
             keep_fetched(marks);

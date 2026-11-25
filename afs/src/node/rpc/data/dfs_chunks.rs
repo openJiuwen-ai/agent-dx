@@ -852,11 +852,12 @@ impl DfsChunksService {
         let timing = local
             .read_work_metrics()
             .map(|metrics| metrics.share.clone());
-        let timed = |record: &dyn Fn(&crate::node::metrics::work::ShareTimingMetrics)| {
-            if let Some(timing) = &timing {
-                record(timing);
-            }
-        };
+        // Each stage is timed until it ends, also when it fails or the
+        // request is cancelled (!318 P3-2).
+        let timer =
+            |start: &dyn Fn(
+                &crate::node::metrics::work::ShareTimingMetrics,
+            ) -> crate::node::metrics::work::ShareTimer| { timing.as_ref().map(start) };
         let denied = |status: Status| {
             if status.code() == tonic::Code::PermissionDenied {
                 event("holder_denied");
@@ -867,12 +868,12 @@ impl DfsChunksService {
         // 1. one kind of grant, this Node, this peer, the request's version
         let grant = holders.check_request(&peer, &request).map_err(denied)?;
         // 2. Meta, outside the read slots
-        let asked = std::time::Instant::now();
+        let authorizing = timer(&|t| t.holder_request("authorize"));
         let mut authorized = holders
             .authorize(&peer, &grant, false)
             .await
             .map_err(denied)?;
-        timed(&|t| t.holder_request("authorize", asked.elapsed()));
+        drop(authorizing);
         // 3. ranges inside the version's layout
         if let Err(status) = holders.check_ranges(&grant, &request.operations) {
             if status.code() == tonic::Code::PermissionDenied {
@@ -908,8 +909,15 @@ impl DfsChunksService {
                 return Err(holder_not_ready());
             };
             event("holder_waited");
-            timed(&|t| t.holder_waiters(holders.waiting()));
-            let waiting = std::time::Instant::now();
+            if let Some(timing) = &timing {
+                timing.holder_waiters(holders.waiting());
+            }
+            let mut waiting = timer(&|t| t.holder_wait());
+            let mut ended = |outcome: &'static str| {
+                if let Some(waiting) = waiting.take() {
+                    waiting.end(outcome);
+                }
+            };
             let deadline = tokio::time::Instant::now() + budget;
             loop {
                 // Wakes on any in-flight change, and when a version stops
@@ -923,7 +931,7 @@ impl DfsChunksService {
                 // The version may stop being shared while this waits (S3).
                 if !holders.registry.is_shared(&grant.file_version_id) || !all_in_flight(&missing) {
                     event("holder_not_ready");
-                    timed(&|t| t.holder_wait("not_ready", waiting.elapsed()));
+                    ended("not_ready");
                     return Err(holder_not_ready());
                 }
                 let woke = tokio::time::timeout_at(deadline, async {
@@ -939,11 +947,11 @@ impl DfsChunksService {
                         break;
                     }
                     event("holder_wait_timeout");
-                    timed(&|t| t.holder_wait("timeout", waiting.elapsed()));
+                    ended("timeout");
                     return Err(holder_not_ready());
                 }
             }
-            timed(&|t| t.holder_wait("ready", waiting.elapsed()));
+            ended("ready");
             // Ranges again after the wait: the version may have stopped being
             // shared (code review S3).
             if let Err(status) = holders.check_ranges(&grant, &request.operations) {
@@ -956,15 +964,17 @@ impl DfsChunksService {
         }
         // 5. re-validate before a slot when the authorization ran short (R5)
         if authorized.until <= std::time::Instant::now() + REVALIDATE_MARGIN {
+            let authorizing = timer(&|t| t.holder_request("authorize"));
             authorized = holders
                 .authorize(&peer, &grant, true)
                 .await
                 .map_err(denied)?;
+            drop(authorizing);
         }
         // 6. a fresh admission deadline after any wait (R2), then a slot
         #[cfg(test)]
         holders.reach(super::dfs_holder_serve::TestPoint::SlotQueue);
-        let slot_wait = std::time::Instant::now();
+        let slot_wait = timer(&|t| t.holder_request("slot"));
         let admission_deadline = local.peer_serve_deadline();
         let permit = match self.read_permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -976,7 +986,7 @@ impl DfsChunksService {
             .map_err(|_| Status::resource_exhausted("DFS peer read admission deadline exceeded"))?
             .map_err(|_| Status::unavailable("DFS peer read admission is closed"))?,
         };
-        timed(&|t| t.holder_request("slot", slot_wait.elapsed()));
+        drop(slot_wait);
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         let metrics = self.payload_metrics.clone();
@@ -1005,7 +1015,7 @@ impl DfsChunksService {
             local.record_read_cache_event("holder_served");
             #[cfg(test)]
             hooks.reach(super::dfs_holder_serve::TestPoint::Serve);
-            let serving = std::time::Instant::now();
+            let serving = timing.as_ref().map(|t| t.holder_request("serve"));
             // 8. serve
             let served = stream_dfs_ranges_until(
                 &local,
@@ -1015,9 +1025,7 @@ impl DfsChunksService {
                 admission_deadline,
                 crc_mode,
             );
-            if let Some(timing) = &timing {
-                timing.holder_request("serve", serving.elapsed());
-            }
+            drop(serving);
             if let Err(error) = served {
                 // A Chunk that left the catalog after the checks was evicted
                 // (or collected), as caches are: not ready here, not a failed

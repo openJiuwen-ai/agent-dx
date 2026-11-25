@@ -1033,42 +1033,73 @@ impl ShareTimingMetrics {
         })
     }
 
-    /// `outcome`: `ready`, `not_ready` or `timeout`.
-    pub(crate) fn holder_wait(&self, outcome: &'static str, took: std::time::Duration) {
-        self.holder_wait
-            .with_label_values(&[outcome])
-            .observe(took.as_secs_f64());
+    /// Times one holder wait until it ends; `outcome` (`ready`, `not_ready`
+    /// or `timeout`) is set by [`ShareTimer::end`], and a wait dropped
+    /// before (its request cancelled) is recorded as `cancelled`.
+    pub(crate) fn holder_wait(&self) -> ShareTimer {
+        ShareTimer::new(&self.holder_wait, ["cancelled", ""], 1)
     }
 
     pub(crate) fn holder_waiters(&self, waiting: usize) {
         self.holder_waiters.observe(waiting as f64);
     }
 
-    /// `stage`: `authorize`, `slot` or `serve`.
-    pub(crate) fn holder_request(&self, stage: &'static str, took: std::time::Duration) {
-        self.holder_request
-            .with_label_values(&[stage])
-            .observe(took.as_secs_f64());
+    /// Times one holder request stage (`authorize`, `slot` or `serve`) until
+    /// it ends, whatever the end: done, failed or cancelled.
+    pub(crate) fn holder_request(&self, stage: &'static str) -> ShareTimer {
+        ShareTimer::new(&self.holder_request, [stage, ""], 1)
     }
 
-    /// `role`: `durable`, `verified_cache` or `peer_holder`; `outcome`: `ok`,
-    /// `not_ready`, `busy`, `denied` or `error`.
-    pub(crate) fn peer_attempt(
-        &self,
-        role: &'static str,
-        outcome: &'static str,
-        took: std::time::Duration,
-    ) {
-        self.peer_attempt
-            .with_label_values(&[role, outcome])
-            .observe(took.as_secs_f64());
+    /// Times one remote read attempt; `role`: `durable`, `verified_cache` or
+    /// `peer_holder`; `outcome` (`ok`, `not_ready`, `busy`, `denied` or
+    /// `error`) is set by [`ShareTimer::end`], an attempt dropped before (its
+    /// read cancelled) is recorded as `cancelled`.
+    pub(crate) fn peer_attempt(&self, role: &'static str) -> ShareTimer {
+        ShareTimer::new(&self.peer_attempt, [role, "cancelled"], 2)
     }
 
-    /// `stage`: `sources`, `holder_list`, `remote` or `staging`.
-    pub(crate) fn route(&self, stage: &'static str, took: std::time::Duration) {
-        self.route
-            .with_label_values(&[stage])
-            .observe(took.as_secs_f64());
+    /// Times one remote read stage (`sources`, `holder_list`, `remote` or
+    /// `staging`) until it ends, whatever the end: done, failed or cancelled.
+    pub(crate) fn route(&self, stage: &'static str) -> ShareTimer {
+        ShareTimer::new(&self.route, [stage, ""], 1)
+    }
+}
+
+/// One timing sample of [`ShareTimingMetrics`], recorded when dropped, so a
+/// stage that fails or is cancelled is counted like one that completes
+/// (!318 P3-2). Its last label is the outcome where the metric has one.
+#[cfg(feature = "dfs")]
+#[must_use = "a timer records when it is dropped"]
+pub(crate) struct ShareTimer {
+    histogram: afs_metrics::HistogramVec,
+    labels: [&'static str; 2],
+    arity: usize,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "dfs")]
+impl ShareTimer {
+    fn new(histogram: &afs_metrics::HistogramVec, labels: [&'static str; 2], arity: usize) -> Self {
+        Self {
+            histogram: histogram.clone(),
+            labels,
+            arity,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Ends the sample with `outcome` as its last label.
+    pub(crate) fn end(mut self, outcome: &'static str) {
+        self.labels[self.arity - 1] = outcome;
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for ShareTimer {
+    fn drop(&mut self) {
+        self.histogram
+            .with_label_values(&self.labels[..self.arity])
+            .observe(self.started.elapsed().as_secs_f64());
     }
 }
 

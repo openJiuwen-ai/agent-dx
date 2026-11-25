@@ -2268,3 +2268,26 @@ async fn h2_pr318_sharing_on_tracks_the_fetch_and_clears_it() {
     assert_eq!(fixture.metric(&cache_event("installed")), 1);
     assert!(!flights.contains(&chunk.id), "left in flight");
 }
+
+/// !318 P3-2: a read whose source lookup fails still leaves its `sources`
+/// stage sample (stages are timed whatever their end).
+#[test]
+fn h2_pr318_failed_source_lookup_is_timed() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer::default();
+    let (engine, meta, _transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    meta.deny_after.store(1, Ordering::SeqCst);
+    meta.lookups.store(1, Ordering::SeqCst);
+    let mut out = [0; 4];
+    assert!(engine.read_batch(&read_op(chunk, 4), &mut out).is_err());
+    let sources = afs_metrics::encode_text(&fixture.registry)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            line.starts_with("afs_dfs_read_route_seconds_count")
+                && line.contains("stage=\"sources\"")
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum::<u64>();
+    assert_eq!(sources, 1);
+}

@@ -652,6 +652,8 @@ dropped_partial_ranges，单位是chunk或段的事件次数；dropped_partial�
 `afs_dfs_read_holder_waiters`（一次等待开始时本持有者上的等待者数，含自己）、`afs_dfs_read_holder_request_seconds{stage}`（authorize：Meta验证含排队；slot：取读槽；serve：槽内供数）；
 读者侧`afs_dfs_read_peer_attempt_seconds{role,outcome}`（一次远端读尝试，role为durable、verified_cache、peer_holder，outcome为ok、not_ready、busy、denied、error）与
 `afs_dfs_read_route_seconds{stage}`（sources：取来源；holder_list：取持有者名单；remote：远端读全程；staging：交给拼装与安装）。带标签的直方图在第一次采样后才出现。
+每个阶段都计时到它结束为止，无论成功、失败还是被取消，每次都留一个样本；持有者侧的二次授权（授权将到期时在取读槽前重新验证）也记入 authorize。
+等待和远端读尝试被取消（请求或读被丢弃）时，记为 `outcome="cancelled"`。
 判读：`dropped_queue_full`>0且install耗时之和接近窗口时长，为安装能力不足；install耗时低而queue_wait均值高并与reconcile时段重叠，为安装被阻塞。只有写者持有持久副本时，各读者verified_cache字节之和应等于各读者
 送出的`afs_dfs_payload_bytes_total{direction="send",operation="read"}`之和；不一致时该轮证据不全。
 
