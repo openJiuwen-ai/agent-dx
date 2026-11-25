@@ -374,7 +374,7 @@ async fn iac_drafts_prepare_from_the_published_template_without_deployment_seed_
     assert_ne!(calls[0].2.volume.id, calls[1].2.volume.id);
     let (actual_tenant, _, seed) = &calls[0];
     assert_eq!(actual_tenant, &tenant);
-    assert_eq!(seed.execution.env[GOLDEN_PHASE], "seed");
+    assert!(!seed.execution.env.contains_key(GOLDEN_PHASE));
     assert!(!seed.execution.env.contains_key("API_KEY"));
     assert_eq!(seed.execution.readiness_probe, input.readiness_probe);
     assert_eq!(seed.execution.service, input.service);
@@ -431,7 +431,7 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     );
     let recipe = completed.prewarm_recipe.as_ref().unwrap();
     assert_eq!(recipe.snapshot_id, "snapshot-ready");
-    assert_eq!(recipe.restore_env[GOLDEN_PHASE], "restore");
+    assert!(recipe.restore_env.is_empty());
     assert_eq!(
         author
             .publish_with_id("tenant", &input, Some("version-a"))
@@ -445,7 +445,7 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     assert_eq!(calls[0], calls[1]);
     let seed = &calls[0].2;
     assert!(!seed.execution.env.contains_key("API_KEY"));
-    assert_eq!(seed.execution.env[GOLDEN_PHASE], "seed");
+    assert!(!seed.execution.env.contains_key(GOLDEN_PHASE));
     assert_eq!(
         seed.execution.env["DIGITALMATE_CRYPTO_WORKSPACE"],
         seed.volume.id
@@ -461,13 +461,7 @@ async fn unsupported_target_settings_are_rejected_before_publication() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Platform::default());
     let author = Activator::new(state, platform.clone());
-    for (key, value) in [
-        ("API_KEY", "private"),
-        ("MODEL_ENDPOINT", "${model_url}"),
-        ("MODEL_ENDPOINT", "https://user:password@example.test"),
-        ("DIGITALMATE_GOLDEN_PHASE", "seed"),
-        ("GOLDEN_PHASE", "seed"),
-    ] {
+    for (key, value) in [("MODEL_ENDPOINT", "${model_url}"), ("GOLDEN_PHASE", "seed")] {
         let mut input = draft(true);
         input.env.insert(key.into(), value.into());
         assert!(matches!(
@@ -497,6 +491,42 @@ async fn unsupported_target_settings_are_rejected_before_publication() {
             .version,
         "1"
     );
+
+    let mut business = draft(true);
+    business.env.insert(
+        "DIGITALMATE_CRYPTO_CA_PEM".into(),
+        "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".into(),
+    );
+    business
+        .env
+        .insert("API_KEY".into(), "publisher-owned-shared-key".into());
+    business.env.insert(
+        "MODEL_ENDPOINT".into(),
+        "https://example.test/v1?api-version=1".into(),
+    );
+    business.env.insert(
+        "DIGITALMATE_KEENABLE_API_KEY".into(),
+        "fixture-search-key".into(),
+    );
+    let published = author.publish("tenant", &business).await.unwrap();
+    assert_eq!(published.env, business.env);
+    author.reconcile_snapshot_preparations().await.unwrap();
+    let calls = platform.calls.lock().await;
+    let seed = &calls.last().unwrap().2;
+    assert_eq!(
+        seed.execution.env["DIGITALMATE_CRYPTO_CA_PEM"],
+        business.env["DIGITALMATE_CRYPTO_CA_PEM"]
+    );
+    assert_eq!(
+        seed.execution.env["DIGITALMATE_KEENABLE_API_KEY"],
+        "fixture-search-key"
+    );
+    for (key, value) in &business.env {
+        if key != "DIGITALMATE_CRYPTO_WORKSPACE" {
+            assert_eq!(seed.execution.env.get(key), Some(value));
+        }
+    }
+    assert!(!seed.execution.env.contains_key(GOLDEN_PHASE));
 }
 
 #[tokio::test]
@@ -916,7 +946,7 @@ async fn automatic_golden_is_protected_before_backfill_and_used_without_product_
             .find(|request| request.id == binding.current.environment_id)
             .unwrap();
         assert_eq!(request.execution.snapshot_id, binding.current.snapshot_id);
-        assert_eq!(request.execution.env[GOLDEN_PHASE], "restore");
+        assert!(!request.execution.env.contains_key(GOLDEN_PHASE));
         assert_eq!(
             request.execution.env["DIGITALMATE_CRYPTO_WORKSPACE"],
             workspace
