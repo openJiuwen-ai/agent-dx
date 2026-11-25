@@ -117,7 +117,9 @@ struct ReplayCursor<'a> {
 struct ScannedSegment {
     name: String,
     pub(super) file: File,
-    declared: Tail,
+    /// The tail slot replay used as an upper bound, when one was reachable.
+    /// `None` means the frame chain alone located the end.
+    declared: Option<Tail>,
     offset: u64,
     length: u64,
 }
@@ -133,28 +135,53 @@ fn replay_segment(
     cursor: &mut ReplayCursor<'_>,
 ) -> Result<ScannedSegment> {
     if segment.base != cursor.tip || segment.base_revision != cursor.revision {
-        return Err(invalid_log("WAL segment base/revision gap"));
+        return Err(corrupt_log("WAL segment base/revision gap"));
     }
     let name = wal_name(segment.base)?;
     let mut file = open_file(&dir.join(&name), false).map_err(|error| {
-        invalid_log(format!(
+        corrupt_log(format!(
             "{name} offset 0 at base sequence {} required segment: {error}",
             segment.base.sequence
         ))
     })?;
-    let declared = header(&mut file, identity, segment.base)?;
     let length = file.metadata()?.len();
-    if declared.end > length
-        || segment
-            .sealed
-            .is_some_and(|(tail, _)| declared != tail || length != tail.end)
+    // A sealed segment is immutable, so any disagreement with the manifest is
+    // damage. The active segment is the only one a loss can shorten.
+    //
+    // The tail slot is a progress note. Under `tolerate_tail_rollback` it is
+    // used only when it describes a position the file still holds; otherwise
+    // `None` sends replay to the frame chain, which carries its own
+    // `previous_hash` and sequence and therefore locates the last complete
+    // record even when every slot points past the file end.
+    let declared = match segment.sealed {
+        Some(_) => Some(header(&mut file, identity, segment.base)?),
+        None if limits.tolerate_tail_rollback => {
+            reachable_tail(&mut file, identity, segment.base, length)?
+        }
+        None => Some(header(&mut file, identity, segment.base)?),
+    };
+    if let (Some((tail, _)), Some(declared)) = (segment.sealed, declared)
+        && (declared != tail || length != tail.end)
     {
-        return Err(invalid_log(format!(
+        return Err(corrupt_log(format!(
             "{name} sealed/declared durable content missing or changed"
         )));
     }
+    if let Some(declared) = declared
+        && declared.end > length
+    {
+        // Without the rollback the newest slot is authoritative, so a file
+        // shorter than it can only be damage.
+        return Err(corrupt_log(format!(
+            "{name} sealed/declared durable content missing or changed"
+        )));
+    }
+    // Replay reads the whole file: a slot only records what was acknowledged,
+    // and a complete frame past it is still a record the writer produced and
+    // may have applied. `declared` therefore bounds nothing; it is checked
+    // against what the frames actually reach at the end of the scan.
     let mut offset = LOG_HEADER_BYTES;
-    let mut matched = declared.end == offset && declared.tip == cursor.tip;
+    let mut matched = declared.is_some_and(|tail| tail.end == offset && tail.tip == cursor.tip);
     while offset < length {
         if length - offset < 8 {
             break;
@@ -162,8 +189,16 @@ fn replay_segment(
         file.seek(SeekFrom::Start(offset))?;
         let mut prefix = [0; 8];
         file.read_exact(&mut prefix)?;
-        let size = frame_length(&prefix, limits.record_max_bytes)
-            .map_err(|error| invalid_log(format!("{name} offset {offset}: {error}")))?;
+        let size = match frame_length(&prefix, limits.record_max_bytes) {
+            Ok(size) => size,
+            Err(error) => {
+                // A prefix that is not a legal frame length is not evidence of
+                // where the data ends. Stopping would be a guess, so it stays
+                // an error; a tail that was merely written short is caught by
+                // the size check below instead, which does prove incompleteness.
+                return Err(corrupt_log(format!("{name} offset {offset}: {error}")));
+            }
+        };
         if size as u64 > length - offset {
             break;
         }
@@ -185,13 +220,17 @@ fn replay_segment(
                 ))
             })
             .map_err(|error| {
+                // The frame is complete (an incomplete one broke out above), so
+                // its bytes were written in full and may have been acknowledged.
+                // A power loss cannot produce that shape; cutting here would
+                // discard history, so it stays an error.
                 log_context(
                     error,
                     format!("{name} offset {offset} after sequence {}", tip.sequence),
                 )
             })?;
         if record.revision_before() != revision {
-            return Err(invalid_log(format!(
+            return Err(corrupt_log(format!(
                 "{name} offset {offset} after sequence {}: business revision gap; expected {revision}, found before {} after {}",
                 tip.sequence,
                 record.revision_before(),
@@ -210,20 +249,30 @@ fn replay_segment(
         if cursor.tip.sequence > cursor.covered {
             cursor.records.push(record);
         }
-        if offset == declared.end {
+        if let Some(declared) = declared
+            && offset == declared.end
+        {
             if cursor.tip != declared.tip {
-                return Err(invalid_log(format!(
+                return Err(corrupt_log(format!(
                     "{name} declared tail hash/sequence mismatch"
                 )));
             }
             matched = true;
         }
-        if offset > declared.end && !matched {
-            return Err(invalid_log(format!("{name} declared tail inside record")));
+        if let Some(declared) = declared
+            && offset > declared.end
+            && !matched
+        {
+            return Err(corrupt_log(format!("{name} declared tail inside record")));
         }
     }
-    if !matched || offset < declared.end {
-        return Err(invalid_log(format!(
+    // With a reachable declaration the scan had to reach it exactly: a shorter
+    // stop means the frames contradict what the writer claimed durable.
+    // Without one the chain itself decided, and `offset` is the answer.
+    if let Some(declared) = declared
+        && (!matched || offset < declared.end)
+    {
+        return Err(corrupt_log(format!(
             "{name} declared durable content incomplete"
         )));
     }
@@ -246,31 +295,66 @@ fn finish_active_segment(
     prepared_segment: Option<LogTip>,
 ) -> Result<(File, u64, u64)> {
     let ScannedSegment {
+        name,
         mut file,
         declared,
         offset,
         length,
-        ..
     } = scanned;
     let tip = cursor.tip;
     if cursor.anchors.iter().any(|matched| !matched) {
-        return Err(invalid_log(
+        return Err(corrupt_log(
             "CURRENT checkpoint chain anchor missing or mismatched; no fallback can discard acknowledged history",
         ));
     }
+    // A selected checkpoint is installed state, not a hint: its covered
+    // position must still be reached by the replayed frames. Truncating below
+    // it would keep an image describing records that no longer exist.
+    if cursor.covered > tip.sequence {
+        return Err(corrupt_log(
+            "recovered tail precedes the selected checkpoint; truncation would discard installed state",
+        ));
+    }
     if prepared_segment.is_some_and(|base| base != tip) {
-        return Err(invalid_log(
+        return Err(corrupt_log(
             "unlisted empty WAL is not the recovered next segment",
         ));
     }
-    let changed = offset != length || tip != declared.tip;
+    // A rollback must leave a slot the strict read selects, otherwise the
+    // newest generation still describes a position the file no longer holds.
+    // `declared` is the slot this replay chose: when it is not the newest slot
+    // on disk, the newest one contradicts the file and must be superseded.
+    let superseded = match declared {
+        Some(tail) => newest_slot_generation(&mut file)? > tail.generation,
+        None => true,
+    };
+    let changed = offset != length || declared.is_some_and(|tail| tip != tail.tip) || superseded;
     if offset != length {
+        // Every byte after `offset` was refused by the chain, so none of it can
+        // carry an acknowledged record. Keep it as evidence, then cut.
         preserve_tail(dir, &mut file, offset, length)?;
         file.set_len(offset)?;
+        afs_logging::warn!("meta.log.tail_rolled_back";
+            "action" => "tail_rolled_back",
+            "segment" => %name,
+            "declared_end" => declared.map_or(0, |tail| tail.end),
+            "declared_sequence" => declared.map_or(0, |tail| tail.tip.sequence),
+            "rolled_back_to" => offset,
+            "actual_len" => length,
+            "dropped_undeclared_bytes" => length - offset,
+            "recovered_sequence" => tip.sequence,
+            "anchor" => if declared.is_some() { "tail_slot" } else { "frame_chain" },
+            "preserved" => "incomplete-tail");
     }
     let generation = if changed {
-        let generation = declared
-            .generation
+        let base = match declared {
+            Some(tail) => tail.generation,
+            // No slot described a reachable position, so the chain decided.
+            // Start past whatever the slots still hold so the rewritten
+            // declaration wins the "newest generation" comparison.
+            None => newest_slot_generation(&mut file)?,
+        };
+        let generation = base
             .checked_add(1)
             .ok_or_else(|| invalid_log("tail generation exhausted"))?;
         write_tail(
@@ -283,11 +367,27 @@ fn finish_active_segment(
         )?;
         generation
     } else {
-        declared.generation
+        declared.map_or(0, |tail| tail.generation)
     };
     // Confirm complete but previously unacknowledged same-kernel pages.
     file.sync_all()?;
     Ok((file, offset, generation))
+}
+
+/// The highest generation either slot holds, readable or not.
+fn newest_slot_generation(file: &mut File) -> Result<u64> {
+    use std::io::{Read, Seek};
+    let mut bytes = [0u8; LOG_HEADER_BYTES as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut bytes)?;
+    let mut newest = 0u64;
+    for index in 0..2 {
+        let start = STATIC_BYTES + index * SLOT_BYTES;
+        if let Some(tail) = parse_tail(&bytes[start..start + SLOT_BYTES])? {
+            newest = newest.max(tail.generation);
+        }
+    }
+    Ok(newest)
 }
 
 pub(super) fn replay(

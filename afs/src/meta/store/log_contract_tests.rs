@@ -73,6 +73,7 @@ fn local_fixture(limits: Option<CaseLimits>) -> Fixture<LocalLog> {
         wal_max_bytes: limits.wal_max_bytes,
         segment_bytes: (limits.wal_max_bytes / 2).max(LOG_HEADER_BYTES + 256),
         segments_max: 16,
+        ..Default::default()
     });
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("meta-store");

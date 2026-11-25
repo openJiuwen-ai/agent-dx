@@ -386,6 +386,7 @@ fn checkpoint_log_limits() -> LocalLogOptions {
         wal_max_bytes: 128 * 1024,
         segment_bytes: 4608,
         segments_max: 32,
+        ..Default::default()
     }
 }
 

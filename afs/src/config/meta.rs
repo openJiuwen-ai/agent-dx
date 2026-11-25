@@ -18,6 +18,9 @@ pub(super) struct MetaSettings {
     pub(super) meta_checkpoint_wal_records: u64,
     pub(super) meta_checkpoint_interval_ms: u64,
     pub(super) meta_wal_segment_bytes: u64,
+    /// Rolls a damaged WAL tail back to the last position present on disk
+    /// instead of refusing to start.
+    pub(super) meta_log_tail_rollback: bool,
     pub(super) meta_request_retention_ms: u64,
     pub(super) meta_request_outcomes_max: usize,
     pub(super) meta_request_bytes_max: u64,
@@ -85,6 +88,13 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> MetaSettings {
             .meta_wal_segment_bytes
             .or(file.meta_wal_segment_bytes)
             .unwrap_or(log_defaults.segment_bytes),
+        meta_log_tail_rollback: cli
+            .meta_log_tail_rollback
+            .or(file.meta_log_tail_rollback)
+            // Only the local log can roll a tail back; other backends have no
+            // file to cut, so the default follows the backend and nothing has
+            // to be configured for them.
+            .unwrap_or(meta_store == MetaStoreBackend::LocalFile),
         meta_request_retention_ms: cli
             .meta_request_retention_ms
             .or(file.meta_request_retention_ms)
@@ -244,11 +254,16 @@ impl Config {
                 "meta_wal_segment_bytes must not exceed meta_wal_max_bytes",
             ));
         }
+        // The rollback rewrites WAL bytes, so it can only describe the local
+        // log; other backends keep their own durability and are never touched.
+        let tolerate_tail_rollback =
+            self.meta_log_tail_rollback && self.meta_store == MetaStoreBackend::LocalFile;
         crate::meta::store::local_log::LocalLogOptions {
             record_max_bytes: self.meta_record_max_bytes,
             batch_max_bytes: self.meta_batch_max_bytes,
             wal_max_bytes: self.meta_wal_max_bytes,
             segment_bytes: self.meta_wal_segment_bytes,
+            tolerate_tail_rollback,
             ..Default::default()
         }
         .validate()

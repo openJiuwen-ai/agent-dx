@@ -30,8 +30,8 @@ use super::{
     BackendPersistence, MetaFuture, StoreRevision,
     journal::{
         AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogCursor, LogStatus, LogTip, MetaLog,
-        RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, decode_frame, encode_batch,
-        fenced, frame_length, full, invalid_log, log_context, unavailable,
+        RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, corrupt_log, decode_frame,
+        encode_batch, fenced, frame_length, full, invalid_log, log_context, unavailable,
     },
     log::Record,
 };
@@ -68,6 +68,17 @@ pub struct LocalLogOptions {
     /// Soft rotation target; an atomic batch is never split between segments.
     pub segment_bytes: u64,
     pub segments_max: usize,
+    /// Roll an active segment's tail back to the newest declared position that
+    /// actually exists on disk, then cut the file there, instead of refusing to
+    /// open. A tail slot is written after the frames it declares and both are
+    /// made durable by one `sync_data`, so a power loss can leave a slot
+    /// pointing past the file end; nothing behind that end was ever written,
+    /// which is why rolling back keeps every stored byte.
+    ///
+    /// Damage that is not a tail — a changed sealed segment, a middle segment
+    /// gap, a corrupted CURRENT or IDENTITY, or no reachable tail slot at all —
+    /// is still refused.
+    pub tolerate_tail_rollback: bool,
 }
 impl Default for LocalLogOptions {
     fn default() -> Self {
@@ -77,6 +88,7 @@ impl Default for LocalLogOptions {
             wal_max_bytes: 1024 * 1024 * 1024,
             segment_bytes: 64 * 1024 * 1024,
             segments_max: 64,
+            tolerate_tail_rollback: false,
         }
     }
 }
@@ -383,6 +395,9 @@ impl LocalLog {
         {
             return Err(invalid_log("live WAL identity/length changed"));
         }
+        // A rolled-back handle cut the file and rewrote the tail slot, so the
+        // newest slot describes a reachable position again and the strict read
+        // applies exactly as it does without the rollback.
         let declared = header(&mut state.file, inner.identity, active.base)?;
         if declared.tip != state.tip
             || declared.end != state.end
@@ -990,6 +1005,9 @@ impl MetaLog for LocalLog {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tail_rollback_tests;
 
 #[cfg(test)]
 mod format_golden_tests;

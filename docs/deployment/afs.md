@@ -327,6 +327,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `meta_batch_max_bytes` | 调优 | Meta | `134217728` | 单个持久批次上限 |
 | `meta_wal_max_bytes` | 调优 | Meta | `1073741824`（`etcd` 后端 `536870912`） | WAL 总量上限；空间用尽时写入失败关闭 |
 | `meta_wal_segment_bytes` | 调优 | Meta | `67108864` | 软分段大小，不超过 WAL 上限 |
+| `meta_log_tail_rollback` | 产品差异 | Meta（`local-file`） | `true` | 启动时若 WAL 尾部声明超过文件实际长度，回退到磁盘上真实存在的最后一条完整记录并截断，而不是拒绝启动。设为 `false` 恢复"损坏即拒绝"的行为。非 `local-file` 后端忽略此项 |
 | `meta_checkpoint_wal_bytes` | 调优 | Meta | `134217728` | 后台检查点的 WAL 字节阈值 |
 | `meta_checkpoint_wal_records` | 调优 | Meta | `1000000` | 后台检查点的记录数阈值 |
 | `meta_checkpoint_interval_ms` | 调优 | Meta | `60000` | 后台检查点间隔 |
@@ -991,6 +992,7 @@ resource_exhausted，停止后不允许等待结果生成新的响应。RPC许�
 | `meta_watch_events_max` | 1000000 | watch历史事件条数上限 |
 | `meta_watch_bytes_max` | 67108864 | watch历史事件持有容量的逻辑字节上限 |
 | `meta_watch_retention_ms` | 3600000 | watch历史最长保留时间；清理仍以完整revision为单位 |
+| `meta_log_tail_rollback` | true | 仅 `local-file`；损坏的 active 段尾部回退到磁盘上真实存在的最后完整记录并截断，见下节 |
 
 单记录／批次／总WAL上限仍分别使用 `meta_record_max_bytes`、`meta_batch_max_bytes`、
 `meta_wal_max_bytes`。调整总WAL时须同时核对分段目标和原子批次所需空间。
@@ -1010,6 +1012,43 @@ expected 只作约束，不能抬高分配值；水位与 reservation/原结果�
 
 停用确认不再等待所有历史 grant 实体被删完。后台沿游标每次最多扫描128份、删除32份，
 并受原单记录、历史和持久化预算约束；除首次旧水位引导外，未产生删除就不追加管理事务。
+
+### WAL 尾部损坏的自动恢复
+
+`local-file` 的 active 段在文件头保留两个轮换的 tail 槽，记录"已持久化到这里"。
+断电或数据损坏会让这个声明与实际文件长度不一致，`meta_log_tail_rollback`（默认开启）
+在启动时处理这种情况：
+
+- **声明位置超过文件长度**（数据没写进去）：按帧链逐帧校验（CRC32C + BLAKE3 前一帧
+  hash + 序列号连续性），回退到**磁盘上真实存在的最后一条完整记录**并截断。超出部分
+  从未写入，因此不删除任何现存字节。截断的尾部作为 `incomplete-tail-<hash>` 保留在目录里
+  供事后分析，日志记录 `meta.log.tail_rolled_back`（含 `declared_end`、`rolled_back_to`、
+  `dropped_undeclared_bytes`、`anchor`）。
+- **文件比声明更长**（多写了未声明的尾部）：按同样规则截到最后一个完整记录。
+- **两个 tail 槽都超出文件长度**：帧链自行定位，不依赖槽，同样可恢复
+  （日志里 `anchor=frame_chain`）。
+
+判据是**断点之后还剩什么**，不是「有没有可用的槽」：只剩不足一帧的碎片即为尾部；
+若后面仍有大量合法帧，说明损坏在中间，拒绝启动。
+
+以下情况**仍然拒绝启动并保留现场**，需人工介入或从备份还原：
+
+| 情况 | 日志/错误 |
+| --- | --- |
+| 损坏出现在文件中部（断点后仍有完整记录） | `offset ... after sequence ...` |
+| 非法长度前缀（无法证明是尾部） | `frame length outside record bound` |
+| 两个 tail 槽的 CRC 都无效 | `WAL declared tail CRC/format; ambiguous tail is not discarded` |
+| 段文件短于自身的 4096 字节头部 | `shorter than its 4096 byte header` |
+| 回退点早于 checkpoint 覆盖位置 | `recovered tail precedes the selected checkpoint` |
+| `CURRENT`、`IDENTITY` 损坏或其身份与本机不符 | `CURRENT format/hash/CRC`、`IDENTITY format/hash/CRC` |
+| 两个 checkpoint 都无法读取 | `CURRENT has no valid checkpoint` |
+
+这类错误使用 `META_LOG_CORRUPT`（`DataLoss`），与配置错误（`CONFIG_INVALID`）和
+二进制版本不匹配（`STORAGE_FORMAT_INCOMPATIBLE`）区分开。恢复前请先停 `afs-meta`、
+整目录备份 `data_dir/meta-store`，再按报错判断是重试、回退二进制还是从备份还原。
+
+`meta_log_tail_rollback=false` 恢复"任何尾部不一致都拒绝启动"的行为，用于需要
+逐字节审查现场的环境。该开关只影响本地日志；`redis`／`etcd`／`memory` 后端忽略它。
 当前 Home grant 即使 session 到期仍保留以支持恢复；后继身份切换完成后旧记录可回收。
 普通 holder 已过期或被后继 session 替代时可回收，沿用过期 session ID 不允许续回的既有合同。
 清理批次会在原单记录字节额度内缩小，不扩大配置上限。

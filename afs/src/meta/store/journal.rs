@@ -305,15 +305,29 @@ pub(super) fn invalid_log(message: impl Into<String>) -> Error {
         format!("Meta operation log: {}", message.into()),
     )
 }
+/// The stored log contradicts its own durable declaration: a shortened active
+/// tail, a missing or altered segment, or an unreadable checkpoint.
+///
+/// Kept apart from `invalid_log` (configuration and caller mistakes) and from
+/// `STORAGE_FORMAT_INCOMPATIBLE` (this binary cannot read the format at all).
+/// A format mismatch may be the right data for another build, and a
+/// configuration mistake is never repaired by touching the directory, so only
+/// this code describes damage to the bytes on disk.
+pub(super) fn corrupt_log(message: impl Into<String>) -> Error {
+    Error::coded(
+        afs_error::META_LOG_CORRUPT,
+        format!("Meta operation log: {}", message.into()),
+    )
+}
 /// Adds `context` (file, offset) to a log error. A format incompatibility
 /// keeps `STORAGE_FORMAT_INCOMPATIBLE` so operators can tell a binary/data
-/// mismatch from corruption; every other error stays an invalid log, as before.
+/// mismatch from damage, and damaged content keeps `META_LOG_CORRUPT` so the
+/// tail rollback can recognise what it may act on; every other error stays an
+/// invalid log, as before.
 pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Error {
-    if error.code() == afs_error::STORAGE_FORMAT_INCOMPATIBLE {
-        Error::coded(
-            afs_error::STORAGE_FORMAT_INCOMPATIBLE,
-            format!("Meta operation log: {context}: {}", error.message()),
-        )
+    let code = error.code();
+    if code == afs_error::STORAGE_FORMAT_INCOMPATIBLE || code == afs_error::META_LOG_CORRUPT {
+        Error::coded(code, format!("Meta operation log: {context}: {error}"))
     } else {
         invalid_log(format!("{context}: {error}"))
     }
@@ -437,7 +451,7 @@ pub(super) fn decode_frame(
     if u32::from_be_bytes(crc_bytes)
         != crc32c::crc32c_append(crc32c::crc32c(&frame[..4]), &frame[8..])
     {
-        return Err(invalid_log("frame CRC mismatch"));
+        return Err(corrupt_log("frame CRC mismatch"));
     }
     let body_end = frame.len() - 32;
     let payload = &frame[8..body_end];
@@ -446,7 +460,7 @@ pub(super) fn decode_frame(
     hasher.update(payload);
     let hash = *hasher.finalize().as_bytes();
     if frame[body_end..] != hash {
-        return Err(invalid_log("record hash mismatch"));
+        return Err(corrupt_log("record hash mismatch"));
     }
     // Inner layer: after the frame's integrity, before the full decode.
     if let Ok((_, record)) = postcard::take_from_bytes::<EnvelopeHead>(payload) {
@@ -894,7 +908,12 @@ mod tests {
             frame[4..8].copy_from_slice(&crc.to_be_bytes());
             frame
         }
-        async fn refused(dir: &Path, file: &str, markers: &[&str]) {
+        /// Asserts startup refuses and leaves the bytes alone.
+        ///
+        /// `expected` separates damage to the bytes (`META_LOG_CORRUPT`) from
+        /// records that belong to another store identity or format, which say
+        /// the data may well be intact for a different build.
+        async fn refused(dir: &Path, file: &str, markers: &[&str], expected: afs_error::ErrorCode) {
             let root = dir.join("meta-store");
             let before = inventory(&root);
             let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
@@ -918,7 +937,8 @@ mod tests {
             let message = error.to_string();
             assert_eq!(
                 error.downcast_ref::<Error>().unwrap().code(),
-                afs_error::CONFIG_INVALID
+                expected,
+                "refusal code must match the kind of damage"
             );
             assert!(message.contains(file), "{message}");
             for marker in markers {
@@ -1026,10 +1046,17 @@ mod tests {
                 "revision-backward" | "key-value" => "canonical",
                 _ => "format/identity",
             };
+            // Damage to the stored bytes; the rest rewrite identity, version or
+            // chain fields, which describe data that another build may read.
+            let expected = match case {
+                "business-base" | "crc" | "hash" => afs_error::META_LOG_CORRUPT,
+                _ => afs_error::CONFIG_INVALID,
+            };
             refused(
                 &dir,
                 "wal-00000000000000000001.log",
                 &["offset 4096", "sequence 0", item],
+                expected,
             )
             .await;
             fs::remove_dir_all(dir).unwrap();
@@ -1048,6 +1075,7 @@ mod tests {
                 wal_max_bytes: 128 * 1024,
                 segment_bytes: 4608,
                 segments_max: 16,
+                ..Default::default()
             };
             let log = LocalLog::open(&root, limits).unwrap();
             let mut tip = LogTip::EMPTY;
@@ -1074,7 +1102,14 @@ mod tests {
                 bytes[6] ^= 1;
                 fs::write(&wal, bytes).unwrap();
             }
-            refused(&dir, name, &["offset 0", "sequence"]).await;
+            // A missing segment is damage to the stored set. A rewritten segment
+            // header changes the format tag, which may be valid for another
+            // build, so it keeps the configuration-level code.
+            let expected = match case {
+                "missing-middle" => afs_error::META_LOG_CORRUPT,
+                _ => afs_error::CONFIG_INVALID,
+            };
+            refused(&dir, name, &["offset 0", "sequence"], expected).await;
             fs::remove_dir_all(dir).unwrap();
         }
     }
