@@ -344,10 +344,7 @@ pub(super) fn corrupt_log(message: impl Into<String>) -> Error {
 /// detail to a fresh copy would nest the prefix twice.
 pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Error {
     let code = error.code();
-    let detail = error
-        .message()
-        .strip_prefix(LOG_ERROR_PREFIX)
-        .unwrap_or_else(|| error.message());
+    let detail = log_detail(&error);
     if code == afs_error::STORAGE_FORMAT_INCOMPATIBLE || code == afs_error::META_LOG_CORRUPT {
         Error::coded(code, format!("{LOG_ERROR_PREFIX}{context}: {detail}"))
     } else {
@@ -357,6 +354,18 @@ pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Erro
 /// The prefix every `Meta operation log` error carries, so a wrapped message
 /// can be rebuilt around one new context instead of nesting another copy.
 const LOG_ERROR_PREFIX: &str = "Meta operation log: ";
+
+/// The bare detail of a log error, with the shared prefix removed.
+///
+/// Use this when the detail is going to be embedded in another log message:
+/// `Display` would contribute the prefix a second time plus the `0x… Kind:`
+/// decoration, and `message()` alone still carries the prefix.
+pub(super) fn log_detail(error: &Error) -> String {
+    match error.message().strip_prefix(LOG_ERROR_PREFIX) {
+        Some(detail) => detail.to_owned(),
+        None => error.message().to_owned(),
+    }
+}
 pub(super) fn unavailable(message: impl Into<String>) -> Error {
     Error::coded(afs_error::IO_UNAVAILABLE, message)
 }
@@ -1195,6 +1204,93 @@ mod tests {
                 .to_string()
                 .contains("hash mismatch")
         );
+    }
+
+    /// A damaged checkpoint image is not a tail problem: recovery refuses, and
+    /// the collected per-image detail must not restate the shared prefix. This
+    /// path collects each failure as text before wrapping them in one message,
+    /// so it is the one place where the prefix could still appear twice even
+    /// though `log_context` was fixed.
+    #[tokio::test]
+    async fn a_damaged_checkpoint_refuses_with_a_single_log_prefix() {
+        use super::super::local_log::{LocalLog, LocalLogOptions};
+        use std::fs;
+        let dir = tempfile::Builder::new()
+            .prefix("p3-checkpoint-damaged-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        // Recovery refuses, so this error is what an operator would read.
+        let root = dir.join("meta-store");
+        let limits = LocalLogOptions {
+            record_max_bytes: 1024,
+            batch_max_bytes: 4096,
+            wal_max_bytes: 128 * 1024,
+            segment_bytes: 4608,
+            segments_max: 16,
+            ..Default::default()
+        };
+        let log = LocalLog::open(&root, limits).unwrap();
+        let records = test_records(2);
+        let first = super::super::state::State::default()
+            .replay_record(&records[0])
+            .unwrap();
+        let (_, covered) = encode_frame(
+            log.identity(),
+            LogTip::EMPTY.at(log.term()),
+            records[0].clone(),
+            1024 * 1024,
+        )
+        .unwrap();
+        log.append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
+        log.install_checkpoint(
+            covered,
+            super::super::log::StateImage::encode(&first, 1024 * 1024).unwrap(),
+        )
+        .await
+        .unwrap();
+        drop(log);
+
+        // Damage every listed image so no fallback is left.
+        let images = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("checkpoint-"))
+            })
+            .collect::<Vec<_>>();
+        assert!(!images.is_empty(), "fixture needs an installed image");
+        for image in &images {
+            let mut bytes = fs::read(image).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF;
+            fs::write(image, bytes).unwrap();
+        }
+
+        let error = match LocalLog::open(&root, limits) {
+            Ok(_) => panic!("a damaged checkpoint must refuse"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert_eq!(
+            error.code(),
+            afs_error::CONFIG_INVALID,
+            "an unreadable image is a configuration-level refusal"
+        );
+        assert!(
+            message.contains("CURRENT has no valid checkpoint"),
+            "{message}"
+        );
+        assert_eq!(
+            message.matches("Meta operation log: ").count(),
+            1,
+            "collected image details must not restate the prefix: {message}"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

@@ -120,7 +120,11 @@ fn select_checkpoint(
             Err(error) if error.code() == afs_error::STORAGE_FORMAT_INCOMPATIBLE => {
                 return Err(error);
             }
-            Err(error) => errors.push(error.to_string()),
+            // Take the detail, not `Display`: the collected text is embedded in
+            // one `invalid_log` below, which adds the shared prefix itself, so
+            // formatting the whole error would nest a second copy of it and
+            // repeat the code/kind decoration for every failing image.
+            Err(error) => errors.push(log_detail(&error)),
         }
     }
     if !references.is_empty() {

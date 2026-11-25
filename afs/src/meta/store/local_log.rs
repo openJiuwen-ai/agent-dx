@@ -31,7 +31,8 @@ use super::{
     journal::{
         AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogCursor, LogStatus, LogTip, MetaLog,
         RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, corrupt_log, decode_frame,
-        encode_batch, fenced, frame_length, full, invalid_log, log_context, unavailable,
+        encode_batch, fenced, frame_length, full, invalid_log, log_context, log_detail,
+        unavailable,
     },
     log::Record,
 };
