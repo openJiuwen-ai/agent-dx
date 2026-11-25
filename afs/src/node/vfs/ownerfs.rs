@@ -9,7 +9,7 @@ use std::{
     ffi::{CString, OsStr, OsString},
     fs, io,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
         unix::{
             ffi::{OsStrExt, OsStringExt},
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
@@ -2346,16 +2346,9 @@ impl LocalOwnerFs {
     ) -> Self {
         let mut state = OwnerState::new();
         for root in roots.cached_local_roots().unwrap_or_default() {
-            if let Ok(attributes) = disk
-                .metadata(&root.data_dir)
-                .map_err(Error::from)
-                .and_then(attributes_from_metadata)
+            if let Ok((metadata, identity)) = identified_path(&disk, &root.data_dir)
+                && let Ok(attributes) = attributes_from_metadata(metadata)
             {
-                let identity = disk
-                    .metadata(&root.data_dir)
-                    .map_err(Error::from)
-                    .and_then(|metadata| identity_from_metadata(&metadata))
-                    .unwrap_or_else(|_| identity_from_attributes(&attributes));
                 state.insert_root(root.name, root.id, identity, attributes, None);
             }
         }
@@ -2686,7 +2679,7 @@ impl LocalOwnerFs {
         }
         let physical = data_dir.join_path(parent).map_err(Error::from)?;
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
-        let actual = identity_from_metadata(&dir.metadata().map_err(Error::from)?)?;
+        let actual = identity_from_fd(dir.as_fd(), &dir.metadata().map_err(Error::from)?)?;
         check_expected_identity(Some(expected), &actual)
     }
 
@@ -2715,7 +2708,7 @@ impl LocalOwnerFs {
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
         let metadata = dir.metadata().map_err(Error::from)?;
         if !parent.is_root() {
-            let actual = identity_from_metadata(&metadata)?;
+            let actual = identity_from_fd(dir.as_fd(), &metadata)?;
             check_expected_identity(Some(expected), &actual)?;
         }
         Ok((attributes_from_metadata(metadata)?, dir))
@@ -2791,8 +2784,7 @@ impl LocalOwnerFs {
             .data_dir()
             .join_path(&relative)
             .map_err(Error::from)?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (_, identity) = identified_path(&self.disk, &physical)?;
         check_expected_identity(expected, &identity)?;
         self.disk.statvfs().map_err(Error::from)
     }
@@ -2835,13 +2827,14 @@ impl LocalOwnerFs {
             )?;
         }
         let created_metadata = create_file.metadata().map_err(Error::from)?;
-        let created_identity = identity_from_metadata(&created_metadata)?;
+        let created_identity = identity_from_fd(create_file.as_fd(), &created_metadata)?;
         drop(create_file);
         let file = self
             .disk
             .open_file(&physical, OpenSpec::new(flags & !libc::O_CREAT, 0))
             .map_err(Error::from)?;
-        let reopened_identity = identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
+        let reopened_identity =
+            identity_from_fd(file.as_fd(), &file.metadata().map_err(Error::from)?)?;
         if reopened_identity != created_identity {
             return Err(stale("created file was replaced before readonly reopen"));
         }
@@ -2854,7 +2847,7 @@ impl LocalOwnerFs {
             clear_suidgid_on_file(&file)?;
         }
         let metadata = file.metadata().map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let identity = identity_from_fd(file.as_fd(), &metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         state.ensure_peer_session(peer_node_id, access)?;
@@ -3216,12 +3209,11 @@ impl LocalOwnerFs {
             .map_err(Error::from)?;
         self.disk.hard_link(&source, &target).map_err(Error::from)?;
 
-        let target_metadata = self.disk.metadata(&target).map_err(Error::from)?;
+        let (target_metadata, target_identity) = identified_path(&self.disk, &target)?;
         let target_kind = kind_from_metadata(&target_metadata)?;
-        let target_identity = identity_from_metadata(&target_metadata)?;
+
         let target_attributes = attributes_from_metadata(target_metadata)?;
-        let refreshed_source = self.disk.metadata(&source).map_err(Error::from)?;
-        let refreshed_source_identity = identity_from_metadata(&refreshed_source)?;
+        let (refreshed_source, refreshed_source_identity) = identified_path(&self.disk, &source)?;
         let refreshed_source_kind = kind_from_metadata(&refreshed_source)?;
         let refreshed_source_attributes = attributes_from_metadata(refreshed_source)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
@@ -3382,9 +3374,8 @@ impl LocalOwnerFs {
         let new_entry = if expected_new.is_some() {
             Some(self.owner_entry_for_path(&access.id, new_relative.clone(), expected_new)?)
         } else {
-            match self.disk.metadata(&physical_new) {
-                Ok(metadata) => {
-                    let identity = identity_from_metadata(&metadata)?;
+            match identified_path(&self.disk, &physical_new) {
+                Ok((metadata, identity)) => {
                     let attributes = attributes_from_metadata(metadata)?;
                     Some(files::OwnerEntry {
                         root_id: access.id.clone(),
@@ -3392,8 +3383,8 @@ impl LocalOwnerFs {
                         attributes,
                     })
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => return Err(Error::from(error)),
+                Err(error) if error.code() == afs_error::IO_NOT_FOUND => None,
+                Err(error) => return Err(error),
             }
         };
         authorize_namespace_remove(ctx, &old_parent_attributes, &old_entry.attributes)?;
@@ -3581,7 +3572,7 @@ impl LocalOwnerFs {
             .open_file(&physical, OpenSpec::new(open_flags, 0))
             .map_err(Error::from)?;
         let metadata = file.metadata().map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let identity = identity_from_fd(file.as_fd(), &metadata)?;
         check_expected_identity(expected, &identity)?;
         let write_sync = write_sync_mode_from_flags(flags);
         let mut needs_flush = flags & libc::O_TRUNC != 0;
@@ -3809,9 +3800,9 @@ impl LocalOwnerFs {
         relative: &StoragePath,
     ) -> Result<()> {
         let physical = data_dir.join_path(relative).map_err(Error::from)?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         let kind = kind_from_metadata(&metadata)?;
-        let identity = identity_from_metadata(&metadata)?;
+
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         if let Some(record) = state.inodes.get(&inode)
@@ -3858,9 +3849,9 @@ impl LocalOwnerFs {
         expected: Option<&files::FileIdentity>,
     ) -> Result<files::OwnerEntry> {
         let physical = data_dir.join_path(&relative).map_err(Error::from)?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         let kind = kind_from_metadata(&metadata)?;
-        let identity = identity_from_metadata(&metadata)?;
+
         check_expected_identity(expected, &identity)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
@@ -4003,8 +3994,8 @@ impl LocalOwnerFs {
             .data_dir()
             .join_path(&record.relative)
             .map_err(Error::from)?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
+
         if identity != record.identity {
             return Err(stale("inode no longer names the same local file"));
         }
@@ -4169,8 +4160,7 @@ impl LocalOwnerFs {
             .join_path(&record.relative)
             .map_err(Error::from)?;
         let _namespace_guard = self.namespace_lock.lock().map_err(|_| poisoned())?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         check_expected_identity(Some(&record.identity), &identity)?;
         let current = attributes_from_metadata(metadata)?;
         let (change, kernel_mode_clear) = normalize_kernel_mode_clear(&current, change, options)?;
@@ -4182,8 +4172,7 @@ impl LocalOwnerFs {
         if options.kill_suidgid && (kernel_mode_clear || apply_killpriv_to_change(&change)) {
             clear_suidgid_on_path(&self.disk, &physical)?;
         }
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         state.update_record(inode.value, identity, attributes.clone(), attributes.kind)?;
@@ -4217,8 +4206,7 @@ impl LocalOwnerFs {
             .data_dir()
             .join_path(&record.relative)
             .map_err(Error::from)?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         check_expected_identity(Some(&record.identity), &identity)?;
         let attributes = attributes_from_metadata(metadata)?;
         Ok((physical, attributes))
@@ -4441,7 +4429,7 @@ impl LocalOwnerFs {
             )?;
         }
         let created_metadata = create_file.metadata().map_err(Error::from)?;
-        let created_identity = identity_from_metadata(&created_metadata)?;
+        let created_identity = identity_from_fd(create_file.as_fd(), &created_metadata)?;
         let mark_owner_mode = create_trace.elapsed();
         drop(create_file);
         // The reopened descriptor is what the client actually gets: it carries
@@ -4452,7 +4440,8 @@ impl LocalOwnerFs {
             LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(flags & !libc::O_CREAT, 0))
                 .map_err(Error::from)?;
         drop(parent_dir);
-        let reopened_identity = identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
+        let reopened_identity =
+            identity_from_fd(file.as_fd(), &file.metadata().map_err(Error::from)?)?;
         if reopened_identity != created_identity {
             return Err(stale("created file was replaced before readonly reopen"));
         }
@@ -4466,7 +4455,7 @@ impl LocalOwnerFs {
             clear_suidgid_on_file(&file)?;
         }
         let metadata = file.metadata().map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let identity = identity_from_fd(file.as_fd(), &metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let mark_state_lock = create_trace.elapsed();
@@ -4578,7 +4567,7 @@ impl LocalOwnerFs {
             .open_file(&physical, OpenSpec::new(open_flags, 0))
             .map_err(Error::from)?;
         let metadata = file.metadata().map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let identity = identity_from_fd(file.as_fd(), &metadata)?;
         if identity != record.identity {
             return Err(stale("open saw a replacement at the same path"));
         }
@@ -5163,7 +5152,7 @@ impl LocalOwnerFs {
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
         dir.sync_all().map_err(Error::from)?;
         let metadata = dir.metadata().map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let identity = identity_from_fd(dir.as_fd(), &metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let inode = state.inode_for_path(
@@ -5246,8 +5235,7 @@ impl LocalOwnerFs {
             created_gid(ctx, &parent_record.attributes),
             mode,
         )?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let inode = state.inode_for_path(
@@ -5415,14 +5403,11 @@ impl LocalOwnerFs {
             Some((data_dir, epoch)) => {
                 // 解析出的 root_id 在同名重建后不变：先确认缓存中的版本就是内核解析到的
                 // 目录，再把该版本的 epoch 交给 delete_root 在 workspace 锁内复核。
-                match self.disk.metadata(&data_dir) {
-                    Ok(metadata) => check_expected_identity(
-                        Some(&root_identity),
-                        &identity_from_metadata(&metadata)?,
-                    )?,
+                match identified_path(&self.disk, &data_dir) {
+                    Ok((_, identity)) => check_expected_identity(Some(&root_identity), &identity)?,
                     // 目录已不存在时交给 delete_root 收敛残留记录。
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(Error::from(error)),
+                    Err(error) if error.code() == afs_error::IO_NOT_FOUND => {}
+                    Err(error) => return Err(error),
                 }
                 self.ensure_root_empty(&data_dir)?;
                 self.delete_local_root(&root_id, Some(epoch), Some(&root_identity), false)
@@ -5697,21 +5682,20 @@ impl LocalOwnerFs {
         )?;
         let physical_from = root_use.data_dir().join_path(&from).map_err(Error::from)?;
         let physical_to = root_use.data_dir().join_path(&to).map_err(Error::from)?;
-        let from_metadata = self.disk.metadata(&physical_from).map_err(Error::from)?;
-        let from_identity = identity_from_metadata(&from_metadata)?;
+        let (from_metadata, from_identity) = identified_path(&self.disk, &physical_from)?;
         let source_attributes = attributes_from_metadata(from_metadata)?;
         authorize_namespace_remove(ctx, &old_parent_attributes, &source_attributes)?;
         authorize_create_in_directory(ctx, &new_parent_attributes)?;
-        let destination_metadata = match self.disk.metadata(&physical_to) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(Error::from(error)),
+        let destination = match identified_path(&self.disk, &physical_to) {
+            Ok(entry) => Some(entry),
+            Err(error) if error.code() == afs_error::IO_NOT_FOUND => None,
+            Err(error) => return Err(error),
         };
         let same_hardlink = flags.0 == 0
-            && destination_metadata.as_ref().is_some_and(|metadata| {
-                identity_from_metadata(metadata).ok().as_ref() == Some(&from_identity)
-            });
-        if let Some(metadata) = destination_metadata {
+            && destination
+                .as_ref()
+                .is_some_and(|(_, identity)| *identity == from_identity);
+        if let Some((metadata, _)) = destination {
             let victim = attributes_from_metadata(metadata)?;
             authorize_namespace_remove(ctx, &new_parent_attributes, &victim)?;
         }
@@ -5719,9 +5703,9 @@ impl LocalOwnerFs {
             .rename(&physical_from, &physical_to, rename_mode)
             .map_err(Error::from)?;
         if same_hardlink {
-            let metadata = self.disk.metadata(&physical_to).map_err(Error::from)?;
+            let (metadata, identity) = identified_path(&self.disk, &physical_to)?;
             let kind = kind_from_metadata(&metadata)?;
-            let identity = identity_from_metadata(&metadata)?;
+
             let attributes = attributes_from_metadata(metadata)?;
             self.remember_alias_path(&from_parent.root_id, to, identity, attributes, kind)?;
         } else {
@@ -5797,9 +5781,9 @@ impl LocalOwnerFs {
             ctx.uid,
             created_gid(ctx, &parent_attributes),
         )?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         let kind = kind_from_metadata(&metadata)?;
-        let identity = identity_from_metadata(&metadata)?;
+
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let inode = state.inode_for_path(
@@ -5829,8 +5813,7 @@ impl LocalOwnerFs {
                     .data_dir()
                     .join_path(&record.relative)
                     .map_err(Error::from)?;
-                let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
-                let identity = identity_from_metadata(&metadata)?;
+                let (_, identity) = identified_path(&self.disk, &physical)?;
                 check_expected_identity(Some(&record.identity), &identity)?;
                 self.disk.read_link(&physical).map_err(Error::from)
             }
@@ -5922,19 +5905,17 @@ impl LocalOwnerFs {
             .data_dir()
             .join_path(&source_record.relative)
             .map_err(Error::from)?;
-        let source_metadata = self.disk.metadata(&source).map_err(Error::from)?;
-        let source_identity = identity_from_metadata(&source_metadata)?;
+        let (source_metadata, source_identity) = identified_path(&self.disk, &source)?;
         check_expected_identity(Some(&source_record.identity), &source_identity)?;
         authorize_read(_ctx, &attributes_from_metadata(source_metadata)?)?;
         let target = root_use.data_dir().join_path(&child).map_err(Error::from)?;
         self.disk.hard_link(&source, &target).map_err(Error::from)?;
 
-        let target_metadata = self.disk.metadata(&target).map_err(Error::from)?;
+        let (target_metadata, target_identity) = identified_path(&self.disk, &target)?;
         let target_kind = kind_from_metadata(&target_metadata)?;
-        let target_identity = identity_from_metadata(&target_metadata)?;
+
         let target_attributes = attributes_from_metadata(target_metadata)?;
-        let refreshed_source = self.disk.metadata(&source).map_err(Error::from)?;
-        let refreshed_source_identity = identity_from_metadata(&refreshed_source)?;
+        let (refreshed_source, refreshed_source_identity) = identified_path(&self.disk, &source)?;
         let refreshed_source_kind = kind_from_metadata(&refreshed_source)?;
         let refreshed_source_attributes = attributes_from_metadata(refreshed_source)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
@@ -5992,11 +5973,7 @@ impl LocalOwnerFs {
             }
             Err(error) => return Err(error),
         };
-        let metadata = self
-            .disk
-            .metadata(root_use.data_dir())
-            .map_err(Error::from)?;
-        let identity = identity_from_metadata(&metadata)?;
+        let (metadata, identity) = identified_path(&self.disk, root_use.data_dir())?;
         let attributes = attributes_from_metadata(metadata)?;
         self.publish_local_root_entry(
             name,
@@ -6268,9 +6245,9 @@ impl LocalOwnerFs {
             .data_dir()
             .join_path(&relative)
             .map_err(Error::from)?;
-        let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
+        let (metadata, identity) = identified_path(&self.disk, &physical)?;
         let kind = kind_from_metadata(&metadata)?;
-        let identity = identity_from_metadata(&metadata)?;
+
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let inode = match mode {
@@ -7927,23 +7904,112 @@ fn attributes_from_metadata(metadata: fs::Metadata) -> Result<FileAttributes> {
     })
 }
 
-fn identity_from_attributes(attributes: &FileAttributes) -> files::FileIdentity {
-    DecodedIdentity {
-        dev: 0,
-        ino: 0,
-        kind: attributes.kind,
-        birth_sec: 0,
-        birth_nsec: 0,
+fn identified_path(
+    disk: &LocalFs,
+    path: &StoragePath,
+) -> Result<(fs::Metadata, files::FileIdentity)> {
+    let metadata = disk.metadata(path).map_err(Error::from)?;
+    match metadata.created() {
+        Ok(birth) => {
+            let identity = identity_from_birth_time(&metadata, birth)?;
+            Ok((metadata, identity))
+        }
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            // Resolve again with O_PATH. Discard the path stat so a concurrent
+            // rename cannot pair one inode's metadata with another's handle.
+            let file = disk.open_entry(path).map_err(Error::from)?;
+            let metadata = file.metadata().map_err(Error::from)?;
+            let identity = identity_from_fd(file.as_fd(), &metadata)?;
+            Ok((metadata, identity))
+        }
+        Err(error) => Err(Error::from(error)),
     }
-    .into_identity()
 }
 
-fn identity_from_metadata(metadata: &fs::Metadata) -> Result<files::FileIdentity> {
-    // dev+ino alone is insufficient: Linux may reuse the same inode immediately
-    // after unlink, while B still has a positive dentry cached. Birth time is
-    // stable across writes and renames, unlike ctime, and distinguishes the
-    // replacement without making ordinary writes invalidate open handles.
-    let birth = metadata.created().map_err(Error::from)?;
+fn identity_from_fd(fd: BorrowedFd<'_>, metadata: &fs::Metadata) -> Result<files::FileIdentity> {
+    identity_with_birth_time(fd, metadata, metadata.created())
+}
+
+fn identity_with_birth_time(
+    fd: BorrowedFd<'_>,
+    metadata: &fs::Metadata,
+    birth: io::Result<std::time::SystemTime>,
+) -> Result<files::FileIdentity> {
+    match birth {
+        Ok(birth) => identity_from_birth_time(metadata, birth),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            identity_from_kernel_handle(fd, metadata)
+        }
+        Err(error) => Err(Error::from(error)),
+    }
+}
+
+fn identity_from_kernel_handle(
+    fd: BorrowedFd<'_>,
+    metadata: &fs::Metadata,
+) -> Result<files::FileIdentity> {
+    const HANDLE_CAPACITY: usize = libc::MAX_HANDLE_SZ as usize;
+    #[repr(C)]
+    struct HandleBuffer {
+        header: libc::file_handle,
+        bytes: [u8; HANDLE_CAPACITY],
+    }
+    let mut handle = HandleBuffer {
+        header: libc::file_handle {
+            handle_bytes: libc::MAX_HANDLE_SZ as libc::c_uint,
+            handle_type: 0,
+            f_handle: [],
+        },
+        bytes: [0; HANDLE_CAPACITY],
+    };
+    let mut mount_id = 0;
+    // SAFETY: fd is borrowed from a live descriptor. The NUL-terminated empty
+    // path and AT_EMPTY_PATH refer to that descriptor itself. The C-layout
+    // buffer contains the file_handle header followed by handle_bytes writable
+    // bytes, and mount_id is writable for the duration of the call.
+    let result = unsafe {
+        libc::name_to_handle_at(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            std::ptr::from_mut(&mut handle).cast::<libc::file_handle>(),
+            &mut mount_id,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        return Err(Error::coded(
+            afs_error::IO_NOT_SUPPORTED,
+            format!(
+                "file birth time is unavailable and the kernel file handle query failed: {error}"
+            ),
+        ));
+    }
+    let len = usize::try_from(handle.header.handle_bytes)
+        .ok()
+        .filter(|&len| len > 0 && len <= handle.bytes.len())
+        .ok_or_else(|| Error::coded(afs_error::IO_OTHER, "invalid kernel file handle length"))?;
+    // Linux file handles are opaque and scoped to their filesystem. Include
+    // the mount and filesystem IDs and keep the encoding disjoint from the
+    // 29-byte birth-time format. OwnerFs additionally scopes it to the Home
+    // root and rejects operations from retired grants and peer sessions.
+    let mut bytes = Vec::with_capacity(30 + len);
+    bytes.push(1);
+    bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+    bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    bytes.push(file_kind_code(kind_from_metadata(metadata)?));
+    bytes.extend_from_slice(&mount_id.to_le_bytes());
+    bytes.extend_from_slice(&handle.header.handle_type.to_le_bytes());
+    bytes.extend_from_slice(&handle.header.handle_bytes.to_le_bytes());
+    bytes.extend_from_slice(&handle.bytes[..len]);
+    Ok(files::FileIdentity(bytes))
+}
+
+fn identity_from_birth_time(
+    metadata: &fs::Metadata,
+    birth: std::time::SystemTime,
+) -> Result<files::FileIdentity> {
+    // Birth time is stable across updates and distinguishes reused inodes.
     let since_epoch = birth.duration_since(UNIX_EPOCH).map_err(|_| {
         Error::coded(
             afs_error::NODE_VFS_INVALID,
@@ -7975,12 +8041,7 @@ impl DecodedIdentity {
         bytes.extend_from_slice(&self.ino.to_le_bytes());
         bytes.extend_from_slice(&self.birth_sec.to_le_bytes());
         bytes.extend_from_slice(&self.birth_nsec.to_le_bytes());
-        bytes.push(match self.kind {
-            FileKind::Regular => 1,
-            FileKind::Directory => 2,
-            FileKind::Symlink => 3,
-            FileKind::Special(kind) => special_kind_code(kind),
-        });
+        bytes.push(file_kind_code(self.kind));
         files::FileIdentity(bytes)
     }
 }
@@ -8010,6 +8071,15 @@ fn kind_from_metadata(metadata: &fs::Metadata) -> Result<FileKind> {
             afs_error::NODE_VFS_INVALID,
             "unknown local file kind",
         ))
+    }
+}
+
+fn file_kind_code(kind: FileKind) -> u8 {
+    match kind {
+        FileKind::Regular => 1,
+        FileKind::Directory => 2,
+        FileKind::Symlink => 3,
+        FileKind::Special(kind) => special_kind_code(kind),
     }
 }
 
@@ -8538,6 +8608,70 @@ mod tests {
     use crate::node::vfs::ownerfs::root::{
         PreparedRoot, RootGrant, RootLookupState, RootMeta, RootReservation,
     };
+
+    #[test]
+    fn tmpfs_identity_survives_mutation_and_rejects_a_replacement() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let disk = LocalFs::open(temp.path()).unwrap();
+        let original = StoragePath::new("original").unwrap();
+        let renamed = StoragePath::new("renamed").unwrap();
+        let alias = StoragePath::new("alias").unwrap();
+        let original_path = temp.path().join("original");
+        let mut writer = fs::File::create(&original_path).unwrap();
+        let identity = |file: &fs::File| {
+            let metadata = file.metadata().unwrap();
+            identity_with_birth_time(
+                file.as_fd(),
+                &metadata,
+                Err(io::Error::from(io::ErrorKind::Unsupported)),
+            )
+            .unwrap()
+        };
+        let first = identity(&disk.open_entry(&original).unwrap());
+        writer.write_all(b"append").unwrap();
+        fs::rename(&original_path, temp.path().join("renamed")).unwrap();
+        fs::hard_link(temp.path().join("renamed"), temp.path().join("alias")).unwrap();
+        assert_eq!(first, identity(&disk.open_entry(&renamed).unwrap()));
+        assert_eq!(first, identity(&disk.open_entry(&alias).unwrap()));
+
+        fs::remove_file(temp.path().join("renamed")).unwrap();
+        fs::remove_file(temp.path().join("alias")).unwrap();
+        fs::write(&original_path, b"replacement").unwrap();
+        let replacement = identity(&disk.open_entry(&original).unwrap());
+        assert_eq!(first, identity(&writer));
+        assert_eq!(
+            check_expected_identity(Some(&first), &replacement)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+    }
+
+    #[test]
+    fn tmpfs_entry_open_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let disk = LocalFs::open(temp.path()).unwrap();
+        fs::write(temp.path().join("target"), b"bytes").unwrap();
+        std::os::unix::fs::symlink("target", temp.path().join("link")).unwrap();
+        let path = StoragePath::new("link").unwrap();
+        let link = disk.open_entry(&path).unwrap();
+        let metadata = link.metadata().unwrap();
+        assert!(metadata.file_type().is_symlink());
+        let missing_birth = || Err(io::Error::from(io::ErrorKind::Unsupported));
+        let link_identity =
+            identity_with_birth_time(link.as_fd(), &metadata, missing_birth()).unwrap();
+        let target = fs::File::open(temp.path().join("target")).unwrap();
+        let target_identity =
+            identity_with_birth_time(target.as_fd(), &target.metadata().unwrap(), missing_birth())
+                .unwrap();
+        assert_ne!(link_identity, target_identity);
+        assert!(
+            disk.open_entry(&StoragePath::new("link/target").unwrap())
+                .is_err()
+        );
+    }
 
     struct NoopLockedLocalRootCatalog;
 
@@ -9874,7 +10008,13 @@ mod tests {
     }
 
     fn fixture_with_rights(rights: Vec<RootRight>) -> (tempfile::TempDir, OwnerFs, RequestContext) {
-        let temp = tempfile::tempdir().unwrap();
+        fixture_on_disk(tempfile::tempdir().unwrap(), rights)
+    }
+
+    fn fixture_on_disk(
+        temp: tempfile::TempDir,
+        rights: Vec<RootRight>,
+    ) -> (tempfile::TempDir, OwnerFs, RequestContext) {
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
         let meta = Arc::new(LocalMeta {
             node_id: "node-a".into(),
@@ -14721,7 +14861,7 @@ mod tests {
                 .disk
                 .open_file(&path, OpenSpec::new(libc::O_RDWR | libc::O_CREAT, 0o644))
                 .unwrap();
-            let identity = identity_from_metadata(&file.metadata().unwrap()).unwrap();
+            let identity = identity_from_fd(file.as_fd(), &file.metadata().unwrap()).unwrap();
             local.state.lock().unwrap().insert_file_handle(
                 files::LocalOpenFile {
                     #[cfg(test)]
@@ -14785,7 +14925,7 @@ mod tests {
                 .disk
                 .open_file(&path, OpenSpec::new(libc::O_RDWR | libc::O_CREAT, 0o644))
                 .unwrap();
-            let identity = identity_from_metadata(&file.metadata().unwrap()).unwrap();
+            let identity = identity_from_fd(file.as_fd(), &file.metadata().unwrap()).unwrap();
             local.state.lock().unwrap().insert_file_handle(
                 files::LocalOpenFile {
                     #[cfg(test)]
@@ -14810,7 +14950,7 @@ mod tests {
                 .disk
                 .open_file(&path, OpenSpec::new(libc::O_RDWR | libc::O_CREAT, 0o644))
                 .unwrap();
-            let identity = identity_from_metadata(&file.metadata().unwrap()).unwrap();
+            let identity = identity_from_fd(file.as_fd(), &file.metadata().unwrap()).unwrap();
             local.state.lock().unwrap().insert_file_handle(
                 files::LocalOpenFile {
                     #[cfg(test)]
@@ -16230,7 +16370,7 @@ mod tests {
             .disk
             .open_file(&path, OpenSpec::new(libc::O_RDONLY, 0))
             .unwrap();
-        let identity = identity_from_metadata(&os_file.metadata().unwrap()).unwrap();
+        let identity = identity_from_fd(os_file.as_fd(), &os_file.metadata().unwrap()).unwrap();
         let fence = pf1_fence(&fs, &binding);
         assert!(
             fs.private_pf1_observe_between(&fence, || {
