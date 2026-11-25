@@ -251,6 +251,7 @@ pub struct DigitalMateGatewayApi {
     webhook: Option<Arc<super::ingestion::WebhookHttp>>,
     #[cfg(unix)]
     runtime: unix::Runtime,
+    observation: Option<Arc<super::observation::Observation>>,
 }
 
 impl DigitalMateGatewayApi {
@@ -463,6 +464,7 @@ impl DigitalMateGatewayApi {
             )
             .await;
         }
+        let auth_started = tokio::time::Instant::now();
         let token = match accounts::bearer(request.headers()) {
             Ok(v) => v,
             Err(e) => return auth_error(e),
@@ -544,6 +546,10 @@ impl DigitalMateGatewayApi {
         if request.uri().path() == "/file-api/upload" {
             return self.upload(request, ingress, scope, principal).await;
         }
+        // H1 计时：t0 = 请求进入认证流程的时刻。锚点在选路完成后构造，模板标签
+        // 取最终选中的版本（配置里的 version 可能是别名，无法区分实际版本）。
+        // 认证失败不构造（未认证请求不计业务量）；session/quota/download/upload
+        // 在此前已返回。
         // Client user_id is only an ignored hint. The authenticated session owns
         // both binding selection and the user identity sent to AgentServer.
         if request.uri().query().is_some_and(|query| {
@@ -608,6 +614,23 @@ impl DigitalMateGatewayApi {
         if let Err(e) = self.auth.check(&principal).await {
             return auth_error(e);
         }
+        // 体验锚点：以建连后的最终选择为准——重选可能换模板版本或启动方式。
+        // 首用时延不在这里结算，由 driver 收到后端 connection.ack 后记录。
+        let template_release = format!(
+            "{}@{}",
+            self.config.jiuwen.template,
+            connection.template_version()
+        );
+        let anchor = self.observation.as_ref().map(|observation| {
+            observation
+                .anchor(
+                    &template_release,
+                    auth_started,
+                    &self.config.tenant,
+                    &principal.user_id,
+                )
+                .with_start_mode(connection.start_mode())
+        });
         let auth = self.auth.clone();
         let upgrade = hyper::upgrade::on(&mut request);
         let config = self.config.clone();
@@ -630,7 +653,7 @@ impl DigitalMateGatewayApi {
             let _ = frontend::run_authenticated(
                 socket,
                 front,
-                |requests, output| connection.run(user_id, driver, requests, output),
+                |requests, output| connection.run(user_id, driver, requests, output, anchor),
                 guard,
             )
             .await;
@@ -695,6 +718,7 @@ impl DigitalMateGatewayApi {
             Err(e) => return agent_error(e),
         };
         let template = view.template;
+        let template_release = format!("{}@{}", template.name, template.version);
         let workspace = match absolute_directory(
             template
                 .env
@@ -711,6 +735,7 @@ impl DigitalMateGatewayApi {
             None => return agent_error(Error::NotFound),
         };
         let user_id = principal.user_id.clone();
+        let tenant = scope.tenant.clone();
         let guard = accounts::SessionGuard {
             auth: self.auth.clone(),
             principal,
@@ -718,16 +743,23 @@ impl DigitalMateGatewayApi {
         let upload = Upload {
             ingress,
             context,
-            tenant: scope.tenant,
+            tenant: tenant.clone(),
             environment_id: target.current.environment_id,
             workspace,
-            user_id,
+            user_id: user_id.clone(),
             agent_type: self.config.jiuwen.agent_type.clone(),
         };
-        tokio::select! {
+        let (response, upload_ok) = tokio::select! {
             response = upload.respond(request.into_body(), &content_type) => response,
-            _ = guard.watch() => error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"),
+            _ = guard.watch() => (error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"), false),
+        };
+        // 只上传、从不发 chat 的用户也应计入活跃；失败不记。
+        if upload_ok {
+            if let Some(observation) = &self.observation {
+                observation.record_activity(&template_release, &tenant, &user_id);
+            }
         }
+        response
     }
     async fn download(
         &self,
@@ -1043,8 +1075,15 @@ impl DigitalMateGatewayApi {
             #[cfg(test)]
             composio: None,
             webhook: None,
+            observation: None,
         })
     }
+    /// 注入适配器自有的业务观测；未配置 PG 时内部只有直埋指标。
+    pub fn with_observation(mut self, observation: Arc<super::observation::Observation>) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+
     pub async fn build(
         config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,

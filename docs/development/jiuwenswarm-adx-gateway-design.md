@@ -286,9 +286,9 @@ Activator 对参数做通用模板渲染，再调用已有 Environment 能力。
 
 ### 部署
 
-配置示例：[Jiuwen](../../gateway/examples/jiuwen.json)、[账号](../../gateway/examples/accounts.json)。
+配置示例：[Jiuwen](../../gateway/examples/jiuwen.json)、[账号](../../gateway/examples/accounts.json)、[业务观测](../../gateway/examples/observability.json)。
 
-部署前由数据库 schema 所有者执行 [schema.sql](../../gateway/src/ingress/accounts/schema.sql)。Ingress 数据库角色仅需 schema USAGE、表 SELECT/INSERT/UPDATE，不需创建 schema 权限。PostgreSQL 可与 LiteLLM 共用实例，使用独立 schema 和角色；ADX 不读写 LiteLLM 内部表。
+部署前由数据库 schema 所有者执行 [schema.sql](../../gateway/src/ingress/accounts/schema.sql) 与 [observability/schema.sql](../../gateway/src/ingress/digitalmategateway/observability/schema.sql)。Ingress 数据库角色仅需 schema USAGE、表 SELECT/INSERT/UPDATE，不需创建 schema 权限。观测表 `adx_ops_observations.active_minute` 的运行时角色只需 SELECT/INSERT/DELETE；Grafana 通过只读视图 `active_minute_safe` 读取活跃用户/会话/DAU。PostgreSQL 可与 LiteLLM 共用实例，使用独立 schema 和角色；ADX 不读写 LiteLLM 内部表。
 
 Ingress 环境配置：
 
@@ -297,15 +297,22 @@ ADX_JIUWEN_CONFIG=/etc/adx/jiuwen.json
 ADX_ACCOUNT_CONFIG=/etc/adx/accounts.json
 ADX_AGENT_CONFIG=/etc/adx/agent.json
 ADX_ENVIRONMENT_FILES_CONFIG=/etc/adx/environment-files.json
+ADX_OBSERVABILITY_CONFIG=/etc/adx/observability.json
 HUAWEI_OAUTH_CLIENT_ID=<应用 Client ID>
 HUAWEI_OAUTH_CLIENT_SECRET=<应用 Client Secret>
 ADX_AGC_API_CLIENT_SECRET=<AGC 中国区项目 API client secret>
 ADX_ACCOUNT_DATABASE_URL=<PostgreSQL URL>
+ADX_OBSERVATION_DATABASE_URL=<观测 PostgreSQL URL>
+ADX_OBSERVATION_HMAC_KEY=<长期稳定的 HMAC 密钥>
 ADX_LITELLM_ADMIN_KEY=<LiteLLM 管理凭据>
 ADX_CREDENTIAL_KEY_FILE=/run/secrets/adx-account-credential-key
 ```
 
 ADX_CREDENTIAL_KEY_FILE 仅供内置账号模块保护 PostgreSQL 中的用户模型凭据，所有账号模块副本使用相同的 32 字节密钥（64 位十六进制文本）。独立 Activator 不读取该文件；Binding.parameters 不加密，不再有独立私有启动快照。
+
+`ADX_OBSERVABILITY_CONFIG` 不配置时只导出进程内直埋族（首用时延、首输出、任务结果、在途、基数溢出）；配置后额外启用活跃去重落库。缺少 URL/HMAC 密钥、schema 表缺失/无权限或 schema 版本不匹配时拒绝启动；数据库连接暂时不可用先退避重试，仍失败才软降级（活跃族缺数，其余直埋照常）并告警，恢复需要重启进程。`ADX_OBSERVATION_HMAC_KEY` 必须长期稳定——轮换等于更换一批用户引用，历史活跃无法对齐；租户、用户、会话在表中都只落 HMAC 引用。活跃数据按 `retention_days` 由进程自行清理；生产按活跃用户规模评估 PostgreSQL 容量（每个去重元组一行：分钟、租户、用户、会话、模板版本；单用户每会话维度上限 `max_sessions_per_user_minute`）。
+
+`start_mode`（cold / resumed / binding_reuse / unknown）由 Activator 在激活时判定并随 `ResolvedTarget.activation` 回传：新建/重建绑定或环境为 `cold`；既有绑定且前态为 Pausing/Paused/Resuming 为 `resumed`；命中绑定缓存、或既有执行已 Running 且 ready 为 `binding_reuse`；无法判定为 `unknown`。Ingress 只透传，不二次猜测。滚动升级必须先升 Ingress 再升 Activator：`ResolvedTarget` 带 `#[serde(deny_unknown_fields)]`，旧 Ingress 会把新 Activator 返回的 `activation` 字段当作未知字段拒绝；新 Ingress 对旧 Activator 的响应按 `activation` 的默认值 `unknown` 处理，不影响其余体验指标。
 
 PostgreSQL 默认强制 TLS 并验证证书，database_ca_file 可增加内部 CA；database_allow_plaintext 仅用于明确受信的隔离网络。LiteLLM 默认要求 HTTPS，allow_plaintext 仅用于同类内部网络。华为 Account Kit 与 AGC 中国区目标地址固定，不接受请求覆盖。配置 AGC 后缺少 API client secret、其他生产凭据缺失或数据库 schema 不匹配时启动失败，不回退到本地身份。
 

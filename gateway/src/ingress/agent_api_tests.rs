@@ -1739,6 +1739,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         },
         requests,
         output,
+        None,
     ));
     backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
     assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
@@ -1760,6 +1761,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         },
         second_requests,
         second_output,
+        None,
     ));
     second_backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
     assert_eq!(
@@ -1935,6 +1937,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
                     },
                     requests,
                     output,
+                    None,
                 ));
                 backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
                 assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
@@ -2231,6 +2234,86 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
         }
     }
 }
+/// 重选跨模板版本：别名从 v1 切到 v2 后，selection 的 template_version 必须更新。
+#[tokio::test]
+async fn websocket_retry_uses_the_final_template_version_after_alias_switch() {
+    use crate::ingress::agent_service::{AgentV2Access, ServiceSelector};
+    use adx_agent_api::{local::LocalControl, managed::ManagedService, request::RequestContext};
+    use adx_agent_core::activator::AliasUpdate;
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    use adx_agent_core::{Protocol, Scope, TemplateDraft, TemplateRef};
+    use std::time::Duration;
+
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let backend = Arc::new(Backend::default());
+    let activator = Arc::new(adx_activator::Activator::new(
+        state.clone(),
+        backend.clone(),
+    ));
+    let draft = |image: &str| {
+        serde_json::from_value::<adx_agent_core::TemplateVersion>(serde_json::json!({
+            "name":"versions", "version":"1", "image":image, "isolation_runtime":"runc",
+            "resources":{"cpu_millis":250,"memory_mib":256},
+            "service":[{"protocol":"ws","port":8080}],
+            "env":{"WORKSPACE":"${workspace}"}
+        }))
+        .unwrap()
+    };
+    let first = activator
+        .publish("tenant", &TemplateDraft::from(&draft("app:1")))
+        .await
+        .unwrap();
+    let second = activator
+        .publish("tenant", &TemplateDraft::from(&draft("app:2")))
+        .await
+        .unwrap();
+    assert_eq!(first.version, "1");
+    assert_eq!(second.version, "2");
+    let alias = |version: &str| AliasUpdate {
+        config: AliasConfig {
+            tenant: "tenant".into(),
+            template: "versions".into(),
+            alias: "live".into(),
+            seed: "stable".into(),
+            versions: vec![VersionWeight {
+                version: version.into(),
+                weight: 1,
+            }],
+        },
+        expected_revision: None,
+    };
+    let created = activator.update_alias(&alias("1")).await.unwrap();
+    let scope = Scope {
+        tenant: "tenant".into(),
+        template: "versions".into(),
+        template_ref: TemplateRef::Alias("live".into()),
+        binding_id: "alice".into(),
+    };
+    let access = AgentV2Access::new(Arc::new(ManagedService::new(Arc::new(LocalControl::new(
+        activator.clone(),
+    )))));
+    let selector = ServiceSelector {
+        protocol: Protocol::Ws,
+        port: None,
+    };
+    let mut selected = access
+        .select_with_parameters(
+            Arc::new(RequestContext::new(Duration::from_secs(2))),
+            scope.clone(),
+            selector,
+            Some(b"workspace=v1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.template_version(), "1");
+    activator.delete_binding(&scope).await.unwrap();
+    let mut update = alias("2");
+    update.expected_revision = Some(created.revision);
+    activator.update_alias(&update).await.unwrap();
+    assert!(access.retry(&mut selected).await.unwrap());
+    assert_eq!(selected.template_version(), "2");
+}
+
 #[cfg(feature = "mock-e2e")]
 #[path = "command_watch_auth_tests.rs"]
 mod command_watch_auth_tests;

@@ -186,6 +186,73 @@ async fn activation_uses_only_the_image_saved_at_publication() {
 }
 
 #[tokio::test]
+async fn start_mode_distinguishes_cold_warm_cache_and_resume() {
+    use adx_agent_core::activator::{ActivationKind, ResolveRequest};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    activator
+        .publish("tenant", &TemplateDraft::from(&template()))
+        .await
+        .unwrap();
+    let scope = scope("mode");
+    let deadline = adx_agent_core::unix_time_millis() + 60_000;
+    let selector = adx_agent_core::activator::ServiceSelector {
+        protocol: Protocol::Http,
+        port: None,
+    };
+    let request = |bypass_cache: bool, generation: Option<String>| ResolveRequest {
+        activation: adx_agent_core::activator::ActivationRequest {
+            scope: scope.clone(),
+            expected_generation: generation,
+            bypass_cache,
+            parameters: None,
+            reuse_subject_binding: false,
+        },
+        service: selector,
+    };
+
+    assert_eq!(
+        activator
+            .resolve(&request(false, None), deadline)
+            .await
+            .unwrap()
+            .activation,
+        ActivationKind::Cold
+    );
+    assert_eq!(
+        activator
+            .resolve(&request(false, None), deadline)
+            .await
+            .unwrap()
+            .activation,
+        ActivationKind::BindingReuse
+    );
+    let binding = activator.binding(&scope).await.unwrap();
+    // 缓存未命中但执行仍然运行：仍是 warm reuse。
+    assert_eq!(
+        activator
+            .resolve(&request(true, Some(binding.generation.clone())), deadline)
+            .await
+            .unwrap()
+            .activation,
+        ActivationKind::BindingReuse
+    );
+    platform
+        .pause("tenant", &binding.current.environment_id, 30)
+        .await
+        .unwrap();
+    assert_eq!(
+        activator
+            .resolve(&request(true, Some(binding.generation)), deadline)
+            .await
+            .unwrap()
+            .activation,
+        ActivationKind::Resumed
+    );
+}
+
+#[tokio::test]
 async fn publication_validates_metadata_before_execution() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Platform::default());

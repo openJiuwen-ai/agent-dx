@@ -131,7 +131,7 @@ async fn alias_service_validation_uses_current_version_and_prewrite_retry_uses_n
         .reconcile_binding(&scope, context.deadline_unix_ms())
         .await
         .unwrap();
-    let (new, port) = managed
+    let (new, port, _start_mode) = managed
         .retry_resolve(
             &context,
             &scope,

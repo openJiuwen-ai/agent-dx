@@ -30,6 +30,10 @@ pub struct ServiceSelection {
     requested_port: Option<u16>,
     environment_id: String,
     generation: String,
+    /// 最终选中的模板版本（激活后落定的 `binding.current.version`）。
+    template_version: String,
+    /// 启动模式判定（Activator 回传；M2-4）。
+    start_mode: adx_agent_core::activator::ActivationKind,
     retried: bool,
     parameters: Option<Vec<u8>>,
     product_selected: bool,
@@ -54,6 +58,16 @@ impl ServiceSelection {
             return Err(Error::Invalid("selected service is not WebSocket".into()));
         }
         Ok(self.port)
+    }
+
+    /// 启动模式判定（Activator 回传；M2-4 体验族标签）。
+    pub(crate) fn start_mode(&self) -> adx_agent_core::activator::ActivationKind {
+        self.start_mode
+    }
+
+    /// 最终选中的模板版本，供体验族 `template_release` 标签使用。
+    pub(crate) fn template_version(&self) -> &str {
+        &self.template_version
     }
 
     pub(crate) fn forwarding_uri(&self, backend_uri: &http::Uri) -> Result<http::Uri, Error> {
@@ -97,7 +111,7 @@ impl AgentV2Access {
         selector: ServiceSelector,
         parameters: Option<&[u8]>,
     ) -> Result<ServiceSelection, Error> {
-        let (target, port) = context
+        let (target, port, start_mode) = context
             .run(self.managed.resolve_with_parameters(
                 &context,
                 &scope,
@@ -115,6 +129,8 @@ impl AgentV2Access {
             requested_port: selector.port,
             environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
+            template_version: target.binding.current.version,
+            start_mode,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
             product_selected: false,
@@ -164,7 +180,7 @@ impl AgentV2Access {
             Err(error) => return Err(InitializationError::Agent(error)),
         };
         if reuse_subject_binding {
-            let (target, port) = context
+            let (target, port, start_mode) = context
                 .run(self.managed.resolve_product(
                     &context,
                     &scope,
@@ -184,6 +200,8 @@ impl AgentV2Access {
                 requested_port: selector.port,
                 environment_id: target.binding.current.environment_id,
                 generation: target.binding.generation,
+                template_version: target.binding.current.version,
+                start_mode,
                 retried: false,
                 parameters,
                 product_selected: true,
@@ -212,7 +230,7 @@ impl AgentV2Access {
                 &selection.generation,
             ))
             .await;
-        let (target, port) = match resolved {
+        let (target, port, start_mode) = match resolved {
             Err(error @ Error::Conflict(_))
                 if selection.protocol == Protocol::Ws && !selection.product_selected =>
             {
@@ -248,8 +266,12 @@ impl AgentV2Access {
             }
             result => result?,
         };
+        // 重选可能换了 Environment，也可能换了激活方式；两者都要更新，
+        // 否则体验归因会把 start_mode 记成旧选择。
+        selection.start_mode = start_mode;
         selection.environment_id = target.binding.current.environment_id;
         selection.generation = target.binding.generation;
+        selection.template_version = target.binding.current.version;
         selection.port = port;
         Ok(true)
     }
@@ -263,7 +285,7 @@ impl AgentV2Access {
         &self,
         ingress: &Ingress,
         selection: ServiceSelection,
-    ) -> Result<IngressStream, ServiceAccessError> {
+    ) -> Result<(IngressStream, ServiceSelection), ServiceAccessError> {
         self.connect_service_inner(ingress, selection, false).await
     }
 
@@ -274,7 +296,7 @@ impl AgentV2Access {
         &self,
         ingress: &Ingress,
         selection: ServiceSelection,
-    ) -> Result<IngressStream, ServiceAccessError> {
+    ) -> Result<(IngressStream, ServiceSelection), ServiceAccessError> {
         self.connect_service_inner(ingress, selection, true).await
     }
 
@@ -283,42 +305,62 @@ impl AgentV2Access {
         ingress: &Ingress,
         mut selection: ServiceSelection,
         wait_for_listener: bool,
-    ) -> Result<IngressStream, ServiceAccessError> {
+    ) -> Result<(IngressStream, ServiceSelection), ServiceAccessError> {
         loop {
-            let result = selection
+            let (opened, needs_resume) = selection
                 .context
                 .run(async {
-                    let attempt = async {
-                        let route = ingress
-                            .resolve_route(
-                                &selection.environment_id,
-                                selection.port,
-                                AccessKind::Direct,
-                                String::new(),
-                            )
-                            .await?;
-                        loop {
-                            let opened = ingress
-                                .open_resolved_stream(route.clone(), &selection.scope.tenant)
-                                .await;
-                            if wait_for_listener
-                                && matches!(&opened, Err(IngressOpenError::Connect(error))
-                                    if error.kind() == std::io::ErrorKind::ConnectionRefused)
-                            {
-                                // No route refresh or activation for a port that is merely
-                                // starting. The surrounding context also bounds this sleep.
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                continue;
-                            }
-                            return opened;
+                    let route = match ingress
+                        .resolve_route(
+                            &selection.environment_id,
+                            selection.port,
+                            AccessKind::Direct,
+                            String::new(),
+                        )
+                        .await
+                    {
+                        Ok(route) => route,
+                        Err(error) => return Ok((Err(error), false)),
+                    };
+                    // The Activator's warm cache hit cannot know that the
+                    // execution went dormant. The route is the authoritative
+                    // wake signal; keep it for the final start-mode backfill.
+                    let needs_resume = route.needs_resume;
+                    let opened = loop {
+                        let opened = ingress
+                            .open_resolved_stream(route.clone(), &selection.scope.tenant)
+                            .await;
+                        if wait_for_listener
+                            && matches!(&opened, Err(IngressOpenError::Connect(error))
+                                if error.kind() == std::io::ErrorKind::ConnectionRefused)
+                        {
+                            // No route refresh or activation for a port that is merely
+                            // starting. The surrounding context also bounds this sleep.
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            continue;
                         }
-                    }
-                    .await;
-                    Ok(attempt)
+                        break opened;
+                    };
+                    Ok((opened, needs_resume))
                 })
                 .await?;
-            match result {
-                Ok(stream) => return Ok(stream),
+            match opened {
+                // 重选可能改变 environment/generation/start_mode；
+                // 调用方必须拿到**最终**选择，体验不能归因到旧环境。
+                Ok(stream) => {
+                    if needs_resume
+                        && matches!(
+                            selection.start_mode,
+                            adx_agent_core::activator::ActivationKind::BindingReuse
+                                | adx_agent_core::activator::ActivationKind::Unknown
+                        )
+                    {
+                        // The data path woke a dormant execution after a warm
+                        // Activator cache hit; report the actual start mode.
+                        selection.start_mode = adx_agent_core::activator::ActivationKind::Resumed;
+                    }
+                    return Ok((stream, selection));
+                }
                 Err(error) => {
                     let retryable = !matches!(
                         error,
