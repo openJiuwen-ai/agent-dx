@@ -174,6 +174,16 @@ struct NodeTransfer {
 }
 
 impl ChunkTransfer for NodeTransfer {
+    /// CRC-segment Chunks (what holders are offered for) read like any range.
+    fn read_crc32c_range(
+        &self,
+        batch: &PeerReadBatch,
+        _chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.read_ranges(batch, out)
+    }
+
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
         if let [first, _, ..] = batch.operations.as_slice()
             && let CopyLocation::Node { node_id, .. } = &first.source.location
@@ -1758,6 +1768,20 @@ fn h2_cpu_out_of_order_segments_zero_fill_only_the_gap() {
 
 /// H2 step 2b: a reader with sharing on, A (node-b) as the durable copy, and
 /// `holders` (node ids) offered by Meta for the version.
+/// A CRC-segment Chunk object of `length` bytes (its digest is never checked
+/// by these tests' transfers).
+fn crc_object(chunk: &ChunkId, length: u64) -> ChunkObject {
+    ChunkObject {
+        id: chunk.clone(),
+        length,
+        content_digest: crate::dfs::ContentDigest {
+            algorithm: crate::dfs::DigestAlgorithm::Crc32cSegmentsV1,
+            bytes: [1; 32],
+        },
+        encoding: crate::dfs::ChunkEncoding::Raw,
+    }
+}
+
 fn holder_fixture(
     fixture: &Fixture,
     holders: &[&str],
@@ -1769,10 +1793,11 @@ fn holder_fixture(
     if let Some(node) = published {
         candidates.push(candidate("cache", &chunk, node, CopyRole::VerifiedCache));
     }
-    let meta = Arc::new(MetaStub::new(sources_reply(vec![(
-        chunk.clone(),
-        candidates,
-    )])));
+    let mut reply = sources_reply(vec![(chunk.clone(), candidates)]);
+    // !318 P3-1: holders are offered only for Chunks Meta describes as
+    // CRC-segment objects, as its replies for native writes do.
+    reply.chunks[0].chunk = Some(crc_object(&chunk, 4));
+    let meta = Arc::new(MetaStub::new(reply));
     *meta.holders.lock().unwrap() = holders
         .iter()
         .map(|node| crate::dfs::VersionHolder {
@@ -1921,9 +1946,9 @@ fn h2_step2b_sharing_off_offers_no_holder() {
 }
 
 /// Code review follow-up: a holder serves the range form without a BLAKE3
-/// outboard, so a Chunk verified by its whole-body BLAKE3 (a known
-/// non-CRC object) gets no holder candidate; CRC-segment Chunks, and
-/// Chunks whose object the reply leaves out, do.
+/// outboard, so only a Chunk Meta describes as a CRC-segment object gets a
+/// holder candidate: not one verified by its whole-body BLAKE3, and (!318
+/// P3-1) not one whose object the reply leaves out.
 #[tokio::test]
 async fn h2_step2b_holders_are_offered_only_for_range_verifiable_chunks() {
     let fixture = Fixture::new();
@@ -1972,7 +1997,7 @@ async fn h2_step2b_holders_are_offered_only_for_range_verifiable_chunks() {
             .filter(|source| source.holder_grant.is_some())
             .count()
     };
-    assert_eq!((holders(0), holders(1), holders(2)), (1, 0, 1));
+    assert_eq!((holders(0), holders(1), holders(2)), (1, 0, 0));
 }
 
 /// P3 (re-review): a demoted holder is not a candidate. The writer answers
@@ -2090,7 +2115,7 @@ async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
         .iter()
         .map(|chunk| ChunkSources {
             chunk_id: chunk.clone(),
-            chunk: None,
+            chunk: Some(crc_object(chunk, 4)),
             allowed_ranges: Vec::new(),
             sources: vec![candidate("a", chunk, "node-b", CopyRole::DurableReplica)],
         })

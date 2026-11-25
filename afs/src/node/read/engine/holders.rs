@@ -243,15 +243,16 @@ impl DfsReadEngine {
         // could turn a busy writer into a failed read.
         let demoted = self.demoted_now();
         for set in &mut result {
-            // A holder read is a range read without a BLAKE3 outboard, so for
-            // a Chunk identified by its whole-body BLAKE3 the reader could not
-            // check the bytes against the identity; such Chunks keep to the
-            // copies read through the verified paths. Native writes produce
-            // CRC-segment Chunks only, whose ranges the reader verifies.
-            if set
+            // A holder read is a range read without a BLAKE3 outboard, so the
+            // reader checks its bytes only against a CRC-segment identity.
+            // Only a Chunk Meta describes as such gets a holder (!318 P3-1):
+            // not one identified by its whole-body BLAKE3, nor one whose
+            // object the reply leaves out. Native writes produce CRC-segment
+            // Chunks only, and Meta's replies describe them.
+            if !set
                 .chunk
                 .as_ref()
-                .is_some_and(|chunk| !chunk.is_segment_crc32c())
+                .is_some_and(ChunkObject::is_segment_crc32c)
             {
                 continue;
             }
