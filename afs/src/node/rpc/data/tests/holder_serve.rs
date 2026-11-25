@@ -1651,3 +1651,254 @@ async fn pair_read(
         writer_reads: writer_reads.reads(),
     }
 }
+
+// ---- !318 review fixes ----------------------------------------------------
+
+/// Reader-side Meta of the !318 tests: each Chunk's durable copy, and one
+/// holder whose lookup takes `holder_delay_ms`.
+struct ReviewMeta {
+    reply: crate::dfs::DfsChunkSourcesReply,
+    holder: crate::dfs::VersionHolder,
+    holder_delay_ms: u64,
+}
+
+impl crate::node::read::engine::ReadSourceProvider for ReviewMeta {
+    fn sources_for(
+        &self,
+        request: crate::dfs::DfsChunkSourcesRequest,
+    ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
+        let mut reply = self.reply.clone();
+        reply
+            .chunks
+            .retain(|set| request.chunk_ids.contains(&set.chunk_id));
+        Ok(reply)
+    }
+
+    fn version_holders_async(
+        &self,
+        _: crate::dfs::DfsVersionHoldersRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, Vec<crate::dfs::VersionHolder>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(self.holder_delay_ms)).await;
+            Ok(vec![self.holder.clone()])
+        })
+    }
+}
+
+fn review_chunk(seed: u8) -> StagedChunk {
+    let bytes: Vec<u8> = (0..(2 * 65536 + 5))
+        .map(|i: u32| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect();
+    StagedChunk::new_crc32c(crate::dfs::OperationId::new("review"), bytes).unwrap()
+}
+
+/// A holder endpoint that accepts connections and never answers.
+async fn silent_holder() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    (endpoint, server)
+}
+
+/// A reader ("reader", epoch 1) of `chunks` over the real gRPC transfer: each
+/// Chunk's durable copy at a writer that answers at once, and `holder` as
+/// the version's one holder.
+struct ReviewReader {
+    engine: Arc<crate::node::read::engine::DfsReadEngine>,
+    writer: Arc<CountingWriter>,
+    metrics: afs_metrics::Registry,
+    _servers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn review_reader(
+    temp: &std::path::Path,
+    chunks: &[StagedChunk],
+    holder: &str,
+    holder_delay_ms: u64,
+) -> ReviewReader {
+    use crate::node::read::engine::{DfsReadConfig, DfsReadEngine};
+    let writer_local = Arc::new(LocalChunkStore::open(temp.join("writer"), "writer").unwrap());
+    for staged in chunks {
+        writer_local.put(staged.clone()).unwrap();
+    }
+    let writer = Arc::new(CountingWriter::default());
+    let mut service = dfs_reuse_test_service(writer_local, writer.clone());
+    service.authenticator = Arc::new(FixedPeer("reader"));
+    let (writer_endpoint, writer_server) = serve(service).await;
+    let source = |staged: &StagedChunk| crate::dfs::SourceCandidate {
+        copy_id: crate::dfs::CopyId::new("writer-copy"),
+        chunk_id: staged.chunk.id.clone(),
+        role: crate::dfs::CopyRole::DurableReplica,
+        state: crate::dfs::CopyState::Ready,
+        location: crate::dfs::CopyLocation::Node {
+            node_id: "writer".into(),
+            node_epoch: 1,
+            device_id: "d".into(),
+            device_epoch: 1,
+            catalog_revision: 1,
+        },
+        data_endpoint: Some(writer_endpoint.clone()),
+        load_hint: 0,
+        read_grant: crate::dfs::DfsReadGrant {
+            namespace_id: NamespaceId::new("namespace"),
+            file_version_id: FileVersionId::new("v"),
+            layout_root_id: LayoutRootId::new("l"),
+            caller_node_id: "reader".into(),
+            caller_node_epoch: 1,
+            expires_at_unix_ms: 4_000_000_000_000,
+            fence: 1,
+            token: "per-copy".into(),
+        },
+        holder_grant: None,
+    };
+    let meta = Arc::new(ReviewMeta {
+        reply: crate::dfs::DfsChunkSourcesReply {
+            revision: 1,
+            chunks: chunks
+                .iter()
+                .map(|staged| crate::dfs::ChunkSources {
+                    chunk_id: staged.chunk.id.clone(),
+                    chunk: Some(staged.chunk.clone()),
+                    allowed_ranges: vec![(0, staged.chunk.length)],
+                    sources: vec![source(staged)],
+                })
+                .collect(),
+        },
+        holder: crate::dfs::VersionHolder {
+            node_id: "holder".into(),
+            node_epoch: 9,
+            data_endpoint: holder.into(),
+            grant: grant("v", "l"),
+        },
+        holder_delay_ms,
+    });
+    let metrics = afs_metrics::Registry::new();
+    let work = crate::node::metrics::work::ReadWorkMetrics::register(&metrics).unwrap();
+    let pool = Arc::new(
+        crate::node::rpc::peer::PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            2,
+        )
+        .unwrap(),
+    );
+    let transfer = Arc::new(
+        crate::node::rpc::peer::GrpcChunkTransfer::new(pool, std::time::Duration::from_secs(5))
+            .unwrap(),
+    );
+    let local = Arc::new(
+        LocalChunkStore::open(temp.join("reader"), "reader")
+            .unwrap()
+            .with_read_work_metrics(work),
+    );
+    let engine = Arc::new(
+        DfsReadEngine::new(
+            NamespaceId::new("namespace"),
+            "reader".into(),
+            local,
+            meta,
+            transfer,
+            DfsReadConfig::default(),
+        )
+        .with_read_authority(Arc::new(
+            crate::node::read::engine::LocalReadAuthority::new(
+                1,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ),
+        ))
+        .with_holder_lists(std::time::Duration::from_secs(60)),
+    );
+    ReviewReader {
+        engine,
+        writer,
+        metrics,
+        _servers: vec![writer_server],
+    }
+}
+
+/// Reads all of `staged` as the FUSE path does: within `budget` from now.
+async fn read_within(
+    reader: &ReviewReader,
+    staged: &StagedChunk,
+    budget: std::time::Duration,
+) -> afs_error::Result<Vec<u8>> {
+    let batch = crate::node::read::engine::ReadBatch {
+        file_version_id: Some(FileVersionId::new("v")),
+        layout_root_id: LayoutRootId::new("l"),
+        ops: vec![crate::node::read::engine::ChunkReadOp {
+            chunk_id: staged.chunk.id.clone(),
+            chunk_offset: 0,
+            length: staged.chunk.length,
+            output_offset: 0,
+        }],
+        lookahead: Vec::new(),
+    };
+    reader
+        .engine
+        .read_native_unified_async(
+            batch,
+            staged.chunk.length as usize,
+            std::time::Instant::now() + budget,
+            Arc::new(()),
+        )
+        .await
+        .map(|bytes| bytes.to_vec())
+}
+
+/// !318 P1 (reproduced by the reviewer): 100 ms are left and Meta takes
+/// 500 ms to list the version's holders. The holder lookup takes only a
+/// share of the time left: the durable copy is read, correctly, in time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_pr318_slow_holder_list_leaves_the_read_time_for_its_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let staged = review_chunk(1);
+    let (holder, _silent) = silent_holder().await;
+    let reader = review_reader(temp.path(), std::slice::from_ref(&staged), &holder, 500).await;
+    let budget = std::time::Duration::from_millis(100);
+    let started = std::time::Instant::now();
+    let read = read_within(&reader, &staged, budget).await;
+    let took = started.elapsed();
+    assert_eq!(read.expect("read from the durable copy"), staged.bytes());
+    assert_eq!(reader.writer.reads(), 1, "the durable copy got the request");
+    assert!(took < budget, "{took:?}");
+    let count = |name: &str, label: &str| histogram_count(&reader.metrics, name, label);
+    assert_eq!(
+        count("afs_dfs_read_route_seconds", "stage=\"holder_list\""),
+        1
+    );
+    assert_eq!(
+        count("afs_dfs_read_peer_attempt_seconds", "role=\"peer_holder\""),
+        0,
+        "no holder in time, none asked"
+    );
+}
+
+/// !318 P1 (code-derived): the holder list is at hand, the read runs one
+/// attempt at a time (parallelism 1) and the holder never answers. The
+/// holder attempt takes only a share of the time left: the durable copy,
+/// which answers at once, is read correctly within the read's deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_pr318_unresponsive_holder_leaves_the_read_time_for_its_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let staged = review_chunk(2);
+    let (holder, _silent) = silent_holder().await;
+    let reader = review_reader(temp.path(), std::slice::from_ref(&staged), &holder, 0).await;
+    let budget = std::time::Duration::from_millis(400);
+    let started = std::time::Instant::now();
+    let read = read_within(&reader, &staged, budget).await;
+    let took = started.elapsed();
+    assert_eq!(read.expect("read from the durable copy"), staged.bytes());
+    assert_eq!(reader.writer.reads(), 1, "the durable copy got the request");
+    assert!(took < budget, "{took:?}");
+    let count = |name: &str, label: &str| histogram_count(&reader.metrics, name, label);
+    assert_eq!(
+        count("afs_dfs_read_peer_attempt_seconds", "role=\"peer_holder\""),
+        1,
+        "the holder was asked first"
+    );
+}

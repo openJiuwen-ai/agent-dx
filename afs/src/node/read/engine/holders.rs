@@ -11,6 +11,9 @@ use super::*;
 /// The longest a read spends asking Meta for holders; a slower Meta only
 /// means no holders for this read.
 const HOLDER_LOOKUP_WAIT: Duration = Duration::from_millis(250);
+/// A holder lookup takes at most this share (1/n) of the read's time left,
+/// so the copies the read already has keep the rest (!318 P1).
+const HOLDER_LOOKUP_SHARE: u32 = 4;
 /// The wait a holder read asks for: `budget` (`dfs_holder_wait_ms`, default
 /// 30 ms, review/19) only when the holder ranks above this reader for the
 /// Chunk (rendezvous over the version, the Chunk and the Node, re-review P2)
@@ -208,8 +211,8 @@ impl DfsReadEngine {
             Cached::Current(holders) | Cached::Stale(Some(holders)) => holders,
             Cached::Stale(None) => return result,
             Cached::Lookup(_lookup) => {
-                let wait = deadline
-                    .saturating_duration_since(Instant::now())
+                let wait = (deadline.saturating_duration_since(Instant::now())
+                    / HOLDER_LOOKUP_SHARE)
                     .min(HOLDER_LOOKUP_WAIT);
                 let request = crate::dfs::DfsVersionHoldersRequest {
                     caller_id: self.local_node_id.clone(),

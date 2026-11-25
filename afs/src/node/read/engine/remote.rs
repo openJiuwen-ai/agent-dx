@@ -279,7 +279,13 @@ impl DfsReadEngine {
             _ => Vec::new(),
         };
         let attempted = Instant::now();
-        let result = self.try_peer_before(round.deadline, choices, fetch).await;
+        let holder = attempt
+            .operations
+            .iter()
+            .all(|item| item.source.holder_grant.is_some());
+        let result = self
+            .try_peer_before(round.deadline, choices, holder, fetch)
+            .await;
         if let Some(metrics) = self.local.read_work_metrics() {
             let source = &attempt.operations[0].source;
             let role = if source.holder_grant.is_some() {
@@ -432,13 +438,18 @@ impl DfsReadEngine {
         }
     }
 
+    /// One attempt within its share of the read's time left: `1/choices`
+    /// with parallel reads, and always for a holder (!318 P1), which is
+    /// optional and never the last copy, so a slow or silent holder leaves
+    /// the remaining copies their time. Otherwise the whole time left.
     async fn try_peer_before(
         &self,
         deadline: Instant,
         choices: usize,
+        holder: bool,
         fetch: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
-        if self.distribution.parallelism <= 1 {
+        if self.distribution.parallelism <= 1 && !holder {
             return fetch.await;
         }
         let budget = deadline.saturating_duration_since(Instant::now())
@@ -783,7 +794,11 @@ impl DfsReadEngine {
                 let fetch = self
                     .transfer
                     .read_ranges_async(&single_batch, &mut single_scratch);
-                match self.try_peer_before(round.deadline, choices, fetch).await {
+                let holder = item.source.holder_grant.is_some();
+                match self
+                    .try_peer_before(round.deadline, choices, holder, fetch)
+                    .await
+                {
                     Ok(()) => {
                         if !self.source_matches(batch, &item.source) {
                             return Err(external_denied(
