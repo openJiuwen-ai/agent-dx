@@ -306,8 +306,12 @@ impl LocalLog {
             "next writer term durable in CURRENT; handle not returned",
         );
         replay.recovered.term = manifest.term;
-        report_tail_rollback(replay.rollback.as_ref());
+        // Budget first: a failed open returns no handle, so reporting after it
+        // would announce a rollback for a store this process never served. The
+        // rollback did happen either way, which is why a stale line is not
+        // wrong — only misleading about whether the process came up.
         let wal_bytes = wal_budget(&dir, limits, 0, 0, &manifest.retired_segments)?;
+        report_tail_rollback(replay.rollback.as_ref());
         Ok(Self {
             inner: Arc::new(Inner {
                 owner_pid: std::process::id(),
@@ -1051,7 +1055,7 @@ fn report_tail_rollback(rollback: Option<&TailRollback>) {
         "actual_len" => rollback.actual_len,
         "rolled_back_to" => rollback.rolled_back_to,
         "dropped_undeclared_bytes" => rollback.dropped_bytes,
-        "dropped_acknowledged_records" => rollback.dropped_records,
+        "dropped_declared_records" => rollback.dropped_declared_records,
         "recovered_sequence" => rollback.recovered_sequence,
         "preserved" => if rollback.preserved { "incomplete-tail" } else { "none" });
 }

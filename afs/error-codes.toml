@@ -567,7 +567,7 @@ value = "0x03020004"
 kind = "DataLoss"
 component = "Meta"
 subsystem = "Store"
-description = "Meta 操作日志内容损坏：帧 CRC/哈希不符、帧链序列断裂、段头哈希不符或段文件短于自身头部。已应答的前缀仍在磁盘上，可回退到帧链验证通过的最后一条完整记录；与配置错误 CONFIG_INVALID、版本不匹配 STORAGE_FORMAT_INCOMPATIBLE 区分"
+description = "Meta 操作日志内容损坏：帧 CRC 或记录哈希不符、段头哈希不符、段文件短于自身头部、回退点越过 checkpoint 覆盖位置、证据份数耗尽。已声明的前缀仍在磁盘上，可回退到帧链验证通过的最后一条完整记录；与配置错误 CONFIG_INVALID（含帧链字段不符、CURRENT/IDENTITY 损坏等归属不明的情况）和版本不匹配 STORAGE_FORMAT_INCOMPATIBLE 区分"
 
 [[error]]
 name = "META_NODE_PROTOCOL_VERSION"

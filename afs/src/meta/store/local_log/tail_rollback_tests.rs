@@ -57,11 +57,19 @@ fn slot_offset(generation: u64) -> usize {
     STATIC_BYTES + (generation % 2) as usize * SLOT_BYTES
 }
 
+/// Returns `(newest, older)` by generation, not by physical slot index: which
+/// slot holds the newer generation alternates with every write, so a test that
+/// relied on the index would silently depend on the fixture's parity.
 fn read_slots(dir: &Path) -> (Tail, Tail) {
     let mut file = fs::File::open(wal_path(dir)).unwrap();
     let identity = read_identity(dir).unwrap();
     let (a, b) = read_tail_slots(&mut file, identity, LogTip::EMPTY).unwrap();
-    (a.expect("slot a"), b.expect("slot b"))
+    let (a, b) = (a.expect("slot a"), b.expect("slot b"));
+    if a.generation >= b.generation {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 /// Rewrites one tail slot with a correct CRC so only its position changes.
@@ -200,7 +208,7 @@ async fn a_frame_aligned_cut_reports_the_records_it_drops() {
         .rollback()
         .expect("a cut that drops an acknowledged record must be reported");
     assert_eq!(
-        rollback.dropped_records,
+        rollback.dropped_declared_records,
         newest.tip.sequence - previous.tip.sequence,
         "the reported loss must be measured from the superseded slot"
     );

@@ -33,8 +33,12 @@ pub(crate) struct TailRollback {
     pub(crate) rolled_back_to: u64,
     /// Bytes that were on disk but not declared durable.
     pub(crate) dropped_bytes: u64,
-    /// Records the writer had acknowledged and recovery could not keep.
-    pub(crate) dropped_records: u64,
+    /// Records the writer declared durable that recovery could not keep. An
+    /// upper bound, not a count of acknowledged writes: the slot's page can
+    /// reach the disk before the frames it declares, so some of these were
+    /// never acknowledged. Reads as "declared, not preserved", matching
+    /// `declared_sequence`.
+    pub(crate) dropped_declared_records: u64,
     pub(crate) recovered_sequence: u64,
     /// Whether the dropped bytes were copied to an `incomplete-tail-*` file.
     /// A loss that the file boundary already expressed leaves nothing to keep.
@@ -399,7 +403,7 @@ fn finish_active_segment(
             actual_len: length,
             rolled_back_to: offset,
             dropped_bytes: length - offset,
-            dropped_records: lost_records,
+            dropped_declared_records: lost_records,
             recovered_sequence: tip.sequence,
             preserved: cut,
         })
@@ -431,8 +435,9 @@ fn finish_active_segment(
     };
     // Confirm complete but previously unacknowledged same-kernel pages. Only
     // this recovery's own writes need it: a clean segment was already made
-    // durable by the writer that left it behind.
-    if changed || cut {
+    // durable by the writer that left it behind. `changed` already covers the
+    // cut (`offset != length` is one of its terms).
+    if changed {
         file.sync_all()?;
     }
     Ok((file, offset, generation, rollback))

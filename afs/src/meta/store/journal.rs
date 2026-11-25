@@ -306,8 +306,9 @@ pub(super) fn invalid_log(message: impl Into<String>) -> Error {
     )
 }
 /// The stored log contradicts its own durable declaration: a frame whose CRC
-/// or hash does not match, a gap in the frame chain, a segment header whose
-/// hash no longer matches, or a segment shorter than its own header.
+/// or record hash does not match, a segment header whose hash no longer
+/// matches, a segment shorter than its own header, a rollback point below the
+/// installed checkpoint, or exhausted evidence slots.
 ///
 /// Kept apart from `invalid_log` (configuration and caller mistakes) and from
 /// `STORAGE_FORMAT_INCOMPATIBLE` (this binary cannot read the format at all).
@@ -315,33 +316,47 @@ pub(super) fn invalid_log(message: impl Into<String>) -> Error {
 /// configuration mistake is never repaired by touching the directory, so only
 /// this code describes damage to the bytes on disk.
 ///
-/// `CURRENT`, `IDENTITY` and the checkpoint directory are deliberately *not*
-/// reported under this code. They answer "whose data is this and where should
-/// replay start"; if that is unknown, cutting the WAL is a guess, and a guess
-/// on a directory that may belong to another store destroys someone else's
-/// data. Those stay `CONFIG_INVALID` so the operator checks the mount before
-/// anything is written.
+/// Fields that identify the data are deliberately *not* reported under this
+/// code: `CURRENT`, `IDENTITY`, unreadable checkpoints, ambiguous tail slots,
+/// and mismatched chain fields (`sequence`, `base`, `previous_hash`). They
+/// answer "whose data is this and where should replay start"; a mismatch there
+/// is equally consistent with another build or another store's disk, so it is
+/// not the certainty a CRC failure is. Cutting on that guess destroys someone
+/// else's data, so those stay `CONFIG_INVALID` and the operator checks the
+/// mount before anything is written.
 pub(super) fn corrupt_log(message: impl Into<String>) -> Error {
+    let message: String = message.into();
+    // Accept a message that already carries the prefix, so wrapping a log error
+    // in `corrupt_log` cannot produce two copies of it.
+    let detail = message
+        .strip_prefix(LOG_ERROR_PREFIX)
+        .unwrap_or(message.as_str());
     Error::coded(
         afs_error::META_LOG_CORRUPT,
-        format!("Meta operation log: {}", message.into()),
+        format!("{LOG_ERROR_PREFIX}{detail}"),
     )
 }
 /// Adds `context` (file, offset) to a log error, keeping the code so a caller
-/// can tell a format mismatch from damage. The message is appended rather than
-/// formatted through `Display`, which would repeat the existing prefix and the
-/// `0x… DataLoss:` decoration.
+/// can tell a format mismatch from damage.
+///
+/// The detail is taken with `message()` and the shared prefix stripped first:
+/// every log error already carries `Meta operation log: `, so appending the
+/// detail to a fresh copy would nest the prefix twice.
 pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Error {
     let code = error.code();
+    let detail = error
+        .message()
+        .strip_prefix(LOG_ERROR_PREFIX)
+        .unwrap_or_else(|| error.message());
     if code == afs_error::STORAGE_FORMAT_INCOMPATIBLE || code == afs_error::META_LOG_CORRUPT {
-        Error::coded(
-            code,
-            format!("Meta operation log: {context}: {}", error.message()),
-        )
+        Error::coded(code, format!("{LOG_ERROR_PREFIX}{context}: {detail}"))
     } else {
-        invalid_log(format!("{context}: {}", error.message()))
+        invalid_log(format!("{context}: {detail}"))
     }
 }
+/// The prefix every `Meta operation log` error carries, so a wrapped message
+/// can be rebuilt around one new context instead of nesting another copy.
+const LOG_ERROR_PREFIX: &str = "Meta operation log: ";
 pub(super) fn unavailable(message: impl Into<String>) -> Error {
     Error::coded(afs_error::IO_UNAVAILABLE, message)
 }

@@ -307,10 +307,13 @@ pub(super) fn preserve_tail(dir: &Path, file: &mut File, start: u64, end: u64) -
     let length = end
         .checked_sub(start)
         .ok_or_else(|| invalid_log("tail evidence position"))?;
+    // A capacity limit, not damage: the tail is too large to preserve whole.
+    // Reported as ResourceExhausted so it is not confused with the count limit
+    // below, which does mean repeated damage.
     if length > 128 * 1024 * 1024 {
-        return Err(full(
-            "incomplete tail exceeds evidence budget; original WAL retained",
-        ));
+        return Err(full(format!(
+            "incomplete tail of {length} bytes exceeds the 134217728 byte evidence budget; original WAL retained — inspect it, or raise the budget"
+        )));
     }
     let mut bytes = Vec::new();
     bytes

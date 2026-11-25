@@ -1033,37 +1033,55 @@ expected 只作约束，不能抬高分配值；水位与 reservation/原结果�
 **每次回退都会记录** `meta.log.tail_rolled_back`，含 `anchor`（`tail_slot` 或 `frame_chain`）、
 `declared_end`、`declared_sequence`（写者声称已持久化的位置，取自**被取代的最新槽**）、
 `rolled_back_to`、`actual_len`、`dropped_undeclared_bytes`、
-`dropped_acknowledged_records`（丢失的已应答记录数）与 `preserved`。
+`dropped_declared_records` 与 `preserved`。
 
-`preserved=none` 配 `dropped_acknowledged_records>0` 是一种需要留意的情况：文件恰好止于
+`dropped_declared_records` 是**上界，不是事实**：槽所在页可能先于其所声明的帧数据落盘，
+因此这些记录中有一部分在崩溃前并未真正应答。它的含义是「写者已声明、恢复未能保留」，
+最多 N 条——与 `declared_sequence` 的「写者声称」语义一致。
+
+`preserved=none` 配 `dropped_declared_records>0` 是一种需要留意的情况：文件恰好止于
 帧边界，没有字节可截，但最新槽声明过的那条记录已经不在了。外部 `truncate` 若落在帧边界上
 就会产生这种形态，**它是唯一能观测到该损坏的信号**，请务必核查。
 
-证据文件最多保留 `3` 份，且不计入 `meta_wal_max_bytes` 预算（超出部分在极端情况下可达
-约 256MiB）。达到上限后启动会被拒绝，说明同一段在反复损坏、恢复没有收敛——
-此时应检查 `incomplete-tail-*` 的内容，而不是清理磁盘空间。
+**证据文件的上限有两道，失败方式不同**：
+
+| 上限 | 阈值 | 超出后 |
+| --- | --- | --- |
+| 份数 | 目录里已有 `2` 份 `incomplete-tail-*` | 拒绝启动，`META_LOG_CORRUPT` |
+| 单份体积 | 单次回退的尾部超过 128MiB | 拒绝启动，`IO_CAPACITY` |
+
+份数达到上限说明同一段在反复损坏、恢复没有收敛，应检查 `incomplete-tail-*` 的内容，
+而不是清理磁盘空间。体积上限是另一种情况：尾部太大，不裁剪就无法存证。
+证据文件**不计入** `meta_wal_max_bytes` 预算，最坏额外占用约 256MiB（2 × 128MiB）。
 
 以下情况**仍然拒绝启动并保留现场**，需人工介入或从备份还原：
 
 | 情况 | 错误码 | 日志/错误 |
 | --- | --- | --- |
-| 损坏出现在文件中部（断点后仍有完整记录） | `META_LOG_CORRUPT` | `offset ... after sequence ...` |
+| 帧内容损坏（CRC 或记录哈希不符），且断点后仍有完整记录 | `META_LOG_CORRUPT` | `offset ... after sequence ...: frame CRC mismatch` |
 | 非法长度前缀（无法证明是尾部） | `META_LOG_CORRUPT` | `frame length outside record bound` |
-| 两个 tail 槽的 CRC 都无效 | `CONFIG_INVALID` | `WAL declared tail CRC/format; ambiguous tail is not discarded` |
 | 段文件短于自身的 4096 字节头部 | `META_LOG_CORRUPT` | `shorter than its 4096 byte header` |
 | 回退点早于 checkpoint 覆盖位置 | `META_LOG_CORRUPT` | `recovered tail precedes the selected checkpoint` |
-| 证据槽已满（3 份） | `META_LOG_CORRUPT` | `tail evidence slots exhausted after ...` |
+| 证据份数已满（2 份） | `META_LOG_CORRUPT` | `tail evidence slots exhausted after ...` |
+| 单次回退尾部超过 128MiB | `IO_CAPACITY` | `incomplete tail exceeds evidence budget` |
+| **帧链字段断裂**（`sequence`/`base`/`previous_hash` 不符） | `CONFIG_INVALID` | `... sequence ...` / `... base ...` / `... previous-hash ...` |
+| 两个 tail 槽的 CRC 都无效 | `CONFIG_INVALID` | `WAL declared tail CRC/format; ambiguous tail is not discarded` |
 | `CURRENT` 损坏或其身份与本机不符 | `CONFIG_INVALID` | `CURRENT format/hash/CRC` |
 | `IDENTITY` 损坏或与本机不符 | `CONFIG_INVALID` | `IDENTITY format/hash/CRC` |
 | 两个 checkpoint 都无法读取 | `CONFIG_INVALID` | `CURRENT has no valid checkpoint` |
 
-**为什么要区分这两个码**：`META_LOG_CORRUPT`（`DataLoss`）表示"字节本身损坏，
-已应答前缀仍在磁盘上"，排查方向是核对数据；`CONFIG_INVALID` 表示"无法确定这份数据属于
-谁、该从哪里回放"——它可能只是挂错了盘。后者**绝不能自动改盘**，否则会破坏别人的数据，
-所以先检查挂载与配置，再考虑还原备份。
+**两类码的区别**：
 
-`CONFIG_INVALID` 与真正的配置写错同名，遇到时请优先排查：`data_dir` 是否指向预期目录、
-`IDENTITY` 是否与集群一致、挂载是否落在正确的盘上。
+- `META_LOG_CORRUPT`（`DataLoss`）＝**字节本身坏了**（CRC、记录哈希、段头哈希、
+  段长不足、回退越过 checkpoint）。已声明的前缀仍在磁盘上，排查方向是核对数据。
+- `CONFIG_INVALID`＝**无法确定这份数据属于谁、该从哪里回放**。包括 `CURRENT`／`IDENTITY`
+  损坏、checkpoint 全坏、tail 槽自述不可信，以及**帧链字段断裂**——后者看起来像损坏，
+  但字段不符同样可能是「换了一个二进制／挂了另一个 store 的盘」，与 CRC 不符的确定性不同，
+  所以保守地归入这一类。
+
+后者**绝不能自动改盘**：如果盘属于别人，改盘就毁掉了别人的数据。先检查挂载与配置，
+再考虑还原备份。`CONFIG_INVALID` 与真正的配置写错同名，遇到时优先排查 `data_dir`
+是否指向预期目录、`IDENTITY` 是否与集群一致、挂载是否落在正确的盘上。
 
 `STORAGE_FORMAT_INCOMPATIBLE` 是第三种情况：数据对另一个版本的二进制是完好的，
 应回退二进制而不是改数据。
