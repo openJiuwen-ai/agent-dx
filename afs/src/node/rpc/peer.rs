@@ -251,7 +251,9 @@ enum DataPeerClientInner {
 /// 复用 diagnostics `NodeData` 会话。
 #[cfg(feature = "ownerfs")]
 pub struct OwnerPeerClient {
-    client: StdMutex<OwnerFilesClient<Channel>>,
+    // Nonempty: constructors always supply the first connection.
+    clients: Vec<OwnerFilesClient<Channel>>,
+    next_client: AtomicUsize,
     lock_control: afs_protocol::node_control::owner_control_client::OwnerControlClient<Channel>,
     long_lock_control:
         Option<afs_protocol::node_control::owner_control_client::OwnerControlClient<Channel>>,
@@ -308,7 +310,8 @@ pub fn owner_files_client_from_channel_result(channel: Channel) -> PeerResult<Ow
             channel.clone(),
         ),
         long_lock_control: None,
-        client: StdMutex::new(OwnerFilesClient::new(channel)),
+        clients: vec![OwnerFilesClient::new(channel)],
+        next_client: AtomicUsize::new(0),
         runtime: OwnerRuntime::current_or_new("OwnerFiles client")?,
         prefetched_reads: StdMutex::new(HashMap::new()),
         pending_releases: Arc::new(AtomicUsize::new(0)),
@@ -342,7 +345,8 @@ pub fn owner_files_client_from_channel_with_runtime_and_metrics(
             channel.clone(),
         ),
         long_lock_control: None,
-        client: StdMutex::new(OwnerFilesClient::new(channel)),
+        clients: vec![OwnerFilesClient::new(channel)],
+        next_client: AtomicUsize::new(0),
         runtime: OwnerRuntime::Existing(runtime),
         prefetched_reads: StdMutex::new(HashMap::new()),
         pending_releases: Arc::new(AtomicUsize::new(0)),
@@ -381,6 +385,14 @@ impl OwnerPeerClient {
         Ok(())
     }
 
+    /// Add independent connections to the same Home. Dependent operations
+    /// still wait for the preceding response before issuing another request.
+    pub fn with_additional_channels(mut self, channels: impl IntoIterator<Item = Channel>) -> Self {
+        self.clients
+            .extend(channels.into_iter().map(OwnerFilesClient::new));
+        self
+    }
+
     pub fn with_long_wait_channel(mut self, channel: Channel) -> Self {
         self.long_lock_control = Some(
             afs_protocol::node_control::owner_control_client::OwnerControlClient::new(channel),
@@ -411,16 +423,8 @@ impl OwnerPeerClient {
     }
 
     fn cloned_client(&self) -> PeerResult<OwnerFilesClient<Channel>> {
-        Ok(self
-            .client
-            .lock()
-            .map_err(|_| {
-                PeerError::coded(
-                    afs_error::CLIENT_WORKER_FAILED,
-                    "OwnerFiles client lock poisoned",
-                )
-            })?
-            .clone())
+        let index = self.next_client.fetch_add(1, AtomicOrdering::Relaxed) % self.clients.len();
+        Ok(self.clients[index].clone())
     }
 
     /// Keeps a Home-side close in a bounded background job so a transient

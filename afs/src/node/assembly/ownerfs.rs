@@ -27,6 +27,8 @@ struct OwnerFilesFactory {
     meta: Arc<rpc::meta::GrpcRootMeta>,
     peers: Arc<rpc::peer::PeerConnectionPool>,
     runtime: tokio::runtime::Handle,
+    /// Drives OwnerFiles channels and the synchronous peer client.
+    rpc_runtime: Arc<OwnerRpcRuntime>,
     metrics: rpc::OwnerRpcMetrics,
     data_mode: rpc::peer::DataMode,
     rdma_device: Option<String>,
@@ -78,8 +80,16 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         let channel = bridge::block_on(
             &self.runtime,
             self.peers
-                .owner_files_channel(home_node_id, node_epoch, &uri),
+                .owner_files_channel(home_node_id, node_epoch, &uri, 0),
         )?;
+        let mut additional = Vec::with_capacity(usize::from(OWNER_FILES_CONNECTIONS) - 1);
+        for connection in 1..OWNER_FILES_CONNECTIONS {
+            additional.push(bridge::block_on(
+                &self.runtime,
+                self.peers
+                    .owner_files_channel(home_node_id, node_epoch, &uri, connection),
+            )?);
+        }
         let long_wait_channel = bridge::block_on(
             &self.runtime,
             self.peers.long_wait_channel(home_node_id, node_epoch, &uri),
@@ -87,15 +97,72 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         Ok(Arc::new(
             rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
                 channel,
-                self.runtime.clone(),
+                self.rpc_runtime.handle(),
                 Some(self.metrics.clone()),
             )
             .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
             .with_rdma_admission(self.rdma_admission.clone())
+            .with_additional_channels(additional)
             .with_long_wait_channel(long_wait_channel),
         ))
     }
 }
+
+/// Small runtime for OwnerFiles client traffic. A FUSE worker blocks on each
+/// peer request; on the shared Node runtime the request and its HTTP/2
+/// connection task woke a different idle worker at every step (about seven
+/// worker context switches per request). One worker per OwnerFiles
+/// connection lets the connection tasks run in parallel.
+#[cfg(feature = "ownerfs")]
+struct OwnerRpcRuntime {
+    runtime: Option<tokio::runtime::Runtime>,
+    handle: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "ownerfs")]
+impl OwnerRpcRuntime {
+    fn new() -> afs_error::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(OWNER_RPC_WORKERS)
+            .thread_name("afs-owner-rpc")
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_WORKER_FAILED,
+                    format!("failed to build the OwnerFiles client runtime: {error}"),
+                )
+            })?;
+        let handle = runtime.handle().clone();
+        Ok(Self {
+            runtime: Some(runtime),
+            handle,
+        })
+    }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.handle.clone()
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+impl Drop for OwnerRpcRuntime {
+    fn drop(&mut self) {
+        // The last owner may drop on a Node runtime thread, where a blocking
+        // runtime shutdown would panic.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// OwnerFiles connections to each Home, and the client runtime workers that
+/// drive them: one HTTP/2 connection serializes all of its streams.
+#[cfg(feature = "ownerfs")]
+const OWNER_FILES_CONNECTIONS: u8 = 4;
+
+#[cfg(feature = "ownerfs")]
+const OWNER_RPC_WORKERS: usize = OWNER_FILES_CONNECTIONS as usize;
 
 /// What `assemble` hands to the later stages.
 pub(super) struct OwnerFsAssembly {
@@ -158,10 +225,13 @@ pub(super) async fn assemble(
                 afs_error::Error::coded(afs_error::NODE_TRANSFER_UNAVAILABLE, error.to_string())
             })?;
         }
+        let rpc_runtime = Arc::new(OwnerRpcRuntime::new()?);
+        peer_connections.set_owner_files_runtime(rpc_runtime.handle());
         let remote_factory = Arc::new(OwnerFilesFactory {
             meta: root_meta.clone(),
             peers: peer_connections.clone(),
             runtime: tokio::runtime::Handle::current(),
+            rpc_runtime,
             metrics: owner_rpc_metrics.clone(),
             data_mode: owner_data_mode,
             rdma_device: cfg.rdma_device.clone(),
