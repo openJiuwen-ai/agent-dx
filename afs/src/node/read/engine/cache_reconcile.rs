@@ -522,8 +522,9 @@ pub(super) struct ReadCacheRuntime {
     /// Each idle buffer keeps the segment-budget charge for its capacity.
     segment_pool: Mutex<Vec<(Vec<u8>, StageCharge)>>,
     /// H2 step 2: Chunks being fetched or installed here, which a holder
-    /// may let another reader wait for.
-    pub(super) in_flight: Arc<crate::node::read::holders::HolderInFlight>,
+    /// may let another reader wait for. Set only with sharing on (!318
+    /// P2-5): without it nothing is tracked.
+    pub(super) in_flight: std::sync::OnceLock<Arc<crate::node::read::holders::HolderInFlight>>,
     #[cfg(test)]
     pub(super) zero_fill_bytes: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -681,7 +682,7 @@ impl ReadCacheRuntime {
             recheck_period: Duration::from_secs(1),
             fresh_installs: Mutex::new(HashMap::new()),
             segment_pool: Mutex::new(Vec::new()),
-            in_flight: crate::node::read::holders::HolderInFlight::new(),
+            in_flight: std::sync::OnceLock::new(),
             #[cfg(test)]
             zero_fill_bytes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -805,7 +806,10 @@ impl ReadCacheRuntime {
     /// Hands a charged job to the installer.
     pub(super) fn submit(&self, mut job: CacheJob, charge: StageCharge) -> Result<()> {
         job.charge = Some(charge);
-        job.in_flight = Some(self.in_flight.begin(&job.chunk.id));
+        job.in_flight = self
+            .in_flight
+            .get()
+            .map(|flights| flights.begin(&job.chunk.id));
         job.queued_at = Instant::now();
         self.send
             .send(job)
@@ -1048,6 +1052,7 @@ impl DfsReadEngine {
             ReadCacheBudgets::default(),
             Some(local),
         )));
+        engine.track_holder_in_flight();
         engine
     }
 
@@ -1068,6 +1073,7 @@ impl DfsReadEngine {
         );
         runtime.recheck_period = recheck_period;
         self.distributed_cache = Some(Arc::new(runtime));
+        self.track_holder_in_flight();
         self
     }
 
@@ -1076,17 +1082,31 @@ impl DfsReadEngine {
     /// holder lists cached `ttl`).
     pub(crate) fn with_holder_lists(mut self, ttl: Duration) -> Self {
         self.holder_lists = Some(HolderLists::new(ttl));
+        self.track_holder_in_flight();
         self
     }
 
+    /// With sharing and the native read cache both on, start tracking the
+    /// Chunks in flight here (either may be configured first).
+    fn track_holder_in_flight(&self) {
+        if self.holder_lists.is_some()
+            && let Some(cache) = &self.distributed_cache
+        {
+            let _ = cache
+                .in_flight
+                .set(crate::node::read::holders::HolderInFlight::new());
+        }
+    }
+
     /// H2 step 2: the Chunks this engine is fetching or installing, for the
-    /// holder side of the data plane. `None` without the native read cache.
+    /// holder side of the data plane. `None` without the native read cache
+    /// or without sharing (!318 P2-5).
     pub(crate) fn holder_in_flight(
         &self,
     ) -> Option<Arc<crate::node::read::holders::HolderInFlight>> {
         self.distributed_cache
             .as_ref()
-            .map(|cache| cache.in_flight.clone())
+            .and_then(|cache| cache.in_flight.get().cloned())
     }
 
     pub(crate) fn with_distributed_cache_budgets(
@@ -1103,6 +1123,7 @@ impl DfsReadEngine {
             budgets,
             Some(local),
         )));
+        self.track_holder_in_flight();
         Ok(self)
     }
 

@@ -226,8 +226,13 @@ impl DfsReadEngine {
             .unwrap_or(1);
         // review/18 a1: in flight only while fetched from a copy that is not
         // a holder (a holder may itself be waiting for this reader).
-        let marks: Vec<_> = match &self.distributed_cache {
-            Some(cache)
+        // Nothing is tracked without sharing (!318 P2-5).
+        let flights = self
+            .distributed_cache
+            .as_ref()
+            .and_then(|cache| cache.in_flight.get());
+        let marks: Vec<_> = match flights {
+            Some(flights)
                 if attempt
                     .operations
                     .iter()
@@ -236,7 +241,7 @@ impl DfsReadEngine {
                 attempt
                     .operations
                     .iter()
-                    .map(|item| cache.in_flight.begin(&item.op.chunk_id))
+                    .map(|item| flights.begin(&item.op.chunk_id))
                     .collect()
             }
             _ => Vec::new(),

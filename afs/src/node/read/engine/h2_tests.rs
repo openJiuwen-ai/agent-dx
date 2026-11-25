@@ -2152,3 +2152,119 @@ async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
         "different Chunks rank different holders first"
     );
 }
+
+/// !318 P2-5: a reader of one CRC Chunk with the read cache and sharing each
+/// on or off; Meta offers one durable copy (the transfer serves 7s, which is
+/// the Chunk's body) and no holder.
+fn share_engine(
+    fixture: &Fixture,
+    cache: bool,
+    share: bool,
+) -> (
+    Arc<DfsReadEngine>,
+    Arc<MetaStub>,
+    Arc<NodeTransfer>,
+    ChunkObject,
+) {
+    let body = vec![7; 256 * 1024];
+    let chunk = StagedChunk::new_crc32c(OperationId::new("share"), body)
+        .unwrap()
+        .chunk;
+    let mut reply = sources_reply(vec![(
+        chunk.id.clone(),
+        vec![candidate(
+            "a",
+            &chunk.id,
+            "node-b",
+            CopyRole::DurableReplica,
+        )],
+    )]);
+    reply.chunks[0].chunk = Some(chunk.clone());
+    reply.chunks[0].allowed_ranges = vec![(0, chunk.length)];
+    let meta = Arc::new(MetaStub::new(reply));
+    let transfer = Arc::new(NodeTransfer::default());
+    let mut engine = fixture
+        .engine(meta.clone(), transfer.clone(), DfsReadConfig::default())
+        .with_read_authority(authority());
+    if cache {
+        engine = engine.with_distributed_cache("session".into(), 1 << 30);
+    }
+    if share {
+        engine = engine.with_holder_lists(Duration::from_secs(60));
+    }
+    (Arc::new(engine), meta, transfer, chunk)
+}
+
+async fn read_whole(engine: &Arc<DfsReadEngine>, chunk: &ChunkObject) {
+    let engine = engine.clone();
+    let batch = read_op(chunk.id.clone(), chunk.length);
+    let out = tokio::task::spawn_blocking(move || {
+        let mut out = vec![0; batch.ops[0].length as usize];
+        engine.read_batch(&batch, &mut out).map(|()| out)
+    })
+    .await
+    .unwrap()
+    .expect("read");
+    assert!(out.iter().all(|b| *b == 7));
+}
+
+async fn until_published(meta: &MetaStub, chunk: &ChunkObject) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !meta.published.lock().unwrap().contains(&chunk.id) {
+        assert!(
+            Instant::now() < deadline,
+            "the cache copy was not published"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// !318 P2-5: with sharing off (read cache off, or on) nothing is tracked
+/// for holders: no in-flight set, no holder lookup or holder-form read; the
+/// read cache still installs and publishes the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_pr318_sharing_off_tracks_nothing_in_flight() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = share_engine(&fixture, false, false);
+    read_whole(&engine, &chunk).await;
+    assert!(engine.holder_in_flight().is_none());
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(*transfer.holder_form.lock().unwrap(), vec![false]);
+
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = share_engine(&fixture, true, false);
+    let mut services = crate::runtime::Services::new();
+    engine.start_distributed_cache(&mut services);
+    read_whole(&engine, &chunk).await;
+    until_published(&meta, &chunk).await;
+    assert_eq!(fixture.metric(&cache_event("installed")), 1);
+    assert!(
+        engine.holder_in_flight().is_none(),
+        "in-flight tracking without sharing"
+    );
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(*transfer.holder_form.lock().unwrap(), vec![false]);
+}
+
+/// !318 P2-5: with sharing on, the Chunk is in flight while it is fetched
+/// from the durable copy, is installed and published, and nothing is left
+/// in flight afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_pr318_sharing_on_tracks_the_fetch_and_clears_it() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = share_engine(&fixture, true, true);
+    let flights = engine
+        .holder_in_flight()
+        .expect("sharing tracks in-flight Chunks");
+    transfer.watch.set(flights.clone()).unwrap();
+    let mut services = crate::runtime::Services::new();
+    engine.start_distributed_cache(&mut services);
+    read_whole(&engine, &chunk).await;
+    until_published(&meta, &chunk).await;
+    assert_eq!(
+        *transfer.in_flight_seen.lock().unwrap(),
+        vec![("node-b".to_owned(), true)]
+    );
+    assert_eq!(fixture.metric(&cache_event("installed")), 1);
+    assert!(!flights.contains(&chunk.id), "left in flight");
+}
