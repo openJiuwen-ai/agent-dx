@@ -133,14 +133,23 @@ impl GrpcRootMeta {
         OwnerRootsClient::new(self.channel.clone())
     }
 
-    pub(crate) fn poll_root_command_batch(&self, after_revision: u64) -> Result<RootCommandBatch> {
+    /// Poll with the caller's remaining fail-closed budget; the RPC still
+    /// respects the client's configured request timeout.
+    pub(crate) fn poll_root_command_batch(
+        &self,
+        after_revision: u64,
+        budget: Duration,
+    ) -> Result<RootCommandBatch> {
         let mut client = self.client();
         let reply = self
-            .run(client.poll_root_command_batch(PollRootCommandBatchRequest {
-                node_id: self.node_id.clone(),
-                session_id: self.session_id.clone(),
-                after_revision,
-            }))?
+            .run_with_timeout(
+                budget,
+                client.poll_root_command_batch(PollRootCommandBatchRequest {
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    after_revision,
+                }),
+            )?
             .into_inner();
         root_command_batch_from_wire(after_revision, reply)
     }
