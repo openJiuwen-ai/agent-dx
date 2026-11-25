@@ -97,6 +97,7 @@ services:
       cache_entries: 10000
       create_unknown_retention_seconds: 600
       auth_cache_ttl_seconds: 10
+      allowed_host_paths: ["*"]
       agent_address: ''
       loopback_http: true
       workspace_affinity:

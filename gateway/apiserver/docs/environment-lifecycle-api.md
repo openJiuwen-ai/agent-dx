@@ -475,7 +475,46 @@ Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path
 {"image":"registry.example/app:v1","mounts":[{"type":"bind","host_path":"/mnt/sfs/workspaces/w-user","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]}
 ```
 
-The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. This endpoint does not mount SFS, authorize per-tenant host paths, or coordinate multiple sandboxes using the same directory. Source-directory creation requires the explicit flag described below. Expose arbitrary host-path creation only to trusted management callers until deployment-specific path authorization is provided. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
+The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. Source-directory creation requires the explicit flag described below. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
+
+API Server authorizes inline Local mount sources through `allowed_host_paths`.
+The shipped API Server JSON and the standalone/ingress-api deployment profiles
+explicitly set `allowed_host_paths: ["*"]`, allowing every valid source path.
+In an `adxctl` deployment, restrict the field through the local API Server override:
+
+```yaml
+service_overrides:
+  apiserver:
+    config:
+      allowed_host_paths:
+        - /mnt/sfs/workspaces
+        - /opt/adx/config/tls/ca.pem
+```
+
+An omitted or empty list rejects every inline Local mount; requests without Local
+mounts remain valid. An override replaces the shipped list, including an explicit
+empty list. The exact entry `"*"` permits every valid source path, even in a list
+with other entries; path syntax validation still applies. Quote `"*"` in YAML.
+Entries are either the `"*"` wildcard or normalized absolute paths naming
+directories or individual files. Each path entry permits itself and its descendants,
+using path-component matching: `/mnt/sfs/workspaces-backup` is outside
+`/mnt/sfs/workspaces`. An explicit
+`/` entry allows every absolute source path. Both `host_path` and `hostPath` use
+this check, independent of runtime class or administrator status. A denied source
+rejects the whole create request with `PERMISSION_DENIED` (HTTP 403), before
+scheduling or directory creation. Mount options and initialization attributes are
+preserved. HTTP, embedded Agent and E2B/template creation share this admission.
+
+The policy matches the requested source path lexically; the API Server does not
+access the worker's filesystem or resolve symlinks on that worker. Operators must
+control the allowed paths and their backing filesystem. This is not per-tenant
+filesystem authorization. Image/S3 sources, Volume references and Local rootfs
+selection retain their separate policies. Runtime-owned bootstrap mounts and
+Jiuwenbox deployment-policy mounts are added outside this request check; a default
+policy's `/etc` bind is not removed by setting `allowed_host_paths`. Restart API
+Server after configuration changes; existing Environments and their resume paths
+are not rewritten. This endpoint does not mount shared storage or coordinate
+multiple sandboxes accessing the same directory.
 
 
 For runsc host/Volume bind mounts, callers may explicitly request

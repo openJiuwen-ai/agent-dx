@@ -102,6 +102,44 @@ fn apiserver_local_rootfs_allowlist_accepts_only_normalized_absolute_paths() {
 }
 
 #[test]
+fn host_path_allowlist_validates_normalized_absolute_file_or_directory_paths() {
+    let mut value = base();
+    value["ingress_mode"] = json!("standalone");
+    for invalid in [
+        "",
+        "relative",
+        "/srv//data",
+        "/srv/data/",
+        "/srv/../etc",
+        "/srv/./data",
+        "/srv/\nuser",
+    ] {
+        value["allowed_host_paths"] = json!([invalid]);
+        let error = serde_json::from_value::<Config>(value.clone())
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("allowed_host_paths"),
+            "{invalid:?}: {error}"
+        );
+    }
+    for allowed in [
+        json!([]),
+        json!(["*"]),
+        json!(["/mnt/workspaces", "*"]),
+        json!(["/mnt/workspaces", "/etc/agentos/ca.pem"]),
+        json!(["/"]),
+    ] {
+        value["allowed_host_paths"] = allowed;
+        serde_json::from_value::<Config>(value.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+}
+
+#[test]
 fn unknown_create_retention_is_positive_and_configurable() {
     let mut value = base();
     value["ingress_mode"] = json!("standalone");

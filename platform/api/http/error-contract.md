@@ -52,7 +52,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 |---|---|---:|---|---|---|
 | `INVALID_ARGUMENT` | `InvalidArgument`、`OutOfRange` | 400、413 | `never` | `not_started` | 请求格式、范围或不支持的字段组合无效 |
 | `UNAUTHENTICATED` | `Unauthenticated` | 401 | `never` | `not_started` | 凭据缺失、无效或过期 |
-| `PERMISSION_DENIED` | `PermissionDenied` | 403 | `never` | `not_started` | 已认证身份没有权限；实例接口可以为租户隔离映射成 404 |
+| `PERMISSION_DENIED` | `PermissionDenied` | 403 | `never` | `not_started` | 已认证身份没有权限，包括创建请求的 host_path 不匹配 API Server 的 allowed_host_paths；实例接口可以为租户隔离映射成 404 |
 | `NOT_FOUND` | `NotFound` | 404 | `never` | `terminal` | 权威状态确认资源不存在；删除接口可以将其视为幂等成功 |
 | `CONFLICT` | `AlreadyExists`、`FailedPrecondition`、`Aborted` | 409 | `never` | `not_started` | 身份、规格、代次、状态或操作参数冲突 |
 | `RESOURCE_EXHAUSTED` | `ResourceExhausted` | 429 | `after_backoff` / `never` | `not_started` / `terminal` | 准入、队列或资源暂时不足可退避；后端明确返回的创建限流失败为 terminal/never |
