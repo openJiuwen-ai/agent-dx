@@ -624,4 +624,42 @@ mod in_flight_tests {
         drop(second);
         assert!(!flights.contains(&chunk));
     }
+
+    /// !318 P2-4: readers of two versions that reuse one Chunk each hold
+    /// their own mark: one ending in success, failure or cancellation never
+    /// clears another's.
+    #[tokio::test]
+    async fn in_flight_marks_of_one_chunk_are_counted_per_reader() {
+        let flights = HolderInFlight::new();
+        let chunk = ChunkId::new("shared-by-two-versions");
+        let other = flights.begin(&chunk);
+        // Success: the mark is kept, then dropped.
+        drop(flights.begin(&chunk));
+        assert!(flights.contains(&chunk));
+        // Failure: a fetch that errs drops its mark.
+        let failed: Result<(), ()> = {
+            let _mark = flights.begin(&chunk);
+            Err(())
+        };
+        assert!(failed.is_err());
+        assert!(flights.contains(&chunk));
+        // Cancellation: a fetch dropped while it waits drops its mark.
+        let fetch = {
+            let flights = flights.clone();
+            let chunk = chunk.clone();
+            tokio::spawn(async move {
+                let _mark = flights.begin(&chunk);
+                std::future::pending::<()>().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        fetch.abort();
+        assert!(fetch.await.unwrap_err().is_cancelled());
+        assert!(
+            flights.contains(&chunk),
+            "another reader's mark was cleared"
+        );
+        drop(other);
+        assert!(!flights.contains(&chunk));
+    }
 }

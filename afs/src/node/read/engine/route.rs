@@ -194,7 +194,11 @@ impl ReplicatedSources<'_> {
         // while it is fetched from a copy that is not a holder; the marks the
         // attempts leave in this scope last until the Chunks are staged for
         // installation (queued installs keep their own mark).
-        super::remote::keeping_fetched(async {
+        let one_chunk = remote_batch
+            .ops
+            .windows(2)
+            .all(|pair| pair[0].chunk_id == pair[1].chunk_id);
+        super::remote::keeping_fetched(one_chunk, async {
             let reading = Instant::now();
             self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
                 .await?;

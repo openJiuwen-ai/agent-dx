@@ -44,24 +44,56 @@ const MAX_REFRESH_WAIT: Duration = Duration::from_millis(250);
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(5);
 const BUSY_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
-tokio::task_local! {
+/// One remote read's scope (see [`keeping_fetched`]).
+struct Fetched {
     /// In-flight marks of the Chunks this read fetched from a copy, kept
     /// until the read has staged them (review/18 a1).
-    static FETCHED: std::cell::RefCell<Vec<crate::node::read::holders::InFlightGuard>>;
+    marks: std::cell::RefCell<Vec<crate::node::read::holders::InFlightGuard>>,
+    /// Whether this read may ask a holder to wait (!318 P2-4).
+    holder_wait: bool,
+}
+
+tokio::task_local! {
+    static FETCHED: Fetched;
 }
 
 /// Runs `read` with a scope that keeps the in-flight marks of the Chunks it
 /// fetches until it ends.
-pub(super) async fn keeping_fetched<T>(read: impl std::future::Future<Output = T>) -> T {
+///
+/// `holder_wait`: whether the read may ask holders to wait for a Chunk in
+/// flight there. Only a read of one Chunk may (!318 P2-4): a read of several
+/// keeps each Chunk it fetched in flight until all of them are staged, so
+/// two such reads asking each other for their second Chunks would each wait
+/// for a Chunk the other installs only after its own wait. A read that may
+/// wait marks nothing but that one Chunk, for which waits only go to
+/// higher-ranked holders (re-review P2), so no wait cycle can form.
+pub(super) async fn keeping_fetched<T>(
+    holder_wait: bool,
+    read: impl std::future::Future<Output = T>,
+) -> T {
     FETCHED
-        .scope(std::cell::RefCell::new(Vec::new()), read)
+        .scope(
+            Fetched {
+                marks: std::cell::RefCell::new(Vec::new()),
+                holder_wait,
+            },
+            read,
+        )
         .await
 }
 
 /// Keeps `marks` until the enclosing [`keeping_fetched`] scope ends, or
 /// drops them now outside one.
 fn keep_fetched(marks: Vec<crate::node::read::holders::InFlightGuard>) {
-    let _ = FETCHED.try_with(move |kept| kept.borrow_mut().extend(marks));
+    let _ = FETCHED.try_with(move |fetched| fetched.marks.borrow_mut().extend(marks));
+}
+
+/// Whether the current read may ask a holder to wait; none outside a
+/// [`keeping_fetched`] scope.
+pub(crate) fn holder_wait_allowed() -> bool {
+    FETCHED
+        .try_with(|fetched| fetched.holder_wait)
+        .unwrap_or(false)
 }
 
 impl DfsReadEngine {

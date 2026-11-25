@@ -1070,17 +1070,39 @@ impl crate::node::rpc::data::PeerAuthenticator for FixedPeer {
     }
 }
 
-/// The writer of the P2 test: accepts its own per-copy grants, counts reads,
-/// and answers after `delay_ms`.
+/// The writer of the P2 test: accepts its own per-copy grants and counts
+/// reads; with a gate, each read waits (at most 10 s) until it opens.
 #[derive(Default)]
 struct CountingWriter {
     reads: AtomicUsize,
-    delay_ms: u64,
+    gate: Option<(Mutex<bool>, std::sync::Condvar)>,
+}
+impl CountingWriter {
+    fn gated() -> Self {
+        Self {
+            gate: Some((Mutex::new(false), std::sync::Condvar::new())),
+            ..Default::default()
+        }
+    }
+    fn open(&self) {
+        if let Some((open, opened)) = &self.gate {
+            *open.lock().unwrap() = true;
+            opened.notify_all();
+        }
+    }
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
 }
 impl DfsReadAuthorizer for CountingWriter {
     fn authorize(&self, _: &str, request: &DfsReadRangesRequest) -> afs_error::Result<()> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        if let Some((open, opened)) = &self.gate {
+            let open = open.lock().unwrap();
+            let _open = opened
+                .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+                .unwrap();
+        }
         if request.operations.iter().all(|op| {
             op.grant
                 .as_ref()
@@ -1116,8 +1138,7 @@ impl DfsHolderGrantValidator for AnyHolderGrant {
 }
 
 /// Reader-side Meta of the P2 test: the writer, and the other reader as the
-/// one holder; source lookups take a moment, so both readers have their
-/// Chunk in flight before either asks the other.
+/// one holder.
 struct PairMeta {
     reply: crate::dfs::DfsChunkSourcesReply,
     holder: crate::dfs::VersionHolder,
@@ -1134,8 +1155,11 @@ impl crate::node::read::engine::ReadSourceProvider for PairMeta {
         request: crate::dfs::DfsChunkSourcesRequest,
     ) -> crate::node::read::admission::ReadFuture<'_, crate::dfs::DfsChunkSourcesReply> {
         Box::pin(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            self.sources_for(request)
+            let mut reply = self.sources_for(request.clone())?;
+            reply
+                .chunks
+                .retain(|set| request.chunk_ids.contains(&set.chunk_id));
+            Ok(reply)
         })
     }
     fn version_holders_async(
@@ -1158,14 +1182,9 @@ async fn serve(service: DfsChunksService) -> (String, tokio::task::JoinHandle<()
     (endpoint, server)
 }
 
-/// P2 (re-review): two readers start the same CRC Chunk together and each is
-/// the other's holder. Only the reader whose holder ranks above it for the
-/// Chunk (rendezvous) may wait, so the waits cannot form a cycle: nobody
-/// waits out the holder wait, and the writer is read once — the other reader
-/// gets the Chunk from the first one's read cache.
 /// P2 with the holder wait restored (as 2c will use it, review/18 a5): a
 /// reader waits only for a holder ranked above it for the Chunk. The
-/// higher-ranked reader starts first and is fetching from a slow writer:
+/// higher-ranked reader starts first and is held fetching at the writer:
 /// the other one waits for it and reads its copy, the writer serves once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h2_p2_a_reader_waits_for_a_higher_ranked_holder() {
@@ -1203,13 +1222,38 @@ async fn h2_a5_readers_without_a_holder_wait_ask_none() {
     }
 }
 
+/// !318 P2-4: two readers, two Chunks ranked oppositely (A above B for X, B
+/// above A for Y). Each reads both in one batch, A as [X, Y] and B as
+/// [Y, X]; each sees a published cache copy of its own top Chunk, so it
+/// fetches that one first (both held at the gate until both are there) and
+/// keeps it in flight until the batch ends. Then each asks the other, as
+/// the higher-ranked holder, for its second Chunk. A reader whose batch
+/// covers more than one Chunk asks no holder to wait, so neither waits for
+/// a Chunk the other can only install after its own wait: no wait, no
+/// timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_pr318_readers_of_crossed_chunks_never_wait_for_each_other() {
+    let pair = pair_read(|pool| pool.with_holder_wait_ms(400), Start::Crossed).await;
+    assert_eq!(pair.timeouts, 0, "{:?}", pair.elapsed);
+    assert_eq!(
+        pair.waited_at_higher + pair.waited_at_lower,
+        0,
+        "{:?}",
+        pair.elapsed
+    );
+    assert_eq!(pair.writer_reads, 4);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Start {
     Together,
-    /// The reader ranked higher for the Chunk starts and is fetching it from
-    /// the writer before the other one starts.
+    /// The reader ranked higher for the Chunk starts and is held fetching
+    /// it from the writer when the other one starts.
     HigherFirst,
     LowerFirst,
+    /// Two Chunks ranked oppositely; each reader reads both, its own top
+    /// Chunk first (!318 P2-4).
+    Crossed,
 }
 
 struct PairOutcome {
@@ -1221,9 +1265,57 @@ struct PairOutcome {
     writer_reads: usize,
 }
 
-/// Two readers start one CRC Chunk together, each the other's holder, over
-/// real transfers and holder services; `configure` sets up both readers'
-/// peer connection pools.
+fn cache_event_count(registry: &afs_metrics::Registry, event: &str) -> u64 {
+    let sample = format!("afs_dfs_read_cache_events_total{{event=\"{event}\"}} ");
+    afs_metrics::encode_text(registry)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(sample.as_str())?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+/// CRC Chunks for the pair test: one, or two ranked oppositely for r1 and
+/// r2 (r1 above r2 for the first).
+fn pair_chunks(two: bool) -> Vec<(StagedChunk, Vec<u8>)> {
+    let make = |seed: u32| {
+        let bytes: Vec<u8> = (0..(3 * 65536 + 17))
+            .map(|i: u32| (i.wrapping_add(seed) % 249) as u8)
+            .collect();
+        let staged =
+            StagedChunk::new_crc32c(crate::dfs::OperationId::new("pair"), bytes.clone()).unwrap();
+        (staged, bytes)
+    };
+    let version = FileVersionId::new("v");
+    let r1_above = |staged: &StagedChunk| {
+        crate::node::read::engine::holder_ranks_above(&version, &staged.chunk.id, "r1", "r2")
+    };
+    if !two {
+        return vec![make(0)];
+    }
+    let mut first = None;
+    let mut second = None;
+    for seed in 0.. {
+        let chunk = make(seed);
+        if r1_above(&chunk.0) {
+            first.get_or_insert(chunk);
+        } else {
+            second.get_or_insert(chunk);
+        }
+        if first.is_some() && second.is_some() {
+            break;
+        }
+    }
+    vec![first.unwrap(), second.unwrap()]
+}
+
+/// Two readers, each the other's holder, over real transfers and holder
+/// services; `configure` sets up both readers' peer connection pools. The
+/// writer's gate orders the readers (no sleeps); every wait is bounded.
 async fn pair_read(
     configure: fn(
         crate::node::rpc::peer::PeerConnectionPool,
@@ -1232,31 +1324,31 @@ async fn pair_read(
 ) -> PairOutcome {
     use crate::node::read::engine::{ChunkReadOp, DfsReadConfig, DfsReadEngine, ReadBatch};
     let temp = tempfile::tempdir().unwrap();
-    let bytes: Vec<u8> = (0..(3 * 65536 + 17)).map(|i| (i % 249) as u8).collect();
-    let staged =
-        StagedChunk::new_crc32c(crate::dfs::OperationId::new("pair"), bytes.clone()).unwrap();
-    let layout = LayoutRoot {
+    let chunks = pair_chunks(matches!(start, Start::Crossed));
+    let mut layout = LayoutRoot {
         id: LayoutRootId::new("l"),
-        file_length: staged.chunk.length,
-        inline_extents: vec![Extent {
-            file_offset: 0,
+        file_length: 0,
+        inline_extents: Vec::new(),
+    };
+    for (staged, _) in &chunks {
+        layout.inline_extents.push(Extent {
+            file_offset: layout.file_length,
             length: staged.chunk.length,
             chunk_id: staged.chunk.id.clone(),
             chunk_offset: 0,
-        }],
-    };
+        });
+        layout.file_length += staged.chunk.length;
+    }
     // The writer.
     let writer_local =
         Arc::new(LocalChunkStore::open(temp.path().join("writer"), "writer").unwrap());
-    writer_local.put(staged.clone()).unwrap();
-    let writer_reads = Arc::new(CountingWriter {
-        reads: AtomicUsize::new(0),
-        // Slow enough that a staggered second reader finds the first fetching.
-        delay_ms: if matches!(start, Start::Together) {
-            0
-        } else {
-            100
-        },
+    for (staged, _) in &chunks {
+        writer_local.put(staged.clone()).unwrap();
+    }
+    let writer_reads = Arc::new(if matches!(start, Start::Together) {
+        CountingWriter::default()
+    } else {
+        CountingWriter::gated()
     });
     // One writer endpoint per reader, so the per-copy grants' caller matches
     // the peer each server authenticates; one store, one counter.
@@ -1315,10 +1407,24 @@ async fn pair_read(
             fence: 1,
             token: "per-copy".into(),
         };
-        let writer_copy = crate::dfs::SourceCandidate {
-            copy_id: crate::dfs::CopyId::new("writer-copy"),
+        // Crossed: this reader's own top Chunk has a published cache copy
+        // (served by the writer here), read before any holder; the other
+        // Chunk only the durable copy, read after the holder.
+        let own_top = |staged: &StagedChunk| {
+            matches!(start, Start::Crossed) && chunks[index].0.chunk.id == staged.chunk.id
+        };
+        let writer_copy = |staged: &StagedChunk| crate::dfs::SourceCandidate {
+            copy_id: crate::dfs::CopyId::new(if own_top(staged) {
+                "cache-copy"
+            } else {
+                "writer-copy"
+            }),
             chunk_id: staged.chunk.id.clone(),
-            role: crate::dfs::CopyRole::DurableReplica,
+            role: if own_top(staged) {
+                crate::dfs::CopyRole::VerifiedCache
+            } else {
+                crate::dfs::CopyRole::DurableReplica
+            },
             state: crate::dfs::CopyState::Ready,
             location: crate::dfs::CopyLocation::Node {
                 node_id: "writer".into(),
@@ -1329,7 +1435,7 @@ async fn pair_read(
             },
             data_endpoint: Some(writer_endpoints[index].clone()),
             load_hint: 0,
-            read_grant: per_copy,
+            read_grant: per_copy.clone(),
             holder_grant: None,
         };
         let mut holder_grant = grant("v", "l");
@@ -1338,12 +1444,15 @@ async fn pair_read(
         let meta = Arc::new(PairMeta {
             reply: crate::dfs::DfsChunkSourcesReply {
                 revision: 1,
-                chunks: vec![crate::dfs::ChunkSources {
-                    chunk_id: staged.chunk.id.clone(),
-                    chunk: Some(staged.chunk.clone()),
-                    allowed_ranges: vec![(0, staged.chunk.length)],
-                    sources: vec![writer_copy],
-                }],
+                chunks: chunks
+                    .iter()
+                    .map(|(staged, _)| crate::dfs::ChunkSources {
+                        chunk_id: staged.chunk.id.clone(),
+                        chunk: Some(staged.chunk.clone()),
+                        allowed_ranges: vec![(0, staged.chunk.length)],
+                        sources: vec![writer_copy(staged)],
+                    })
+                    .collect(),
             },
             holder: crate::dfs::VersionHolder {
                 node_id: other.into(),
@@ -1410,67 +1519,124 @@ async fn pair_read(
             server,
         });
     }
-    let batch = ReadBatch {
-        file_version_id: Some(FileVersionId::new("v")),
-        layout_root_id: LayoutRootId::new("l"),
-        ops: vec![ChunkReadOp {
-            chunk_id: staged.chunk.id.clone(),
-            chunk_offset: 0,
-            length: staged.chunk.length,
-            output_offset: 0,
-        }],
-        lookahead: Vec::new(),
+    // Each reader's batch (its own top Chunk first) and expected bytes.
+    let batch_of = |order: &[usize]| {
+        let mut ops = Vec::new();
+        let mut expected = Vec::new();
+        for &chunk in order {
+            let (staged, bytes) = &chunks[chunk];
+            ops.push(ChunkReadOp {
+                chunk_id: staged.chunk.id.clone(),
+                chunk_offset: 0,
+                length: staged.chunk.length,
+                output_offset: expected.len(),
+            });
+            expected.extend_from_slice(bytes);
+        }
+        (
+            ReadBatch {
+                file_version_id: Some(FileVersionId::new("v")),
+                layout_root_id: LayoutRootId::new("l"),
+                ops,
+                lookahead: Vec::new(),
+            },
+            expected,
+        )
     };
+    // r1 ranks above r2 for chunks[0] (`pair_chunks`); for one Chunk, find out.
     let higher = usize::from(!crate::node::read::engine::holder_ranks_above(
         &FileVersionId::new("v"),
-        &staged.chunk.id,
+        &chunks[0].0.chunk.id,
         names[0],
         names[1],
     ));
     let order = match start {
-        Start::Together | Start::HigherFirst => [higher, 1 - higher],
+        Start::Together | Start::HigherFirst | Start::Crossed => [higher, 1 - higher],
         Start::LowerFirst => [1 - higher, higher],
     };
-    let started = std::time::Instant::now();
-    let mut reads = Vec::new();
-    for (position, index) in order.into_iter().enumerate() {
-        if position == 1 && !matches!(start, Start::Together) {
-            // The first reader is fetching the Chunk from the writer.
-            let first = nodes[order[0]].engine.holder_in_flight().unwrap();
-            while !first.contains(&staged.chunk.id) {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        }
+    let read_of = |index: usize| {
         let engine = nodes[index].engine.clone();
-        let batch = batch.clone();
-        reads.push(tokio::task::spawn_blocking(move || {
-            let mut out = vec![0; batch.ops[0].length as usize];
-            engine.read_batch(&batch, &mut out).map(|_| out)
-        }));
+        let own_first: Vec<usize> = if chunks.len() == 1 {
+            vec![0]
+        } else if index == 0 {
+            vec![0, 1]
+        } else {
+            vec![1, 0]
+        };
+        let (batch, expected) = batch_of(&own_first);
+        tokio::task::spawn_blocking(move || {
+            let mut out = vec![0; expected.len()];
+            engine
+                .read_batch(&batch, &mut out)
+                .map(|()| out == expected)
+        })
+    };
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(10);
+    // Bounded until-loops that stop early when a read already ended (its
+    // result then decides the test instead of a hang).
+    async fn until_or_ended(
+        what: &str,
+        deadline: std::time::Instant,
+        reads: &[tokio::task::JoinHandle<afs_error::Result<bool>>],
+        ready: impl Fn() -> bool,
+    ) {
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            if reads.iter().any(|read| read.is_finished()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
+    let mut reads = Vec::new();
+    match start {
+        Start::Together => {
+            reads.push(read_of(order[0]));
+            reads.push(read_of(order[1]));
+        }
+        Start::HigherFirst | Start::LowerFirst => {
+            reads.push(read_of(order[0]));
+            // The first reader is at the writer: its Chunk is in flight.
+            until_or_ended("the first fetch", deadline, &reads, || {
+                writer_reads.reads() >= 1
+            })
+            .await;
+            reads.push(read_of(order[1]));
+            // The second one waits at the first, or reads the writer too.
+            let first = &nodes[order[0]].registry;
+            until_or_ended("the second reader", deadline, &reads, || {
+                writer_reads.reads() >= 2 || cache_event_count(first, "holder_waited") >= 1
+            })
+            .await;
+        }
+        Start::Crossed => {
+            reads.push(read_of(order[0]));
+            reads.push(read_of(order[1]));
+            until_or_ended("both first fetches", deadline, &reads, || {
+                writer_reads.reads() >= 2
+            })
+            .await;
+        }
+    }
+    writer_reads.open();
     for read in reads {
-        assert_eq!(read.await.unwrap().expect("both readers read"), bytes);
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read)
+            .await
+            .expect("a read hangs")
+            .unwrap();
+        assert!(result.expect("both readers read"), "wrong bytes");
     }
     let elapsed = started.elapsed();
-    let event = |node: &Node, event: &str| {
-        let sample = format!("afs_dfs_read_cache_events_total{{event=\"{event}\"}} ");
-        afs_metrics::encode_text(&node.registry)
-            .unwrap()
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(sample.as_str())?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
-            .unwrap_or(0)
-    };
     let timeouts: u64 = nodes
         .iter()
-        .map(|node| event(node, "holder_wait_timeout"))
+        .map(|node| cache_event_count(&node.registry, "holder_wait_timeout"))
         .sum();
-    let waited_at_higher = event(&nodes[higher], "holder_waited");
-    let waited_at_lower = event(&nodes[1 - higher], "holder_waited");
+    let waited_at_higher = cache_event_count(&nodes[higher].registry, "holder_waited");
+    let waited_at_lower = cache_event_count(&nodes[1 - higher].registry, "holder_waited");
     for node in nodes {
         node.server.abort();
     }
@@ -1482,6 +1648,6 @@ async fn pair_read(
         waited_at_higher,
         waited_at_lower,
         timeouts,
-        writer_reads: writer_reads.reads.load(Ordering::SeqCst),
+        writer_reads: writer_reads.reads(),
     }
 }

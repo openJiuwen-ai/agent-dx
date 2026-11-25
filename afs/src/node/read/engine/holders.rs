@@ -13,16 +13,18 @@ use super::*;
 const HOLDER_LOOKUP_WAIT: Duration = Duration::from_millis(250);
 /// The wait a holder read asks for: `budget` (`dfs_holder_wait_ms`, default
 /// 30 ms, review/19) only when the holder ranks above this reader for the
-/// Chunk (rendezvous over the version, the Chunk and the Node, re-review P2),
-/// otherwise none. Two readers fetching the same Chunk at once are each
-/// other's holders; with this order only one of them waits for the other, so
-/// the waits for one Chunk can never form a cycle and the highest-ranked
-/// reader never waits at all.
+/// Chunk (rendezvous over the version, the Chunk and the Node, re-review P2)
+/// and the read covers one Chunk only (!318 P2-4,
+/// [`super::remote::keeping_fetched`]), otherwise none. Two readers fetching
+/// the same Chunk at once are each other's holders; with this order only one
+/// of them waits for the other, so the waits for one Chunk can never form a
+/// cycle and the highest-ranked reader never waits at all.
 pub(crate) fn holder_wait_ms(version: &FileVersionId, item: &ResolvedReadOp, budget: u32) -> u32 {
     let Some(grant) = &item.source.holder_grant else {
         return 0;
     };
     if budget != 0
+        && super::remote::holder_wait_allowed()
         && holder_ranks_above(
             version,
             &item.op.chunk_id,
