@@ -1692,6 +1692,24 @@ fn review_chunk(seed: u8) -> StagedChunk {
     StagedChunk::new_crc32c(crate::dfs::OperationId::new("review"), bytes).unwrap()
 }
 
+fn review_layout(chunks: &[StagedChunk]) -> LayoutRoot {
+    let mut layout = LayoutRoot {
+        id: LayoutRootId::new("l"),
+        file_length: 0,
+        inline_extents: Vec::new(),
+    };
+    for staged in chunks {
+        layout.inline_extents.push(Extent {
+            file_offset: layout.file_length,
+            length: staged.chunk.length,
+            chunk_id: staged.chunk.id.clone(),
+            chunk_offset: 0,
+        });
+        layout.file_length += staged.chunk.length;
+    }
+    layout
+}
+
 /// A holder endpoint that accepts connections and never answers.
 async fn silent_holder() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1703,6 +1721,41 @@ async fn silent_holder() -> (String, tokio::task::JoinHandle<()>) {
         }
     });
     (endpoint, server)
+}
+
+/// A real holder ("holder", epoch 9) of `chunks`, sharing version "v".
+async fn review_holder(
+    temp: &std::path::Path,
+    chunks: &[StagedChunk],
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<crate::node::rpc::data::HolderServe>,
+    Arc<LocalChunkStore>,
+) {
+    let local = Arc::new(LocalChunkStore::open(temp.join("holder"), "holder").unwrap());
+    for staged in chunks {
+        local.put(staged.clone()).unwrap();
+    }
+    let registry = HolderRegistry::new();
+    registry.retain(&FileVersionId::new("v"), 1);
+    registry.attach(&FileVersionId::new("v"), &review_layout(chunks));
+    let meta = Arc::new(FakeMeta {
+        genuine: Mutex::new(Some(grant("v", "l"))),
+        calls: AtomicUsize::new(0),
+        keep_ms: 30_000,
+    });
+    let holders = crate::node::rpc::data::HolderServe::new(
+        meta,
+        registry,
+        HolderInFlight::new(),
+        "holder".into(),
+        9,
+    );
+    let mut service = dfs_reuse_test_service(local.clone(), Arc::new(DenyDfsReadAuthorizer));
+    service.holders = Some(holders.clone());
+    let (endpoint, server) = serve(service).await;
+    (endpoint, server, holders, local)
 }
 
 /// A reader ("reader", epoch 1) of `chunks` over the real gRPC transfer: each
@@ -1901,4 +1954,40 @@ async fn h2_pr318_unresponsive_holder_leaves_the_read_time_for_its_copy() {
         1,
         "the holder was asked first"
     );
+}
+
+/// !318 P2-3: the holder has X and Y. While serving X, after every check,
+/// X is evicted as a cache would. The holder answers NOT_READY for X (the
+/// read falls back to the durable copy) and is not demoted: the next read,
+/// of Y, is still served by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_pr318_chunk_evicted_while_served_is_not_ready_not_a_bad_holder() {
+    let temp = tempfile::tempdir().unwrap();
+    let x = review_chunk(3);
+    let y = review_chunk(4);
+    let chunks = [x.clone(), y.clone()];
+    let (endpoint, _server, serve, holder_local) = review_holder(temp.path(), &chunks).await;
+    let evict = x.chunk.id.clone();
+    serve.on(crate::node::rpc::data::HolderTestPoint::Serve, move || {
+        assert_eq!(holder_local.collect_generation(1, &[evict]).unwrap(), 1);
+    });
+    let reader = review_reader(temp.path(), &chunks, &endpoint, 0).await;
+    let budget = std::time::Duration::from_secs(5);
+    assert_eq!(read_within(&reader, &x, budget).await.unwrap(), x.bytes());
+    assert_eq!(reader.writer.reads(), 1, "X from the durable copy");
+    assert_eq!(read_within(&reader, &y, budget).await.unwrap(), y.bytes());
+    assert_eq!(reader.writer.reads(), 1, "Y from the holder, not demoted");
+    let text = afs_metrics::encode_text(&reader.metrics).unwrap();
+    let event = |name: &str| {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!(
+                    "afs_dfs_read_cache_events_total{{event=\"{name}\"}} "
+                ))?
+                .parse::<u64>()
+                .ok()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(event("holder_answered_not_ready"), 1);
 }

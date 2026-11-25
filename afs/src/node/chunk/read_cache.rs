@@ -424,6 +424,14 @@ impl LocalChunkStore {
         })
     }
 
+    /// Whether the catalog has any record of `id`, whatever its state: a
+    /// Chunk without one was evicted or collected, not damaged (!318 P2-3).
+    pub(crate) fn has_catalog_record(&self, id: &ChunkId) -> bool {
+        self.catalog
+            .lock()
+            .is_ok_and(|catalog| catalog.records.contains_key(id))
+    }
+
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
         Ok(self
             .catalog

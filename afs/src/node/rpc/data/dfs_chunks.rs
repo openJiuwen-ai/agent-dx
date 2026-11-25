@@ -1019,6 +1019,19 @@ impl DfsChunksService {
                 timing.holder_request("serve", serving.elapsed());
             }
             if let Err(error) = served {
+                // A Chunk that left the catalog after the checks was evicted
+                // (or collected), as caches are: not ready here, not a failed
+                // copy (!318 P2-3). A Chunk still cataloged keeps its error,
+                // so damage is never reported as NOT_READY.
+                let evicted = request.operations.iter().any(|op| {
+                    !local.has_catalog_record(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
+                });
+                let error = if evicted {
+                    local.record_read_cache_event("holder_not_ready");
+                    holder_not_ready()
+                } else {
+                    error
+                };
                 let _ = sender.blocking_send(Err(error));
             }
         });
