@@ -309,6 +309,7 @@ struct Fixture {
     lost_read_prepare_replies: Arc<AtomicUsize>,
     lost_read_releases: Arc<AtomicUsize>,
     lost_read_release_replies: Arc<AtomicUsize>,
+    open_reply_pause: Arc<StdMutex<Option<OpenReplyPause>>>,
     /// The Home window service; attached to the server only with `home_hixl`.
     home: Arc<OwnerHixlService>,
     registry: afs_metrics::Registry,
@@ -537,6 +538,11 @@ struct CommitLoss {
     control_outage: Option<Arc<AtomicBool>>,
 }
 
+struct OpenReplyPause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 struct LateCommit {
     entered: Arc<tokio::sync::Notify>,
     finished: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -584,6 +590,8 @@ async fn fixture_with_commit_loss(
     let lose_releases = lost_read_releases.clone();
     let lost_read_release_replies = Arc::new(AtomicUsize::new(0));
     let lose_release_replies = lost_read_release_replies.clone();
+    let open_reply_pause = Arc::new(StdMutex::new(None::<OpenReplyPause>));
+    let pause_open_reply = open_reply_pause.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .layer(tower::layer::layer_fn(
@@ -593,6 +601,7 @@ async fn fixture_with_commit_loss(
                     let lose_prepare_replies = lose_prepare_replies.clone();
                     let lose_releases = lose_releases.clone();
                     let lose_release_replies = lose_release_replies.clone();
+                    let pause_open_reply = pause_open_reply.clone();
                     tower::service_fn(move |request: axum::http::Request<tonic::body::Body>| {
                         use tower::ServiceExt;
                         let lose_prepare_reply =
@@ -618,6 +627,12 @@ async fn fixture_with_commit_loss(
                                     left.checked_sub(1)
                                 })
                                 .is_ok();
+                        let open_pause = request
+                            .uri()
+                            .path()
+                            .ends_with("/Open")
+                            .then(|| pause_open_reply.lock().unwrap().take())
+                            .flatten();
                         let inner = inner.clone();
                         let lost_commits = lost_commits.clone();
                         async move {
@@ -691,6 +706,10 @@ async fn fixture_with_commit_loss(
                                 .into_http());
                             }
                             let reply = inner.oneshot(request).await?;
+                            if let Some(pause) = open_pause {
+                                let _ = pause.entered.send(());
+                                let _ = pause.resume.await;
+                            }
                             if lose_prepare_reply {
                                 return Ok(tonic::Status::unavailable(
                                     "injected lost read prepare reply",
@@ -742,6 +761,7 @@ async fn fixture_with_commit_loss(
         lost_read_prepare_replies,
         lost_read_releases,
         lost_read_release_replies,
+        open_reply_pause,
         home,
         registry,
         _server: server,
@@ -3434,6 +3454,66 @@ async fn assert_auto_grpc_open_prefetch_invalidation(truncate: bool) {
             }
             read(&peer, &reader, 0, OLD.len()).unwrap()
         })
+        .await;
+    assert_eq!(observed, if truncate { &[][..] } else { NEW });
+    assert_eq!(fixture.grpc_reads(), 1);
+    assert_eq!(fixture.native_read_batches(), 0);
+}
+
+#[tokio::test]
+async fn late_grpc_open_reply_cannot_restore_body_after_write() {
+    assert_late_grpc_open_reply_is_discarded(false).await;
+}
+
+#[tokio::test]
+async fn late_grpc_open_reply_cannot_restore_body_after_truncate() {
+    assert_late_grpc_open_reply_is_discarded(true).await;
+}
+
+async fn assert_late_grpc_open_reply_is_discarded(truncate: bool) {
+    const OLD: &[u8] = b"old bytes";
+    const NEW: &[u8] = b"new bytes";
+    let mut fixture = fixture_with(
+        policy(DataMode::Auto),
+        false,
+        MemorySource::new(OLD.to_vec(), SLOT),
+    )
+    .await;
+    Arc::get_mut(&mut fixture.client).unwrap().read_session = None;
+    let writer = fixture
+        .with_client(|peer| open(&peer, libc::O_WRONLY))
+        .await;
+    fixture
+        .handler
+        .provide_open_prefetch
+        .store(true, Ordering::SeqCst);
+    let (entered, snapshotted) = tokio::sync::oneshot::channel();
+    let (resume, wait) = tokio::sync::oneshot::channel();
+    *fixture.open_reply_pause.lock().unwrap() = Some(OpenReplyPause {
+        entered,
+        resume: wait,
+    });
+    let client = fixture.client.clone();
+    let reader = tokio::task::spawn_blocking(move || open(&client, libc::O_RDONLY));
+    tokio::time::timeout(Duration::from_secs(2), snapshotted)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .with_client(move |peer| {
+            if truncate {
+                let truncation = open(&peer, libc::O_WRONLY | libc::O_TRUNC);
+                assert_eq!(truncation.identity, writer.identity);
+            } else {
+                assert_eq!(peer.write(&grant(), &writer, 0, NEW).unwrap(), NEW.len());
+            }
+        })
+        .await;
+    resume.send(()).unwrap();
+    let reader = reader.await.unwrap();
+    assert_eq!(fixture.grpc_reads(), 0);
+    let observed = fixture
+        .with_client(move |peer| read(&peer, &reader, 0, OLD.len()).unwrap())
         .await;
     assert_eq!(observed, if truncate { &[][..] } else { NEW });
     assert_eq!(fixture.grpc_reads(), 1);

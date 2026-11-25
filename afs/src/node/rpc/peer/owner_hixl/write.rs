@@ -32,8 +32,8 @@ use tonic::transport::Channel;
 
 const CLOSE_WRITE_WINDOW_BUDGET: Duration = Duration::from_millis(100);
 const BACKGROUND_WRITE_RECOVERY_BUDGET: Duration = Duration::from_secs(2);
-const BACKGROUND_WRITE_RECOVERY_ROUND: Duration = Duration::from_millis(500);
-const BACKGROUND_WRITE_RECOVERY_BACKOFF: Duration = Duration::from_millis(250);
+const WRITE_RECOVERY_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+const WRITE_RECOVERY_BACKOFF: Duration = Duration::from_millis(250);
 
 impl OwnerReadSession {
     /// Confirms a usable session before sending a potentially truncating Open.
@@ -647,7 +647,26 @@ impl PendingWrite {
             cancel_next: true,
             recover_commit: Some(self.finish.clone()),
         };
-        let reply = send_abort(&self.lease.session, &request, deadline).await?;
+        // Home returns promptly while Commit runs. Poll on the client without
+        // occupying a server worker, within the caller's chosen deadline.
+        let reply = loop {
+            let timeout = remaining(deadline)?.min(WRITE_RECOVERY_RPC_TIMEOUT);
+            match write_rpc_once(
+                &self.lease.session.client,
+                request.clone(),
+                timeout,
+                |mut client, command| async move { client.abort_write_hixl(command).await },
+            )
+            .await
+            {
+                Ok(reply) => break reply,
+                Err(error) if retries_prepare(&error) || transport_cancelled(&error) => {
+                    let next = (Instant::now() + WRITE_RECOVERY_BACKOFF).min(deadline);
+                    tokio::time::sleep_until(next.into()).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         match reply.recovery {
             Some(Recovery::Written(written)) if written <= length => Ok(Ok(written)),
             Some(Recovery::Failure(failure)) => {
@@ -673,19 +692,8 @@ impl PendingWrite {
         tokio::spawn(
             async move {
                 let mut ticket = self;
-                while remaining(deadline).is_ok() {
-                    let round_deadline =
-                        (Instant::now() + BACKGROUND_WRITE_RECOVERY_ROUND).min(deadline);
-                    match ticket.recover(round_deadline, length).await {
-                        Ok(_) => {
-                            ticket.resolved = true;
-                            return;
-                        }
-                        Err(error) if retries_prepare(&error) || transport_cancelled(&error) => {}
-                        Err(_) => return,
-                    }
-                    let next = (Instant::now() + BACKGROUND_WRITE_RECOVERY_BACKOFF).min(deadline);
-                    tokio::time::sleep_until(next.into()).await;
+                if ticket.recover(deadline, length).await.is_ok() {
+                    ticket.resolved = true;
                 }
                 // Dropping an unresolved ticket still poisons the session.
             }
@@ -855,15 +863,9 @@ where
     const ATTEMPTS: u32 = PREPARE_ATTEMPTS as u32;
     for left in (1..=ATTEMPTS).rev() {
         let timeout = remaining(deadline)? / left;
-        let mut command = afs_tracing::request_with_current_context(request.clone());
-        command.set_timeout(timeout);
-        let error = match tokio::time::timeout(timeout, send(client.clone(), command)).await {
-            Ok(Ok(reply)) => return Ok(reply.into_inner()),
-            Ok(Err(status)) => status_to_error(status),
-            Err(_) => afs_error::Error::coded(
-                afs_error::CLIENT_DEADLINE_EXCEEDED,
-                "OwnerFs HIXL write RPC timed out",
-            ),
+        let error = match write_rpc_once(client, request.clone(), timeout, &send).await {
+            Ok(reply) => return Ok(reply),
+            Err(error) => error,
         };
         observe_error(&error);
         if left == 1
@@ -874,6 +876,27 @@ where
         }
     }
     Err(protocol_error("OwnerFs HIXL write RPC produced no result"))
+}
+
+async fn write_rpc_once<Req, Reply, SendReply>(
+    client: &OwnerFilesClient<Channel>,
+    request: Req,
+    timeout: Duration,
+    send: impl FnOnce(OwnerFilesClient<Channel>, tonic::Request<Req>) -> SendReply,
+) -> afs_error::Result<Reply>
+where
+    SendReply: std::future::Future<Output = Result<tonic::Response<Reply>, tonic::Status>>,
+{
+    let mut command = afs_tracing::request_with_current_context(request);
+    command.set_timeout(timeout);
+    match tokio::time::timeout(timeout, send(client.clone(), command)).await {
+        Ok(Ok(reply)) => Ok(reply.into_inner()),
+        Ok(Err(status)) => Err(status_to_error(status)),
+        Err(_) => Err(afs_error::Error::coded(
+            afs_error::CLIENT_DEADLINE_EXCEEDED,
+            "OwnerFs HIXL write RPC timed out",
+        )),
+    }
 }
 
 fn transport_cancelled(error: &afs_error::Error) -> bool {

@@ -2237,7 +2237,7 @@ async fn owner_prefetch_cache_hits_do_not_count_as_client_rpc_or_payload() {
     );
     let grant = test_grant();
     let file = test_remote_file(b"prefetched-handle".to_vec());
-    client.prefetched_reads.lock().unwrap().insert(
+    client.prefetched_reads.lock().unwrap().entries.insert(
         file.handle.clone(),
         super::PrefetchedOwnerRead {
             #[cfg(feature = "dfs")]

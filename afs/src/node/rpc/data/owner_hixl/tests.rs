@@ -468,6 +468,106 @@ async fn read_only_home_does_not_admit_hixl_writes() {
 }
 
 #[test]
+fn repeat_write_recovery_leaves_a_home_worker_free_during_slow_commit() {
+    use afs_protocol::node_data::{
+        OwnerAbortWriteHixlRequest, OwnerFinishWriteHixlRequest, OwnerPrepareWriteHixlRequest,
+        owner_abort_write_hixl_reply::Recovery,
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(3)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (home, exports, source) = fixture(SLOT, 2);
+        let session_id = session(&home);
+        let peer = "node-b".to_owned();
+        let data = b"write once";
+        let prepared = home
+            .prepare_write(
+                peer.clone(),
+                OwnerPrepareWriteHixlRequest {
+                    session_id,
+                    write_id: "slow-commit".to_owned(),
+                    access: Some(access("root-a")),
+                    handle: Some(OwnerHandle {
+                        opaque: OPEN_HANDLE.to_vec(),
+                    }),
+                    length: u32::try_from(data.len()).unwrap(),
+                    data_checksum: SlotChecksum::Blake3.digest(data),
+                    data_checksum_algorithm: HixlSlotChecksumAlgorithm::Blake3 as i32,
+                    slot_bytes: SLOT as u64,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        exports.write(prepared.slots[0].address, data);
+        let finish = OwnerFinishWriteHixlRequest {
+            session_id,
+            write_id: prepared.write_id,
+            engine_generation: prepared.engine_generation,
+            ..Default::default()
+        };
+        let recover = OwnerAbortWriteHixlRequest {
+            session_id,
+            write_id: finish.write_id.clone(),
+            engine_generation: finish.engine_generation,
+            cancel_next: true,
+            recover_commit: Some(finish.clone()),
+            ..Default::default()
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = source.pause_next_write(entered.clone());
+        let commit = tokio::spawn({
+            let home = home.clone();
+            let peer = peer.clone();
+            async move { home.commit_write(peer, finish).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        // Both calls run the real Home handler. Dropping the RPC waiter at its
+        // deadline models the client retrying while the file write is paused.
+        let local_timeout = Duration::from_millis(300);
+        let (first, second) = tokio::join!(
+            tokio::time::timeout(
+                local_timeout,
+                home.abort_write(peer.clone(), recover.clone())
+            ),
+            tokio::time::timeout(
+                local_timeout,
+                home.abort_write(peer.clone(), recover.clone())
+            )
+        );
+        let spare = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::task::spawn_blocking(|| ()),
+        )
+        .await;
+        resume.send(()).unwrap();
+        let written = commit.await.unwrap().unwrap().into_inner().written;
+        assert_eq!(written as usize, data.len());
+        assert!(
+            matches!(spare, Ok(Ok(()))),
+            "the two timed-out recovery calls still occupied both spare Home workers"
+        );
+        for reply in [first, second] {
+            assert_eq!(
+                reply.unwrap().unwrap_err().code(),
+                tonic::Code::DeadlineExceeded
+            );
+        }
+        let receipt = home.abort_write(peer, recover).await.unwrap().into_inner();
+        assert_eq!(receipt.recovery, Some(Recovery::Written(written)));
+        assert_eq!(exports.active(), 0);
+    });
+}
+
+#[test]
 fn a_late_close_cannot_close_a_reused_session_id_or_quarantine_its_windows() {
     let (previous, _, _) = fixture(SLOT, 2);
     let previous_id = session(&previous);

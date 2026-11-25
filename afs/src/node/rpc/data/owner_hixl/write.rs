@@ -520,78 +520,77 @@ impl OwnerHixlService {
         }
         let fingerprint = blake3::hash(&request.encode_to_vec());
         let mut registry = self.lock_registry()?;
-        loop {
-            let session = registry.session_mut(request.session_id, peer)?;
-            let target = if let Some(record) = session.writes.get_mut(&request.write_id) {
-                check_generation(record, request.engine_generation)?;
-                if record
-                    .finish_fingerprint
-                    .is_some_and(|hash| hash != fingerprint)
-                {
-                    return Err(invalid_write(
-                        "OwnerFs HIXL write recovery differs from commit",
+        let session = registry.session_mut(request.session_id, peer)?;
+        let target = if let Some(record) = session.writes.get_mut(&request.write_id) {
+            check_generation(record, request.engine_generation)?;
+            if record
+                .finish_fingerprint
+                .is_some_and(|hash| hash != fingerprint)
+            {
+                return Err(invalid_write(
+                    "OwnerFs HIXL write recovery differs from commit",
+                ));
+            }
+            match &mut record.state {
+                WriteState::Ready(target) if !session.closed && request.reused.is_none() => {
+                    record.finish_fingerprint = Some(fingerprint);
+                    target.clone()
+                }
+                WriteState::Committing(_) => {
+                    // A short-lived recovery poll must not occupy a blocking
+                    // worker for the duration of the original file write.
+                    return Err(Status::deadline_exceeded(
+                        "OwnerFs HIXL write is still in progress",
                     ));
                 }
-                match &mut record.state {
-                    WriteState::Ready(target) if !session.closed && request.reused.is_none() => {
-                        record.finish_fingerprint = Some(fingerprint);
-                        target.clone()
+                WriteState::Committed { result, .. } => {
+                    let next = result
+                        .as_mut()
+                        .ok()
+                        .and_then(|reply| reply.next_window.take());
+                    let receipt = recovery_receipt(result);
+                    if let Some(next) = next {
+                        self.discard_successor(
+                            &mut registry,
+                            peer,
+                            request.session_id,
+                            &next.write_id,
+                        )?;
                     }
-                    WriteState::Committing(_) => {
-                        registry = self.wait_for_write(registry)?;
-                        continue;
-                    }
-                    WriteState::Committed { result, .. } => {
-                        let next = result
-                            .as_mut()
-                            .ok()
-                            .and_then(|reply| reply.next_window.take());
-                        let receipt = recovery_receipt(result);
-                        if let Some(next) = next {
-                            self.discard_successor(
-                                &mut registry,
-                                peer,
-                                request.session_id,
-                                &next.write_id,
-                            )?;
-                        }
-                        return Ok(receipt);
-                    }
-                    _ => {
-                        return Err(invalid_write(
-                            "OwnerFs HIXL write ticket cannot be recovered",
-                        ));
-                    }
+                    return Ok(receipt);
                 }
-            } else {
-                let reused = request
-                    .reused
-                    .as_ref()
-                    .filter(|_| !session.closed)
-                    .ok_or_else(|| {
-                        invalid_write("OwnerFs HIXL write ticket cannot be recovered")
-                    })?;
-                Self::consume_write_window(session, request, reused, fingerprint)?
-            };
-            let result = Err(coded_status(
-                afs_error::NODE_OWNER_WRITE_NOT_EXECUTED,
-                "OwnerFs HIXL Commit was fenced before file mutation",
-            ));
-            let receipt = recovery_receipt(&result);
-            let release = self.release_write_target(&target);
-            write_record(session, &request.write_id, request.engine_generation)?.state =
-                WriteState::Committed {
-                    result,
-                    pinned: release.is_err().then_some(target),
-                };
-            session.last_used = Instant::now();
-            self.transfers.writes_changed.notify_all();
-            if let Err(error) = release {
-                afs_logging::error!("ownerfs.hixl_write_release_failed"; "error" => error.to_string());
-                let _ = self.quarantine_pending(&mut registry, true);
+                _ => {
+                    return Err(invalid_write(
+                        "OwnerFs HIXL write ticket cannot be recovered",
+                    ));
+                }
             }
-            return Ok(receipt);
+        } else {
+            let reused = request
+                .reused
+                .as_ref()
+                .filter(|_| !session.closed)
+                .ok_or_else(|| invalid_write("OwnerFs HIXL write ticket cannot be recovered"))?;
+            Self::consume_write_window(session, request, reused, fingerprint)?
+        };
+        let result = Err(coded_status(
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED,
+            "OwnerFs HIXL Commit was fenced before file mutation",
+        ));
+        let receipt = recovery_receipt(&result);
+        let release = self.release_write_target(&target);
+        write_record(session, &request.write_id, request.engine_generation)?.state =
+            WriteState::Committed {
+                result,
+                pinned: release.is_err().then_some(target),
+            };
+        session.last_used = Instant::now();
+        self.transfers.writes_changed.notify_all();
+        if let Err(error) = release {
+            afs_logging::error!("ownerfs.hixl_write_release_failed"; "error" => error.to_string());
+            let _ = self.quarantine_pending(&mut registry, true);
         }
+        Ok(receipt)
     }
 
     fn discard_successor(

@@ -258,6 +258,13 @@ struct PrefetchedOwnerRead {
     bytes: Vec<u8>,
 }
 
+#[cfg(feature = "ownerfs")]
+#[derive(Default)]
+struct PrefetchedOwnerReads {
+    generation: u64,
+    entries: HashMap<Vec<u8>, PrefetchedOwnerRead>,
+}
+
 /// OwnerFs 的 node-to-node 文件客户端。
 ///
 /// 它实现 `RemoteFiles`，供非 Home 节点把根内文件操作转发到 Home。read/write
@@ -272,7 +279,7 @@ pub struct OwnerPeerClient {
     runtime: OwnerRuntime,
     // Per-open read snapshot and file identity returned by OwnerFiles.Open. It is
     // removed at release and never reused for another open of the same path.
-    prefetched_reads: StdMutex<HashMap<Vec<u8>, PrefetchedOwnerRead>>,
+    prefetched_reads: StdMutex<PrefetchedOwnerReads>,
     pending_releases: Arc<AtomicUsize>,
     rdma_admission: Arc<tokio::sync::Semaphore>,
     metrics: Option<super::OwnerRpcMetrics>,
@@ -326,7 +333,7 @@ pub fn owner_files_client_from_channel_result(channel: Channel) -> PeerResult<Ow
         long_lock_control: None,
         client: StdMutex::new(OwnerFilesClient::new(channel)),
         runtime: OwnerRuntime::current_or_new("OwnerFiles client")?,
-        prefetched_reads: StdMutex::new(HashMap::new()),
+        prefetched_reads: StdMutex::default(),
         pending_releases: Arc::new(AtomicUsize::new(0)),
         rdma_admission: Arc::new(tokio::sync::Semaphore::new(OWNER_RDMA_MAX_CLIENT_WINDOWS)),
         metrics: None,
@@ -361,7 +368,7 @@ pub fn owner_files_client_from_channel_with_runtime_and_metrics(
         long_lock_control: None,
         client: StdMutex::new(OwnerFilesClient::new(channel)),
         runtime: OwnerRuntime::Existing(runtime),
-        prefetched_reads: StdMutex::new(HashMap::new()),
+        prefetched_reads: StdMutex::default(),
         pending_releases: Arc::new(AtomicUsize::new(0)),
         rdma_admission: Arc::new(tokio::sync::Semaphore::new(OWNER_RDMA_MAX_CLIENT_WINDOWS)),
         metrics,
@@ -415,7 +422,7 @@ impl OwnerPeerClient {
         if mode != DataMode::Grpc
             && let Ok(mut prefetched) = self.prefetched_reads.lock()
         {
-            prefetched.clear();
+            prefetched.entries.clear();
         }
         self.data_mode = mode;
         self.rdma_device = device;
@@ -424,10 +431,14 @@ impl OwnerPeerClient {
     }
 
     fn invalidate_owner_body(&self, identity: &[u8]) {
-        self.prefetched_reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, entry| entry.identity != identity);
+        {
+            let mut reads = self
+                .prefetched_reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reads.generation = reads.generation.wrapping_add(1);
+            reads.entries.retain(|_, entry| entry.identity != identity);
+        }
         if let Some(session) = self.hixl_read_session() {
             session.invalidate(identity);
         }
@@ -1528,7 +1539,16 @@ impl RemoteFiles for OwnerPeerClient {
         expected_identity: Option<&FileIdentity>,
         options: OpenOptions,
     ) -> afs_error::Result<(RemoteFile, FileAttributes)> {
-        let open_prefetch = self.before_body_open(grant, flags)?;
+        let prefetch_generation = if self.before_body_open(grant, flags)? {
+            Some(
+                self.prefetched_reads
+                    .lock()
+                    .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
+                    .generation,
+            )
+        } else {
+            None
+        };
         let reply = owner_rpc!(
             self,
             open,
@@ -1539,7 +1559,7 @@ impl RemoteFiles for OwnerPeerClient {
                 mode: 0,
                 expected_file_identity: expected_identity.map(file_identity),
                 kill_suidgid: options.kill_suidgid,
-                disable_prefetch: !open_prefetch,
+                disable_prefetch: prefetch_generation.is_none(),
             }
         );
         let identity = reply
@@ -1553,17 +1573,22 @@ impl RemoteFiles for OwnerPeerClient {
                 .attr
                 .ok_or_else(|| protocol_error("OwnerOpenReply missing attr"))?,
         )?;
-        if open_prefetch && let Some(bytes) = reply.prefetched_data {
-            self.prefetched_reads
+        if let (Some(generation), Some(bytes)) = (prefetch_generation, reply.prefetched_data) {
+            let mut reads = self
+                .prefetched_reads
                 .lock()
-                .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
-                .insert(
+                .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?;
+            // A completed mutation may have invalidated the file while OPEN
+            // was in flight. The identity is only known after the reply.
+            if reads.generation == generation {
+                reads.entries.insert(
                     handle.opaque.clone(),
                     PrefetchedOwnerRead {
                         identity: identity.opaque.clone(),
                         bytes,
                     },
                 );
+            }
         }
         if flags & libc::O_TRUNC != 0 {
             self.invalidate_owner_body(&identity.opaque);
@@ -1670,6 +1695,7 @@ impl RemoteFiles for OwnerPeerClient {
                 .prefetched_reads
                 .lock()
                 .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
+                .entries
                 .get(&file.handle)
         {
             let bytes = &bytes.bytes;
@@ -1813,6 +1839,7 @@ impl RemoteFiles for OwnerPeerClient {
         self.prefetched_reads
             .lock()
             .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
+            .entries
             .remove(&file.handle);
         self.body_released(&file.handle);
         // All writes and explicit sync/flush calls have already received their
