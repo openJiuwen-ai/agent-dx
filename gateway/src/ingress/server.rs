@@ -1188,7 +1188,7 @@ impl Ingress {
                     } else {
                         "download"
                     },
-                    request_id: request_id.chars().take(128).collect(),
+                    request_id: crate::common::transfer::bounded_id(&request_id),
                     trace_id: trace.trace_id().unwrap_or_default(),
                     span_id: trace.span_id().unwrap_or_default(),
                     tunnel_id: String::new(),

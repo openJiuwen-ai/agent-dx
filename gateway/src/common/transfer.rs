@@ -426,24 +426,24 @@ impl TransferProgress {
 // removes its entry immediately; no completed-request tombstones are retained.
 #[derive(Default)]
 struct Schedule {
-    deadlines: BTreeMap<(Instant, u64), Weak<TransferProgress>>,
-    by_id: HashMap<u64, Instant>,
+    deadlines: BTreeMap<(Instant, usize), Weak<TransferProgress>>,
+    by_id: HashMap<usize, Instant>,
     armed: Option<Instant>,
 }
 impl Schedule {
-    fn insert(&mut self, id: u64, at: Instant, progress: Weak<TransferProgress>) -> bool {
+    fn insert(&mut self, id: usize, at: Instant, progress: Weak<TransferProgress>) -> bool {
         if let Some(previous) = self.by_id.insert(id, at) {
             self.deadlines.remove(&(previous, id));
         }
         self.deadlines.insert((at, id), progress);
         self.armed.is_none_or(|armed| at < armed)
     }
-    fn cancel(&mut self, id: u64) {
+    fn cancel(&mut self, id: usize) {
         if let Some(at) = self.by_id.remove(&id) {
             self.deadlines.remove(&(at, id));
         }
     }
-    fn due(&mut self) -> Option<(u64, Weak<TransferProgress>)> {
+    fn due(&mut self) -> Option<(usize, Weak<TransferProgress>)> {
         if self
             .deadlines
             .first_key_value()
@@ -467,7 +467,6 @@ struct Monitor {
     policy: TransferPolicy,
     schedule: Mutex<Schedule>,
     wake: Arc<Notify>,
-    next: AtomicU64,
     started: AtomicBool,
     active: AtomicU64,
     checks: AtomicU64,
@@ -487,7 +486,6 @@ impl TransferMonitor {
             policy,
             schedule: Mutex::new(Schedule::default()),
             wake: Arc::new(Notify::new()),
-            next: AtomicU64::new(1),
             started: AtomicBool::new(false),
             active: AtomicU64::new(0),
             checks: AtomicU64::new(0),
@@ -528,7 +526,9 @@ impl TransferMonitor {
             h2_transport: Mutex::new(None),
             events: Mutex::new(()),
         });
-        let id = self.0.next.fetch_add(1, Ordering::Relaxed);
+        // The registration and queued Weak keep this allocation alive until
+        // cancellation; its private address cannot be reused while scheduled.
+        let id = Arc::as_ptr(&progress) as usize;
         let earlier = self
             .0
             .schedule
@@ -543,7 +543,13 @@ impl TransferMonitor {
         if earlier {
             self.0.wake.notify_one();
         }
-        if !self.0.started.swap(true, Ordering::Relaxed) {
+        if !self.0.started.load(Ordering::Relaxed)
+            && self
+                .0
+                .started
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             let monitor = Arc::downgrade(&self.0);
             tokio::spawn(async move {
                 loop {
@@ -668,7 +674,7 @@ impl Monitor {
 
 pub(crate) struct TransferRegistration {
     monitor: TransferMonitor,
-    id: u64,
+    id: usize,
     pub progress: Arc<TransferProgress>,
     finished: bool,
 }
@@ -718,6 +724,18 @@ impl Drop for TransferRegistration {
 fn milliseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+/// Preserve the character bound while allocating once for the common short IDs.
+pub(crate) fn bounded_id(value: &str) -> String {
+    let end = if value.len() <= 128 {
+        value.len()
+    } else {
+        value
+            .char_indices()
+            .nth(128)
+            .map_or(value.len(), |(index, _)| index)
+    };
+    value[..end].to_owned()
+}
 pub(crate) fn ratio(wait_ms: u64, elapsed_ms: u64) -> f64 {
     if elapsed_ms == 0 {
         0.0
@@ -729,6 +747,13 @@ pub(crate) fn ratio(wait_ms: u64, elapsed_ms: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_ids_preserve_short_and_multibyte_values() {
+        assert_eq!(bounded_id("data-short"), "data-short");
+        assert_eq!(bounded_id(&"x".repeat(129)), "x".repeat(128));
+        assert_eq!(bounded_id(&"é".repeat(100)), "é".repeat(100));
+        assert_eq!(bounded_id(&"é".repeat(129)), "é".repeat(128));
+    }
     #[test]
     fn overhead_wait_clock_runs_only_on_state_changes() {
         let wait = Wait::default();
@@ -773,6 +798,15 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn overhead_blocked_diagnostics_do_not_block_transfer_completion() {
+        // Other observer tests install no-op dispatchers on their log workers.
+        // Isolate this blocking subscriber so it always exercises the sink.
+        const CHILD: &str = "ADX_OVERHEAD_BACKPRESSURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["common::transfer::tests::overhead_blocked_diagnostics_do_not_block_transfer_completion", "--exact", "--nocapture"])
+                .env(CHILD,"1").status().unwrap().success());
+            return;
+        }
         use std::sync::{mpsc, Condvar};
         struct Blocked {
             entered: mpsc::SyncSender<()>,
@@ -840,7 +874,14 @@ mod tests {
         release.1.notify_all();
         worker.join().unwrap();
         finish.join().unwrap();
-        assert!(blocked.is_ok(), "diagnostic subscriber was not exercised");
+        assert!(
+            blocked.is_ok(),
+            "diagnostic subscriber was not exercised: checks={}, slow={}, budget={}, suppressed={}",
+            monitor.0.checks.load(Ordering::Relaxed),
+            monitor.0.slow.load(Ordering::Relaxed),
+            monitor.0.budget.lock().unwrap().1,
+            monitor.0.suppressed.load(Ordering::Relaxed)
+        );
         assert!(
             result.is_ok(),
             "blocked diagnostic output delayed completion"

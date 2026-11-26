@@ -1156,6 +1156,9 @@ Slow summaries capture counters under the lifecycle lock, then enter a bounded
 64-record queue with a lazy dedicated log thread per monitor. Full queues and
 unavailable log workers increment the existing suppression counter; request
 completion never waits for the log sink. Queued summaries may be lost at process exit.
+The log budget applies to capture/submission attempts. Backlogs can write in a burst,
+and detection/completion records can arrive out of order; use the captured elapsed/window
+fields for correlation. Detailed span attributes follow the independent trace export policy.
 Active slow transfers keep sampling
 windows without generating additional periodic diagnostic records.
 See [file transfer diagnostics](../docs/testing/distributed-traces.md#文件传输-trace-与慢传输诊断)
