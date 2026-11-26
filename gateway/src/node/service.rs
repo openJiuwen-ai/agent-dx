@@ -204,7 +204,7 @@ impl RelayService {
                 }
             }
         };
-        // Serialize shutdown with Begin: no accepted task may be left unconsumed.
+        // Serialize shutdown with BeginDrain: no accepted task may be left unconsumed.
         if let Some(upgrade) = &upgrade {
             let has_task = upgrade.close_admission().await;
             if has_task && !upgrading {
@@ -217,7 +217,7 @@ impl RelayService {
         // This owner drops the TCP listener; an RPC acknowledgement is not release evidence.
         drop(listener);
         let mut deadline = tokio::time::Instant::now() + config.drain_timeout;
-        if upgrading {
+        if upgrading && !health_joined {
             let _ = health_stop.send(true);
             match tokio::time::timeout(std::time::Duration::from_secs(1), &mut health_task).await {
                 Ok(Ok(Ok(()))) => {

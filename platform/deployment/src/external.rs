@@ -4,8 +4,7 @@ use crate::{
     rollout::{artifact, hex, Mode, RemoteArchive},
     Result,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -18,42 +17,32 @@ use std::{
 
 const MAX_INPUT: u64 = 4 * 1024 * 1024;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Declaration {
+struct Declaration {
     schema: u32,
     mode: Mode,
-    components: Components,
-    ready: Ready,
-    #[serde(default)]
-    upgrade_components: Vec<Role>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Ready {
     components: Components,
 }
 
 // Named fields reject missing, duplicate and additional roles during deserialization.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Components {
     adxlet: Component,
     relay: Component,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Component {
     version: String,
-    release_id: String,
     artifact: ArchiveDescriptor,
     config: ConfigInput,
 }
 
 /// External declaration wire form of a remote package: `{url, sha256}`.
-#[derive(PartialEq, Deserialize, Serialize)]
+#[derive(PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArchiveDescriptor {
     url: String,
@@ -71,26 +60,6 @@ impl ArchiveDescriptor {
 }
 
 use crate::config::ConfigInput;
-
-pub(crate) struct PreparedComponent {
-    pub(crate) role: Role,
-    pub(crate) version: String,
-    pub(crate) release_id: String,
-    pub(crate) binary_sha256: String,
-    pub(crate) raw_config_sha256: String,
-    pub(crate) effective_config_sha256: String,
-}
-
-pub(crate) struct PreparedGroup {
-    pub(crate) mode: Mode,
-    pub(crate) processes: Vec<Process>,
-    pub(crate) components: Vec<PreparedComponent>,
-}
-
-pub(crate) struct Prepared {
-    pub(crate) target: PreparedGroup,
-    pub(crate) ready: PreparedGroup,
-}
 
 fn budget(deadline: Instant, stopped: &AtomicBool) -> Result<()> {
     if stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
@@ -136,9 +105,6 @@ pub(crate) fn config_snapshot(
 ) -> Result<ServiceOverride> {
     input.validate()?;
     let bytes = read_pinned(open_input(&input.mount_path)?, deadline, stopped)?;
-    if format!("{:x}", Sha256::digest(&bytes)) != input.sha256 {
-        return Err("external config digest mismatch".into());
-    }
     let patch: ServiceOverride =
         serde_json::from_slice(&bytes).map_err(|_| "invalid external ServiceOverride JSON")?;
     if patch
@@ -153,15 +119,14 @@ pub(crate) fn config_snapshot(
 
 fn validate_components(components: &Components, mode: Mode) -> Result<()> {
     for component in [&components.adxlet, &components.relay] {
-        if !hex(&component.version, 40) || component.release_id.trim().is_empty() {
-            return Err("external version or release label is invalid".into());
+        if !hex(&component.version, 40) {
+            return Err("external version is invalid".into());
         }
         component.artifact.remote().validate()?;
         component.config.validate()?;
     }
     if mode == Mode::Embedded
         && (components.adxlet.version != components.relay.version
-            || components.adxlet.release_id != components.relay.release_id
             || components.adxlet.artifact != components.relay.artifact)
     {
         return Err("embedded external components must select the same full package".into());
@@ -174,26 +139,12 @@ impl Declaration {
         if self.schema != 1 {
             return Err("unsupported external declaration schema".into());
         }
-        if self.upgrade_components.len() > 1
-            || self
-                .upgrade_components
-                .iter()
-                .any(|role| !matches!(role, Role::Adxlet | Role::Relay))
-            || (self.mode == Mode::Embedded && !self.upgrade_components.is_empty())
-        {
-            return Err("invalid external upgrade components".into());
-        }
-        validate_components(&self.components, self.mode)?;
-        validate_components(&self.ready.components, self.mode)
+        validate_components(&self.components, self.mode)
     }
 }
 
 /// Reads one pinned declaration only; never acquires component configuration or packages.
-pub(crate) fn read_declaration(
-    path: &Path,
-    deadline: Instant,
-    stopped: &AtomicBool,
-) -> Result<(Declaration, String)> {
+fn read_declaration(path: &Path, deadline: Instant, stopped: &AtomicBool) -> Result<Declaration> {
     budget(deadline, stopped)?;
     if !path.is_absolute() {
         return Err("external declaration path must be absolute".into());
@@ -204,7 +155,7 @@ pub(crate) fn read_declaration(
         serde_saphyr::from_str(text).map_err(|_| "invalid external declaration YAML")?;
     declaration.validate()?;
     budget(deadline, stopped)?;
-    Ok((declaration, format!("{:x}", Sha256::digest(&bytes))))
+    Ok(declaration)
 }
 
 fn apply_embedded(
@@ -328,7 +279,7 @@ fn prepare_group(
     deadline: Instant,
     stopped: &AtomicBool,
     runtime: &tokio::runtime::Handle,
-) -> Result<PreparedGroup> {
+) -> Result<Vec<Process>> {
     budget(deadline, stopped)?;
     fs::DirBuilder::new().mode(0o700).create(directory)?;
     let mut candidate = deployment.clone();
@@ -394,22 +345,19 @@ fn prepare_group(
             process,
         )?;
     }
-    let mut identities = Vec::new();
-    let mut owned_binary_sha256 = None;
     for (role, component) in [
         (Role::Adxlet, components.adxlet),
         (Role::Relay, components.relay),
     ] {
         budget(deadline, stopped)?;
-        let acquisition = directory.join(role.name());
-        let binary = if mode == Mode::Embedded && role == Role::Relay {
-            artifact::PreparedBinary {
-                commit: component.version.clone(),
-                sha256: owned_binary_sha256
-                    .clone()
-                    .ok_or("missing owned Adxlet digest")?,
-            }
-        } else {
+        let process = processes
+            .iter_mut()
+            .find(|process| {
+                process.role == role || (mode == Mode::Embedded && process.role == Role::Adxlet)
+            })
+            .ok_or("missing prepared process")?;
+        if role == Role::Adxlet || mode == Mode::Standalone {
+            let acquisition = directory.join(role.name());
             fs::DirBuilder::new().mode(0o700).create(&acquisition)?;
             artifact::remote::prepare_binary(
                 &acquisition,
@@ -422,45 +370,22 @@ fn prepare_group(
                 deadline,
                 stopped,
                 runtime,
-            )?
-        };
-        if role == Role::Adxlet {
-            owned_binary_sha256 = Some(binary.sha256.clone());
-        }
-        let process = processes
-            .iter_mut()
-            .find(|process| {
-                process.role == role || (mode == Mode::Embedded && process.role == Role::Adxlet)
-            })
-            .ok_or("missing prepared process")?;
-        if role == Role::Adxlet || mode == Mode::Standalone {
+            )?;
             process.binary = acquisition.join("executable");
         }
         process.sources.insert(
             role,
             crate::config::ProcessSource {
-                version: Some(binary.commit.clone()),
-                archive_sha256: Some(component.artifact.sha256.clone()),
-                raw_config_sha256: Some(component.config.sha256.clone()),
+                version: Some(component.version),
+                archive_sha256: Some(component.artifact.sha256),
+                raw_config_sha256: None,
             },
         );
-        identities.push(PreparedComponent {
-            role,
-            version: binary.commit,
-            release_id: component.release_id,
-            binary_sha256: binary.sha256,
-            raw_config_sha256: component.config.sha256,
-            effective_config_sha256: process.configuration_sha256.clone(),
-        });
     }
-    Ok(PreparedGroup {
-        mode,
-        processes,
-        components: identities,
-    })
+    Ok(processes)
 }
 
-/// Called by the startup worker, not from the supervisor actor or async executor.
+/// Prepare one declared node group before the supervisor starts any process.
 /// All acquisitions share this first-preparation deadline and the caller's stop flag.
 pub(crate) fn prepare(
     path: &Path,
@@ -468,30 +393,20 @@ pub(crate) fn prepare(
     directory: &Path,
     stopped: &AtomicBool,
     runtime: &tokio::runtime::Handle,
-) -> Result<Prepared> {
+) -> Result<Vec<Process>> {
     let deadline = Instant::now() + Duration::from_secs(900);
-    let (declaration, _) = read_declaration(path, deadline, stopped)?;
-    fs::DirBuilder::new().mode(0o700).create(directory)?;
-    let target = prepare_group(
+    let declaration = read_declaration(path, deadline, stopped)?;
+    let processes = prepare_group(
         deployment,
         declaration.components,
         declaration.mode,
-        &directory.join("target"),
-        deadline,
-        stopped,
-        runtime,
-    )?;
-    let ready = prepare_group(
-        deployment,
-        declaration.ready.components,
-        declaration.mode,
-        &directory.join("ready"),
+        directory,
         deadline,
         stopped,
         runtime,
     )?;
     budget(deadline, stopped)?;
-    Ok(Prepared { target, ready })
+    Ok(processes)
 }
 
 #[cfg(test)]
@@ -500,9 +415,9 @@ mod tests {
 
     #[test]
     fn declarations_require_complete_roles_and_embedded_same_package() {
-        let component = serde_json::json!({"version":"a".repeat(40), "release_id":"release-label",
+        let component = serde_json::json!({"version":"a".repeat(40),
             "artifact":{"url":"https://example.invalid/package.tar.gz", "sha256":"b".repeat(64)},
-            "config":{"mount_path":"/mounted/config", "sha256":"c".repeat(64)}});
+            "config":{"mount_path":"/mounted/config"}});
         assert!(
             serde_json::from_value::<Components>(serde_json::json!({"adxlet":component})).is_err()
         );
@@ -510,36 +425,26 @@ mod tests {
             serde_json::from_value(serde_json::json!({"adxlet":component,"relay":component}))
                 .unwrap();
         validate_components(&components, Mode::Embedded).unwrap();
-        components.relay.release_id = "different-label".into();
+        components.relay.version = "d".repeat(40);
         assert!(validate_components(&components, Mode::Embedded).is_err());
         validate_components(&components, Mode::Standalone).unwrap();
         let groups = serde_json::json!({"adxlet":component,"relay":component});
+        for field in ["ready", "upgrade_components", "release_id"] {
+            let mut wire = serde_json::json!({"schema":1,"mode":"standalone","components":groups});
+            wire[field] = serde_json::json!({});
+            assert!(
+                serde_json::from_value::<Declaration>(wire).is_err(),
+                "{field}"
+            );
+        }
         let mut declaration: Declaration = serde_json::from_value(serde_json::json!({
-            "schema":1,"mode":"standalone","components":groups,
-            "ready":{"components":groups},"upgrade_components":["adxlet"]
+            "schema":1,"mode":"standalone","components":groups
         }))
         .unwrap();
         declaration.validate().unwrap();
-        let official = serde_json::to_value(&declaration).unwrap();
-        assert_eq!(
-            official["components"]["adxlet"]["artifact"],
-            component["artifact"]
-        );
-        assert!(!serde_json::to_string(&official)
-            .unwrap()
-            .contains("archive_sha256"));
-        serde_json::from_value::<Declaration>(official)
-            .unwrap()
-            .validate()
-            .unwrap();
-        declaration.upgrade_components.push(Role::Relay);
-        assert!(declaration.validate().is_err());
-        declaration.upgrade_components = vec![Role::Relay];
         declaration.mode = Mode::Embedded;
-        assert!(declaration.validate().is_err());
-        declaration.upgrade_components.clear();
         declaration.validate().unwrap();
-        declaration.ready.components.relay.config.mount_path = "relative".into();
+        declaration.components.relay.config.mount_path = "relative".into();
         assert!(declaration.validate().is_err());
         let mut invalid = component.clone();
         invalid["artifact"]
@@ -659,15 +564,13 @@ mod tests {
     }
 
     #[test]
-    fn config_requires_authenticated_bytes_and_relay_payload_is_not_ignored() {
+    fn config_snapshot_accepts_path_only_and_relay_payload_is_not_ignored() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config");
         let bytes = br#"{"env":{"EXAMPLE":"effective"}}"#;
         fs::write(&path, bytes).unwrap();
-        let mut input = ConfigInput {
-            mount_path: path,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
-        };
+        let input: ConfigInput =
+            serde_json::from_value(serde_json::json!({"mount_path":path})).unwrap();
         let patch = config_snapshot(
             &input,
             Instant::now() + Duration::from_secs(1),
@@ -686,7 +589,7 @@ mod tests {
             service.env.get("EXAMPLE").map(String::as_str),
             Some("effective")
         );
-        input.sha256 = "0".repeat(64);
+        fs::write(&input.mount_path, b"{").unwrap();
         assert!(config_snapshot(
             &input,
             Instant::now() + Duration::from_secs(1),
@@ -699,7 +602,6 @@ mod tests {
         for key in ["ADX_POD_UID", "ADX_SUPERVISOR_OWNER_SERVICE"] {
             let bytes = serde_json::to_vec(&serde_json::json!({"env":{(key):"forged"}})).unwrap();
             fs::write(&input.mount_path, &bytes).unwrap();
-            input.sha256 = format!("{:x}", Sha256::digest(&bytes));
             assert!(config_snapshot(
                 &input,
                 Instant::now() + Duration::from_secs(1),

@@ -78,12 +78,6 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-impl ConfigError {
-    pub fn is_configuration_error(&self) -> bool {
-        !matches!(self, Self::Resource(_))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub bind: SocketAddr,
@@ -742,12 +736,6 @@ mod tests {
             let listener: crate::ingress::ListenerConfig = serde_json::from_value(value).unwrap();
             assert!(listener.validate().is_err());
         }
-    }
-
-    #[test]
-    fn resource_unavailability_is_not_configuration() {
-        assert!(!ConfigError::Resource("FD budget unavailable".into()).is_configuration_error());
-        assert!(ConfigError::Invalid("invalid value".into()).is_configuration_error());
     }
 
     #[test]

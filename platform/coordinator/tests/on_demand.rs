@@ -235,13 +235,11 @@ impl Routes for Backend {
         }
         let relay = self.relay.lock().unwrap().clone();
         if let Some(relay) = relay {
-            relay
-                .activate_route(
-                    record.spec.id.clone(),
-                    record.runtime.id.clone(),
-                    record.runtime.ip.unwrap(),
-                )
-                .await;
+            relay.activate_route(
+                record.spec.id.clone(),
+                record.runtime.id.clone(),
+                record.runtime.ip.unwrap(),
+            );
         }
         Ok(())
     }
@@ -252,9 +250,7 @@ impl Routes for Backend {
         }
         let relay = self.relay.lock().unwrap().clone();
         if let Some(relay) = relay {
-            relay
-                .retire_route(record.spec.id.clone(), record.runtime.id.clone())
-                .await;
+            relay.retire_route(record.spec.id.clone(), record.runtime.id.clone());
         }
         Ok(())
     }

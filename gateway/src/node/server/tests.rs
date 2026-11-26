@@ -195,8 +195,7 @@ async fn h2_liveness_healthy_idle_and_half_close_remain_usable() {
         .with_route_enforcement();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    node.activate_route("instance".into(), "environment".into(), address.ip())
-        .await;
+    node.activate_route("instance".into(), "environment".into(), address.ip());
     let mut link = link(node.clone()).await;
     let (mut send, mut recv) = open_stream(&mut link, listener.local_addr().unwrap()).await;
     let (mut backend, _) = listener.accept().await.unwrap();
@@ -242,8 +241,7 @@ async fn idle_barrier_preserves_keepalive_and_admits_concurrent_connects() {
         .with_route_enforcement();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    node.activate_route("instance".into(), "environment".into(), address.ip())
-        .await;
+    node.activate_route("instance".into(), "environment".into(), address.ip());
     let mut link = link(node.clone()).await;
     let (mut first, mut first_response) = open_stream(&mut link, address).await;
     let (mut backend, _) = listener.accept().await.unwrap();

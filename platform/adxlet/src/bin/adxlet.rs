@@ -289,83 +289,98 @@ fn coordinator_channel(
     ))
 }
 
+async fn report_node_cycle(
+    coordinator: &mut pb::coordinator_service_client::CoordinatorServiceClient<
+        adx_transport::rpc::RpcChannel,
+    >,
+    last: &mut pb::RegisterNodeRequest,
+    manager: &Adxlet,
+    journal: Option<&adxlet::journal::JournalSink>,
+    timeout: Duration,
+    report_interval: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Preserve the sealing caller's fatal overflow result before the shared report.
+    if manager.process_sealing() && last.heartbeat_sequence == u64::MAX {
+        last.accepting_allocations = false;
+        return Err("heartbeat sequence exhausted".into());
+    }
+    match adxlet::node_reconciliation::reconcile_node(
+        coordinator,
+        last,
+        manager,
+        journal,
+        timeout,
+        report_interval,
+    )
+    .await
+    {
+        Ok(()) => (),
+        Err(error) => {
+            adx_observability::warn!(accepting_allocations=manager.accepting_allocations(), %error, "authoritative node reconciliation incomplete")
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            let configuration = error.is::<adx_process::ConfigurationError>();
             eprintln!("Adxlet initialization failed: {error}");
-            std::process::ExitCode::from(if configuration {
-                adx_process::CONFIGURATION_EXIT_CODE
-            } else {
-                1
-            })
+            std::process::ExitCode::FAILURE
         }
     }
 }
 
 fn validate_config(
     config: &Config,
-) -> Result<(ResourceSource, Option<PressureGate>), adx_process::ConfigurationError> {
-    use adx_process::ConfigurationError;
+) -> Result<(ResourceSource, Option<PressureGate>), &'static str> {
     if let Some(baseline) = &config.network_baseline {
         baseline
             .validate()
-            .map_err(|_| ConfigurationError("invalid network baseline configuration"))?;
+            .map_err(|_| "invalid network baseline configuration")?;
     }
     adxlet::network_baseline::validate_peer_aliases(&config.network_peer_aliases)
-        .map_err(|_| ConfigurationError("invalid network peer aliases"))?;
+        .map_err(|_| "invalid network peer aliases")?;
     if config
         .platform_ingress_sources
         .as_ref()
         .is_some_and(|sources| sources.is_empty())
     {
-        return Err(ConfigurationError(
-            "platform_ingress_sources must not be empty",
-        ));
+        return Err("platform_ingress_sources must not be empty");
     }
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
-        return Err(ConfigurationError(
-            "configure sandboxd_socket and/or jiuwenbox",
-        ));
+        return Err("configure sandboxd_socket and/or jiuwenbox");
     }
     if config.runtime_control.is_none() {
-        return Err(ConfigurationError(
-            "runtime_control is required for event-driven lifecycle observations",
-        ));
+        return Err("runtime_control is required for event-driven lifecycle observations");
     }
     for mount in config.storage_mounts.values() {
         mount
             .validate()
-            .map_err(|_| ConfigurationError("invalid storage mount configuration"))?;
+            .map_err(|_| "invalid storage mount configuration")?;
     }
     config
         .runtime_logs
         .validate()
-        .map_err(|_| ConfigurationError("invalid runtime log policy"))?;
+        .map_err(|_| "invalid runtime log policy")?;
     if config.node_id.is_empty()
         || config.report_interval_seconds == 0
         || config.metrics_interval_seconds == 0
         || config.rpc_timeout_seconds == 0
         || config.runtime_ready_timeout_seconds == 0
     {
-        return Err(ConfigurationError(
-            "node identity and positive intervals required",
-        ));
+        return Err("node identity and positive intervals required");
     }
     if !matches!(
         (&config.coordinator_address, &config.discovery),
         (Some(_), None) | (None, Some(_))
     ) {
-        return Err(ConfigurationError(
-            "configure exactly one of coordinator_address and discovery",
-        ));
+        return Err("configure exactly one of coordinator_address and discovery");
     }
     if config.checkpoint_dir.is_some() && config.checkpoint_storage.is_some() {
-        return Err(ConfigurationError(
-            "checkpoint_dir and checkpoint_storage are mutually exclusive",
-        ));
+        return Err("checkpoint_dir and checkpoint_storage are mutually exclusive");
     }
     if config.checkpoint_dir.is_none()
         && config.checkpoint_storage.is_none()
@@ -374,23 +389,17 @@ fn validate_config(
             .get("ADX_EXECD_CONTROL_SOCKET_PATH")
             .is_some_and(|value| !value.is_empty())
     {
-        return Err(ConfigurationError(
-            "checkpoint socket requires checkpoint storage",
-        ));
+        return Err("checkpoint socket requires checkpoint storage");
     }
     let source = match (config.capacity_file.clone(), config.resource_source.clone()) {
         (Some(path), None) => ResourceSource::File { path },
         (None, Some(source)) => source,
         _ => {
-            return Err(ConfigurationError(
-                "configure exactly one of capacity_file and resource_source",
-            ))
+            return Err("configure exactly one of capacity_file and resource_source");
         }
     };
     let gate = match &config.pressure {
-        Some(pressure) => pressure
-            .gate()
-            .map_err(|_| ConfigurationError("invalid pressure thresholds"))?,
+        Some(pressure) => pressure.gate().map_err(|_| "invalid pressure thresholds")?,
         None => None,
     };
     Ok((source, gate))
@@ -406,30 +415,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.sandboxd_health_failure_threshold,
         Duration::from_secs(config.sandboxd_health_failure_seconds),
     )
-    .map_err(|_| adx_process::ConfigurationError("invalid sandboxd health thresholds"))?;
+    .map_err(|_| "invalid sandboxd health thresholds")?;
     let embedded_relay_config = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
-        adx_process::resource::raise_nofile_soft_limit_from_env().map_err(
-            |error| -> Box<dyn std::error::Error> {
-                if adx_process::resource::is_configuration_error(&error) {
-                    adx_process::ConfigurationError("invalid embedded Relay FD limit configuration")
-                        .into()
-                } else {
-                    error.into()
-                }
-            },
-        )?;
-        Some(data_plane_gateway::config::RelayConfig::from_env().map_err(
-            |error| -> Box<dyn std::error::Error> {
-                if error.is_configuration_error() {
-                    adx_process::ConfigurationError(
-                        "invalid embedded Relay environment configuration",
-                    )
-                    .into()
-                } else {
-                    error.into()
-                }
-            },
-        )?)
+        adx_process::resource::raise_nofile_soft_limit_from_env()?;
+        Some(data_plane_gateway::config::RelayConfig::from_env()?)
     } else {
         None
     };
@@ -612,7 +601,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (Some(root), None) => Some(adxlet::checkpoint::StorageConfig::Local { root }),
         (None, storage) => storage,
         (Some(_), Some(_)) => {
-            return Err("configure only one of checkpoint_dir and checkpoint_storage".into())
+            return Err("configure only one of checkpoint_dir and checkpoint_storage".into());
         }
     };
     let mut checkpoint_scopes = Vec::new();
@@ -943,27 +932,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         Err(_) => {
-                            adx_observability::warn!("protected successor observation timed out; retaining handshake state");
+                            adx_observability::warn!(
+                                "protected successor observation timed out; retaining handshake state"
+                            );
                         }
                     }
                     continue;
                 }
             }
-            if manager.process_sealing() {
-                last.accepting_allocations = false;
-                last.heartbeat_sequence = last
-                    .heartbeat_sequence
-                    .checked_add(1)
-                    .ok_or("heartbeat sequence exhausted")?;
-                if let Err(error) = coordinator.register_node(last.clone()).await {
-                    adx_observability::warn!(%error, "sealed node heartbeat unavailable");
-                }
-                continue;
-            }
             // Startup and every reporting period use the same complete authority
             // cycle for every configured runtime. The cycle publishes readiness
             // immediately after success, before waiting for the next report tick.
-            match adxlet::node_reconciliation::reconcile_node(
+            report_node_cycle(
                 &mut coordinator,
                 &mut last,
                 &manager,
@@ -971,13 +951,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 timeout,
                 Duration::from_secs(config.report_interval_seconds),
             )
-            .await
-            {
-                Ok(()) => (),
-                Err(error) => {
-                    adx_observability::warn!(accepting_allocations=manager.accepting_allocations(), %error, "authoritative node reconciliation incomplete")
-                }
-            }
+            .await?;
         }
         #[allow(unreachable_code)]
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -1076,8 +1050,205 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
+// This shared fixture also exposes ordinary-recovery helpers unused by this binary test.
+#[allow(dead_code)]
+#[path = "../../tests/common/authority.rs"]
+mod sealing_test_authority;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sealing_registration_timeout_keeps_admission_closed() {
+        use futures_util::FutureExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct RuntimeProbe(Arc<AtomicUsize>);
+        #[tonic::async_trait]
+        impl adxlet::RuntimeDriver for RuntimeProbe {
+            async fn start(
+                &self,
+                _: &adx_core::EnvironmentSpec,
+                _: &str,
+                _: u64,
+                _: &[adx_core::scheduling::DeviceAllocation],
+            ) -> adx_core::Result<std::net::IpAddr> {
+                panic!("sealing heartbeat must not start a runtime");
+            }
+            async fn is_running(&self, _: &str) -> adx_core::Result<bool> {
+                panic!("sealing heartbeat must not reconcile runtimes");
+            }
+            async fn remove(&self, _: &str) -> adx_core::Result<()> {
+                panic!("sealing heartbeat must not remove a runtime");
+            }
+            async fn inventory(&self) -> adx_core::Result<Vec<adxlet::RuntimeObservation>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(adx_core::Error::Unavailable("unexpected recovery".into()))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let control = directory.path().join("authority.json");
+        let session = "test-session";
+        let deadline = adx_core::observation::now_millis().unwrap() + 60_000;
+        std::fs::write(
+            &control,
+            serde_json::to_vec(&serde_json::json!({
+                "process": adx_protocol::relay::AdxletProcessRequest {
+                    rollout_id: "sealed-rollout".into(), local_task_id: "sealed-task".into(),
+                    epoch: 1, old_node_session: session.into(), old_relay_session: "relay".into(),
+                    deadline_unix_millis: deadline,
+                },
+                "process_deadline_ms": deadline, "process_sealed": true,
+                "control": null, "bootstrap_isolated": false, "may_have_executed": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runtime_calls = Arc::new(AtomicUsize::new(0));
+        let manager =
+            sealing_test_authority::manager(Arc::new(RuntimeProbe(runtime_calls.clone())))
+                .with_upgrade_control(control, session.into())
+                .unwrap();
+        assert!(manager.process_sealing());
+        assert!(!manager.accepting_allocations());
+
+        #[derive(Clone)]
+        struct NotifyRegistration(Arc<tokio::sync::Notify>);
+        impl tonic::service::Interceptor for NotifyRegistration {
+            fn call(
+                &mut self,
+                request: tonic::Request<()>,
+            ) -> Result<tonic::Request<()>, tonic::Status> {
+                self.0.notify_one();
+                Ok(request)
+            }
+        }
+
+        let authority = sealing_test_authority::Authority::default();
+        authority.block_inspect.store(true, Ordering::SeqCst);
+        let received = Arc::new(tokio::sync::Notify::new());
+        let service = pb::coordinator_service_server::CoordinatorServiceServer::with_interceptor(
+            authority.clone(),
+            NotifyRegistration(received.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let timeout = Duration::from_millis(250);
+        let transport = RpcClient::network(adx_protocol::auth::Principal::Node("n".into()));
+        let channel = coordinator_channel(&transport, &address.to_string(), timeout).unwrap();
+        let mut coordinator =
+            pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
+        let mut registration = pb::RegisterNodeRequest {
+            node_id: "n".into(),
+            session_id: session.into(),
+            accepting_allocations: true,
+            reconciling: false,
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            report_node_cycle(
+                &mut coordinator,
+                &mut registration,
+                &manager,
+                None,
+                timeout,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("initial sealing report must reach the local Coordinator")
+        .unwrap();
+        assert!(received.notified().now_or_never().is_some());
+        assert!(!authority.reports.lock().unwrap()[0].accepting_allocations);
+
+        authority.stall_report.store(true, Ordering::SeqCst);
+        let entered = AtomicBool::new(false);
+        let watchdog = tokio::time::Instant::now() + Duration::from_secs(2);
+        let result = tokio::time::timeout_at(watchdog, async {
+            tokio::join!(
+                async {
+                    received.notified().await;
+                    entered.store(true, Ordering::SeqCst);
+                    assert!(!manager.accepting_allocations());
+                },
+                report_node_cycle(
+                    &mut coordinator,
+                    &mut registration,
+                    &manager,
+                    None,
+                    timeout,
+                    Duration::from_millis(10)
+                ),
+            )
+        })
+        .await;
+        let resumed = if result.is_ok() {
+            authority.stall_report.store(false, Ordering::SeqCst);
+            registration.accepting_allocations = true;
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    report_node_cycle(
+                        &mut coordinator,
+                        &mut registration,
+                        &manager,
+                        None,
+                        timeout,
+                        Duration::from_millis(10),
+                    ),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        server.abort();
+        let _ = server.await;
+
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "Coordinator did not accept the stalled registration"
+        );
+        assert!(
+            result.is_ok(),
+            "sealing registration ignored rpc_timeout and blocked the report cycle"
+        );
+        result.unwrap().1.unwrap();
+        resumed
+            .unwrap()
+            .expect("next sealing report must still run")
+            .unwrap();
+        assert!(!registration.accepting_allocations);
+        assert!(!manager.accepting_allocations());
+        let reports = authority.reports.lock().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports
+            .iter()
+            .all(|report| !report.accepting_allocations && !report.reconciling));
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.heartbeat_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(authority
+            .inspect_entered
+            .notified()
+            .now_or_never()
+            .is_none());
+        assert_eq!(runtime_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn memory_only_pressure_configuration_omits_disk_path() {

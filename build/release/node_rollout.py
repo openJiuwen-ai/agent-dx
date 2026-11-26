@@ -1,8 +1,9 @@
-"""Journaled Pod/process publishing and explicit ready promotion. Standard library only."""
+"""Journaled Pod/process publishing. Standard library only."""
 import argparse
 import hashlib
 import http.client
 from collections import namedtuple
+from contextlib import contextmanager
 from functools import partial
 from itertools import chain
 import json
@@ -16,7 +17,7 @@ import sys
 import threading
 import tempfile
 import time
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, urlsplit
 
 LIMIT = 8 * 1024 * 1024
 TIMEOUT = 15
@@ -27,6 +28,34 @@ CAPABILITIES = ("planned_migration", "paused_transfer", "quiesce",
 
 class Refusal(Exception):
     pass
+
+
+class ManagementError(Refusal):
+    def __init__(self, status, code, message):
+        super().__init__(f"management request returned HTTP {status}: {code}: {message}")
+        self.status = status
+        self.code = code
+
+
+RECOVERABLE_ERRORS = (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
+                      subprocess.SubprocessError, http.client.HTTPException)
+
+
+@contextmanager
+def locked_journal(journal_path):
+    """Hold the publisher lock across journal replacements and all external I/O."""
+    import fcntl
+
+    path = Path(journal_path).absolute()
+    descriptor = os.open(path.with_name(path.name + ".lock"),
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(descriptor, "a+b") as lock:
+        require(stat.S_ISREG(os.fstat(lock.fileno()).st_mode), "lock must be regular")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Refusal("another publisher holds journal lock") from error
+        yield path
 
 
 def require(condition, message):
@@ -98,10 +127,9 @@ def http_json(base, path, body=None):
                         error = decode(data).get("error")
                     except (Refusal, ValueError, RecursionError):
                         error = None
-                    detail = (": " + error["code"] + ": " + error["message"]
-                              if isinstance(error, dict) and text(error.get("code"))
-                              and text(error.get("message")) else "")
-                    raise Refusal(status_error + detail)
+                    if isinstance(error, dict) and text(error.get("code")) and text(error.get("message")):
+                        raise ManagementError(response.status, error["code"], error["message"])
+                    raise Refusal(status_error)
                 return decode(data)
             data.extend(chunk)
         raise Refusal("management response exceeds size limit")
@@ -167,8 +195,7 @@ def template_hash(template):
 
 
 def workload_kind(workload):
-    """Legacy DaemonSet plans omit kind; only StatefulSet plans carry it explicitly."""
-    kind = workload.get("kind", "DaemonSet")
+    kind = workload.get("kind")
     require(kind in ("DaemonSet", "StatefulSet"), "invalid workload kind")
     return kind
 
@@ -194,6 +221,13 @@ def stable_statefulset_name(workload_name, name):
     owned Pod and are refused instead of silently accepted.
     """
     return re.fullmatch(re.escape(workload_name) + r"-(0|[1-9][0-9]*)", name) is not None
+
+
+def pod_task_identity(task_id, epoch):
+    require(isinstance(task_id, str) and re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", task_id)
+            and task_id not in (".", ".."), "invalid task ID")
+    require(isinstance(epoch, int) and not isinstance(epoch, bool) and 0 < epoch <= 2**64 - 1,
+            "epoch must be positive u64")
 
 
 def pod_replacement(plan, pod, candidates):
@@ -227,16 +261,8 @@ def pod_replacement(plan, pod, candidates):
     return candidate, evidence, host
 
 
-def replacement_host(workload, source_host, state):
-    """Reconcile the recorded replacement host with a legacy journal.
-
-    DaemonSet replacements keep the source host, so a pre-replacement_host
-    journal may fall back to it. StatefulSet replacements may change host and
-    must keep their recorded host instead.
-    """
+def replacement_host(state):
     recorded = state.get("replacement_host")
-    if recorded is None and workload_kind(workload) == "DaemonSet":
-        recorded = source_host
     require(text(recorded), "replacement host unavailable")
     return recorded
 
@@ -248,30 +274,12 @@ def plan_pod(args, kube, get, local):
     require(text(args.context) and not args.context.startswith("-"), "explicit Kubernetes context required")
     require(text(args.config) and PurePosixPath(args.config).is_absolute()
             and PurePosixPath(args.config).suffix in (".yaml", ".yml"), "absolute deployment YAML required")
-    require((args.declaration_candidate is None) == (args.configmap is None), "candidate and ConfigMap must be paired")
-    require(args.declaration_candidate is not None or args.declaration_key == "target.yaml", "key requires candidate")
-    source = None
-    if args.declaration_candidate is not None:
-        require(text(args.configmap) and not args.configmap.startswith("-")
-                and re.fullmatch(r"[A-Za-z0-9._-]+", args.declaration_key), "invalid ConfigMap selection")
-        candidate_text = read_json_file(args.declaration_candidate, raw=True)
-        desired = declaration_candidate(decode(candidate_text.encode("utf-8")), candidate_text)
-        require(not desired.get("upgrade_components", []), "Pod candidate cannot upgrade processes")
-        cm, old = declaration_configmap(kube(["get", "configmap", args.configmap, "--namespace", args.namespace]),
-                                       args.namespace, args.configmap, args.declaration_key)
-        require(old != candidate_text, "candidate equals original declaration")
-        source = dict(name=args.configmap, namespace=args.namespace, uid=cm["uid"],
-                      resource_version=cm["resource_version"], key=args.declaration_key,
-                      original_text=old, candidate_text=candidate_text)
     origin(args.origin)
     require(type(args.batch_size) is int and args.batch_size > 0, "batch size must be positive")
-    require(text(args.task_id) and "/" not in args.task_id and "%" not in args.task_id
-            and len(args.task_id.encode("utf-8")) <= 128, "invalid task ID")
-    fields = (args.namespace, workload_name, args.container, args.task_id)
+    pod_task_identity(args.task_id, args.epoch)
+    fields = (args.namespace, workload_name, args.container)
     require(all(text(v) and not v.startswith("-") for v in fields), "invalid identity")
-    require(type(args.epoch) is int and 0 < args.epoch <= 2**64 - 1, "epoch must be positive u64")
-    require(re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", args.target_image),
-            "target image must be fixed by SHA-256 digest")
+    require(text(args.target_image), "target image required")
     mappings = {}
     for entry in args.node:
         pod, separator, node = entry.partition("=")
@@ -285,8 +293,6 @@ def plan_pod(args, kube, get, local):
         require(obj["apiVersion"] == "apps/v1" and workload["name"] == workload_name,
                 "unexpected " + kind + " identity")
         downward_uid(obj["spec"]["template"])
-        if source:
-            declaration_mount(obj["spec"]["template"], args.container, source["name"], source["key"])
         workload["kind"] = kind
         workload["original_image"] = image(obj["spec"]["template"], args.container)
         template = obj["spec"]["template"]
@@ -323,14 +329,6 @@ def plan_pod(args, kube, get, local):
         for pod, record in owned:
             record["actual"] = pod_actual(pod, args.namespace, args.container,
                                           mappings.get(record["name"]), local(record["name"]))
-            if source:
-                path = declaration_mount(pod, args.container, source["name"], source["key"])
-                record["declaration_path"] = path
-                if source["original_text"] is not None:
-                    observed = local(record["name"], path).get("external_declaration")
-                    require(isinstance(observed, dict) and observed.get("path") == path
-                            and observed.get("raw_sha256") == hashlib.sha256(old.encode("utf-8")).hexdigest()
-                            and isinstance(observed.get("desired"), dict), "old declaration projection differs")
             pods.append(record)
         return workload, sorted(pods, key=lambda p: p["name"])
 
@@ -351,9 +349,8 @@ def plan_pod(args, kube, get, local):
                 and type(view.get("protocol_version")) is int and view["protocol_version"] == 3
                 and view.get("unknown") is False, "unknown or incompatible node identity/session")
         require(view.get("observed_pod_uid") == uid, "observed Pod UID differs from Kubernetes")
-        require(isinstance(view.get("runtime_rootfs_sha256"), str)
-                and re.fullmatch(r"[0-9a-f]{64}", view["runtime_rootfs_sha256"])
-                and text(view.get("runtime_rootfs_path")), "missing runtime rootfs evidence")
+        require(text(view.get("runtime_rootfs_sha256")) and text(view.get("runtime_rootfs_path")),
+                "missing runtime rootfs evidence")
         return view
 
     workload, pods = inventory()
@@ -363,12 +360,6 @@ def plan_pod(args, kube, get, local):
             and capabilities["node_protocol_version"] == 3
             and all(capabilities.get(c) is True for c in CAPABILITIES), "required capabilities unavailable")
     views = {mappings[pod["name"]]: inspect(mappings[pod["name"]], pod["uid"]) for pod in pods}
-    require((workload, pods) == inventory(), "Kubernetes objects changed during planning")
-    for node, view in views.items():
-        current = inspect(node, view["observed_pod_uid"])
-        fields = ("node_session_id", "runtime_rootfs_sha256", "runtime_rootfs_path", "observed_pod_uid")
-        require(all(current.get(k) == view.get(k) for k in fields),
-                "node session or runtime changed during planning")
     bindings = []
     for pod in pods:
         node = mappings[pod["name"]]
@@ -384,14 +375,6 @@ def plan_pod(args, kube, get, local):
             "workload": workload, "pods": pods, "capabilities": capabilities,
             "begin": dict(task_id=args.task_id, epoch=args.epoch, namespace=args.namespace,
                            daemonset_uid=workload["uid"], target_image=args.target_image, nodes=bindings)}
-    if source:
-        fresh, current = declaration_configmap(kube([
-            "get", "configmap", source["name"], "--namespace", args.namespace]),
-                                              args.namespace, source["name"], source["key"])
-        require(fresh["uid"] == source["uid"] and current == old, "ConfigMap source changed")
-        source["resource_version"] = fresh["resource_version"]
-        result["declaration"] = source
-    validate_pod_plan(result)
     require(len(canonical(result).encode("utf-8")) <= LIMIT, "plan exceeds size limit")
     return result
 
@@ -417,7 +400,7 @@ def process_pod(pod, namespace, pod_name, container):
     return evidence
 
 
-def pod_actual(pod, namespace, container, node, response, plan=None, session=None):
+def pod_actual(pod, namespace, container, node, response, session=None):
     evidence = process_pod(pod, namespace, pod["metadata"]["name"], container)
     statuses = [item for item in pod["status"]["containerStatuses"] if item.get("name") == container]
     require(text(statuses[0].get("imageID")), "missing opaque image content identity")
@@ -434,41 +417,6 @@ def pod_actual(pod, namespace, container, node, response, plan=None, session=Non
                                           modes=(owner["mode"],))
         require(all(component["runtime"][key] == runtime[key] for key in ("node_session", "relay_session")),
                 "owned component sessions differ")
-    if plan is not None:
-        if "declaration" not in plan:
-            require("external_declaration" in response and response["external_declaration"] is None
-                    and "external_startup" in response and response["external_startup"] is None,
-                    "replacement is not default image startup")
-            require(all("sources" in item and item["sources"] == {} for item in components),
-                    "default image provenance unknown or externally changed")
-        else:
-            source = plan["declaration"]
-            desired = declaration_candidate(decode(source["candidate_text"].encode("utf-8")), source["candidate_text"])
-            path = declaration_mount(pod, container, source["name"], source["key"])
-            require(response.get("external_declaration") == dict(
-                path=path, raw_sha256=hashlib.sha256(source["candidate_text"].encode("utf-8")).hexdigest(),
-                desired=desired), "replacement default initialization declaration differs")
-            startup = response.get("external_startup")
-            require(isinstance(startup, dict) and startup.get("selection") == "target"
-                    and startup.get("mode") == desired["mode"] == owner["mode"], "target startup unconfirmed")
-            initial = startup.get("components")
-            require(isinstance(initial, list) and len(initial) == 2
-                    and {item.get("role") for item in initial} == {"adxlet", "relay"}, "startup roles incomplete")
-            for component in components:
-                expected_roles = (component["role"],) if owner["mode"] == "standalone" else ("adxlet", "relay")
-                expected_sources = {role: dict(version=desired["components"][role]["version"],
-                    archive_sha256=desired["components"][role]["artifact"]["sha256"],
-                    raw_config_sha256=desired["components"][role]["config"]["sha256"]) for role in expected_roles}
-                require(component.get("sources") == expected_sources, "actual target provenance differs")
-                for role in expected_roles:
-                    selected = next(item for item in initial if item["role"] == role)
-                    target = desired["components"][role]
-                    require(selected.get("version") == target["version"]
-                            and selected.get("release_id") == target["release_id"]
-                            and selected.get("raw_config_sha256") == target["config"]["sha256"]
-                            and selected.get("binary_sha256") == component["runtime"]["executable_sha256"]
-                            and selected.get("effective_config_sha256") == component["runtime"]["configuration_sha256"],
-                            "actual binary/config differs from selected target")
     return dict(container_id=evidence["container_id"], restart_count=evidence["restart_count"],
                 running=evidence["running"], image_id=statuses[0]["imageID"], boot_nonce=boot,
                 node_session=runtime["node_session"])
@@ -477,36 +425,26 @@ def pod_actual(pod, namespace, container, node, response, plan=None, session=Non
 def process_component(response, role, node, pod_uid, eligible=True, complete=True, modes=("standalone",)):
     require(response.get("ok") is True, "node-info failed")
     view = response["node_info"]
-    version = view.get("schema_version")
-    require(isinstance(version, int) and not isinstance(version, bool) and version == 1, "incompatible node-info")
+    require(isinstance(view.get("schema_version"), int) and not isinstance(view["schema_version"], bool)
+            and view["schema_version"] == 1, "unsupported node-info schema")
     require(view.get("pod_uid") == pod_uid, "node-info Pod UID differs from Kubernetes")
-    require(text(view.get("boot_nonce")) and len(view["boot_nonce"].encode("utf-8")) <= 128, "missing boot nonce")
+    require(text(view.get("boot_nonce")), "missing boot nonce")
     matches = [item for item in view["components"] if item.get("role") == role and item.get("node_id") == node]
     require(len(matches) == 1, "no unique component for explicit role and ADX node ID")
     component = matches[0]
     require(component.get("mode") in modes, "unsupported component mode")
     if eligible:
         require(component.get("can_upgrade") is True, "component cannot upgrade")
-    service = component.get("service_id")
-    require(isinstance(service, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", service), "invalid service ID")
+    require(text(component.get("service_id")), "missing service ID")
     runtime = component.get("runtime")
     if runtime is None and not complete:
         return component, view["boot_nonce"]
     require(isinstance(runtime, dict), "missing runtime")
-    require(set(runtime) == {"boot_nonce", "pod_uid", "pid", "executable_sha256",
-                             "configuration_sha256", "node_session", "relay_session"},
-            "incomplete or unsupported runtime")
     require(runtime["pod_uid"] == pod_uid and runtime["boot_nonce"] == view["boot_nonce"],
             "runtime Pod UID or boot nonce differs from node-info")
-    pid = runtime["pid"]
-    require(isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid <= 2**32 - 1, "invalid runtime PID")
-    fields = ("pod_uid", "node_session", "relay_session")
-    require(all(text(runtime[key]) and len(runtime[key].encode("utf-8")) <= 128 for key in fields),
-            "missing runtime identity/session")
-    digest = runtime["executable_sha256"]
-    require(isinstance(runtime["configuration_sha256"], str)
-            and re.fullmatch(r"[0-9a-f]{64}", runtime["configuration_sha256"]), "invalid configuration SHA-256")
-    require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), "invalid executable SHA-256")
+    require(text(runtime.get("node_session")), "missing node session")
+    if component["mode"] == "standalone" or runtime.get("relay_session") != "":
+        require(text(runtime.get("relay_session")), "missing relay session")
     return component, view["boot_nonce"]
 
 
@@ -526,154 +464,9 @@ def require_process_steps(response):
             "adxlet process rollout requires step_protocol 2; incompatible local step semantics")
 
 
-def remote_archive(value):
-    require(isinstance(value, dict) and set(value) == {"url", "archive_sha256"}, "invalid remote archive")
-    require(text(value["url"]) and not any(character.isspace() for character in value["url"]),
-            "invalid archive URL")
-    try:
-        parsed = urlsplit(value["url"])
-        host, port = parsed.hostname, parsed.port
-    except ValueError as error:
-        raise Refusal("invalid archive URL") from error
-    require(host and not any(ord(character) <= 32 or ord(character) == 127 for character in value["url"])
-            and not re.search(r"%(?![0-9a-fA-F]{2})", value["url"]), "invalid archive URL")
-    decoded_host = unquote(host)
-    require(not any(character in decoded_host for character in "#%/<>?@[\\]^|")
-            and not any(ord(character) <= 32 or ord(character) == 127 for character in decoded_host)
-            and (":" not in decoded_host or parsed.netloc.startswith("[")), "invalid archive host")
-    require(value["url"].startswith("https://") and parsed.scheme == "https" and host
-            and (port is None or 0 < port <= 65535) and "\\" not in value["url"] and parsed.username is None
-            and parsed.password is None and "#" not in value["url"], "archive URL must be anonymous HTTPS")
-    require(isinstance(value["archive_sha256"], str)
-            and re.fullmatch(r"[0-9a-f]{64}", value["archive_sha256"]), "invalid archive SHA-256")
-    return value
-
-
-def component_config(value):
-    require(isinstance(value, dict) and set(value) == {"mount_path", "sha256"},
-            "invalid component configuration descriptor")
-    require(isinstance(value["mount_path"], str) and PurePosixPath(value["mount_path"]).is_absolute()
-            and isinstance(value["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]),
-            "invalid component configuration descriptor")
-    return value
-
-
-def declaration_candidate(value, raw_text=None):
-    if raw_text is not None:
-        require(len(raw_text.encode("utf-8")) <= 4 * 1024 * 1024, "declaration exceeds 4 MiB")
-    require(isinstance(value, dict) and set(value) <= {
-        "schema", "mode", "components", "ready", "upgrade_components"}, "invalid declaration fields")
-    require(type(value.get("schema")) is int and value["schema"] == 1
-            and value.get("mode") in ("standalone", "embedded"), "candidate requires schema 1 node mode")
-    roles = value.get("upgrade_components", [])
-    require(isinstance(roles, list) and len(roles) <= 1 and all(role in ("adxlet", "relay") for role in roles)
-            and (value["mode"] != "embedded" or not roles), "invalid upgrade components")
-    ready = value.get("ready")
-    require(isinstance(ready, dict) and set(ready) == {"components"}, "invalid ready group")
-    for group in (value.get("components"), ready["components"]):
-        require(isinstance(group, dict) and set(group) == {"adxlet", "relay"}, "complete roles required")
-        for component in group.values():
-            require(isinstance(component, dict)
-                    and set(component) == {"version", "release_id", "artifact", "config"},
-                    "invalid declaration component")
-            require(isinstance(component["version"], str)
-                    and re.fullmatch(r"[0-9a-f]{40}", component["version"])
-                    and isinstance(component["release_id"], str) and component["release_id"].strip(),
-                    "invalid declaration version or release")
-            artifact = component["artifact"]
-            require(isinstance(artifact, dict) and set(artifact) == {"url", "sha256"},
-                    "invalid official artifact")
-            remote_archive(dict(url=artifact["url"], archive_sha256=artifact["sha256"]))
-            component_config(component["config"])
-        if value["mode"] == "embedded":
-            require(all(group["adxlet"][key] == group["relay"][key] for key in ("version", "release_id", "artifact")),
-                    "embedded requires same package")
-    normalized = dict(value, upgrade_components=roles)
-    require(len(canonical(normalized).encode("utf-8")) <= 64 * 1024, "desired declaration exceeds 64 KiB")
-    return normalized
-
-
-def declaration_configmap(obj, namespace, name, key):
-    evidence = identity(obj, "ConfigMap", namespace)
-    require(obj.get("apiVersion") == "v1" and evidence["name"] == name
-            and obj.get("immutable", False) is False, "invalid or immutable ConfigMap")
-    data = obj.get("data", {})
-    require(isinstance(data, dict) and isinstance(obj.get("binaryData", {}), dict)
-            and key not in obj.get("binaryData", {}), "invalid declaration data")
-    require(key not in data or (isinstance(data[key], str) and bool(data[key].strip())),
-            "invalid existing declaration text")
-    return evidence, data.get(key)
-
-
-def declaration_mount(pod, container, name, key):
-    volumes = pod["spec"].get("volumes", [])
-    names = [volume.get("name") for volume in volumes]
-    require(all(text(name) for name in names) and len(set(names)) == len(names), "ambiguous volumes")
-    containers = [item for item in pod["spec"]["containers"] if item.get("name") == container]
-    require(len(containers) == 1, "ambiguous container")
-    mounts = containers[0].get("volumeMounts", [])
-    candidates = []
-    for volume in volumes:
-        source = volume.get("configMap")
-        if not isinstance(source, dict) or source.get("name") != name:
-            continue
-        relative = key
-        if "items" in source:
-            items = source["items"]
-            require(isinstance(items, list), "invalid ConfigMap items")
-            selected = [item for item in items if item.get("key") == key]
-            require(len(selected) == 1, "declaration key not uniquely mounted")
-            relative = selected[0].get("path")
-        require(isinstance(relative, str) and relative and not PurePosixPath(relative).is_absolute()
-                and all(part not in ("", ".", "..") for part in relative.split("/")),
-                "invalid declaration relative path")
-        for mount in mounts:
-            if mount.get("name") != volume.get("name"):
-                continue
-            require("subPath" not in mount and "subPathExpr" not in mount, "subPath unsupported")
-            root = mount.get("mountPath")
-            require(isinstance(root, str) and PurePosixPath(root).is_absolute()
-                    and ".." not in PurePosixPath(root).parts, "invalid mount path")
-            path = PurePosixPath(root) / relative
-            for other in mounts:
-                if other is mount:
-                    continue
-                other_root = other.get("mountPath")
-                require(isinstance(other_root, str) and PurePosixPath(other_root).is_absolute(),
-                        "invalid shadow mount")
-                require(not (PurePosixPath(other_root).is_relative_to(PurePosixPath(root))
-                             and path.is_relative_to(PurePosixPath(other_root))),
-                        "shadowed declaration mount")
-            candidates.append(str(path))
-    require(len(candidates) == 1, "declaration requires one direct ConfigMap mount")
-    return candidates[0]
-
-
 def plan_process(args, kube, local):
-    """Freeze two observations; injected readers perform GET and node-info only."""
-    source = None
-    candidate_path = args.declaration_candidate
-    require((candidate_path is None) == (args.configmap is None), "candidate and ConfigMap must be paired")
-    require(candidate_path is not None or args.declaration_key == "target.yaml", "key requires candidate")
-    if candidate_path is not None:
-        fields = (
-            "role", "commit", "sha256", "archive_url", "archive_sha256",
-            "component_config_path", "component_config_sha256")
-        require(all(getattr(args, field) is None for field in fields), "candidate conflicts with manual target")
-        candidate_text = read_json_file(candidate_path, raw=True)
-        desired = declaration_candidate(decode(candidate_text.encode("utf-8")), candidate_text)
-        require(desired["mode"] == "standalone" and len(desired.get("upgrade_components", [])) == 1,
-                "process candidate requires standalone and exactly one upgrade component")
-        args.role = desired["upgrade_components"][0]
-        target = desired["components"][args.role]
-        args.commit = target["version"]
-        args.archive_url, args.archive_sha256 = target["artifact"]["url"], target["artifact"]["sha256"]
-        args.component_config_path = target["config"]["mount_path"]
-        args.component_config_sha256 = target["config"]["sha256"]
-    require((args.component_config_path is None) == (args.component_config_sha256 is None),
-            "component configuration flags must be paired")
-    configuration = None if args.component_config_path is None else component_config(
-        dict(mount_path=args.component_config_path, sha256=args.component_config_sha256))
+    """Freeze one observation; execution authority rechecks the selected identity."""
+    configuration = None if args.component_config_path is None else dict(mount_path=args.component_config_path)
     require(all(text(value) and not value.startswith("-") for value in (args.context, args.namespace, args.container)),
             "invalid Kubernetes selection")
     require(text(args.config) and PurePosixPath(args.config).is_absolute(),
@@ -685,13 +478,10 @@ def plan_process(args, kube, local):
             and 0 < args.epoch <= 2**64 - 1, "epoch must be positive u64")
     require(isinstance(args.batch_size, int) and not isinstance(args.batch_size, bool)
             and args.batch_size > 0, "batch size must be positive")
-    require(isinstance(args.commit, str) and re.fullmatch(r"[0-9a-f]{40}", args.commit), "invalid commit")
-    require((args.sha256 is None and args.archive_url is not None)
-            or (isinstance(args.sha256, str) and re.fullmatch(r"[0-9a-f]{64}", args.sha256)),
-            "binary SHA-256 required without archive, or invalid expected SHA-256")
+    require(text(args.commit), "commit required")
+    require(args.sha256 is not None or args.archive_url is not None, "binary SHA-256 required without archive")
     require((args.archive_url is None) == (args.archive_sha256 is None), "archive flags must be paired")
-    archive = None if args.archive_url is None else remote_archive(
-        dict(url=args.archive_url, archive_sha256=args.archive_sha256))
+    archive = None if args.archive_url is None else dict(url=args.archive_url, archive_sha256=args.archive_sha256)
     if args.role == "adxlet":
         require(text(args.origin), "adxlet requires origin")
         origin(args.origin)
@@ -705,46 +495,22 @@ def plan_process(args, kube, local):
         require(pod_name not in mappings and node not in mappings.values(), "duplicate Pod or ADX node mapping")
         mappings[pod_name] = node
     require(mappings, "at least one explicit Pod mapping is required")
-    if candidate_path is not None:
-        require(text(args.configmap) and not args.configmap.startswith("-")
-                and isinstance(args.declaration_key, str)
-                and re.fullmatch(r"[A-Za-z0-9._-]+", args.declaration_key), "invalid ConfigMap selection")
-        cm, original_text = declaration_configmap(kube([
-            "get", "configmap", args.configmap, "--namespace", args.namespace]),
-            args.namespace, args.configmap, args.declaration_key)
-        require(original_text != candidate_text, "candidate equals original declaration")
-        source = dict(name=args.configmap, namespace=args.namespace, uid=cm["uid"],
-                      resource_version=cm["resource_version"], key=args.declaration_key,
-                      original_text=original_text, candidate_text=candidate_text)
 
     def observe(pod_name, node):
         pod = kube(["get", "pod", pod_name, "--namespace", args.namespace])
         evidence = process_pod(pod, args.namespace, pod_name, args.container)
-        path = declaration_mount(pod, args.container, source["name"], source["key"]) if source else None
-        response = local(pod_name, path) if source else local(pod_name)
+        response = local(pod_name)
         if args.role == "adxlet":
             require_process_steps(response)
         component, _ = process_component(response, args.role, node, evidence["uid"])
-        if source and original_text is not None:
-            observation = response.get("external_declaration")
-            require(isinstance(observation, dict) and set(observation) == {"path", "raw_sha256", "desired"}
-                    and observation["path"] == path
-                    and observation["raw_sha256"] == hashlib.sha256(original_text.encode("utf-8")).hexdigest()
-                    and isinstance(observation["desired"], dict), "declaration source differs")
         record = {"node_id": node, "service_id": component["service_id"], "kube": evidence,
                   "runtime": component["runtime"].copy()}
-        if source:
-            record["declaration_path"] = path
         return record
 
     ordered = sorted(mappings.items(), key=lambda item: item[1])
     nodes = [observe(pod_name, node) for pod_name, node in ordered]
-    for record, (pod_name, node) in zip(nodes, ordered):
-        current = observe(pod_name, node)
-        original_rv = record["kube"].pop("resource_version")
-        current_rv = current["kube"].pop("resource_version")
-        require(record == current, "Pod/container incarnation or process identity changed during planning")
-        record["kube"].update(resource_version=original_rv, rechecked_resource_version=current_rv)
+    for record in nodes:
+        pod_name, node = record["kube"]["name"], record["node_id"]
         # No batch index or mutable observation participates in the local task ID.
         key = dict(context=args.context, namespace=args.namespace, container=args.container, config=args.config,
                    role=args.role, pod=pod_name, node_id=node, service_id=record["service_id"],
@@ -772,25 +538,16 @@ def plan_process(args, kube, local):
                   sha256=args.sha256, rollout_id=args.task_id, epoch=args.epoch, nodes=nodes, batches=batches)
     if args.role == "adxlet":
         result["origin"] = args.origin
-    if source:
-        fresh, fresh_text = declaration_configmap(kube([
-            "get", "configmap", source["name"], "--namespace", args.namespace]),
-            args.namespace, source["name"], source["key"])
-        require(fresh["uid"] == source["uid"] and fresh_text == original_text, "ConfigMap source changed")
-        source["resource_version"] = fresh["resource_version"]
-        result["declaration"] = source
-    validate_process_plan(result)
     require(len(canonical(result).encode("utf-8")) <= LIMIT, "plan exceeds size limit")
     return result
 
 
-def read_json_file(path, raw=False):
+def read_json_file(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, mode=0o600)
     with os.fdopen(descriptor, "rb") as stream:
         require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "JSON input must be a regular file")
         data = stream.read(LIMIT + 1)
-        value = decode(data)
-        return data.decode("utf-8") if raw else value
+        return decode(data)
 
 
 def write_journal(path, journal):
@@ -819,106 +576,42 @@ def write_journal(path, journal):
 
 
 def validate_process_plan(plan):
-    require(plan.get("schema_version") == 1 and plan.get("mode") == "process", "expected schema 1 process plan")
-    require(not isinstance(plan["schema_version"], bool), "invalid schema version")
-    source = plan.get("declaration")
-    target = None
-    if source is not None:
-        require(isinstance(source, dict) and set(source) == {
-            "name", "namespace", "uid", "resource_version", "key", "original_text", "candidate_text"},
-            "invalid declaration source")
-        require(all(text(source[key]) for key in ("name", "namespace", "uid", "resource_version", "key"))
-                and not source["name"].startswith("-") and source["namespace"] == plan["namespace"]
-                and re.fullmatch(r"[A-Za-z0-9._-]+", source["key"]), "invalid declaration metadata")
-        require((source["original_text"] is None or isinstance(source["original_text"], str))
-                and isinstance(source["candidate_text"], str)
-                and source["original_text"] != source["candidate_text"], "invalid declaration texts")
-        require(source["original_text"] is None or bool(source["original_text"].strip()),
-                "invalid original declaration text")
-        desired = declaration_candidate(decode(source["candidate_text"].encode("utf-8")), source["candidate_text"])
-        require(desired["mode"] == "standalone" and desired.get("upgrade_components") == [plan["role"]]
-                and plan["sha256"] is None,
-                "candidate selection differs")
-        target = desired["components"][plan["role"]]
-        require(plan["commit"] == target["version"], "candidate version differs")
+    """Check execution scope and lossless CLI adaptation; adxctl owns execution fencing."""
+    require(type(plan.get("schema_version")) is int and plan["schema_version"] == 1
+            and plan.get("mode") == "process", "expected schema 1 process plan")
     require(plan["role"] in ("adxlet", "relay"), "invalid role")
     require(all(text(plan[key]) and not plan[key].startswith("-") for key in ("context", "namespace", "container")),
             "invalid Kubernetes selection")
     config = plan["config"]
-    require(text(config) and PurePosixPath(config).is_absolute(), "config must be absolute")
-    require(PurePosixPath(config).suffix in (".yaml", ".yml"), "config must be YAML")
-    require(text(plan["rollout_id"]) and len(plan["rollout_id"].encode("utf-8")) <= 128, "invalid rollout ID")
-    epoch = plan["epoch"]
-    require(isinstance(epoch, int) and not isinstance(epoch, bool) and 0 < epoch <= 2**64 - 1, "invalid epoch")
-    for key, size in (("commit", 40), ("sha256", 64)):
-        if key == "sha256" and plan[key] is None:
-            continue
-        require(isinstance(plan[key], str) and re.fullmatch("[0-9a-f]{" + str(size) + "}", plan[key]),
-                "invalid target " + key)
+    require(text(config) and PurePosixPath(config).is_absolute()
+            and PurePosixPath(config).suffix in (".yaml", ".yml"), "absolute deployment YAML required")
     if plan["role"] == "adxlet":
         origin(plan["origin"])
-    else:
-        require("origin" not in plan, "relay must not use Coordinator")
     nodes = plan["nodes"]
     require(isinstance(nodes, list) and bool(nodes), "empty process plan")
     ids, pods, tasks = [], set(), set()
-    archive_source = nodes[0]["submission"].get("remote_archive")
     for node in nodes:
-        fields = {"node_id", "kube", "submission"}
-        if source is not None:
-            fields.add("declaration_path")
-            path = node.get("declaration_path")
-            require(text(path) and PurePosixPath(path).is_absolute()
-                    and ".." not in PurePosixPath(path).parts, "invalid declaration mount path")
-        require(set(node) == fields, "invalid node fields")
         node_id, evidence, submission = node["node_id"], node["kube"], node["submission"]
-        if target is not None:
-            require(submission.get("component_config") == target["config"]
-                    and submission.get("remote_archive") == dict(
-                        url=target["artifact"]["url"], archive_sha256=target["artifact"]["sha256"])
-                    and "sha256" not in submission, "Submission differs from candidate")
-        require(submission.get("remote_archive") == archive_source, "archive source differs between nodes")
-        require(text(node_id) and len(node_id.encode("utf-8")) <= 128, "invalid node ID")
+        submit_arguments(submission)
+        require(submission.get("remote_archive") == nodes[0]["submission"].get("remote_archive"),
+                "archive differs across process batches")
+        require(submission.get("component_config") == nodes[0]["submission"].get("component_config"),
+                "configuration descriptor differs across process batches")
+        require(text(evidence["name"]) and not evidence["name"].startswith("-"), "invalid Pod name")
         require(evidence["namespace"] == plan["namespace"] and evidence["container"] == plan["container"],
                 "Kubernetes selection differs from plan")
-        fields = ("name", "uid", "kubernetes_node_name", "container_id",
-                  "resource_version", "rechecked_resource_version")
-        require(all(text(evidence[key]) for key in fields),
-                "missing evidence")
-        require(not evidence["name"].startswith("-"), "invalid Pod name")
-        restarts = evidence["restart_count"]
-        require(isinstance(restarts, int) and not isinstance(restarts, bool) and restarts >= 0, "invalid restart count")
-        require(isinstance(evidence["running"], dict), "missing running evidence")
         require(submission["selection"].get("mode") == "publisher", "publisher selection required")
-        require(set(submission["selection"]) == {"mode", "expected"}, "invalid selection")
         expected = submission["selection"]["expected"]
-        component = dict(role=plan["role"], node_id=node_id, service_id=submission["service_id"],
-                         mode="standalone", can_upgrade=True, runtime=expected)
-        process_component({"ok": True, "node_info": dict(schema_version=1, boot_nonce=expected["boot_nonce"],
-                           pod_uid=evidence["uid"], components=[component])}, plan["role"], node_id, evidence["uid"])
-        require(all(submission[key] == plan[key] for key in ("role", "commit")), "target differs")
-        require(submission.get("sha256") == plan["sha256"], "expected digest differs")
-        fields = {"selection", "task_id", "role", "service_id", "commit"}
-        if "component_config" in submission:
-            component_config(submission["component_config"])
-            fields.add("component_config")
-        if plan["sha256"] is not None:
-            fields.add("sha256")
-        else:
-            require("remote_archive" in submission, "archive required without binary SHA-256")
-        if "remote_archive" in submission:
-            remote_archive(submission["remote_archive"])
-            fields.add("remote_archive")
+        require(expected["pod_uid"] == evidence["uid"], "runtime Pod UID differs from Kubernetes")
+        require(all(submission.get(key) == plan[key] for key in ("role", "commit", "sha256")), "target differs")
         if plan["role"] == "adxlet":
-            fields.add("process")
             require(submission["process"] == {"node_id": node_id, "identity": {
-                "rollout_id": plan["rollout_id"], "epoch": epoch, "old_node_session": expected["node_session"],
+                "rollout_id": plan["rollout_id"], "epoch": plan["epoch"], "old_node_session": expected["node_session"],
                 "old_relay_session": expected["relay_session"], "original_sha256": expected["executable_sha256"]}},
                     "maintenance identity differs")
-        require(set(submission) == fields, "invalid Submission fields")
         key = dict(context=plan["context"], namespace=plan["namespace"], container=plan["container"], config=config,
                    role=plan["role"], pod=evidence["name"], node_id=node_id, service_id=submission["service_id"],
-                   rollout_id=plan["rollout_id"], epoch=epoch)
+                   rollout_id=plan["rollout_id"], epoch=plan["epoch"])
         task_id = hashlib.sha256(canonical(key).encode("utf-8")).hexdigest()
         require(submission["task_id"] == task_id, "local task ID differs from canonical identity")
         require(evidence["name"] not in pods and task_id not in tasks, "duplicate Pod/task")
@@ -927,10 +620,9 @@ def validate_process_plan(plan):
         tasks.add(task_id)
     require(ids == sorted(set(ids)), "nodes must be unique and sorted")
     batches = plan["batches"]
-    require(isinstance(batches, list) and bool(batches), "missing batches")
-    require(all(isinstance(batch, list) and bool(batch) for batch in batches), "invalid batch")
-    require(batches[0] == ids[:1] and list(chain.from_iterable(batches)) == ids,
-            "invalid canary or batch order")
+    require(isinstance(batches, list) and batches and all(isinstance(batch, list) and batch for batch in batches),
+            "invalid process batches")
+    require(batches[0] == ids[:1] and list(chain.from_iterable(batches)) == ids, "invalid canary or batch order")
 
 
 def maintenance_owner(plan, node):
@@ -939,6 +631,25 @@ def maintenance_owner(plan, node):
 
 
 def submit_arguments(submission):
+    def fields(value, required, optional=()):
+        require(isinstance(value, dict), "expected Submission object")
+        require(set(required) <= set(value) <= set(required) | set(optional), "unsupported Submission fields")
+
+    fields(submission, ("selection", "task_id", "role", "service_id", "commit"),
+           ("sha256", "component_config", "remote_archive", "process"))
+    selection = submission["selection"]
+    fields(selection, ("mode", "expected"))
+    require(selection["mode"] == "publisher", "publisher selection required")
+    fields(selection["expected"], ("configuration_sha256", "boot_nonce", "pod_uid", "pid",
+                                   "executable_sha256", "node_session", "relay_session"))
+    for name, keys in (("remote_archive", ("url", "archive_sha256")),
+                       ("component_config", ("mount_path",))):
+        if name in submission:
+            fields(submission[name], keys)
+    if "process" in submission:
+        fields(submission["process"], ("node_id", "identity"))
+        fields(submission["process"]["identity"], ("rollout_id", "epoch", "old_node_session",
+                                                  "old_relay_session", "original_sha256"))
     arguments = ["submit"]
     for key in ("task_id", "role", "service_id", "commit"):
         arguments.extend(["--" + key.replace("_", "-"), submission[key]])
@@ -946,14 +657,15 @@ def submit_arguments(submission):
         arguments.extend(["--sha256", submission["sha256"]])
     if "component_config" in submission:
         descriptor = submission["component_config"]
-        arguments.extend(["--component-config-path", descriptor["mount_path"],
-                          "--component-config-sha256", descriptor["sha256"]])
+        arguments.extend(["--component-config-path", descriptor["mount_path"]])
     arguments.extend(["--expected-runtime", canonical(submission["selection"]["expected"])])
     if "remote_archive" in submission:
-        archive = remote_archive(submission["remote_archive"])
+        archive = submission["remote_archive"]
         arguments.extend(["--archive-url", archive["url"], "--archive-sha256", archive["archive_sha256"]])
     if "process" in submission:
         arguments.extend(["--process-identity", canonical(submission["process"])])
+    require(all(isinstance(value, str) and "\x00" not in value for value in arguments),
+            "Submission CLI values must be strings without NUL")
     return arguments
 
 
@@ -989,11 +701,9 @@ def finish_process(plan, node, task, runtime):
     expected = node["submission"]["selection"]["expected"]
     prepared = task.get("prepared")
     digest = prepared.get("binary_sha256") if isinstance(prepared, dict) else None
-    prepared_valid = (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
-                      and (plan["sha256"] is None or plan["sha256"] == digest))
+    prepared_valid = text(digest) and (plan["sha256"] is None or plan["sha256"] == digest)
     configuration = prepared.get("configuration_sha256") if isinstance(prepared, dict) else None
-    prepared_valid = (prepared_valid and isinstance(configuration, str)
-                      and re.fullmatch(r"[0-9a-f]{64}", configuration))
+    prepared_valid = prepared_valid and text(configuration)
     if plan["role"] == "relay":
         execution = task.get("execution")
         if phase == "failed" and execution is None:
@@ -1027,9 +737,12 @@ def finish_process(plan, node, task, runtime):
         return ("failed", expected["node_session"]) if runtime == expected else None
     if not isinstance(execution, dict):
         return None
-    success = phase == "completed" and execution.get("stage") == "completed"
-    restored = phase == "failed" and execution.get("stage") == "original_selected"
-    if not (success or restored):
+    leg = execution.get("leg")
+    if not isinstance(leg, dict):
+        return None
+    success = phase == "completed" and leg.get("kind") == "target"
+    restored = phase == "failed" and leg.get("kind") == "rollback"
+    if execution.get("stage") != "selected" or not (success or restored):
         return None
     if not text(execution.get("attempt")) or not text(execution.get("node_session")):
         return None
@@ -1057,14 +770,10 @@ def process_upgrade_status(post, owner):
             and isinstance(result.get("owner"), dict) and type(result["owner"].get("epoch")) is int,
             "maintenance query owner differs")
     status = result.get("status")
-    fields = {"absent": {"status", "owner"},
-              "active": {"status", "owner", "origin_session", "current_session", "yielded"},
-              "released": {"status", "owner", "node_session"}}
-    require(isinstance(status, str) and status in fields and set(result) == fields.get(status),
-            "invalid maintenance query status or fields")
+    require(status in ("absent", "active", "released"), "invalid maintenance query status")
     sessions = ("origin_session", "current_session") if status == "active" else (
         ("node_session",) if status == "released" else ())
-    require(all(text(result.get(key)) and len(result[key].encode("utf-8")) <= 128 for key in sessions),
+    require(all(text(result.get(key)) for key in sessions),
             "invalid maintenance query session")
     require(status != "active" or isinstance(result.get("yielded"), bool), "invalid maintenance yield state")
     return result
@@ -1080,7 +789,7 @@ def process_release_receipt(post, owner, session):
     return None
 
 
-def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, sleep):
+def advance_adxlet_process(plan, node, state, save, kube, local, cli, post):
     """Drive local Steps under HTTP maintenance; new processes register themselves."""
     submission = node["submission"]
     expected = submission["selection"]["expected"]
@@ -1121,7 +830,8 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
 
     def exited(task):
         execution = task.get("adxlet_execution")
-        if not isinstance(execution, dict) or execution.get("stage") != "exited":
+        if (not isinstance(execution, dict) or execution.get("stage") != "exited"
+                or execution.get("leg") != dict(kind="target")):
             return None
         require(type(execution.get("old_pid")) is int and execution["old_pid"] == expected["pid"],
                 "exited old PID differs")
@@ -1135,8 +845,18 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
 
     def same_execution(task):
         execution = task.get("adxlet_execution")
-        require(isinstance(execution, dict) and execution.get("attempt") == state["attempt"]
-                and execution.get("node_session") == state["node_session"], "execution identity differs")
+        require(isinstance(execution, dict), "execution identity unavailable")
+        source = dict(attempt=state["attempt"], node_session=state["node_session"])
+        if execution["leg"] == dict(kind="target"):
+            require(all(execution.get(key) == source[key] for key in source), "execution identity differs")
+        else:
+            require(state["stage"] in ("rollback_intent", "release_intent", "failed")
+                    and execution["leg"] == {"kind": "rollback", "from": source}, "rollback B names a different A")
+            require(all(text(execution.get(key)) and len(execution[key].encode("utf-8")) <= 128
+                        and execution[key] != source[key] for key in source),
+                    "rollback B identity unavailable or reuses A")
+            require(execution["node_session"] != expected["node_session"], "rollback B reuses origin session")
+            budget_open(execution)  # validate the local, already fixed 600-second deadline
         return execution
 
     def budget_open(execution):
@@ -1148,16 +868,13 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
         execution = task.get("adxlet_execution")
         retained = (task.get("phase") == "failed" and execution is None and task.get("execution") is None
                     and state["stage"] in ("prepare_intent", "exit_intent") and "attempt" not in state)
-        selected = (isinstance(execution, dict) and
-                    (task.get("phase"), execution.get("stage")) in
-                    (("completed", "completed"), ("failed", "original_selected")))
+        selected = (isinstance(execution, dict) and execution.get("stage") == "selected"
+                    and ((task.get("phase") == "completed" and execution.get("leg") == dict(kind="target"))
+                         or (task.get("phase") == "failed" and execution.get("leg", {}).get("kind") == "rollback")))
         if not (retained or selected):
             return False
         if selected:
             same_execution(task)
-            if task["phase"] == "failed":
-                require(execution.get("rollback_from") == state.get("rollback_from")
-                        and isinstance(execution.get("rollback_from"), dict), "original selection lacks A proof")
         runtime = check_process(plan, node, kube, local, complete=True)
         outcome = finish_process(plan, node, task, runtime)
         if outcome is None:
@@ -1171,8 +888,8 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
 
     def begin_rollback(task):
         execution = same_execution(task)
-        require(execution.get("rollback_from") is None, "original attempt cannot roll back again")
-        require(execution.get("stage") in ("exited", "start_intent", "start_unknown"),
+        require(execution.get("leg") == dict(kind="target"), "original attempt cannot roll back again")
+        require(execution.get("stage") in ("exited", "starting"),
                 "target outcome must be reconciled before rollback")
         require(type(execution.get("old_pid")) is int and execution["old_pid"] == expected["pid"],
                 "rollback old PID differs")
@@ -1180,34 +897,10 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
         require(marker.get("yielded") is True
                 and marker.get("current_session") in (expected["node_session"], state["node_session"]),
                 "rollback requires yielded original and known current session")
-        state.update(stage="rollback_intent",
-                     rollback_from=dict(attempt=state["attempt"], node_session=state["node_session"]))
+        state["stage"] = "rollback_intent"
         save()
-
-    def adopt_original(task):
-        execution = task.get("adxlet_execution")
-        if not isinstance(execution, dict) or execution.get("rollback_from") is None:
-            return False
-        require(execution["rollback_from"] == state["rollback_from"], "rollback B names a different A")
-        fields = ("attempt", "node_session")
-        for key in fields:
-            require(text(execution.get(key))
-                        and len(execution[key].encode("utf-8")) <= 128
-                        and execution[key] != state["rollback_from"][key],
-                    "rollback B identity unavailable or reuses A")
-        require(execution["node_session"] != expected["node_session"], "rollback B reuses origin session")
-        require(execution.get("stage") in ("rollback_ready", "original_start_intent", "original_start_unknown",
-                                           "original_commit_unknown", "original_selected"),
-                "rollback B is not ready")
-        budget_open(execution)  # validate the local, already fixed 600-second deadline
-        state.update(stage="original_start_intent", attempt=execution["attempt"],
-                     node_session=execution["node_session"])
-        save()
-        return True
 
     if state["stage"] == "new":
-        if "declaration" in plan:
-            declaration_gate(plan, node, kube, local, sleep)
         check_process(plan, node, kube, local, original=True)
         # A valid owner-scoped HTTP query is the read-only preflight before any effect.
         marker = query_marker()
@@ -1222,8 +915,7 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
         try:
             response = cli(node, ["query", "--task-id", task_id])
             require(response.get("ok") is True, "query result unavailable")
-        except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                subprocess.SubprocessError, http.client.HTTPException):
+        except RECOVERABLE_ERRORS:
             # Unknown Query is not non-execution proof. Only the exact original
             # identity permits replay through existing same-Submission idempotency.
             require(check_process(plan, node, kube, local) == expected, "original runtime changed")
@@ -1252,8 +944,6 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
         save()
     if state["stage"] == "prepared":
         prepared_task(query_task())
-        if "declaration" in plan:
-            declaration_gate(plan, node, kube, local, sleep)
         require(check_process(plan, node, kube, local) == expected, "original runtime changed")
         state["stage"] = "prepare_intent"
         save()
@@ -1282,14 +972,14 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
                 if current is None:
                     prepared_task(task)
                     require(check_process(plan, node, kube, local) == expected, "old runtime changed before Exit")
-                elif current.get("stage") not in ("exit_intent", "exit_unknown"):
+                elif current.get("stage") != "exiting":
                     return "pending"
                 marker = owned_marker()
                 require(marker.get("current_session") == expected["node_session"], "Exit origin session differs")
                 if current is None:
                     require(marker.get("yielded") is False, "first Exit requires unyielded original")
                 save()
-                # exit_unknown replays the original empty input, including expiry-only observation.
+                # Exiting replays the original empty input, including expiry-only observation.
                 cli(node, ["step", "--task-id", task_id, "--step", "exit",
                            "--attempt", "", "--node-session", ""])
                 task = query_task()
@@ -1305,20 +995,23 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
         task = query_task()
         if not finish_terminal(task):
             execution = same_execution(task)
-            marker = owned_marker()
             stage = execution.get("stage")
+            if stage not in ("exited", "starting", "committing") or task.get("phase") == "completed":
+                return "pending"
+            if stage == "committing" and not (
+                    type(execution.get("candidate_pid")) is int and execution["candidate_pid"] > 0):
+                return "pending"
+            require(execution.get("leg") == dict(kind="target"), "Start requires the target leg")
+            marker = owned_marker()
             allowed_sessions = (expected["node_session"],) if stage == "exited" else (
                 expected["node_session"], state["node_session"])
             require(marker.get("yielded") is True and marker.get("current_session") in allowed_sessions,
                     "Start requires yielded origin and known current session")
-            if stage not in ("exited", "start_intent", "start_unknown", "target_commit_unknown"):
-                return "pending"
-            if task.get("phase") == "completed":
-                return "pending"  # contradictory success without complete proof cannot authorize rollback
-            if stage != "target_commit_unknown" and (not budget_open(execution) or task.get("phase") == "failed"):
+            failed_start = stage == "starting" and text(execution.get("error"))
+            if stage != "committing" and (not budget_open(execution) or task.get("phase") == "failed"):
                 begin_rollback(task)
             else:
-                # Replaying a local Start intent/unknown is idempotent. A plain exited
+                # Replaying a local Starting attempt is idempotent. A plain exited
                 # Task with an unexplained live process is not permission to spawn.
                 if stage == "exited" and check_process(plan, node, kube, local) is not None:
                     return "pending"
@@ -1327,56 +1020,51 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
                 try:
                     cli(node, ["step", "--task-id", task_id, "--step", "start",
                                "--attempt", state["attempt"], "--node-session", state["node_session"]])
-                except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                        subprocess.SubprocessError, http.client.HTTPException) as error:
+                except RECOVERABLE_ERRORS as error:
                     step_error = error
                 task = query_task()
                 if step_error is not None and not (
-                        stage == "start_unknown" and task.get("phase") in ("unknown", "failed")
-                        and task.get("adxlet_execution", {}).get("stage") == "start_unknown"):
+                        failed_start and task.get("phase") in ("unknown", "failed")
+                        and task.get("adxlet_execution", {}).get("stage") == "starting"
+                        and text(task.get("adxlet_execution", {}).get("error"))):
                     # A CLI failure is never rollback proof. Preserve the unknown
                     # request unless fresh Query confirms the same local failure stage.
                     raise step_error
                 if not finish_terminal(task):
                     execution = same_execution(task)
                     # Commit ambiguity uses only same-A Receipt, even after expiry.
-                    if execution.get("stage") == "target_commit_unknown":
+                    if execution.get("stage") == "committing":
                         return "pending"
-                    if execution.get("stage") != "start_unknown" or task.get("phase") not in ("unknown", "failed"):
+                    if (execution.get("stage") != "starting" or not text(execution.get("error"))
+                            or task.get("phase") not in ("unknown", "failed")):
                         return "pending"
-                    if stage != "start_unknown" and budget_open(execution):
+                    if not failed_start and budget_open(execution):
                         return "pending"
                     begin_rollback(task)
-    if state["stage"] in ("rollback_intent", "original_start_intent"):
+    if state["stage"] == "rollback_intent":
         task = query_task()
-        # B can already be terminal when the accepted local rollback returns.
-        # Validate its source and adopt its identity before terminal comparison.
-        adopted = adopt_original(task)
         if not finish_terminal(task):
             execution = same_execution(task)
-            if adopted:
-                require(execution.get("rollback_from") == state["rollback_from"], "original attempt lacks A proof")
-            else:
-                require(state["rollback_from"] == dict(
-                        attempt=execution["attempt"], node_session=execution["node_session"]),
-                        "Rollback must replay the original A")
-                require(execution.get("stage") in ("exited", "start_intent", "start_unknown",
-                                                   "rollback_intent", "rollback_unknown"),
+            if execution["leg"] == dict(kind="target"):
+                require(execution.get("stage") in ("exited", "starting", "stopping_for_rollback"),
                         "rollback target outcome unavailable")
                 # The first request still requires this owner's yielded marker.
                 # Once B exists the accepted local action needs no new approval.
                 marker = owned_marker()
                 require(marker.get("yielded") is True and marker.get("current_session") in (
-                        expected["node_session"], state["rollback_from"]["node_session"]),
+                        expected["node_session"], state["node_session"]),
                         "Rollback requires yielded origin and known current session")
+            elif execution.get("stage") not in ("exited", "starting", "committing"):
+                return "pending"
+            elif execution["stage"] == "committing" and not (
+                    type(execution.get("candidate_pid")) is int and execution["candidate_pid"] > 0):
+                return "pending"
             save()
             # Even after B exists, always replay the frozen source A. Only the
             # local rollback worker may start/resume B; never issue Start(B).
             cli(node, ["step", "--task-id", task_id, "--step", "rollback",
-                       "--attempt", state["rollback_from"]["attempt"],
-                       "--node-session", state["rollback_from"]["node_session"]])
+                       "--attempt", state["attempt"], "--node-session", state["node_session"]])
             task = query_task()
-            adopt_original(task)
             if not finish_terminal(task):
                 return "pending"  # B failure retains maintenance, without recursive rollback
     if state["stage"] == "release_intent":
@@ -1388,18 +1076,20 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
             require(task.get("phase") == state["outcome"], "local task outcome differs from release intent")
             if "attempt" in state:
                 execution = same_execution(task)
-                terminal_stage = "completed" if state["outcome"] == "completed" else "original_selected"
-                require(execution.get("stage") == terminal_stage, "local task has no terminal selection")
+                require(execution.get("stage") == "selected", "local task has no terminal selection")
                 require(execution["node_session"] == body["node_session"], "local release session differs")
-                require(execution.get("rollback_from") == state.get("rollback_from"), "local rollback source differs")
+                require(execution["leg"]["kind"] == ("target" if state["outcome"] == "completed" else "rollback"),
+                        "local selected leg differs")
             else:
                 require(state["outcome"] == "failed" and task.get("adxlet_execution") is None
                         and task.get("execution") is None, "local task did not retain original process")
                 require(body["node_session"] == expected["node_session"], "local original session differs")
         else:
-            if "rollback_from" in state and state["outcome"] == "failed":
-                execution = same_execution(task)
-                require(execution.get("rollback_from") == state["rollback_from"], "release B names a different A")
+            if "attempt" in state:
+                same_execution(task)
+            else:
+                require(task.get("adxlet_execution") is None and task.get("execution") is None,
+                        "release without an attempt requires retained original")
             runtime = check_process(plan, node, kube, local, complete=True)
             require(finish_process(plan, node, task, runtime) == (state["outcome"], body["node_session"]),
                     "release requires current terminal candidate and frozen session")
@@ -1418,18 +1108,14 @@ def advance_adxlet_process(plan, node, state, save, kube, local, cli, post, slee
 
 def advance_process(plan, node, state, save, kube, local, cli, post, sleep):
     if plan["role"] == "adxlet":
-        return advance_adxlet_process(plan, node, state, save, kube, local, cli, post, sleep)
+        return advance_adxlet_process(plan, node, state, save, kube, local, cli, post)
     submission = node["submission"]
     deadline_queried = False
     if state["stage"] == "new":
-        if "declaration" in plan:
-            declaration_gate(plan, node, kube, local, sleep)
         check_process(plan, node, kube, local, original=True)
         state["stage"] = "prepared"
         save()
     if state["stage"] == "prepared":
-        if "declaration" in plan:
-            declaration_gate(plan, node, kube, local, sleep)
         check_process(plan, node, kube, local, original=True)
         state.update(stage="submit_intent", first_submit_unix_ms=int(time.time() * 1000))
         save()
@@ -1439,8 +1125,7 @@ def advance_process(plan, node, state, save, kube, local, cli, post, sleep):
         try:
             response = cli(node, ["query", "--task-id", submission["task_id"]])
             require(response.get("ok") is True, "query result unavailable")
-        except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                subprocess.SubprocessError, http.client.HTTPException):
+        except RECOVERABLE_ERRORS:
             if int(time.time() * 1000) >= state["first_submit_unix_ms"] + 2400 * 1000:
                 return "pending"
             # Uncertain Query is not non-execution proof. Exact original identity
@@ -1476,286 +1161,13 @@ def advance_process(plan, node, state, save, kube, local, cli, post, sleep):
     return state["stage"] if state["stage"] in ("completed", "failed") else "pending"
 
 
-def declaration_patch(source, resource_version, before, after, data_present=True, fence=None):
-    key = source["key"].replace("~", "~0").replace("/", "~1")
-    body = [dict(op="test", path="/metadata/uid", value=source["uid"]),
-            dict(op="test", path="/metadata/resourceVersion", value=resource_version)]
-    if before is not None:
-        body.append(dict(op="test", path=f'/data/{key}', value=before))
-    if before == after:
-        pass
-    elif after is None:
-        body.append(dict(op="remove", path=f'/data/{key}'))
-    elif before is None:
-        body.append(dict(op="add", path=f'/data/{key}' if data_present else "/data",
-                         value=after if data_present else {source["key"]: after}))
-    else:
-        body.append(dict(op="replace", path=f'/data/{key}', value=after))
-    if fence is not None:
-        body.append(dict(op="add", path="/metadata/annotations", value=fence))
-    return body
-
-
-def declaration_write(plan, journal, save, kube, mutate, restore=False):
-    source = plan["declaration"]
-    obj = kube(["get", "configmap", source["name"], "--namespace", source["namespace"]])
-    evidence, current = declaration_configmap(obj, source["namespace"], source["name"], source["key"])
-    require(evidence["uid"] == source["uid"], "ConfigMap UID changed")
-    resource_version = evidence["resource_version"]
-    marker_key = "adx.dev/rollout-input-fence"
-    nonce = template_hash(plan)
-    applied, restored = nonce + ":applied", nonce + ":restored"
-    annotations = obj["metadata"].get("annotations", {})
-    require(isinstance(annotations, dict), "invalid CM annotations")
-    marker = annotations.get(marker_key)
-    owned = journal.get("declaration_write")
-    for name, intent in (("declaration_write", owned), ("declaration_restore", journal.get("declaration_restore"))):
-        if intent is None:
-            continue
-        require(isinstance(intent, dict) and set(intent) == {"rv", "data_present", "fence", "body", "before"}
-                and text(intent["rv"]) and isinstance(intent.get("data_present"), bool), "invalid CM intent")
-        reverse = name == "declaration_restore"
-        before = intent["before"]
-        require(before in (source["original_text"], source["candidate_text"])
-                and (reverse or before == source["original_text"]), "invalid CM intent input")
-        after = source["original_text"] if reverse else source["candidate_text"]
-        fence = intent["fence"]
-        require(isinstance(fence, dict) and fence.get(marker_key) == (restored if reverse else applied),
-                "invalid CM fence")
-        require(reverse or intent["rv"] == source["resource_version"], "forward RV differs from frozen source")
-        require(intent["body"] == declaration_patch(
-            source, intent["rv"], before, after, intent["data_present"], fence), "CM intent body differs")
-    require(current in (source["original_text"], source["candidate_text"]), "foreign ConfigMap text")
-    require(marker != applied or current == source["candidate_text"], "applied marker/data conflict")
-    require(marker != restored or current == source["original_text"], "restored marker/data conflict")
-    if restore:
-        require(owned is not None, "no owned ConfigMap write")
-        if marker == restored:
-            require(current == source["original_text"], "restored marker/data conflict")
-            return
-        require((marker == applied and current == source["candidate_text"])
-                or (resource_version == source["resource_version"] and current == source["original_text"]),
-                "CM ownership unknown or superseded")
-        name = "declaration_restore"
-        before, after = current, source["original_text"]
-        desired_marker = restored
-    else:
-        require("declaration_restore" not in journal, "input restoration already started")
-        require(marker != restored, "input restoration already closed this rollout")
-        if marker == applied:
-            require(owned is not None, "foreign candidate without owned intent")
-            require(current == source["candidate_text"], "applied marker/data conflict")
-            return
-        require(resource_version == source["resource_version"] and current == source["original_text"],
-                "CM ownership unknown or superseded; replan required")
-        name, before, after = "declaration_write", source["original_text"], source["candidate_text"]
-        desired_marker = applied
-    fence = dict(annotations)
-    fence[marker_key] = desired_marker
-    intent = journal.get(name)
-    if intent is None:
-        intent = dict(rv=resource_version, data_present="data" in obj, fence=fence, before=before,
-                      body=declaration_patch(source, resource_version, before, after, "data" in obj, fence))
-        journal[name] = intent
-        save()
-    require(intent["rv"] == resource_version and intent["before"] == current, "fixed CM intent no longer applicable")
-    require(mutate is not None, "ConfigMap mutation transport unavailable")
-    if intent["rv"] == resource_version:
-        require(intent["data_present"] == ("data" in obj), "CM intent data presence differs")
-    require(intent["fence"] == fence, "fence annotations differ from fresh object")
-    mutate(["patch", "configmap", source["name"], "--namespace", source["namespace"],
-            "--type=json", "--patch-file=/dev/stdin", "-o", "json"], intent["body"])
-    fresh = kube(["get", "configmap", source["name"], "--namespace", source["namespace"]])
-    identity_now, text_now = declaration_configmap(fresh, source["namespace"], source["name"], source["key"])
-    require(identity_now["uid"] == source["uid"] and text_now == after
-            and fresh["metadata"].get("annotations", {}).get(marker_key) == desired_marker
-            and identity_now["resource_version"] != resource_version, "ConfigMap effect unconfirmed")
-
-
-def declaration_gate(plan, node, kube, local, sleep, override=False, expected_text=None, marker="applied"):
-    source = plan["declaration"]
-    expected_text = source["candidate_text"] if expected_text is None else expected_text
-    desired = declaration_candidate(decode(expected_text.encode("utf-8")))
-    deadline = time.monotonic() + 30
-    for _ in range(16):
-        obj = kube(["get", "configmap", source["name"], "--namespace", source["namespace"]])
-        evidence, current = declaration_configmap(obj, source["namespace"], source["name"], source["key"])
-        require(evidence["uid"] == source["uid"] and current == expected_text
-                and obj["metadata"].get("annotations", {}).get("adx.dev/rollout-input-fence")
-                == template_hash(plan) + ":" + marker, "CM gate changed")
-        pod = kube(["get", "pod", node["kube"]["name"], "--namespace", source["namespace"]])
-        require(declaration_mount(pod, plan["container"], source["name"], source["key"])
-                == node["declaration_path"], "declaration mount changed")
-        response = local(node["kube"]["name"], node["declaration_path"]) if override else local(node["kube"]["name"])
-        observation = response.get("external_declaration")
-        if observation == dict(path=node["declaration_path"], desired=desired,
-                               raw_sha256=hashlib.sha256(expected_text.encode("utf-8")).hexdigest()):
-            require(time.monotonic() < deadline, "candidate projection observation deadline exceeded")
-            return
-        if time.monotonic() >= deadline:
-            break
-        sleep(2)
-    raise Refusal("candidate projection not yet observed")
-
-
-def process_declaration_restore(plan, node, state, journal, save, kube, local, cli, post, mutate):
-    response = cli(node, ["query", "--task-id", node["submission"]["task_id"]])
-    require(response.get("ok") is True and response["task"].get("submission") == node["submission"],
-            "restoration requires fresh exact task")
-    task = response["task"]
-    runtime = check_process(plan, node, kube, local, complete=True)
-    expected = node["submission"]["selection"]["expected"]
-    execution = task.get("adxlet_execution") if plan["role"] == "adxlet" else task.get("execution")
-    restored = (isinstance(execution, dict) and
-                execution.get("stage" if plan["role"] == "adxlet" else "phase") ==
-                ("original_selected" if plan["role"] == "adxlet" else "rolled_back"))
-    never = (execution is None or (plan["role"] == "relay" and isinstance(execution, dict)
-                                   and execution.get("phase") == "cancelled_before_begin"))
-    require(task.get("phase") == "failed" and ((restored and finish_process(plan, node, task, runtime)
-            == ("failed", runtime["node_session"] if plan["role"] == "adxlet" else None))
-            or (never and runtime == expected)), "original runtime not proven")
-    if plan["role"] == "adxlet" and "release_session" in state:
-        body = dict(owner=maintenance_owner(plan, node), node_session=runtime["node_session"])
-        require(state.get("release_session") == runtime["node_session"]
-                and process_release_receipt(post, body["owner"], body["node_session"]) == body,
-                "fresh released original receipt required")
-    declaration_write(plan, journal, save, kube, mutate, restore=True)
-
-
-def completed_scope(plan, node, state, kube, local):
-    if plan["mode"] == "process":
-        runtime, response = observe_process(plan, node, kube, local, complete=True)
-        namespace = plan["namespace"]
-        pod = kube(["get", "pod", node["kube"]["name"], "--namespace", namespace])
-        actual = pod_actual(pod, namespace, plan["container"], node["node_id"], response)
-        require(all(actual[key] == node["kube"][key] for key in ("container_id", "restart_count"))
-                and actual["boot_nonce"] == node["submission"]["selection"]["expected"]["boot_nonce"],
-                "process container or parent changed")
-    else:
-        namespace = plan["begin"]["namespace"]
-        matches = [pod for pod in pod_inventory(namespace, kube) if pod["metadata"]["uid"] == state["replacement_uid"]]
-        require(len(matches) == 1, "replacement UID changed")
-        pod = matches[0]
-        response = local(pod["metadata"]["name"])
-        actual = pod_actual(pod, namespace, plan["container"], node["node_id"], response)
-        require(all(actual[key] == state["replacement_actual"][key] for key in actual if key != "node_session"),
-                "replacement container or parent changed")
-        require(workload_owns(plan["workload"], pod)
-                and pod["spec"].get("nodeName") == replacement_host(
-                    plan["workload"], node["kubernetes_node_name"], state)
-                and image(pod, plan["container"]) == plan["begin"]["target_image"], "replacement scope changed")
-        runtime = None
-    return pod, runtime, response
-
-
-def promote_ready(plan, journal, save, kube, local, mutate, sleep, cli=None, post=None, get=None):
-    require("declaration" in plan and "declaration_restore" not in journal and "cleanup" not in journal,
-            "promotion requires an unrestored declaration rollout")
-    source = plan["declaration"]
-    desired = declaration_candidate(decode(source["candidate_text"].encode("utf-8")), source["candidate_text"])
-    promoted = dict(desired, ready=dict(components=desired["components"]))
-    after = canonical(promoted)
-    declaration_candidate(promoted, after)
-    marker_key = "adx.dev/rollout-input-fence"
-    nonce = template_hash(plan)
-    obj = kube(["get", "configmap", source["name"], "--namespace", source["namespace"]])
-    evidence, current = declaration_configmap(obj, source["namespace"], source["name"], source["key"])
-    require(evidence["uid"] == source["uid"], "promotion ConfigMap UID changed")
-    marker = obj["metadata"].get("annotations", {}).get(marker_key)
-    intent = journal.get("ready_intent")
-    if intent is not None:
-        require(set(intent) == {"rv", "data_present", "fence", "body"}
-                and intent["fence"].get(marker_key) == nonce + ":promoted"
-                and intent["body"] == declaration_patch(source, intent["rv"], source["candidate_text"], after,
-                                                       intent["data_present"], intent["fence"]),
-                "promotion intent differs")
-    confirmed = marker == nonce + ":promoted" and current == after
-    require(confirmed or (marker == nonce + ":applied" and current == source["candidate_text"]),
-            "promotion ownership unknown or superseded")
-    require(not confirmed or intent is not None, "promoted marker without durable intent")
-    if plan["mode"] == "process":
-        require(all(journal["nodes"].get(node["node_id"], {}).get("stage") == "completed" for node in plan["nodes"]),
-                "all process batches must complete before promotion")
-        nodes = plan["nodes"]
-    else:
-        require(journal["stage"] == "completed", "all Pod batches must complete before promotion")
-        task = pod_task(plan, get)
-        require(task["phase"] == "Completed" and all(n["phase"] == "verified" for n in task["nodes"].values())
-                and all(op["phase"] == "Completed" for op in task["operations"].values()),
-                "Pod completion proof unavailable")
-        nodes = plan["pods"]
-    gates = []
-    for node in nodes:
-        state = journal["nodes"][node["node_id"]]
-        if plan["mode"] == "process":
-            result = cli(node, ["query", "--task-id", node["submission"]["task_id"]])
-            task = result.get("task", {})
-            require(result.get("ok") is True and task.get("submission") == node["submission"]
-                    and task.get("phase") == "completed", "exact completed process task required")
-            prepared = task.get("prepared", {})
-            require(all(isinstance(prepared.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", prepared[key])
-                        for key in ("binary_sha256", "configuration_sha256")), "prepared identity unknown")
-            if plan["role"] == "adxlet":
-                body = dict(owner=maintenance_owner(plan, node), node_session=state["release_session"])
-                require(process_release_receipt(post, body["owner"], body["node_session"]) == body,
-                        "exact historical released receipt required")
-        else:
-            require(state.get("stage") == "verified", "Pod node not historically verified")
-        pod, runtime, response = completed_scope(plan, node, state, kube, local)
-        pod_name = pod["metadata"]["name"]
-        if plan["mode"] == "process":
-            if not confirmed:
-                require(runtime["executable_sha256"] == prepared["binary_sha256"]
-                        and runtime["configuration_sha256"] == prepared["configuration_sha256"],
-                        "current selected component differs from prepared content")
-        require(declaration_mount(pod, plan["container"], source["name"], source["key"])
-                == node["declaration_path"], "promotion projection mount changed")
-        if not confirmed:
-            components = response["node_info"]["components"]
-            require(components[0]["mode"] == desired["mode"], "current node mode differs")
-            for component in components:
-                roles = (component["role"],) if desired["mode"] == "standalone" else ("adxlet", "relay")
-                sources = {role: dict(version=desired["components"][role]["version"],
-                    archive_sha256=desired["components"][role]["artifact"]["sha256"],
-                    raw_config_sha256=desired["components"][role]["config"]["sha256"]) for role in roles}
-                require(component.get("sources") == sources, "complete current group provenance required")
-        gates.append(dict(kube={"name": pod_name}, declaration_path=node["declaration_path"]))
-    if not confirmed:
-        fence = dict(obj["metadata"].get("annotations", {}))
-        fence[marker_key] = nonce + ":promoted"
-        if intent is None or intent["rv"] != evidence["resource_version"]:
-            intent = dict(rv=evidence["resource_version"], data_present="data" in obj, fence=fence)
-            intent["body"] = declaration_patch(source, intent["rv"], source["candidate_text"], after,
-                                                intent["data_present"], fence)
-            journal["ready_intent"] = intent
-            save()
-        require(intent["rv"] == evidence["resource_version"] and intent["fence"] == fence,
-                "fixed promotion intent superseded")
-        mutate(["patch", "configmap", source["name"], "--namespace", source["namespace"],
-                "--type=json", "--patch-file=/dev/stdin", "-o", "json"], intent["body"])
-    for node in gates:
-        declaration_gate(plan, node, kube, local, sleep, override=True, expected_text=after, marker="promoted")
-    return dict(status="completed", ready_promoted=True)
-
-
-def apply_process(plan, journal_path, batch_index, kube, local, cli, post, sleep=time.sleep, mutate=None,
-                  promote=False):
+def apply_process(plan, journal_path, batch_index, kube, local, cli, post, sleep=time.sleep):
     validate_process_plan(plan)
     # Linux publisher Job only. Keep this lock across all I/O and atomic journal replacements.
     require(sys.platform == "linux", "apply-process requires a Linux publisher")
-    import fcntl
 
-    require((promote and batch_index is None)
-            or (not promote and type(batch_index) is int
-                and 0 <= batch_index < len(plan["batches"])), "select batch index or promotion")
-    path = Path(journal_path).absolute()
-    lock = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    with os.fdopen(lock, "a+b") as lock_stream:
-        require(stat.S_ISREG(os.fstat(lock_stream.fileno()).st_mode), "lock must be regular")
-        try:
-            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise Refusal("another publisher holds journal lock") from error
+    require(type(batch_index) is int and 0 <= batch_index < len(plan["batches"]), "select batch index")
+    with locked_journal(journal_path) as path:
         digest = template_hash(plan)
         journal_schema = 2 if plan["role"] == "adxlet" else 1
         if path.exists() or path.is_symlink():
@@ -1763,7 +1175,6 @@ def apply_process(plan, journal_path, batch_index, kube, local, cli, post, sleep
             require(journal.get("plan_hash") == digest, "journal plan hash differs")
             require(journal.get("schema_version") == journal_schema, "invalid journal schema")
         else:
-            require(not promote, "post-release actions require existing journal")
             journal = dict(schema_version=journal_schema, plan_hash=digest, nodes={})
             write_journal(path, journal)
         states = journal["nodes"]
@@ -1776,7 +1187,7 @@ def apply_process(plan, journal_path, batch_index, kube, local, cli, post, sleep
             stages = {"new", "prepared", "submit_intent", "completed", "failed"}
             if plan["role"] == "adxlet":
                 stages.update(("prepare_intent", "exit_intent", "start_intent", "release_intent",
-                               "rollback_intent", "original_start_intent"))
+                               "rollback_intent"))
             require(stage in stages, "invalid journal stage")
             if stage in ("submit_intent", "release_intent", "completed", "failed") or (
                     plan["role"] == "adxlet" and stage != "new"):
@@ -1790,148 +1201,86 @@ def apply_process(plan, journal_path, batch_index, kube, local, cli, post, sleep
                         "invalid release session")
                 require(state.get("outcome") in ("completed", "failed"), "invalid release outcome")
             if "attempt" in state or "node_session" in state or stage in (
-                    "start_intent", "rollback_intent", "original_start_intent"):
+                    "start_intent", "rollback_intent"):
                 require(plan["role"] == "adxlet" and all(text(state.get(key))
                         and len(state[key].encode("utf-8")) <= 128 for key in ("attempt", "node_session")),
                         "invalid durable Step identity")
                 require(state["node_session"] != by_id[node_id]["submission"]["selection"]["expected"]["node_session"],
                         "new session equals old")
-            if "rollback_from" in state or stage in (
-                    "rollback_intent", "original_start_intent"):
-                source = state.get("rollback_from")
-                require(plan["role"] == "adxlet" and isinstance(source, dict)
-                        and set(source) == {"attempt", "node_session"}
-                        and all(text(source[key]) and len(source[key].encode("utf-8")) <= 128 for key in source),
-                        "invalid frozen rollback A")
-                require(source["node_session"] != by_id[node_id]["submission"]["selection"]["expected"]["node_session"],
-                        "rollback A reuses origin session")
-                if stage == "rollback_intent":
-                    require(all(state[key] == source[key] for key in source), "Rollback identity must remain A")
-                if stage == "original_start_intent":
-                    require(all(state[key] != source[key] for key in source), "original identity must be B")
             if plan["role"] == "adxlet" and stage in ("release_intent", "completed"):
                 require("release_session" in state, "missing durable release session")
             if plan["role"] == "adxlet" and stage == "failed" and "release_session" not in state:
                 require("attempt" not in state and "outcome" not in state,
                         "failed execution requires durable release session")
-        for previous in (plan["batches"][:batch_index] if not promote else []):
+        for previous in plan["batches"][:batch_index]:
             require(all(states.get(node_id, {}).get("stage") == "completed" for node_id in previous),
                     "prior batch is not successfully completed and released")
 
         def save():
             write_journal(path, journal)
 
-        if promote:
-            return promote_ready(plan, journal, save, kube, local, mutate, sleep, cli=cli, post=post)
         selected = plan["batches"][batch_index]
-        declaration_stages = ("new", "prepare_intent", "prepared")
-        if plan["role"] == "adxlet":
-            declaration_stages += ("submit_intent",)
         for node_id in selected:
             state = states.setdefault(node_id, {"stage": "new"})
-            if "declaration" in plan and state["stage"] in declaration_stages:
-                try:
-                    if plan["role"] == "adxlet":
-                        owner = maintenance_owner(plan, by_id[node_id])
-                        old_session = by_id[node_id]["submission"]["selection"]["expected"]["node_session"]
-                        marker = process_upgrade_status(post, owner)
-                        require(marker["status"] == "absent" or (marker["status"] == "active"
-                                and marker["origin_session"] == old_session
-                                and marker["current_session"] == old_session and marker["yielded"] is False),
-                                "maintenance owner/origin differs")
-                    if "declaration_write" not in journal:
-                        for candidate in plan["nodes"]:
-                            if states.get(candidate["node_id"], {}).get("stage", "new") in declaration_stages:
-                                check_process(plan, candidate, kube, local, original=True)
-                    declaration_write(plan, journal, save, kube, mutate)
-                except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                        subprocess.SubprocessError, http.client.HTTPException) as error:
-                    return dict(status="pending", batch_index=batch_index, node_id=node_id, detail=str(error))
             if state["stage"] in ("completed", "failed"):
                 result = state["stage"]
             else:
                 try:
                     result = advance_process(plan, by_id[node_id], state, save, kube, local, cli, post, sleep)
-                except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                        subprocess.SubprocessError, http.client.HTTPException) as error:
+                except RECOVERABLE_ERRORS as error:
                     return dict(status="pending", batch_index=batch_index, node_id=node_id, detail=str(error))
             if result != "completed":
-                if result == "failed" and "declaration" in plan:
-                    try:
-                        process_declaration_restore(plan, by_id[node_id], state, journal, save,
-                                                    kube, local, cli, post, mutate)
-                    except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                            subprocess.SubprocessError, http.client.HTTPException) as error:
-                        return dict(status="failed", batch_index=batch_index, node_id=node_id,
-                                    input_restore="pending", detail=str(error))
                 return dict(status=result, batch_index=batch_index, node_id=node_id)
         return dict(status="completed", batch_index=batch_index)
 
 
 def validate_pod_plan(plan):
+    """Bind local Pod selection to the Coordinator owner before any Kubernetes effect."""
     require(type(plan.get("schema_version")) is int and plan["schema_version"] == 1
             and plan.get("mode") == "pod", "expected schema 1 Pod plan")
     origin(plan["origin"])
     require(text(plan["config"]) and PurePosixPath(plan["config"]).is_absolute()
             and PurePosixPath(plan["config"]).suffix in (".yaml", ".yml"), "absolute deployment YAML required")
-    require(all(text(plan[k]) and not plan[k].startswith("-") for k in ("context", "container")),
-            "invalid Pod selection")
     begin, workload = plan["begin"], plan["workload"]
+    pod_task_identity(begin["task_id"], begin["epoch"])
     kind = workload_kind(workload)
-    if "declaration" in plan:
-        source = plan["declaration"]
-        require(set(source) == {
-            "name", "namespace", "uid", "resource_version", "key", "original_text", "candidate_text"}
-                and all(text(source[key]) for key in ("name", "namespace", "uid", "resource_version", "key"))
-                and source["namespace"] == begin["namespace"]
-                and not source["name"].startswith("-") and re.fullmatch(r"[A-Za-z0-9._-]+", source["key"])
-                and (source["original_text"] is None or text(source["original_text"]))
-                and source["original_text"] != source["candidate_text"], "invalid declaration source")
-        desired = declaration_candidate(decode(source["candidate_text"].encode("utf-8")), source["candidate_text"])
-        require(not desired.get("upgrade_components", []), "Pod candidate cannot upgrade processes")
-    require(text(begin["task_id"]) and len(begin["task_id"].encode("utf-8")) <= 128
-            and "/" not in begin["task_id"] and "%" not in begin["task_id"], "invalid task ID")
-    require(type(begin["epoch"]) is int and 0 < begin["epoch"] <= 2**64 - 1, "invalid epoch")
+    selectors = (plan["context"], plan["container"], begin["namespace"], workload["name"])
+    require(all(text(value) and not value.startswith("-") for value in selectors), "invalid Pod selection")
     require(begin["namespace"] == workload["namespace"] and begin["daemonset_uid"] == workload["uid"],
             "workload binding differs")
-    require(re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", begin["target_image"]), "immutable image required")
-    require(all(text(workload[k]) for k in ("name", "uid", "namespace", "original_image")), "invalid workload")
-    for key in ("original_template_hash", "target_template_hash"):
-        require(re.fullmatch("[0-9a-f]{64}", workload[key]), "invalid template fingerprint")
+    require(all(isinstance(workload.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", workload[key])
+                for key in ("original_template_hash", "target_template_hash")), "invalid template fingerprint")
+    require(text(workload.get("original_image")), "missing original template image")
     pods = plan["pods"]
     require(isinstance(pods, list) and bool(pods), "empty Pod plan")
-    ids, names, hosts, uids = [], [], [], []
-    bindings = []
+    ids, names, hosts, uids, bindings = [], [], [], [], []
     for pod in pods:
-        require(all(text(pod[k]) for k in ("name", "uid", "node_id", "kubernetes_node_name")), "invalid Pod")
+        require(text(pod["name"]) and not pod["name"].startswith("-"), "invalid Pod name")
+        if kind == "StatefulSet":
+            require(stable_statefulset_name(workload["name"], pod["name"]),
+                    "StatefulSet Pods must use canonical ordinal names")
+        require(text(pod.get("kubernetes_node_name")) and text(pod.get("original_image")),
+                "missing source host or image")
         require(pod["namespace"] == begin["namespace"] and pod["owner_uid"] == workload["uid"]
                 and pod["target_image"] == begin["target_image"], "Pod plan binding differs")
         inspection = pod["inspection"]
-        actual = pod["actual"]
-        require(all(text(actual[key]) for key in ("container_id", "image_id", "boot_nonce", "node_session"))
-                and actual["node_session"] == inspection["node_session_id"], "invalid actual source identity")
-        if "declaration" in plan:
-            require(text(pod["declaration_path"]) and PurePosixPath(pod["declaration_path"]).is_absolute(),
-                    "invalid declaration mount")
-        require(inspection["observed_pod_uid"] == pod["uid"] and inspection["node_id"] == pod["node_id"]
-                and text(inspection["node_session_id"]), "Pod inspection binding differs")
+        require(pod["actual"]["node_session"] == inspection["node_session_id"], "actual source session differs")
+        require(inspection["observed_pod_uid"] == pod["uid"] and inspection["node_id"] == pod["node_id"],
+                "Pod inspection binding differs")
         bindings.append(dict(node_id=pod["node_id"], pod_uid=pod["uid"],
                              node_session_id=inspection["node_session_id"]))
         ids.append(pod["node_id"])
         names.append(pod["name"])
         hosts.append(pod["kubernetes_node_name"])
         uids.append(pod["uid"])
-    require(names == sorted(names) and len(set(names)) == len(names)
-            and len(set(ids)) == len(ids) and len(set(uids)) == len(uids)
-            and (kind == "StatefulSet" or len(set(hosts)) == len(hosts)),
-            "duplicate or unordered Pod bindings")
-    if kind == "StatefulSet":
-        require(all(stable_statefulset_name(workload["name"], name) for name in names),
-                "StatefulSet Pod names must be canonical ordinals")
+    require(names == sorted(set(names)) and len(set(ids)) == len(ids)
+            and len(set(uids)) == len(uids), "duplicate or unordered Pod bindings")
+    require(kind == "StatefulSet" or len(set(hosts)) == len(hosts), "duplicate source host")
     require(begin["nodes"] == bindings, "begin bindings differ")
     batches = plan["batches"]
-    require(isinstance(batches, list) and batches and all(isinstance(b, list) and b for b in batches)
-            and batches[0] == ids[:1] and list(chain.from_iterable(batches)) == ids, "invalid Pod batches")
+    require(isinstance(batches, list) and batches and all(isinstance(batch, list) and batch for batch in batches),
+            "invalid Pod batches")
+    require(batches[0] == ids[:1] and list(chain.from_iterable(batches)) == ids, "invalid Pod batches")
 
 
 def pod_task(plan, get, cleanup=False):
@@ -2020,7 +1369,7 @@ def pod_inspection(plan, pod, uid, session, get, phase=None, permit=None, revisi
 
 
 def advance_pod(plan, journal, save, batch_index, clients, cleanup=False, cleanup_node=None,
-                local=None, sleep=time.sleep):
+                local=None):
     """Advance with durable intent recorded before each external mutation."""
     kube, get, post, mutate = clients
     begin, workload = plan["begin"], plan["workload"]
@@ -2044,11 +1393,20 @@ def advance_pod(plan, journal, save, batch_index, clients, cleanup=False, cleanu
                     pod["node_id"], local(pod["name"])) == pod["actual"], "source actual identity changed")
         journal["stage"] = "begin_intent"
         save()
-        post("/v1/node-upgrades/tasks", begin)
+        try:
+            post("/v1/node-upgrades/tasks", begin)
+        except ManagementError as error:
+            # Only a confirmed rejection of this first attempt proves it did not
+            # execute. Replays after an unknown response never create this proof.
+            if error.status == 400 and error.code == "InvalidArgument":
+                journal["begin_rejected"] = True
+                save()
+            raise
         journal["stage"] = "template"
         save()
         return False
     if stage == "begin_intent":
+        require(journal.get("begin_rejected") is not True, "Begin was rejected; use stop-pod or abort-pod")
         # Begin is same-owner idempotent, including an ambiguous first reply.
         try:
             pod_task(plan, get)
@@ -2299,10 +1657,6 @@ def advance_pod(plan, journal, save, batch_index, clients, cleanup=False, cleanu
             require(not revoking, "DELETE revocation still pending")
             body = dict(apiVersion="v1", kind="DeleteOptions",
                          preconditions=dict(uid=pod["uid"], resourceVersion=state["delete_rv"]))
-            if "declaration" in plan:
-                declaration_write(plan, journal, save, kube, mutate)
-                gate_node = dict(kube={"name": pod["name"]}, declaration_path=pod["declaration_path"])
-                declaration_gate(plan, gate_node, kube, local, sleep, override=True)
             save()
             url = f"/api/v1/namespaces/{quote(begin['namespace'], safe='')}/pods/{quote(pod['name'], safe='')}"
             mutate(["delete", "--raw", url, "-f", "-"], body)
@@ -2326,7 +1680,7 @@ def advance_pod(plan, journal, save, batch_index, clients, cleanup=False, cleanu
                          baseline_revision=node["control_revision"])
             require(local is not None, "NodeInfo transport unavailable")
             state["replacement_actual"] = pod_actual(candidate, begin["namespace"], plan["container"], node_id,
-                                                     local(evidence["name"]), None if cleanup else plan, session)
+                                                     local(evidence["name"]), session)
             binding.update(pod_uid=evidence["uid"], node_session_id=session)
             save()
             action("quiesce")
@@ -2341,14 +1695,12 @@ def advance_pod(plan, journal, save, batch_index, clients, cleanup=False, cleanu
             current = candidates[0]
             identity(current, "Pod", begin["namespace"])
             require(workload_owns(workload, current)
-                    and current["spec"].get("nodeName") == replacement_host(
-                        workload, pod["kubernetes_node_name"], state)
+                    and current["spec"].get("nodeName") == replacement_host(state)
                     and image(current, plan["container"]) == begin["target_image"], "replacement changed before verify")
             pod_inspection(plan, pod, binding["pod_uid"], binding["node_session_id"], get)
             require(local is not None, "NodeInfo transport unavailable")
             actual = pod_actual(current, begin["namespace"], plan["container"], node_id,
-                                local(current["metadata"]["name"]), None if cleanup else plan,
-                                binding["node_session_id"])
+                                local(current["metadata"]["name"]), binding["node_session_id"])
             require(state.get("replacement_actual") == actual, "replacement container/parent identity changed")
             if node["phase"] != "verified":
                 require(node["permit_id"] == state["permit_id"], "replacement permit changed")
@@ -2431,8 +1783,7 @@ def cleanup_inventory(plan, task, get, kube, local):
                 executable_sha256=item["runtime"]["executable_sha256"],
                 configuration_sha256=item["runtime"]["configuration_sha256"])
                 for item in response["node_info"]["components"]]
-        except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                subprocess.SubprocessError, http.client.HTTPException):
+        except RECOVERABLE_ERRORS:
             pass
     require(all(entry["phase"] in ("Completed", "Cancelled") for entry in task["operations"].values()),
             "cleanup migration unresolved")
@@ -2453,9 +1804,23 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
         save()
         return post(f'{base}/{name}', body)
 
+    if journal.get("begin_rejected") is True:
+        # A previous task with the same ID may exist. Only an authoritative
+        # NotFound permits local cleanup; transport errors remain unknown.
+        try:
+            pod_task(plan, get, cleanup=True)
+        except ManagementError as error:
+            if error.status != 404 or error.code != "NotFound":
+                raise
+        else:
+            journal.pop("begin_rejected")
+            journal["stage"] = "template"
+            save()
+            return None
+        journal["stage"] = "new"
+        journal.pop("begin_rejected")
+        save()
     if journal["stage"] == "new":
-        if not stop and "declaration_write" in journal:
-            declaration_write(plan, journal, save, kube, mutate, restore=True)
         cleanup["local_terminal"] = "stopped" if stop else "aborted"
         save()
         return dict(status=cleanup["local_terminal"], remote_task=False, effects=False)
@@ -2476,8 +1841,6 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
             require(identity(current_workload, kind, begin["namespace"])["uid"] == workload["uid"]
                     and template_hash(current_workload["spec"]["template"]) == workload["original_template_hash"],
                     "aborted task current template unknown")
-            if "declaration_write" in journal:
-                declaration_write(plan, journal, save, kube, mutate, restore=True)
         current = cleanup_inventory(plan, task, get, kube, local)
         return dict(status="partial", task_phase=task["phase"], nodes=current,
                     mixed_images=len({value["image"] for value in current.values()}) > 1,
@@ -2493,8 +1856,6 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
         return None
     if stop:
         return dict(status="stopped", task_phase="Aborting")
-    if "declaration_write" in journal:
-        declaration_write(plan, journal, save, kube, mutate, restore=True)
     if any(entry["phase"] not in ("Completed", "Cancelled") for entry in task["operations"].values()):
         action("abort", dict(stage="freeze"))
         raise Refusal("migration outcomes unresolved; keep maintenance and retry cleanup")
@@ -2581,8 +1942,7 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
             current = matches[0]
             identity(current, "Pod", begin["namespace"])
             require(workload_owns(workload, current)
-                    and current["spec"].get("nodeName") == replacement_host(
-                        workload, pod["kubernetes_node_name"], normal)
+                    and current["spec"].get("nodeName") == replacement_host(normal)
                     and image(current, plan["container"]) == begin["target_image"], "replacement changed")
             pod_inspection(plan, pod, node["pod_uid"], node["node_session_id"], get)
             if state.get("outcome") != "retained_target":
@@ -2655,8 +2015,6 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
             require(all(n.get("outcome") in ("untouched", "restored", "retained_target")
                         for n in cleanup["nodes"].values()), "unsettled cleanup node")
             cleanup_inventory(plan, task, get, kube, local)
-            if "declaration_write" in journal:
-                declaration_write(plan, journal, save, kube, mutate, restore=True)
             action("abort", dict(stage="finalize", template_restored=True))
             return None
     cleanup["template_intent"] = patch
@@ -2666,32 +2024,19 @@ def advance_pod_cleanup(plan, journal, save, kube, get, post, mutate, stop=False
     return None
 
 
-def apply_pod(plan, journal_path, batch_index, clients, sleep=time.sleep, mode="apply", local=None,
-              promote=False):
+def apply_pod(plan, journal_path, batch_index, clients, sleep=time.sleep, mode="apply", local=None):
     kube, get, post, mutate = clients
     require(sys.platform == "linux", "apply-pod requires a Linux publisher")
-    import fcntl
 
     validate_pod_plan(plan)
-    require((promote and batch_index is None and mode == "apply")
-            or (not promote and type(batch_index) is int
-                and 0 <= batch_index < len(plan["batches"])), "select batch index or promotion")
-    path = Path(journal_path).absolute()
-    descriptor = os.open(path.with_name(path.name + ".lock"),
-                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    with os.fdopen(descriptor, "a+b") as lock:
-        require(stat.S_ISREG(os.fstat(lock.fileno()).st_mode), "lock must be regular")
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise Refusal("another publisher holds journal lock") from error
+    require(type(batch_index) is int and 0 <= batch_index < len(plan["batches"]), "select batch index")
+    with locked_journal(journal_path) as path:
         digest = template_hash(plan)
         if path.exists() or path.is_symlink():
             journal = read_json_file(path)
             require(journal.get("schema_version") == 1 and journal.get("plan_hash") == digest,
                     "Pod journal plan hash differs")
         else:
-            require(not promote, "post-release actions require existing journal")
             require(batch_index == 0, "first invocation must select canary")
             journal = dict(schema_version=1, plan_hash=digest, stage="new", nodes={})
             write_journal(path, journal)
@@ -2711,8 +2056,6 @@ def apply_pod(plan, journal_path, batch_index, clients, sleep=time.sleep, mode="
         def save():
             write_journal(path, journal)
 
-        if promote:
-            return promote_ready(plan, journal, save, kube, local, mutate, sleep, get=get)
         deadline = time.monotonic() + 2400
         try:
             while time.monotonic() < deadline:
@@ -2723,12 +2066,11 @@ def apply_pod(plan, journal_path, batch_index, clients, sleep=time.sleep, mode="
                         return outcome
                     sleep(2)
                     continue
-                if advance_pod(plan, journal, save, batch_index, clients, local=local, sleep=sleep):
+                if advance_pod(plan, journal, save, batch_index, clients, local=local):
                     return dict(status="completed", batch_index=batch_index)
                 sleep(2)
             return dict(status="pending", batch_index=batch_index, detail="publisher observation budget expired")
-        except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError,
-                subprocess.SubprocessError, http.client.HTTPException) as error:
+        except RECOVERABLE_ERRORS as error:
             return dict(status="pending", batch_index=batch_index, detail=str(error))
 
 
@@ -2745,38 +2087,27 @@ def parser():
     plan.add_argument("--node", action="append", default=[], metavar="POD=NODE")
     plan.add_argument("--context", required=True)
     plan.add_argument("--batch-size", type=int, default=1)
-    plan.add_argument("--declaration-candidate")
-    plan.add_argument("--configmap")
-    plan.add_argument("--declaration-key", default="target.yaml")
     process = commands.add_parser("plan-process", help="GET-only frozen process plan")
     process.add_argument("--archive-url")
     process.add_argument("--archive-sha256")
     process.add_argument("--sha256")
     process.add_argument("--component-config-path")
-    process.add_argument("--component-config-sha256")
-    process.add_argument("--declaration-candidate")
-    process.add_argument("--configmap")
-    process.add_argument("--declaration-key", default="target.yaml")
-    process.add_argument("--commit")
+    process.add_argument("--commit", required=True)
     for name in ("context", "namespace", "container", "config", "task-id"):
         process.add_argument("--" + name, required=True)
-    process.add_argument("--role", choices=("adxlet", "relay"))
+    process.add_argument("--role", choices=("adxlet", "relay"), required=True)
     process.add_argument("--origin")
     process.add_argument("--epoch", type=int, required=True)
     process.add_argument("--node", action="append", required=True, metavar="POD=NODE")
     process.add_argument("--batch-size", type=int, default=1)
-    apply = commands.add_parser("apply-process", help="select one batch or ready promotion")
+    apply = commands.add_parser("apply-process", help="select one process batch")
     apply.add_argument("--plan", required=True)
     apply.add_argument("--journal", required=True)
-    selection = apply.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--batch-index", type=int)
-    selection.add_argument("--promote-ready", action="store_true")
-    pod_apply = commands.add_parser("apply-pod", help="select one Pod batch or ready promotion")
+    apply.add_argument("--batch-index", type=int, required=True)
+    pod_apply = commands.add_parser("apply-pod", help="select one Pod batch")
     pod_apply.add_argument("--plan", required=True)
     pod_apply.add_argument("--journal", required=True)
-    selection = pod_apply.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--batch-index", type=int)
-    selection.add_argument("--promote-ready", action="store_true")
+    pod_apply.add_argument("--batch-index", type=int, required=True)
     for command in ("stop-pod", "abort-pod"):
         cleanup = commands.add_parser(command, help="freeze or clean up the same Pod rollout")
         cleanup.add_argument("--plan", required=True)
@@ -2810,15 +2141,14 @@ def main(argv=None):
                                      "exec", pod, "--container", snapshot["container"], "--", adxctl, "--config",
                                      snapshot["config"], "rollout", *arguments])
 
-            def pod_local(pod, declaration_path=None):
-                observation = ["--declaration-path", declaration_path] if declaration_path is not None else []
-                return pod_cli(pod, ["node-info", *observation])
+            def pod_local(pod):
+                return pod_cli(pod, ["node-info"])
 
             outcome = apply_pod(snapshot, args.journal, getattr(args, "batch_index", 0), PodClients(pod_kube,
                                 lambda path: http_json(snapshot["origin"], path),
                                 lambda path, body: http_json(snapshot["origin"], path, body), pod_mutate),
                                 mode={"apply-pod": "apply", "stop-pod": "stop", "abort-pod": "abort"}[args.command],
-                                local=pod_local, promote=getattr(args, "promote_ready", False))
+                                local=pod_local)
             emit_cli(canonical(outcome))
             return 0 if outcome["status"] in ("completed", "stopped", "aborted", "partial") else 1
         if args.command == "apply-process":
@@ -2833,22 +2163,15 @@ def main(argv=None):
                                      "exec", node["kube"]["name"], "--container", snapshot["container"], "--",
                                      adxctl, "--config", snapshot["config"], "rollout", *arguments])
 
-            def apply_local(pod_name, declaration_path=None):
+            def apply_local(pod_name):
                 node = next(item for item in snapshot["nodes"] if item["kube"]["name"] == pod_name)
-                arguments = ["node-info"]
-                if declaration_path is not None or "declaration_path" in node:
-                    arguments.extend(["--declaration-path", declaration_path or node["declaration_path"]])
-                return apply_cli(node, arguments)
-
-            def apply_mutate(arguments, body):
-                return kubectl_json(["--context", snapshot["context"], *arguments], body)
+                return apply_cli(node, ["node-info"])
 
             def apply_post(path, body):
                 return http_json(snapshot["origin"], path, body)
 
             outcome = apply_process(snapshot, args.journal, args.batch_index,
-                                    apply_kube, apply_local, apply_cli, apply_post, mutate=apply_mutate,
-                                    promote=args.promote_ready)
+                                    apply_kube, apply_local, apply_cli, apply_post)
             emit_cli(canonical(outcome))
             return 0 if outcome["status"] == "completed" else 1
 
@@ -2856,11 +2179,10 @@ def main(argv=None):
             context = ["--context", args.context] if args.context else []
             return kubectl_get([*context, *arguments])
 
-        def local(pod, declaration_path=None):
-            observation = ["--declaration-path", declaration_path] if declaration_path is not None else []
+        def local(pod):
             return kubectl_json(["--context", args.context, "--namespace", args.namespace,
                                  "exec", pod, "--container", args.container, "--",
-                                 adxctl, "--config", args.config, "rollout", "node-info", *observation])
+                                 adxctl, "--config", args.config, "rollout", "node-info"])
 
         if args.command == "plan-process":
             snapshot = plan_process(args, kube, local)

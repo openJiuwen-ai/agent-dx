@@ -1,5 +1,5 @@
 //! Parent-owned executable selection and a single candidate startup path.
-use super::relay::{Command, Reply};
+use super::actor::{command, Command, CommitStage, Launch, Operation, Owner, Reply};
 use crate::Result;
 use adx_protocol::relay as pb;
 use std::{
@@ -8,56 +8,64 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) enum Operation {
-    StopFailed {
-        identity: super::ProcessIdentity,
-        old_pid: u32,
-        pid: Option<u32>,
-        attempt: String,
-    },
-    Receipt {
-        identity: super::ProcessIdentity,
-        old_pid: u32,
-        attempt: String,
-        pid: Option<u32>,
-    },
-    Fence {
-        pid: u32,
-        identity: super::ProcessIdentity,
-    },
-    Observe {
-        pid: u32,
-        identity: super::ProcessIdentity,
-    },
-    Start {
-        config: Box<crate::config::Process>,
-        pid: u32,
-        binary: PathBuf,
-        executable: std::fs::File,
-        bootstrap: PathBuf,
-        attempt: String,
-        identity: super::ProcessIdentity,
-    },
-    Complete {
-        pid: u32,
-        old_pid: u32,
-        attempt: String,
-        identity: super::ProcessIdentity,
-    },
-}
-
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Execution {
     pub old_pid: u32,
-    pub candidate_pid: Option<u32>,
-    pub stage: String,
+    #[serde(flatten)]
+    pub stage: Stage,
     pub error: Option<String>,
     pub attempt: String,
     pub node_session: String,
     pub deadline_unix_ms: u64,
-    /// The one closed target identity. Only rollback may replay it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback_from: Option<AttemptIdentity>,
+    pub leg: ProcessLeg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum Stage {
+    Exiting,
+    Exited,
+    Starting { candidate_pid: Option<u32> },
+    Committing { candidate_pid: u32 },
+    StoppingForRollback { candidate_pid: Option<u32> },
+    Selected { candidate_pid: u32 },
+}
+
+impl Stage {
+    pub(super) fn candidate_pid(self) -> Option<u32> {
+        match self {
+            Self::Starting { candidate_pid } | Self::StoppingForRollback { candidate_pid } => {
+                candidate_pid
+            }
+            Self::Committing { candidate_pid } | Self::Selected { candidate_pid } => {
+                Some(candidate_pid)
+            }
+            Self::Exiting | Self::Exited => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProcessLeg {
+    Target,
+    Rollback { from: AttemptIdentity },
+}
+
+impl ProcessLeg {
+    pub(super) fn source(&self) -> Option<&AttemptIdentity> {
+        match self {
+            Self::Target => None,
+            Self::Rollback { from } => Some(from),
+        }
+    }
+
+    pub(super) fn selected_phase(&self) -> super::Phase {
+        match self {
+            Self::Target => super::Phase::Completed,
+            Self::Rollback { .. } => super::Phase::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -68,12 +76,11 @@ pub struct AttemptIdentity {
 
 impl Execution {
     pub(super) fn startable(&self) -> bool {
-        let stages = if self.rollback_from.is_some() {
-            &ORIGINAL_START_STAGES
-        } else {
-            &START_STAGES
-        };
-        !self.attempt.is_empty() && stages.contains(&self.stage.as_str())
+        !self.attempt.is_empty()
+            && matches!(
+                self.stage,
+                Stage::Exited | Stage::Starting { .. } | Stage::Committing { .. }
+            )
     }
 }
 
@@ -82,21 +89,6 @@ pub(super) const TARGET_PROCESS: &str = "target-process.json";
 /// Rendered original Process captured with the owned `original` copy.
 pub(super) const ORIGINAL_PROCESS: &str = "original-process.json";
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
-
-pub(crate) async fn command(
-    sender: &tokio::sync::mpsc::Sender<Command>,
-    task: &super::Task,
-    operation: Operation,
-    deadline: Instant,
-) -> Result<Reply> {
-    super::relay::command(
-        sender,
-        task,
-        super::relay::Operation::Adxlet(operation),
-        deadline,
-    )
-    .await
-}
 
 /// Prepare-only adxlet Submit. Verifies the prepared target executable,
 /// takes one RuntimeInspect snapshot of the owned original, verifies and
@@ -128,10 +120,10 @@ pub(super) async fn prepare(
         mut executable,
         config,
         ..
-    } = super::relay::command(
+    } = super::actor::command(
         sender,
         task,
-        super::relay::Operation::RuntimeInspect,
+        super::actor::Operation::RuntimeInspect,
         deadline,
     )
     .await?
@@ -258,7 +250,7 @@ fn validate_pinned(directory: &Path, name: &str, process: &crate::config::Proces
 /// complete runtime observation (PID, configuration digest and Node/Relay
 /// session), then re-verifies the prepared target executable, the owned
 /// original copy and the live original bytes before any side effect. It
-/// persists a fixed 900s `begin_intent`, then fences and observes until the
+/// persists a fixed 900s `Exiting`, then fences and observes until the
 /// Child is actually reaped. `resume` replays an already-persisted intent under
 /// the same fixed deadline and Observes first rather than forcing the old PID
 /// to still be live. On the real reap the next attempt/node_session is minted
@@ -329,10 +321,10 @@ pub(super) async fn exit(
         let original_sha256 = identity.identity.original_sha256.clone();
         let mut original = std::fs::File::open(directory.join("original"))?;
         super::artifact::verify_file(&mut original, &original_sha256, deadline, stopped)?;
-        let (old_pid, mut executable, admin_socket, config) = match super::relay::command(
+        let (old_pid, mut executable, admin_socket, config) = match super::actor::command(
             sender,
             task,
-            super::relay::Operation::RuntimeInspect,
+            super::actor::Operation::RuntimeInspect,
             deadline,
         )
         .await?
@@ -347,7 +339,7 @@ pub(super) async fn exit(
             _ => return Err("owned adxlet absent".into()),
         };
         // Every selection, including LocalManual, must re-confirm the frozen
-        // original against the live RuntimeInspect before any begin_intent or
+        // original against the live RuntimeInspect before any Exiting or
         // Fence: the current configuration digest and admin socket must still
         // match the ORIGINAL_PROCESS snapshot captured during prepare. Any
         // drift rejects the exit before the old process is stopped.
@@ -377,13 +369,12 @@ pub(super) async fn exit(
         super::artifact::verify_file(&mut executable, &original_sha256, deadline, stopped)?;
         task.adxlet_execution = Some(Execution {
             old_pid,
-            candidate_pid: None,
-            stage: "begin_intent".into(),
+            stage: Stage::Exiting,
             error: None,
             attempt: String::new(),
             node_session: identity.identity.old_node_session.clone(),
             deadline_unix_ms,
-            rollback_from: None,
+            leg: ProcessLeg::Target,
         });
         task.phase = super::Phase::Unknown;
         super::store(directory, task)?;
@@ -416,7 +407,7 @@ pub(super) async fn exit(
             task,
             Operation::Observe {
                 pid: old_pid,
-                identity: identity.clone(),
+                owner: Owner::Adxlet(identity.clone()),
             },
             observe_deadline,
         )
@@ -437,7 +428,7 @@ pub(super) async fn exit(
         task,
         Operation::Fence {
             pid: old_pid,
-            identity: identity.clone(),
+            owner: Owner::Adxlet(identity.clone()),
         },
         deadline,
     )
@@ -455,7 +446,7 @@ pub(super) async fn exit(
             task,
             Operation::Observe {
                 pid: old_pid,
-                identity: identity.clone(),
+                owner: Owner::Adxlet(identity.clone()),
             },
             deadline,
         )
@@ -496,24 +487,10 @@ fn record_reap(task: &mut super::Task, directory: &Path) -> Result<()> {
         execution.attempt = attempt;
         execution.node_session = node_session;
     }
-    execution.stage = "exited".into();
+    execution.stage = Stage::Exited;
     execution.error = None;
     super::store(directory, task)
 }
-
-/// Stages from which the normal target Start may (re)run for the saved attempt.
-pub(super) const START_STAGES: [&str; 4] = [
-    "exited",
-    "start_intent",
-    "start_unknown",
-    "target_commit_unknown",
-];
-const ORIGINAL_START_STAGES: [&str; 4] = [
-    "rollback_ready",
-    "original_start_intent",
-    "original_start_unknown",
-    "original_commit_unknown",
-];
 
 /// Closes target A in the actor before minting B. Receipt ambiguity never
 /// proves non-execution. StopFailed(None) can atomically seal a not-yet-run A
@@ -534,42 +511,13 @@ pub(super) async fn rollback(
         .adxlet_execution
         .clone()
         .ok_or("missing target attempt")?;
-    if execution.rollback_from.is_some() {
+    if execution.leg.source().is_some() || matches!(execution.stage, Stage::Committing { .. }) {
         // A failed rename/fsync may already have exposed B. Re-save the same
         // identity before resuming its existing Start/Receipt path.
         super::store(directory, task)?;
         return start(task, directory, sender, stopped).await;
     }
-    let observing_deadline = Instant::now() + Duration::from_secs(2);
-    let observed = command(
-        sender,
-        task,
-        Operation::Receipt {
-            identity: identity.clone(),
-            old_pid: execution.old_pid,
-            attempt: execution.attempt.clone(),
-            pid: execution.candidate_pid,
-        },
-        observing_deadline,
-    )
-    .await;
-    let candidate_pid = match observed {
-        Ok(Reply::Committed) => return record_commit(task, directory),
-        Ok(Reply::Candidate { pid, .. })
-            if execution.candidate_pid.is_none_or(|saved| saved == pid) =>
-        {
-            Some(pid)
-        }
-        Ok(Reply::NeverCreated) if execution.candidate_pid.is_none() => None,
-        // None is only a request for the actor to prove and seal non-creation,
-        // never a local inference from an unavailable Receipt.
-        Err(_) if execution.candidate_pid.is_none() => None,
-        _ => return Err("candidate outcome unknown; maintenance retained".into()),
-    };
-    let rollback_started = matches!(
-        execution.stage.as_str(),
-        "rollback_intent" | "rollback_unknown"
-    );
+    let rollback_started = matches!(execution.stage, Stage::StoppingForRollback { .. });
     let deadline_unix_ms = if rollback_started {
         execution.deadline_unix_ms
     } else {
@@ -583,15 +531,51 @@ pub(super) async fn rollback(
         .unwrap_or_else(Instant::now);
     let current = task.adxlet_execution.as_mut().ok_or("execution absent")?;
     current.deadline_unix_ms = deadline_unix_ms;
-    current.candidate_pid = candidate_pid;
-    current.stage = "rollback_intent".into();
+    current.stage = Stage::StoppingForRollback {
+        candidate_pid: execution.stage.candidate_pid(),
+    };
     task.phase = super::Phase::Unknown;
+    // Freeze the recovery budget even when the first observing Receipt is unavailable.
     super::store(directory, task)?;
+    let observing_deadline = Instant::now() + Duration::from_secs(2);
+    let observed = command(
+        sender,
+        task,
+        Operation::Receipt {
+            owner: Owner::Adxlet(identity.clone()),
+            old_pid: execution.old_pid,
+            attempt: execution.attempt.clone(),
+            pid: execution.stage.candidate_pid(),
+        },
+        observing_deadline,
+    )
+    .await;
+    let candidate_pid = match observed {
+        Ok(Reply::Committed) => return record_commit(task, directory),
+        Ok(Reply::Candidate { pid, .. })
+            if execution
+                .stage
+                .candidate_pid()
+                .is_none_or(|saved| saved == pid) =>
+        {
+            Some(pid)
+        }
+        Ok(Reply::NeverCreated) if execution.stage.candidate_pid().is_none() => None,
+        // None is only a request for the actor to prove and seal non-creation,
+        // never a local inference from an unavailable Receipt.
+        Err(_) if execution.stage.candidate_pid().is_none() => None,
+        _ => return Err("candidate outcome unknown; maintenance retained".into()),
+    };
+    let current = task.adxlet_execution.as_mut().ok_or("execution absent")?;
+    if current.stage.candidate_pid() != candidate_pid {
+        current.stage = Stage::StoppingForRollback { candidate_pid };
+        super::store(directory, task)?;
+    }
     let reply = command(
         sender,
         task,
         Operation::StopFailed {
-            identity,
+            owner: Owner::Adxlet(identity),
             old_pid: execution.old_pid,
             pid: candidate_pid,
             attempt: execution.attempt.clone(),
@@ -619,11 +603,12 @@ pub(super) async fn rollback(
             sender,
             task,
             Operation::Receipt {
-                identity: task
-                    .submission
-                    .process
-                    .clone()
-                    .ok_or("missing parent selection")?,
+                owner: Owner::Adxlet(
+                    task.submission
+                        .process
+                        .clone()
+                        .ok_or("missing parent selection")?,
+                ),
                 old_pid: execution.old_pid,
                 attempt: execution.attempt.clone(),
                 pid: candidate_pid,
@@ -638,14 +623,15 @@ pub(super) async fn rollback(
     let attempt = super::random_id()?;
     let node_session = super::random_id()?;
     let current = task.adxlet_execution.as_mut().ok_or("execution absent")?;
-    current.rollback_from = Some(AttemptIdentity {
-        attempt: execution.attempt,
-        node_session: execution.node_session,
-    });
+    current.leg = ProcessLeg::Rollback {
+        from: AttemptIdentity {
+            attempt: execution.attempt,
+            node_session: execution.node_session,
+        },
+    };
     current.attempt = attempt;
     current.node_session = node_session;
-    current.candidate_pid = None;
-    current.stage = "rollback_ready".into();
+    current.stage = Stage::Exited;
     current.error = None;
     super::store(directory, task)?;
     start(task, directory, sender, stopped).await
@@ -678,16 +664,12 @@ fn original_process(
     Ok(original)
 }
 
-/// Normal target Start for the attempt/node_session minted by the reaped Exit,
-/// under the Exit's saved absolute 900s deadline (never refreshed). Persists
-/// `start_intent` before the actor Start; the actor creates at most one Child
-/// per attempt and a replayed Start of the same attempt returns that Child.
-/// The worker delivers the saved session over a private bootstrap socket to
-/// the actual owned PID only, proves readiness from the live executable, the
-/// effective configuration digest and the adxlet Query, then records
-/// `target_commit_unknown` before Complete. A lost Complete reply is retried
-/// or, after expiry, resolved only through an observing Receipt; a possibly
-/// selected Child is never stopped here. It never contacts the Coordinator.
+/// Start the target or rollback process with its saved attempt/node_session
+/// and fixed phase deadline (900s upgrade, 600s rollback). Persist the leg's
+/// start intent before actor Start; a replay returns the same Child. Deliver
+/// identity to the owned PID, verify readiness, then record commit-unknown
+/// before Complete. Resolve a lost Complete through replay or Receipt without
+/// stopping a possibly selected Child. This worker never contacts Coordinator.
 pub(super) async fn start(
     task: &mut super::Task,
     directory: &Path,
@@ -706,12 +688,7 @@ pub(super) async fn start(
     if !execution.startable() {
         return Err("start requires a reaped exit".into());
     }
-    let original = execution.rollback_from.is_some();
-    let commit_stage = if original {
-        "original_commit_unknown"
-    } else {
-        "target_commit_unknown"
-    };
+    let original = execution.leg.source().is_some();
     let remaining = execution
         .deadline_unix_ms
         .saturating_sub(adx_core::observation::now_millis().unwrap_or(execution.deadline_unix_ms));
@@ -724,11 +701,11 @@ pub(super) async fn start(
             .checked_add(Duration::from_millis(remaining))
             .unwrap_or_else(Instant::now),
     };
-    let pid = match execution.candidate_pid {
-        Some(pid) if execution.stage == commit_stage => pid,
+    let pid = match execution.stage {
+        Stage::Committing { candidate_pid } => candidate_pid,
         // Expiry permits observation only: no new spawn, no refreshed budget.
-        candidate if Instant::now() >= leg.deadline => {
-            return commit(task, directory, &leg, candidate).await;
+        stage if Instant::now() >= leg.deadline => {
+            return commit(task, directory, &leg, stage.candidate_pid()).await;
         }
         _ => {
             let target = if original {
@@ -774,12 +751,9 @@ pub(super) async fn start(
                 deadline_unix_millis: execution.deadline_unix_ms,
             })?;
             let stage = task.adxlet_execution.as_mut().ok_or("execution absent")?;
-            stage.stage = if original {
-                "original_start_intent"
-            } else {
-                "start_intent"
-            }
-            .into();
+            stage.stage = Stage::Starting {
+                candidate_pid: execution.stage.candidate_pid(),
+            };
             stage.error = None;
             super::store(directory, task)?;
             // A lost or failed Start reply is never answered by blindly
@@ -787,8 +761,7 @@ pub(super) async fn start(
             // Receipt. A recorded Child continues to bootstrap/ready with its
             // pid, NeverCreated is a fact, and only a still-unknown outcome
             // re-requests the idempotent Start for the same attempt.
-            let mut observe_first =
-                !matches!(execution.stage.as_str(), "exited" | "rollback_ready");
+            let mut observe_first = execution.stage != Stage::Exited;
             let pid = loop {
                 if stopped.load(Ordering::Acquire) {
                     return Err("supervisor stopping".into());
@@ -816,10 +789,12 @@ pub(super) async fn start(
                         config: Box::new(target.clone()),
                         pid: leg.old_pid,
                         binary: binary.clone(),
-                        executable: executable.try_clone()?,
-                        bootstrap: path.clone(),
                         attempt: execution.attempt.clone(),
-                        identity: identity.clone(),
+                        owner: Owner::Adxlet(identity.clone()),
+                        launch: Launch::Adxlet {
+                            executable: executable.try_clone()?,
+                            bootstrap: path.clone(),
+                        },
                     },
                     leg.deadline,
                 )
@@ -836,7 +811,9 @@ pub(super) async fn start(
             task.adxlet_execution
                 .as_mut()
                 .ok_or("execution absent")?
-                .candidate_pid = Some(pid);
+                .stage = Stage::Starting {
+                candidate_pid: Some(pid),
+            };
             super::store(directory, task)?;
             let evidence = Ready {
                 target: &target,
@@ -851,7 +828,7 @@ pub(super) async fn start(
                 return Err("candidate readiness unknown; maintenance retained".into());
             }
             let stage = task.adxlet_execution.as_mut().ok_or("execution absent")?;
-            stage.stage = commit_stage.into();
+            stage.stage = Stage::Committing { candidate_pid: pid };
             super::store(directory, task)?;
             pid
         }
@@ -879,7 +856,7 @@ struct Ready<'a> {
 
 fn receipt(leg: &Leg<'_>, pid: Option<u32>) -> Operation {
     Operation::Receipt {
-        identity: leg.identity.clone(),
+        owner: Owner::Adxlet(leg.identity.clone()),
         old_pid: leg.old_pid,
         attempt: leg.attempt.to_owned(),
         pid,
@@ -980,12 +957,34 @@ async fn await_ready(
             ) {
                 return false;
             }
+            let Ok(channel) = super::relay::channel(evidence.admin_socket, pid).await else {
+                continue;
+            };
+            let mut candidate =
+                pb::adxlet_process_service_client::AdxletProcessServiceClient::new(channel);
+            let Ok(response) = candidate
+                .query(pb::AdxletProcessRequest {
+                    rollout_id: leg.identity.identity.rollout_id.clone(),
+                    local_task_id: task.submission.task_id.clone(),
+                    epoch: leg.identity.identity.epoch,
+                    ..Default::default()
+                })
+                .await
+            else {
+                continue;
+            };
+            let state = response.into_inner();
+            if state.phase != "ready" || state.node_session != evidence.session {
+                continue;
+            }
+            // Check the actual owned executable once readiness is reported,
+            // within this same fixed deadline; pending polls do not hash it.
             let Ok(Reply::Runtime {
                 pid: actual,
                 config,
                 mut executable,
                 ..
-            }) = super::relay::inspect_candidate(leg.sender, task, pid, leg.deadline).await
+            }) = super::actor::inspect_candidate(leg.sender, task, pid, leg.deadline).await
             else {
                 continue;
             };
@@ -1001,25 +1000,7 @@ async fn await_ready(
             {
                 continue;
             }
-            let Ok(channel) = super::relay::channel(evidence.admin_socket, pid).await else {
-                continue;
-            };
-            let mut candidate =
-                pb::adxlet_process_service_client::AdxletProcessServiceClient::new(channel);
-            if let Ok(response) = candidate
-                .query(pb::AdxletProcessRequest {
-                    rollout_id: leg.identity.identity.rollout_id.clone(),
-                    local_task_id: task.submission.task_id.clone(),
-                    epoch: leg.identity.identity.epoch,
-                    ..Default::default()
-                })
-                .await
-            {
-                let state = response.into_inner();
-                if state.phase == "ready" && state.node_session == evidence.session {
-                    return true;
-                }
-            }
+            return true;
         }
     })
     .await
@@ -1028,8 +1009,8 @@ async fn await_ready(
 
 /// Selects the ready target with Complete (idempotent in the actor) while the
 /// saved deadline holds; after expiry only an observing Receipt may prove the
-/// commit. Success records Completed/`completed`; otherwise the stage stays
-/// `target_commit_unknown` and the Child is never stopped here.
+/// commit. Success records Completed/`Selected`; otherwise the stage stays
+/// `Committing` and the Child is never stopped here.
 async fn commit(
     task: &mut super::Task,
     directory: &Path,
@@ -1042,12 +1023,7 @@ async fn commit(
                 command(
                     leg.sender,
                     task,
-                    Operation::Complete {
-                        pid,
-                        old_pid: leg.old_pid,
-                        attempt: leg.attempt.to_owned(),
-                        identity: leg.identity.clone(),
-                    },
+                    Operation::Commit { pid, old_pid: leg.old_pid, attempt: leg.attempt.to_owned(), owner: Owner::Adxlet( leg.identity.clone()), stage: CommitStage::Select },
                     leg.deadline,
                 )
                 .await,
@@ -1074,20 +1050,14 @@ async fn commit(
     }
 }
 
-pub(super) fn committed_outcome(original: bool) -> (super::Phase, &'static str) {
-    if original {
-        (super::Phase::Failed, "original_selected")
-    } else {
-        (super::Phase::Completed, "completed")
-    }
-}
-
 fn record_commit(task: &mut super::Task, directory: &Path) -> Result<()> {
     let execution = task.adxlet_execution.as_mut().ok_or("execution absent")?;
-    let original = execution.rollback_from.is_some();
-    let (phase, stage) = committed_outcome(original);
-    task.phase = phase;
-    execution.stage = stage.into();
+    let candidate_pid = execution
+        .stage
+        .candidate_pid()
+        .ok_or("committed candidate PID absent")?;
+    task.phase = execution.leg.selected_phase();
+    execution.stage = Stage::Selected { candidate_pid };
     execution.error = None;
     let stored = super::store(directory, task);
     if stored.is_err() {
@@ -1095,12 +1065,7 @@ fn record_commit(task: &mut super::Task, directory: &Path) -> Result<()> {
         // close an ambiguous local write; never re-Start or stop it.
         task.phase = super::Phase::Unknown;
         if let Some(execution) = task.adxlet_execution.as_mut() {
-            execution.stage = if original {
-                "original_commit_unknown"
-            } else {
-                "target_commit_unknown"
-            }
-            .into();
+            execution.stage = Stage::Committing { candidate_pid };
         }
     }
     stored
@@ -1149,6 +1114,46 @@ fn write_private(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_execution_json_keeps_leg_and_requires_commit_pid() {
+        let mut execution = Execution {
+            old_pid: 42,
+            stage: Stage::Committing { candidate_pid: 77 },
+            error: None,
+            attempt: "B".into(),
+            node_session: "session-B".into(),
+            deadline_unix_ms: 600,
+            leg: ProcessLeg::Rollback {
+                from: AttemptIdentity {
+                    attempt: "A".into(),
+                    node_session: "session-A".into(),
+                },
+            },
+        };
+        let mut value = serde_json::to_value(&execution).unwrap();
+        assert_eq!(value["stage"], "committing");
+        assert_eq!(value["candidate_pid"], 77);
+        assert_eq!(
+            value["leg"],
+            serde_json::json!({"kind":"rollback","from":{"attempt":"A","node_session":"session-A"}})
+        );
+        value.as_object_mut().unwrap().remove("candidate_pid");
+        assert!(serde_json::from_value::<Execution>(value.clone()).is_err());
+        value["stage"] = "selected".into();
+        assert!(serde_json::from_value::<Execution>(value).is_err());
+        execution.stage = Stage::Exited;
+        let value = serde_json::to_value(&execution).unwrap();
+        assert!(value.get("candidate_pid").is_none());
+        assert_eq!(
+            serde_json::from_value::<Execution>(value).unwrap().stage,
+            Stage::Exited
+        );
+        assert_eq!(
+            serde_json::to_value(ProcessLeg::Target).unwrap(),
+            serde_json::json!({"kind":"target"})
+        );
+    }
 
     #[tokio::test]
     async fn bootstrap_bind_preserves_occupied_files_and_listeners() {

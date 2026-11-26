@@ -102,6 +102,23 @@ impl CoordinatorRpc {
         }
         Ok(completed)
     }
+    fn resume_lock(&self, id: &str) -> std::result::Result<Arc<Mutex<()>>, Box<Status>> {
+        let mut locks = self
+            .0
+            .resume_locks
+            .lock()
+            .map_err(|_| Box::new(Status::internal("resume registry unavailable")))?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => Ok(lock),
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(id.to_owned(), Arc::downgrade(&lock));
+                Ok(lock)
+            }
+        }
+    }
+
     pub(super) async fn ensure_running(
         &self,
         request: pb::EnsureRunningRequest,
@@ -116,25 +133,9 @@ impl CoordinatorRpc {
                 "resume timeout exceeds 3600 seconds",
             ));
         }
-        let lock = {
-            let mut locks = self
-                .0
-                .resume_locks
-                .lock()
-                .map_err(|_| Status::internal("resume registry unavailable"))?;
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks
-                .get(&request.environment_id)
-                .and_then(std::sync::Weak::upgrade)
-            {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    locks.insert(request.environment_id.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
+        let lock = self
+            .resume_lock(&request.environment_id)
+            .map_err(|error| *error)?;
         // Keep the restore payload off the caller's poll frame: background
         // recovery also drives this path on the default Tokio test/thread stack.
         tokio::time::timeout(
@@ -497,17 +498,26 @@ impl CoordinatorRpc {
         };
         let mut count = 0;
         for stored in pending {
-            let request = pb::EnsureRunningRequest {
-                run_timeout_seconds: None,
-                expected_runtime_id: String::new(),
-                environment_id: stored.spec.id,
-                caller: Some(pb::CallerContext {
-                    tenant_id: stored.spec.tenant_id,
-                    administrator: false,
-                }),
-                timeout_seconds: 1,
-            };
-            if self.ensure_running(request).await.is_ok() {
+            // A sweep advances its captured demand; it must not admit a new wake.
+            let work = Box::pin(async {
+                let lock = self.resume_lock(&stored.spec.id).map_err(|error| *error)?;
+                let _guard = lock.lock().await;
+                {
+                    let mut state = self.0.state.lock().await;
+                    state.recover_authoritative_state().await.map_err(status)?;
+                    let current = state.session.get(&stored.spec.id).await.map_err(status)?;
+                    if current.resume.as_ref().map(|intent| &intent.operation_id)
+                        != stored.resume.as_ref().map(|intent| &intent.operation_id)
+                    {
+                        return Ok(false);
+                    }
+                }
+                self.drive_resume(&stored.spec.id).await.map(|_| true)
+            });
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(1), work).await,
+                Ok(Ok(true))
+            ) {
                 count += 1;
             }
         }

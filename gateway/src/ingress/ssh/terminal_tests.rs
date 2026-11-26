@@ -118,13 +118,11 @@ struct RoutingBackend {
 impl RoutingBackend {
     async fn install(&self, tenant: &str, id: &str) {
         let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":tenant,"environmentID":format!("runtime-{id}"),"environmentIP":"127.0.0.1","nodeProxyAddress":self.node_address.to_string()})).unwrap();
-        self.node
-            .activate_route(
-                route.instance_id.clone(),
-                route.environment_id.clone(),
-                route.environment_ip.parse().unwrap(),
-            )
-            .await;
+        self.node.activate_route(
+            route.instance_id.clone(),
+            route.environment_id.clone(),
+            route.environment_ip.parse().unwrap(),
+        );
         self.routes.put(route);
     }
 }

@@ -128,6 +128,15 @@ bounded by the existing Relay connect timeout and the request's original deadlin
 Route revocation or changed authorization stops this wait. TLS/authentication
 failures and other CONNECT errors, including backend-connect 502, are not eligible
 for this Relay-replacement wait.
+An explicit Relay CONNECT 503 is connection admission, not an Environment wake
+request or an application HTTP 503. Native raw CONNECT and WebSocket admission wait
+through this rejection before sending business bytes. Their short retry window
+starts at the first 503, is fixed for that binding, and cannot extend the original
+processing deadline. An ordinary first CONNECT response keeps its existing wait
+semantics. Actual suspended Environments still use lifecycle recovery; sent bytes
+and established sessions are never replayed by this admission retry. This unpooled
+retry applies to native raw CONNECT/WebSocket admission; E2B HTTP/WebSocket service
+forwarding retains its existing service recovery path.
 When Relay rejects a stale execution binding, an unsent Direct HTTP request can
 wait for the authorized replacement route within its original processing
 deadline. It releases the old pool permit during that wait and admits the body
@@ -383,6 +392,14 @@ synchronization epoch, ownership generation and binding revision. A previous
 controller or proxy session cannot reactivate an old binding. Adxlet
 replays its complete local catalog when the proxy process restarts.
 See [publication and recovery contract](../docs/testing/route-publication.md).
+
+独立 Relay 在受保护 `route.sock` 上提供 `adx.node.v1.RelayUpgradeService.BeginDrain`。
+成功回执只在业务 TCP listener 释放并等待 health 服务退出后返回；同 task/session 重放
+返回同一释放回执和固定排水期限，取消调用不撤回已接收排水。已有连接保持到自然结束或
+真实关闭。adxlet 管理 UDS 的 `Reserve`/`Cancel`/`Switch`/`Finish` 驱动交接，Switch 接收
+父 supervisor 的旧端释放或真实 reap 证据，更换失败候选还须证明该候选 Child 已真实 reap。
+候选通过普通完整绑定同步开放准入；首个 snapshot 结果未知时冻结重放，精确 ready 后仅
+同步 canonical 最新增量，继续保留 owner/epoch 校验与旧端退休 ACK 屏障。
 
 Activity snapshots go to Adxlet at `<dir>/adxlet.sock` using
 `adx.node.v1.NodeActivityService`. Each complete snapshot carries the registered

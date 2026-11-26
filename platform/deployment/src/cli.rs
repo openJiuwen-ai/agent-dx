@@ -90,11 +90,7 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum RolloutCommand {
     /// Observe owned runtime identities; unavailable evidence remains unknown.
-    NodeInfo {
-        /// Observe a mounted declaration only; does not change startup selection.
-        #[arg(long, value_parser = parse_declaration_path)]
-        declaration_path: Option<std::path::PathBuf>,
-    },
+    NodeInfo,
     /// Submit a task against an explicitly selected running incarnation.
     Submit(Box<RolloutSubmitArgs>),
     /// Query a durable rollout task; never restarts it or extends its deadline.
@@ -141,10 +137,8 @@ pub struct RolloutSubmitArgs {
     archive_url: Option<String>,
     #[arg(long, requires = "archive_url")]
     archive_sha256: Option<String>,
-    #[arg(long, requires = "component_config_sha256")]
+    #[arg(long)]
     component_config_path: Option<std::path::PathBuf>,
-    #[arg(long, requires = "component_config_path")]
-    component_config_sha256: Option<String>,
     /// Frozen process-maintenance identity JSON (adxlet only).
     #[arg(long, value_parser = parse_process_identity)]
     process_identity: Option<crate::rollout::ProcessIdentity>,
@@ -165,9 +159,7 @@ pub enum RolloutRole {
 impl RolloutCommand {
     fn request(self) -> crate::rollout::Request {
         match self {
-            Self::NodeInfo { declaration_path } => {
-                crate::rollout::Request::NodeInfo { declaration_path }
-            }
+            Self::NodeInfo => crate::rollout::Request::NodeInfo {},
             Self::Query { task_id } => crate::rollout::Request::Query { task_id },
             Self::Step {
                 task_id,
@@ -194,19 +186,14 @@ impl RolloutCommand {
                     archive_url,
                     archive_sha256,
                     component_config_path,
-                    component_config_sha256,
                     process_identity,
                     expected_runtime,
                     local_manual: _,
                 } = *args;
                 crate::rollout::Request::Submit {
                     submission: Box::new(crate::rollout::Submission {
-                        component_config: component_config_path.zip(component_config_sha256).map(
-                            |(mount_path, sha256)| crate::config::ConfigInput {
-                                mount_path,
-                                sha256,
-                            },
-                        ),
+                        component_config: component_config_path
+                            .map(|mount_path| crate::config::ConfigInput { mount_path }),
                         task_id,
                         service_id,
                         commit,
@@ -231,14 +218,6 @@ impl RolloutCommand {
             }
         }
     }
-}
-
-fn parse_declaration_path(value: &str) -> std::result::Result<std::path::PathBuf, String> {
-    let path = std::path::PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err("declaration path must be absolute".into());
-    }
-    Ok(path)
 }
 
 fn parse_process_identity(
@@ -497,31 +476,7 @@ mod remote_archive_tests {
     }
 
     #[test]
-    fn declaration_observation_path_is_optional_and_absolute() {
-        assert!(parse_declaration_path("relative.yaml").is_err());
-        let path = parse_declaration_path("/mounted/target.yaml").unwrap();
-        assert_eq!(
-            RolloutCommand::NodeInfo {
-                declaration_path: Some(path.clone())
-            }
-            .request(),
-            crate::rollout::Request::NodeInfo {
-                declaration_path: Some(path)
-            }
-        );
-        assert_eq!(
-            RolloutCommand::NodeInfo {
-                declaration_path: None
-            }
-            .request(),
-            crate::rollout::Request::NodeInfo {
-                declaration_path: None
-            }
-        );
-    }
-
-    #[test]
-    fn archive_flags_are_paired_and_preserved() {
+    fn archive_flags_are_paired_and_config_accepts_path_only() {
         let base = [
             "adxctl",
             "rollout",
@@ -565,5 +520,21 @@ mod remote_archive_tests {
                 archive_sha256: digest,
             }
         );
+        let mut argv = base.to_vec();
+        argv.extend(["--component-config-path", "/mounted/relay.json"]);
+        let cli = Cli::try_parse_from(argv.clone()).unwrap();
+        let Command::Rollout { command } = cli.command else {
+            panic!("rollout expected")
+        };
+        let crate::rollout::Request::Submit { submission } = command.request() else {
+            panic!("submit expected")
+        };
+        assert_eq!(
+            serde_json::to_value(submission.component_config.unwrap()).unwrap(),
+            serde_json::json!({"mount_path":"/mounted/relay.json"})
+        );
+        let removed_digest = "c".repeat(64);
+        argv.extend(["--component-config-sha256", &removed_digest]);
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 }

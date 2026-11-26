@@ -29,13 +29,10 @@ message AdxletProcessState {
 
 // Standalone Relay only, on the existing protected route.sock listener.
 service RelayUpgradeService {
-  // Protected standalone UDS only. Exact old identity; never destructive Begin.
+  // Protected standalone UDS only. Exact ready predecessor; preserves live routes on controller takeover.
   rpc TakeoverBindings(BindingTakeoverRequest) returns (BindingState);
-  rpc Begin(RelayUpgradeRequest) returns (RelayUpgradeState);
-  rpc Query(RelayUpgradeRequest) returns (RelayUpgradeState);
-  // Installation keeps admission closed; exact retries preserve later updates.
-  rpc InstallCandidateBindings(BindingSnapshot) returns (BindingState);
-  rpc OpenCandidateBindings(BindingState) returns (BindingState);
+  // Idempotent acceptance survives caller cancellation; success certifies both listeners released.
+  rpc BeginDrain(RelayUpgradeRequest) returns (RelayUpgradeState);
 }
 message BindingTakeoverRequest {
   BindingState expected = 1;
@@ -46,11 +43,9 @@ message RelayUpgradeRequest { string task_id = 1; string proxy_session_id = 2; }
 message RelayUpgradeState {
   string task_id = 1;
   string proxy_session_id = 2;
-  // accepted, draining, completed, forced, interrupted, or failed.
-  string phase = 3;
   // Set only after the business listener is dropped and health owner has exited.
   bool listeners_released = 4;
-  // Fixed when release is confirmed; Begin retries never extend it.
+  // Fixed when release is confirmed; BeginDrain retries never extend it.
   uint64 drain_deadline_unix_ms = 5;
 }
 
@@ -143,28 +138,27 @@ message DrainResponse { uint64 deleted_environments = 1; }
 // Mutations require the launch-time parent supervisor's UDS peer PID.
 service RelayHandoffService {
   rpc Reserve(RelayHandoffRequest) returns (RelayHandoffState);
-  // Parent certifies no old Begin was sent. Exact cancellation is replayable.
+  // Parent certifies no old BeginDrain was sent. Exact cancellation is replayable.
   rpc Cancel(RelayHandoffRequest) returns (RelayHandoffState);
-  // Parent proves the exact failed candidate Child was reaped. Fences its
-  // identity before a replacement generation can be started or opened.
-  rpc ReplaceFailedCandidate(RelayReplacementRequest) returns (RelayHandoffState);
-  rpc Prove(RelayHandoffProof) returns (RelayHandoffState);
-  rpc Switch(RelayHandoffRequest) returns (RelayHandoffState);
+  rpc Switch(RelaySwitchRequest) returns (RelayHandoffState);
   rpc Finish(RelayHandoffProof) returns (RelayHandoffState);
 }
 // Evidence is supplied only by the parent that owns and reaps the old Child.
 message RelayHandoffProof {
   RelayHandoffRequest identity = 1;
   uint32 old_pid = 2;
-  bool begin_accepted = 3;
   bool listeners_released = 4;
   bool old_exited = 5;
 }
-message RelayReplacementRequest {
-  RelayHandoffRequest identity = 1;
-  uint32 failed_pid = 2;
-  bool failed_exited = 3;
-  string replacement_socket = 4;
+// Facts from the supervisor that owns and reaps both Children.
+message RelaySwitchRequest {
+  RelayHandoffProof proof = 1;
+  RelayReplacement replacement = 2;
+}
+message RelayReplacement {
+  uint32 failed_pid = 1;
+  bool failed_exited = 2;
+  string replacement_socket = 3;
 }
 message RelayHandoffRequest {
   string task_id = 1;
@@ -178,7 +172,7 @@ message RelayHandoffRequest {
 }
 message RelayHandoffState {
   RelayHandoffRequest identity = 1;
-  // beginning, installing, installed, opening, active_fenced, completed, cancelled.
+  // beginning, active_fenced, completed, cancelled.
   string phase = 2;
   uint64 candidate_sync_epoch = 3;
 }

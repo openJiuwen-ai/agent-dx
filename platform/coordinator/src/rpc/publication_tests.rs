@@ -2,6 +2,195 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn stale_pending_resume_does_not_create_a_new_wake_after_pause() {
+    use std::{future::Future, task::Poll};
+
+    let redis = cancellation_test_redis::Redis::new().await;
+    let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let session = store.begin(1).await.unwrap();
+    let mut spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+        "id":"a", "tenant_id":"tenant", "image":"image", "runtime_class":"runsc",
+        "priority":0, "resources":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0}
+    }))
+    .unwrap();
+    let profile = recovery_test_profile::qualify(&mut spec);
+    session
+        .register_session(
+            Node {
+                id: "offline".into(),
+                capacity: spec.resources,
+                available: false,
+                labels: Default::default(),
+                devices: vec![],
+                runtime_classes: vec!["runsc".into()],
+            },
+            "127.0.0.1:1".into(),
+            "127.0.0.1:2".into(),
+            Some(NodeSession {
+                id: "boot".into(),
+                sequence: 1,
+                routable: false,
+            }),
+        )
+        .await
+        .unwrap();
+    for id in ["a", "b"] {
+        spec.id = id.into();
+        let assignment = adx_core::Assignment {
+            environment_id: id.into(),
+            node_id: "offline".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        };
+        session
+            .reserve(spec.clone(), assignment.clone())
+            .await
+            .unwrap();
+        let runtime_id = adx_core::runtime_id_for_revision(id, assignment.generation, 2);
+        let artifact = adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: format!("/checkpoints/{id}/first"),
+            size_bytes: 1,
+        };
+        session
+            .commit(EnvironmentRecord {
+                observation: None,
+                spec: spec.clone(),
+                assignment,
+                state: EnvironmentState::Paused,
+                revision: 2,
+                runtime: adx_core::Runtime {
+                    id: runtime_id.clone(),
+                    ip: None,
+                },
+                resources_held: false,
+                checkpoint: Some(adx_core::RestorePoint {
+                    origin: None,
+                    recovery_profile: profile.clone(),
+                    id: format!("pause-{id}-first"),
+                    artifact: artifact.clone(),
+                    expires_at_unix_seconds: None,
+                    source_runtime_id: runtime_id,
+                }),
+                last_operation: None,
+                restart_attempts: 0,
+                restart_pending: false,
+                failure: None,
+                snapshot_source: None,
+                execution_artifacts: vec![artifact],
+            })
+            .await
+            .unwrap();
+        let demanded = session
+            .request_resume(id, recovery::now().unwrap())
+            .await
+            .unwrap();
+        assert!(demanded.resume.is_some());
+    }
+    let rpc = CoordinatorRpc::new(
+        session.clone(),
+        Placement::Pack,
+        Peers::network(),
+        RpcClient::network(Principal::Coordinator),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let a_lock = Arc::new(Mutex::new(()));
+    let a_guard = a_lock.lock().await;
+    rpc.0
+        .resume_locks
+        .lock()
+        .unwrap()
+        .insert("a".into(), Arc::downgrade(&a_lock));
+    let mut pending = Box::pin(rpc.resume_pending());
+    // One fixed deadline covers both polling phases; no background task can
+    // advance the captured scan while the durable lifecycle changes below run.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    tokio::time::timeout_at(
+        deadline,
+        std::future::poll_fn(|cx| {
+            assert!(pending.as_mut().poll(cx).is_pending());
+            if let Ok(state) = rpc.0.state.try_lock() {
+                if state.resume_cursor.as_deref() == Some("b") {
+                    return Poll::Ready(());
+                }
+            }
+            Poll::Pending
+        }),
+    )
+    .await
+    .expect("pending scan must capture a and b before waiting on a's resume lock");
+
+    let before = session.get("b").await.unwrap();
+    let completed_wake = before.resume.as_ref().unwrap().operation_id.clone();
+    let mut record = before.result.unwrap();
+    let paused_revision = record.revision;
+    record.revision += 1;
+    record.state = EnvironmentState::Running;
+    record.resources_held = true;
+    record.runtime.id =
+        adx_core::runtime_id_for_revision("b", record.assignment.generation, record.revision);
+    record.runtime.ip = Some("10.0.0.2".parse().unwrap());
+    record.last_operation = Some(adx_core::CompletedOperation {
+        id: completed_wake.clone(),
+        kind: adx_core::LifecycleKind::Resume,
+        expected_revision: paused_revision,
+    });
+    record = session.commit(record).await.unwrap();
+    assert!(session.get("b").await.unwrap().resume.is_none());
+    let running_revision = record.revision;
+    record.revision += 1;
+    record.state = EnvironmentState::Paused;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    let checkpoint = record.checkpoint.as_mut().unwrap();
+    checkpoint.id = "pause-b-second".into();
+    checkpoint.source_runtime_id = record.runtime.id.clone();
+    checkpoint.artifact.location = "/checkpoints/b/second".into();
+    record.execution_artifacts = vec![checkpoint.artifact.clone()];
+    record.last_operation = Some(adx_core::CompletedOperation {
+        id: "pause-b-second".into(),
+        kind: adx_core::LifecycleKind::Pause,
+        expected_revision: running_revision,
+    });
+    session.commit(record).await.unwrap();
+    let paused_again = session.get("b").await.unwrap();
+    assert!(paused_again.resume.is_none());
+    assert_eq!(
+        paused_again.result.as_ref().unwrap().state,
+        EnvironmentState::Paused
+    );
+
+    let mut deleted = session.get("a").await.unwrap().result.unwrap();
+    deleted.revision += 1;
+    deleted.state = EnvironmentState::Deleted;
+    deleted.checkpoint = None;
+    deleted.snapshot_source = None;
+    deleted.execution_artifacts.clear();
+    deleted.last_operation = None;
+    session.commit(deleted).await.unwrap();
+    drop(a_guard);
+    tokio::time::timeout_at(deadline, pending)
+        .await
+        .expect("original pending scan must finish within its fixed deadline")
+        .unwrap();
+
+    let after = session.get("b").await.unwrap();
+    assert!(
+        after.resume.is_none(),
+        "stale pending snapshot must not create a new wake after completing {completed_wake}; found {:?}",
+        after.resume.as_ref().map(|intent| &intent.operation_id)
+    );
+    assert_eq!(after, paused_again);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
 async fn maintenance_completion_recovery_retains_inspected_normal_handshake_but_not_capacity() {
     let redis = cancellation_test_redis::Redis::new().await;
     let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))

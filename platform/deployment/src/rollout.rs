@@ -1,4 +1,8 @@
 //! Private rollout tasks. Workers never own a Child; the supervisor owns generations.
+use self::actor::Owner;
+#[cfg(test)]
+use self::actor::{CommitStage, Launch};
+pub(crate) mod actor;
 pub(crate) mod adxlet;
 pub(crate) mod artifact;
 pub(crate) mod relay;
@@ -26,32 +30,33 @@ pub(super) fn journal_error(code: &str, detail: &str) -> String {
 /// replay instead of being replaced by a freshly minted B. Only a preparation
 /// failure before any identity was minted legitimately keeps an empty attempt.
 fn mark_exit_unknown(execution: &mut adxlet::Execution, detail: &str) {
-    execution.stage = "exit_unknown".into();
+    execution.stage = adxlet::Stage::Exiting;
     execution.error = Some(journal_error("execution_unknown", detail));
 }
 
 /// Records a Start failure without losing the replayable attempt. A ready
-/// target whose Complete reply was lost keeps `target_commit_unknown` so the
+/// target whose Complete reply was lost keeps `Committing` so the
 /// replay resolves it through Complete/Receipt and never respawns or stops it.
 /// An in-memory `completed` whose durable store failed is equally only
 /// commit-unknown: the actor already cleared its rollout reservation, so only
 /// the Receipt path (same pid/attempt) can close it.
 fn mark_start_unknown(execution: &mut adxlet::Execution, detail: &str) {
-    execution.stage = match execution.stage.as_str() {
-        "target_commit_unknown" | "completed" => "target_commit_unknown",
-        "original_commit_unknown" | "original_selected" => "original_commit_unknown",
-        _ if execution.rollback_from.is_some() => "original_start_unknown",
-        _ => "start_unknown",
-    }
-    .into();
+    execution.stage = match execution.stage {
+        adxlet::Stage::Committing { candidate_pid } | adxlet::Stage::Selected { candidate_pid } => {
+            adxlet::Stage::Committing { candidate_pid }
+        }
+        stage => adxlet::Stage::Starting {
+            candidate_pid: stage.candidate_pid(),
+        },
+    };
     execution.error = Some(journal_error("execution_unknown", detail));
 }
 
 /// Records a failed Exit/Start worker outcome on the in-memory Task before the
 /// worker's final store. Shared by the worker so tests exercise the same path.
 fn record_step_failure(task: &mut Task, step: Step, detail: &str) {
-    // A failure before begin_intent is persisted is a Failed local exit; a
-    // failure after begin_intent is retained as Unknown so the operator can
+    // A failure before Exiting is persisted is a Failed local exit; a
+    // failure after Exiting is retained as Unknown so the operator can
     // recover the maintenance. The reap never claims success when its mint or
     // store fails.
     let post_intent = task.adxlet_execution.is_some();
@@ -71,18 +76,12 @@ fn record_step_failure(task: &mut Task, step: Step, detail: &str) {
             // Before B, retain the fixed stop budget and A; a target that may
             // already be committed must keep its observing closure.
             if matches!(
-                execution.stage.as_str(),
-                "target_commit_unknown" | "completed"
-            ) || execution.rollback_from.is_some()
+                execution.stage,
+                adxlet::Stage::Committing { .. } | adxlet::Stage::Selected { .. }
+            ) || execution.leg.source().is_some()
             {
                 mark_start_unknown(execution, detail);
             } else {
-                if matches!(
-                    execution.stage.as_str(),
-                    "rollback_intent" | "rollback_unknown"
-                ) {
-                    execution.stage = "rollback_unknown".into();
-                }
                 execution.error = Some(journal_error("execution_unknown", detail));
             }
         } else {
@@ -101,10 +100,7 @@ fn record_step_failure(task: &mut Task, step: Step, detail: &str) {
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum Request {
     #[serde(rename = "rollout_node_info")]
-    NodeInfo {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        declaration_path: Option<std::path::PathBuf>,
-    },
+    NodeInfo {},
     #[serde(rename = "rollout_submit")]
     Submit { submission: Box<Submission> },
     #[serde(rename = "rollout_query")]
@@ -464,17 +460,8 @@ pub enum Phase {
     Interrupted,
 }
 
-fn relay_phase(detail: &str) -> Phase {
-    match detail {
-        "completed" => Phase::Completed,
-        "rolled_back" | "failed_retained" | "cancelled_before_begin" => Phase::Failed,
-        "unknown_fenced" | "rollback_unknown" => Phase::Unknown,
-        _ => Phase::Running,
-    }
-}
-
 async fn observe_runtime(
-    sender: &tokio::sync::mpsc::Sender<relay::Command>,
+    sender: &tokio::sync::mpsc::Sender<actor::Command>,
     service: &str,
     node: &str,
     boot_nonce: &str,
@@ -486,7 +473,7 @@ async fn observe_runtime(
 }
 
 async fn observe_runtime_sources(
-    sender: &tokio::sync::mpsc::Sender<relay::Command>,
+    sender: &tokio::sync::mpsc::Sender<actor::Command>,
     service: &str,
     node: &str,
     boot_nonce: &str,
@@ -506,10 +493,10 @@ async fn observe_runtime_sources(
             let (reply, result) = tokio::sync::oneshot::channel();
             tokio::time::timeout(
                 Duration::from_secs(2),
-                sender.send(relay::Command {
+                sender.send(actor::Command {
                     service_id: service.into(),
                     task_id: String::new(),
-                    operation: relay::Operation::RuntimeInspect,
+                    operation: actor::Operation::RuntimeInspect,
                     reply,
                     expires: deadline,
                     expected_pid: None,
@@ -518,7 +505,7 @@ async fn observe_runtime_sources(
             .await??;
             tokio::time::timeout(Duration::from_secs(2), result).await??
         };
-        let relay::Reply::Runtime {
+        let actor::Reply::Runtime {
             config,
             pid,
             mut executable,
@@ -571,7 +558,7 @@ async fn observe_runtime_sources(
                 return Err("active Relay differs from owned Child".into());
             }
         }
-        let relay::Reply::Runtime {
+        let actor::Reply::Runtime {
             pid: checked,
             admin_pid: checked_admin,
             config: checked_config,
@@ -656,21 +643,11 @@ impl Task {
         }
     }
     fn prepared_sha256(&self) -> crate::Result<&str> {
-        if !hex(
-            &self
-                .prepared
-                .as_ref()
-                .ok_or("prepared identity missing")?
-                .configuration_sha256,
-            64,
-        ) {
+        let prepared = self.prepared.as_ref().ok_or("prepared identity missing")?;
+        if !hex(&prepared.configuration_sha256, 64) {
             return Err("prepared configuration identity invalid".into());
         }
-        let digest = &self
-            .prepared
-            .as_ref()
-            .ok_or("prepared binary identity missing")?
-            .binary_sha256;
+        let digest = &prepared.binary_sha256;
         if !hex(digest, 64)
             || self
                 .submission
@@ -706,14 +683,12 @@ fn complete_worker(active: &std::sync::Mutex<Option<Reservation>>, task: &Task, 
 
 pub(crate) struct Tasks {
     deployment: Deployment,
-    startup_pending: std::sync::atomic::AtomicBool,
-    startup_selection: std::sync::Mutex<Option<serde_json::Value>>,
     directory: std::path::PathBuf,
     releases: Option<std::path::PathBuf>,
     info: NodeInfo,
     active: std::sync::Arc<std::sync::Mutex<Option<Reservation>>>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    executor: Option<tokio::sync::mpsc::Sender<relay::Command>>,
+    executor: Option<tokio::sync::mpsc::Sender<actor::Command>>,
     runtime: Option<tokio::runtime::Handle>,
 }
 
@@ -832,10 +807,6 @@ impl Tasks {
             .filter(|id| !id.is_empty());
         Ok(Self {
             deployment: deployment.clone(),
-            startup_pending: std::sync::atomic::AtomicBool::new(
-                deployment.external_declaration.is_some(),
-            ),
-            startup_selection: Default::default(),
             directory,
             releases,
             info,
@@ -846,7 +817,7 @@ impl Tasks {
         })
     }
 
-    pub(crate) fn set_executor(&mut self, executor: tokio::sync::mpsc::Sender<relay::Command>) {
+    pub(crate) fn set_executor(&mut self, executor: tokio::sync::mpsc::Sender<actor::Command>) {
         self.executor = Some(executor);
     }
     pub(crate) fn cancel(&self) {
@@ -861,54 +832,13 @@ impl Tasks {
         self.stopped.clone()
     }
 
-    pub(crate) fn startup_pending(&self) -> bool {
-        self.startup_pending
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(crate) fn complete_startup(
-        &self,
-        fallback: bool,
-        group: &crate::external::PreparedGroup,
-    ) -> crate::Result<()> {
-        let components: Vec<_> = group.components.iter().map(|component| serde_json::json!({
-            "role": component.role, "version": component.version, "release_id": component.release_id,
-            "binary_sha256": component.binary_sha256, "raw_config_sha256": component.raw_config_sha256,
-            "effective_config_sha256": component.effective_config_sha256,
-        })).collect();
-        *self
-            .startup_selection
-            .lock()
-            .map_err(|_| "startup state unavailable")? = Some(serde_json::json!({
-            "selection": if fallback { "ready_fallback" } else { "target" }, "mode": group.mode, "components": components,
-        }));
-        self.startup_pending
-            .store(false, std::sync::atomic::Ordering::Release);
-        Ok(())
-    }
-
-    pub(crate) async fn observe_startup(
-        &self,
-        service: &str,
-        node: &str,
-    ) -> crate::Result<ExpectedRuntime> {
-        observe_runtime(
-            self.executor.as_ref().ok_or("actor unavailable")?,
-            service,
-            node,
-            &self.info.boot_nonce,
-            self.info.pod_uid.clone(),
-        )
-        .await
-    }
-
     pub(crate) fn response(&self, line: &str) -> serde_json::Value {
         use serde_json::json;
         let request = match serde_json::from_str::<Request>(line) {
             Ok(request) => request,
             Err(_) => return json!({"ok":false,"error":{"code":"invalid_request"}}),
         };
-        if let Request::NodeInfo { declaration_path } = &request {
+        if let Request::NodeInfo {} = request {
             let mut info = self.info.clone();
             for component in &mut info.components {
                 if component.role == Role::Adxlet || component.mode == Mode::Standalone {
@@ -918,8 +848,7 @@ impl Tasks {
                         component.runtime = Some(identity);
                         component.sources = Some(sources);
                     }
-                    component.can_upgrade = !self.startup_pending()
-                        && component.mode == Mode::Standalone
+                    component.can_upgrade = component.mode == Mode::Standalone
                         && component.runtime.is_some()
                         && self
                             .executor
@@ -930,33 +859,7 @@ impl Tasks {
                             || adxlet_step_pairing(&self.deployment, &component.service_id));
                 }
             }
-            let startup = self
-                .startup_selection
-                .lock()
-                .ok()
-                .and_then(|selection| selection.clone());
-            let declaration = declaration_path
-                .as_deref()
-                .or(self.deployment.external_declaration.as_deref())
-                .map(|path| {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    let result = crate::external::read_declaration(path, deadline, &self.stopped)
-                        .map_err(|_| "declaration_unavailable")
-                        .and_then(|(desired, raw_sha256)| {
-                            let bytes = serde_json::to_vec(&desired)
-                                .map_err(|_| "declaration_serialization")?;
-                            if bytes.len() > 64 * 1024 {
-                                return Err("declaration_too_large");
-                            }
-                            if std::time::Instant::now() >= deadline {
-                                return Err("declaration_deadline");
-                            }
-                            Ok(json!({"path":path,"raw_sha256":raw_sha256,"desired":desired}))
-                        });
-                    result.unwrap_or_else(|code| json!({"path":path,"error":{"code":code}}))
-                });
-            return json!({"ok":true,"node_info":info,"external_startup":startup,
-                "external_declaration":declaration});
+            return json!({"ok":true,"node_info":info});
         }
         match self.handle(request) {
             Ok(task) => {
@@ -1035,16 +938,16 @@ impl Tasks {
         match (&task.adxlet_execution, step) {
             (_, Step::Exit) if attempt.is_empty() && node_session.is_empty() => (),
             (Some(execution), Step::Rollback)
-                if execution.rollback_from.as_ref().is_some_and(|source| {
+                if execution.leg.source().is_some_and(|source| {
                     source.attempt == attempt && source.node_session == node_session
                 }) => {}
             (Some(execution), Step::Start)
-                if execution.rollback_from.is_none()
+                if execution.leg == adxlet::ProcessLeg::Target
                     && !attempt.is_empty()
                     && execution.attempt == attempt
                     && execution.node_session == node_session => {}
             (Some(execution), Step::Rollback)
-                if execution.rollback_from.is_none()
+                if execution.leg == adxlet::ProcessLeg::Target
                     && !attempt.is_empty()
                     && execution.attempt == attempt
                     && execution.node_session == node_session => {}
@@ -1066,7 +969,7 @@ impl Tasks {
     /// First Exit confirms the frozen original still owns the adxlet in its
     /// worker, then fences and observes asynchronously. A replay that already
     /// recorded a durable `exited` reap, or a still-running worker, returns the
-    /// stored Task without any new side effect; an `exit_unknown` replay still
+    /// stored Task without any new side effect; an `Exiting` replay still
     /// carries the same minted attempt and resumes with it. Start runs only
     /// from a reaped Exit of the same attempt; its replays (lost reply, unknown
     /// spawn or commit) rerun the same attempt so the actor returns the one
@@ -1083,32 +986,30 @@ impl Tasks {
             return Ok(task);
         }
         let task_id = task.submission.task_id.clone();
-        let stage = task
-            .adxlet_execution
-            .as_ref()
-            .map(|execution| (execution.attempt.is_empty(), execution.stage.clone()));
-        match (
-            step,
-            stage
-                .as_ref()
-                .map(|(empty, stage)| (*empty, stage.as_str())),
-        ) {
+        match step {
             // A durable `exited` reap already recorded a minted attempt and
-            // closed the local Exit; a replay is read-only. An `exit_unknown`
+            // closed the local Exit; a replay is read-only. An `Exiting`
             // replay may still carry the same minted A in memory because its
             // durable store failed; that replay continues with the same A.
-            (Step::Exit, Some((false, stage))) if stage != "exit_unknown" => return Ok(task),
-            (Step::Start, _)
+            Step::Exit
+                if task
+                    .adxlet_execution
+                    .as_ref()
+                    .is_some_and(|execution| execution.stage != adxlet::Stage::Exiting) =>
+            {
+                return Ok(task);
+            }
+            Step::Start
                 if task
                     .adxlet_execution
                     .as_ref()
                     .is_some_and(adxlet::Execution::startable) => {}
-            (Step::Start, _) => return Err("conflict"),
-            (Step::Rollback, _)
+            Step::Start => return Err("conflict"),
+            Step::Rollback
                 if task
                     .adxlet_execution
                     .as_ref()
-                    .is_some_and(|execution| execution.rollback_from.is_some()) =>
+                    .is_some_and(|execution| execution.leg.source().is_some()) =>
             {
                 // Re-persist the same B after an ambiguous mint/store, but
                 // never race a live B worker with a stale loaded snapshot.
@@ -1119,10 +1020,13 @@ impl Tasks {
                 }
                 store(directory, &task).map_err(|_| "state_unavailable")?;
             }
-            (Step::Rollback, Some((false, stage)))
-                if adxlet::START_STAGES.contains(&stage)
-                    || matches!(stage, "rollback_intent" | "rollback_unknown") => {}
-            (Step::Rollback, _) => return Err("conflict"),
+            Step::Rollback
+                if task.adxlet_execution.as_ref().is_some_and(|execution| {
+                    !execution.attempt.is_empty()
+                        && (execution.startable()
+                            || matches!(execution.stage, adxlet::Stage::StoppingForRollback { .. }))
+                }) => {}
+            Step::Rollback => return Err("conflict"),
             _ => {}
         }
         let idle = active.as_ref().is_some_and(|reservation| {
@@ -1235,7 +1139,7 @@ impl Tasks {
         {
             reservation.worker_finished = false;
         }
-        // First Exit persists begin_intent from inside its worker; a replay
+        // First Exit persists Exiting from inside its worker; a replay
         // already carries it in the loaded Task.
         Ok(task)
     }
@@ -1245,9 +1149,6 @@ impl Tasks {
         let mut active = self.active.lock().map_err(|_| "state_unavailable")?;
         let (id, submission) = match request {
             Request::Submit { submission } => {
-                if self.startup_pending() {
-                    return Err("startup_pending");
-                }
                 submission.validate().map_err(|_| "invalid_request")?;
                 if let Selection::Publisher { expected } = &submission.selection {
                     if expected.boot_nonce != self.info.boot_nonce
@@ -1293,39 +1194,33 @@ impl Tasks {
                     self.executor.as_ref(),
                     self.runtime.as_ref(),
                 ) {
-                    let outcome = match execution.stage.as_str() {
-                        "target_commit_unknown" => Some(adxlet::committed_outcome(false)),
-                        "original_commit_unknown" => Some(adxlet::committed_outcome(true)),
-                        _ => None,
-                    };
-                    if let Some((phase, stage)) =
-                        outcome.filter(|_| execution.candidate_pid.is_some())
-                    {
+                    if let adxlet::Stage::Committing { candidate_pid } = execution.stage {
+                        let phase = execution.leg.selected_phase();
                         // handle runs on rollout-state, never on the Child actor.
                         // The reservation lock excludes all other journal writers.
                         let observed = runtime.block_on(async {
                             tokio::time::timeout(
                                 Duration::from_secs(2),
-                                adxlet::command(
+                                actor::command(
                                     sender,
                                     &task,
-                                    adxlet::Operation::Receipt {
-                                        identity: identity.clone(),
+                                    actor::Operation::Receipt {
+                                        owner: Owner::Adxlet(identity.clone()),
                                         old_pid: execution.old_pid,
                                         attempt: execution.attempt.clone(),
-                                        pid: execution.candidate_pid,
+                                        pid: Some(candidate_pid),
                                     },
                                     Instant::now() + Duration::from_secs(2),
                                 ),
                             )
                             .await
                         });
-                        if matches!(observed, Ok(Ok(relay::Reply::Committed))) {
+                        if matches!(observed, Ok(Ok(actor::Reply::Committed))) {
                             task.prepared_sha256().map_err(|_| "state_unavailable")?;
                             task.phase = phase;
                             task.finish(&self.info.boot_nonce);
                             if let Some(execution) = task.adxlet_execution.as_mut() {
-                                execution.stage = stage.into();
+                                execution.stage = adxlet::Stage::Selected { candidate_pid };
                                 execution.error = None;
                             }
                             store(&directory, &task).map_err(|_| "state_unavailable")?;
@@ -1496,13 +1391,13 @@ impl Tasks {
                     }
                 })()
                 .and_then(|binary| {
-                    let current = runtime.block_on(relay::command(
+                    let current = runtime.block_on(actor::command(
                         &executor,
                         &task,
-                        relay::Operation::RuntimeInspect,
+                        actor::Operation::RuntimeInspect,
                         deadline,
                     ))?;
-                    let relay::Reply::Runtime { config, .. } = current else {
+                    let actor::Reply::Runtime { config, .. } = current else {
                         return Err("current process snapshot missing".into());
                     };
                     let mut process = crate::config::prepare_component(
@@ -1594,25 +1489,20 @@ impl Tasks {
                         execution.error =
                             Some(journal_error("execution_unknown", &error.to_string()));
                     }
-                    if let Some(execution) = task.execution.as_mut() {
-                        if !matches!(
-                            execution.phase.as_str(),
-                            "completed"
-                                | "cancelled_before_begin"
-                                | "failed_retained"
-                                | "rolled_back"
-                        ) {
-                            execution.phase = if execution.rollback_deadline_unix_ms.is_some() {
-                                "rollback_unknown"
-                            } else {
-                                "unknown_fenced"
-                            }
-                            .into();
-                        }
+                    if task
+                        .execution
+                        .as_ref()
+                        .is_some_and(|execution| execution.phase.terminal_phase().is_none())
+                    {
+                        task.phase = Phase::Unknown;
                     }
                 }
-                if let Some(execution) = &task.execution {
-                    task.phase = relay_phase(&execution.phase);
+                if let Some(phase) = task
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.phase.terminal_phase())
+                {
+                    task.phase = phase;
                 }
                 task.finish(&boot_nonce);
                 let stored = store(&directory, &task).is_ok();
@@ -1700,25 +1590,20 @@ mod tests {
 
     #[test]
     fn finished_worker_receipt_converges_both_legs_only_after_durable_store() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        for (stage, phase, final_stage) in [
-            ("target_commit_unknown", Phase::Completed, "completed"),
-            (
-                "original_commit_unknown",
-                Phase::Failed,
-                "original_selected",
-            ),
-        ] {
+        let runtime = test_runtime(1);
+        for original in [false, true] {
+            let phase = if original {
+                Phase::Failed
+            } else {
+                Phase::Completed
+            };
+            let final_stage = adxlet::Stage::Selected { candidate_pid: 43 };
             let root = tempfile::tempdir().unwrap();
             let mut deployment = deployment();
             deployment.state_dir = root.path().into();
             let mut tasks = Tasks::new(&deployment).unwrap();
             tasks.runtime = Some(runtime.handle().clone());
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<actor::Command>(4);
             tasks.set_executor(sender);
             private_directory(&tasks.directory).unwrap();
             let directory = tasks.directory.join("receipt");
@@ -1747,13 +1632,18 @@ mod tests {
             let mut task = prepared_task(submission.clone(), Phase::Unknown, 1);
             task.adxlet_execution = Some(adxlet::Execution {
                 old_pid: 42,
-                candidate_pid: Some(43),
-                stage: stage.into(),
                 error: Some("lost ACK".into()),
-                attempt: "attempt".into(),
-                node_session: "next".into(),
-                deadline_unix_ms: 1,
-                rollback_from: None,
+                leg: if original {
+                    adxlet::ProcessLeg::Rollback {
+                        from: adxlet::AttemptIdentity {
+                            attempt: "A".into(),
+                            node_session: "session-A".into(),
+                        },
+                    }
+                } else {
+                    adxlet::ProcessLeg::Target
+                },
+                ..target_execution(adxlet::Stage::Committing { candidate_pid: 43 }, 1)
             });
             store(&directory, &task).unwrap();
             *tasks.active.lock().unwrap() = Some(Reservation {
@@ -1784,12 +1674,12 @@ mod tests {
                     let command = receiver.recv().await.unwrap();
                     assert_eq!(command.task_id, "receipt");
                     match command.operation {
-                        relay::Operation::Adxlet(adxlet::Operation::Receipt {
-                            identity: actual,
+                        actor::Operation::Receipt {
+                            owner: Owner::Adxlet(actual),
                             old_pid,
                             attempt,
                             pid,
-                        }) => {
+                        } => {
                             assert_eq!(actual, identity);
                             assert_eq!((old_pid, pid, attempt.as_str()), (42, Some(43), "attempt"));
                         }
@@ -1798,7 +1688,7 @@ mod tests {
                     let reply = if index == 0 {
                         Err("receipt unknown".into())
                     } else {
-                        Ok(relay::Reply::Committed)
+                        Ok(actor::Reply::Committed)
                     };
                     command.reply.send(reply).ok();
                 }
@@ -1875,16 +1765,18 @@ mod tests {
         let mut task = prepared_task(submission, Phase::Failed, u64::MAX);
         task.adxlet_execution = Some(adxlet::Execution {
             old_pid: u32::MAX,
-            candidate_pid: Some(u32::MAX - 2),
-            stage: "original_selected".into(),
             error: Some(journal_error(
                 "candidate_unknown",
                 &"diagnostic".repeat(1000),
             )),
             attempt: "attempt".repeat(128),
             node_session: "session".repeat(128),
-            deadline_unix_ms: u64::MAX,
-            rollback_from: None,
+            ..target_execution(
+                adxlet::Stage::Selected {
+                    candidate_pid: u32::MAX - 2,
+                },
+                u64::MAX,
+            )
         });
         let encoded = serde_json::to_vec(&task).unwrap();
         assert!(encoded.len() <= MAX_JOURNAL_BYTES as usize);
@@ -1895,7 +1787,8 @@ mod tests {
             serde_json::to_value(&task).unwrap()
         );
         let previous = std::fs::read(root.path().join("state.json")).unwrap();
-        task.adxlet_execution.as_mut().unwrap().stage = "x".repeat(MAX_JOURNAL_BYTES as usize);
+        task.adxlet_execution.as_mut().unwrap().error =
+            Some("x".repeat(MAX_JOURNAL_BYTES as usize));
         assert!(store(root.path(), &task).is_err());
         assert_eq!(
             std::fs::read(root.path().join("state.json")).unwrap(),
@@ -2167,39 +2060,33 @@ mod tests {
             assert!(component["sources"].is_null());
             assert_eq!(component["can_upgrade"], false);
         }
-        assert!(response["external_declaration"].is_null());
-        let path = root.path().join("declaration.yaml");
-        std::fs::write(&path, "secret-invalid-declaration").unwrap();
-        let observed = tasks.response(
-            &serde_json::json!({
-                "action":"rollout_node_info","declaration_path":path
-            })
-            .to_string(),
-        );
-        assert_eq!(observed["ok"], true);
-        assert_eq!(observed["node_info"], response["node_info"]);
-        assert_eq!(observed["external_startup"], response["external_startup"]);
-        assert_eq!(
-            observed["external_declaration"]["error"]["code"],
-            "declaration_unavailable"
-        );
-        assert!(!observed.to_string().contains("secret-invalid-declaration"));
-        assert!(!tasks.startup_pending());
-        assert!(tasks.deployment.external_declaration.is_none());
     }
 
     #[test]
     fn relay_terminal_phase_is_not_prepared_or_cli_success() {
-        for (detail, phase) in [
-            ("completed", Phase::Completed),
-            ("rolled_back", Phase::Failed),
-            ("failed_retained", Phase::Failed),
-            ("cancelled_before_begin", Phase::Failed),
-            ("unknown_fenced", Phase::Unknown),
-            ("rollback_unknown", Phase::Unknown),
-            ("reserved", Phase::Running),
+        use relay::RelayStage;
+        for (stage, wire, phase) in [
+            (RelayStage::Upgrading, "upgrading", None),
+            (RelayStage::RollingBack, "rolling_back", None),
+            (RelayStage::Completed, "completed", Some(Phase::Completed)),
+            (RelayStage::RolledBack, "rolled_back", Some(Phase::Failed)),
+            (
+                RelayStage::FailedRetained,
+                "failed_retained",
+                Some(Phase::Failed),
+            ),
+            (
+                RelayStage::CancelledBeforeBegin,
+                "cancelled_before_begin",
+                Some(Phase::Failed),
+            ),
         ] {
-            assert_eq!(relay_phase(detail), phase);
+            assert_eq!(stage.terminal_phase(), phase);
+            assert_eq!(serde_json::to_value(stage).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<RelayStage>(serde_json::json!(wire)).unwrap(),
+                stage
+            );
         }
     }
 
@@ -2483,18 +2370,19 @@ mod tests {
     fn wire_contract_rejects_unknown_actions_and_fields() {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"action":"rollout_node_info"}"#).unwrap(),
-            Request::NodeInfo {
-                declaration_path: None
-            }
+            Request::NodeInfo {}
         );
+        for json in [
+            r#"{"action":"rollout_node_info","unexpected":true}"#,
+            r#"{"action":"rollout_node_info","declaration_path":"/x"}"#,
+        ] {
+            assert!(serde_json::from_str::<Request>(json).is_err());
+        }
         assert!(serde_json::from_str::<Request>(r#"{"action":"rollout_submit"}"#).is_err());
-        assert!(
-            serde_json::from_str::<Request>(r#"{"action":"rollout_node_info","env":{}}"#).is_err()
-        );
     }
 
     #[test]
-    fn rollback_v2_wire_uses_rollback_without_legacy_alias() {
+    fn rollback_wire_uses_rollback_without_legacy_alias() {
         let json = r#"{"action":"rollout_step","task_id":"task-1","step":"rollback","attempt":"A","node_session":"session-A"}"#;
         let request = serde_json::from_str::<Request>(json)
             .expect("protocol 2 must accept the single local rollback step");
@@ -2506,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_v2_node_info_advertises_protocol_two() {
+    fn rollback_node_info_advertises_protocol_two() {
         let info = node_info(&deployment());
         assert_eq!(serde_json::to_value(info).unwrap()["step_protocol"], 2);
     }
@@ -2591,13 +2479,7 @@ mod tests {
         let mut task = prepared_task(submission.clone(), Phase::Unknown, u64::MAX);
         task.adxlet_execution = Some(adxlet::Execution {
             old_pid: 42,
-            candidate_pid: None,
-            stage: "target_identity".into(),
-            error: None,
-            attempt: "attempt".into(),
-            node_session: "next".into(),
-            deadline_unix_ms: u64::MAX,
-            rollback_from: None,
+            ..target_execution(adxlet::Stage::Exited, u64::MAX)
         });
         store(&directory, &task).unwrap();
         let before = std::fs::read(directory.join("state.json")).unwrap();
@@ -2837,53 +2719,115 @@ mod tests {
         (original, target)
     }
 
-    #[test]
-    fn step_exit_replays_minted_identity_without_reminting_or_refresh() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let tasks = Tasks::new(&deployment).unwrap();
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("exit-replay");
-        private_directory(&directory).unwrap();
-        let mut task = prepared_task(
-            adxlet_submission("exit-replay", &service_id),
-            Phase::Unknown,
-            u64::MAX,
-        );
-        task.deadline_unix_ms = 900_000;
-        task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 42,
-            candidate_pid: None,
-            stage: "exited".into(),
+    fn target_execution(stage: adxlet::Stage, deadline_unix_ms: u64) -> adxlet::Execution {
+        adxlet::Execution {
+            old_pid: 4242,
+            stage,
             error: None,
             attempt: "attempt".into(),
             node_session: "next".into(),
-            deadline_unix_ms: 900_000,
-            rollback_from: None,
+            deadline_unix_ms,
+            leg: adxlet::ProcessLeg::Target,
+        }
+    }
+
+    fn step_request(task_id: &str, step: Step, attempt: &str, node_session: &str) -> Request {
+        Request::Step {
+            task_id: task_id.into(),
+            step,
+            attempt: attempt.into(),
+            node_session: node_session.into(),
+        }
+    }
+
+    struct TestHarness {
+        root: tempfile::TempDir,
+        service_id: String,
+        task_id: String,
+        directory: std::path::PathBuf,
+        tasks: Tasks,
+    }
+
+    impl TestHarness {
+        fn new(task_id: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let (mut deployment, service_id) = paired_adxlet();
+            deployment.state_dir = root.path().into();
+            let tasks = Tasks::new(&deployment).unwrap();
+            private_directory(&tasks.directory).unwrap();
+            let directory = tasks.directory.join(task_id);
+            private_directory(&directory).unwrap();
+            Self {
+                root,
+                service_id,
+                task_id: task_id.into(),
+                directory,
+                tasks,
+            }
+        }
+
+        fn executor(
+            &mut self,
+            runtime: &tokio::runtime::Runtime,
+            capacity: usize,
+        ) -> tokio::sync::mpsc::Receiver<actor::Command> {
+            self.tasks.runtime = Some(runtime.handle().clone());
+            let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+            self.tasks.set_executor(sender);
+            receiver
+        }
+
+        fn task(&self, phase: Phase, deadline_unix_ms: u64) -> Task {
+            prepared_task(
+                adxlet_submission(&self.task_id, &self.service_id),
+                phase,
+                deadline_unix_ms,
+            )
+        }
+
+        fn install(&self, task: &Task) {
+            store(&self.directory, task).unwrap();
+            *self.tasks.active.lock().unwrap() = Some(Reservation {
+                task_id: self.task_id.clone(),
+                worker_finished: true,
+            });
+        }
+    }
+
+    fn test_runtime(workers: usize) -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn step_exit_replays_minted_identity_without_reminting_or_refresh() {
+        let h = TestHarness::new("exit-replay");
+        let mut task = h.task(Phase::Unknown, u64::MAX);
+        task.deadline_unix_ms = 900_000;
+        task.adxlet_execution = Some(adxlet::Execution {
+            old_pid: 42,
+            ..target_execution(adxlet::Stage::Exited, 900_000)
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-replay".into(),
-            worker_finished: true,
-        });
-        let before = std::fs::read(directory.join("state.json")).unwrap();
-        let observed = tasks
-            .handle(Request::Step {
-                task_id: "exit-replay".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+        h.install(&task);
+        let before = std::fs::read(h.directory.join("state.json")).unwrap();
+        let observed = h
+            .tasks
+            .handle(step_request("exit-replay", Step::Exit, "", ""))
             .unwrap();
         let execution = observed.adxlet_execution.unwrap();
         assert_eq!(execution.attempt, "attempt");
         assert_eq!(execution.node_session, "next");
         assert_eq!(execution.deadline_unix_ms, 900_000);
-        assert_eq!(execution.stage, "exited");
-        assert_eq!(std::fs::read(directory.join("state.json")).unwrap(), before);
+        assert_eq!(execution.stage, adxlet::Stage::Exited);
+        assert_eq!(
+            std::fs::read(h.directory.join("state.json")).unwrap(),
+            before
+        );
         assert!(
-            tasks
+            h.tasks
                 .active
                 .lock()
                 .unwrap()
@@ -2895,35 +2839,14 @@ mod tests {
 
     #[test]
     fn step_exit_terminal_or_without_reservation_has_no_side_effect() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let tasks = Tasks::new(&deployment).unwrap();
-        private_directory(&tasks.directory).unwrap();
-
-        let terminal_dir = tasks.directory.join("exit-terminal");
-        private_directory(&terminal_dir).unwrap();
-        store(
-            &terminal_dir,
-            &prepared_task(
-                adxlet_submission("exit-terminal", &service_id),
-                Phase::Completed,
-                u64::MAX,
-            ),
-        )
-        .unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-terminal".into(),
-            worker_finished: true,
-        });
+        let h = TestHarness::new("exit-terminal");
+        h.install(&h.task(Phase::Completed, u64::MAX));
+        let terminal_dir = &h.directory;
+        let tasks = &h.tasks;
+        let service_id = &h.service_id;
         let before = std::fs::read(terminal_dir.join("state.json")).unwrap();
         let observed = tasks
-            .handle(Request::Step {
-                task_id: "exit-terminal".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+            .handle(step_request("exit-terminal", Step::Exit, "", ""))
             .unwrap();
         assert_eq!(observed.phase, Phase::Completed);
         assert!(observed.adxlet_execution.is_none());
@@ -2937,7 +2860,7 @@ mod tests {
         store(
             &orphan_dir,
             &prepared_task(
-                adxlet_submission("exit-orphan", &service_id),
+                adxlet_submission("exit-orphan", service_id),
                 Phase::Preparing,
                 u64::MAX,
             ),
@@ -2947,12 +2870,7 @@ mod tests {
         let before = std::fs::read(orphan_dir.join("state.json")).unwrap();
         assert_eq!(
             tasks
-                .handle(Request::Step {
-                    task_id: "exit-orphan".into(),
-                    step: Step::Exit,
-                    attempt: String::new(),
-                    node_session: String::new(),
-                })
+                .handle(step_request("exit-orphan", Step::Exit, "", ""))
                 .unwrap_err(),
             "conflict"
         );
@@ -2964,21 +2882,9 @@ mod tests {
 
     #[test]
     fn step_exit_starts_past_preparation_deadline_and_waits_for_real_observe() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("exit-first");
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new("exit-first");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
 
         let target_bytes = b"owned prepared target executable bytes";
         let target_sha256 = sha256_hex(target_bytes);
@@ -2987,46 +2893,30 @@ mod tests {
         // The three first-exit file proofs: the prepared target executable, the
         // owned original copy, and the live original bytes served by the actor
         // as the RuntimeInspect executable.
-        std::fs::write(directory.join("executable"), target_bytes).unwrap();
-        std::fs::write(directory.join("original"), original_bytes).unwrap();
-        let executable_path = root.path().join("live-exe");
+        std::fs::write(h.directory.join("executable"), target_bytes).unwrap();
+        std::fs::write(h.directory.join("original"), original_bytes).unwrap();
+        let executable_path = h.root.path().join("live-exe");
         std::fs::write(&executable_path, original_bytes).unwrap();
 
-        let submission = Submission {
-            component_config: None,
-            selection: Selection::LocalManual,
-            task_id: "exit-first".into(),
-            role: Role::Adxlet,
-            service_id,
-            commit: "c".repeat(40),
-            sha256: Some(target_sha256.clone()),
-            remote_archive: None,
-            process: Some(ProcessIdentity {
-                node_id: "node".into(),
-                identity: ProcessSelection {
-                    rollout_id: "rollout".into(),
-                    epoch: 1,
-                    old_node_session: "old".into(),
-                    old_relay_session: "relay".into(),
-                    original_sha256: original_sha256.clone(),
-                },
-            }),
-        };
+        let mut submission = adxlet_submission("exit-first", &h.service_id);
+        submission.sha256 = Some(target_sha256.clone());
+        submission
+            .process
+            .as_mut()
+            .unwrap()
+            .identity
+            .original_sha256 = original_sha256.clone();
         let mut stored = prepared_task(submission, Phase::Preparing, 1);
         stored.prepared.as_mut().unwrap().binary_sha256 = target_sha256;
         // deadline_unix_ms = 1 is long past the preparation budget; the first
         // Exit still starts because preparation expiry only bounds the prepare worker.
-        store(&directory, &stored).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-first".into(),
-            worker_finished: true,
-        });
+        h.install(&stored);
 
         let pid = 4242u32;
-        let admin_socket = root.path().join("admin.sock");
+        let admin_socket = h.root.path().join("admin.sock");
         // Pinned private config copies must still carry their effective digest
         // before any Fence; the live RuntimeInspect matches the original copy.
-        let (original_process, _) = pin_snapshots(&directory, &admin_socket);
+        let (original_process, _) = pin_snapshots(&h.directory, &admin_socket);
         let actor_executable = executable_path.clone();
         let actor = runtime.spawn(async move {
             let mut fences = 0;
@@ -3034,10 +2924,10 @@ mod tests {
             for _ in 0..3 {
                 let command = receiver.recv().await.unwrap();
                 match command.operation {
-                    relay::Operation::RuntimeInspect => {
+                    actor::Operation::RuntimeInspect => {
                         command
                             .reply
-                            .send(Ok(relay::Reply::Runtime {
+                            .send(Ok(actor::Reply::Runtime {
                                 config: Box::new(original_process.clone()),
                                 pid,
                                 executable: std::fs::File::open(&actor_executable).unwrap(),
@@ -3047,25 +2937,23 @@ mod tests {
                             }))
                             .ok();
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Fence { .. }) => {
+                    actor::Operation::Fence { .. } => {
                         fences += 1;
                         command
                             .reply
-                            .send(Ok(relay::Reply::State {
+                            .send(Ok(actor::Reply::State {
                                 exited: false,
                                 success: false,
-                                candidate_pid: None,
                             }))
                             .ok();
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Observe { .. }) => {
+                    actor::Operation::Observe { .. } => {
                         observes += 1;
                         command
                             .reply
-                            .send(Ok(relay::Reply::State {
+                            .send(Ok(actor::Reply::State {
                                 exited: true,
                                 success: true,
-                                candidate_pid: None,
                             }))
                             .ok();
                     }
@@ -3075,13 +2963,9 @@ mod tests {
             (fences, observes)
         });
 
-        let started = tasks
-            .handle(Request::Step {
-                task_id: "exit-first".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+        let started = h
+            .tasks
+            .handle(step_request("exit-first", Step::Exit, "", ""))
             .unwrap();
         assert_eq!(started.phase, Phase::Preparing);
         assert!(started.adxlet_execution.is_none());
@@ -3092,20 +2976,9 @@ mod tests {
             (1, 1),
             "exit relies on Fence then a real Observe receipt"
         );
-        for _ in 0..200 {
-            if tasks
-                .active
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|reservation| reservation.worker_finished)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_worker(&h.tasks);
         assert!(
-            tasks
+            h.tasks
                 .active
                 .lock()
                 .unwrap()
@@ -3113,9 +2986,9 @@ mod tests {
                 .unwrap()
                 .worker_finished
         );
-        let loaded = load(&directory).unwrap();
+        let loaded = load(&h.directory).unwrap();
         let execution = loaded.adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "exited");
+        assert_eq!(execution.stage, adxlet::Stage::Exited);
         assert_eq!(execution.old_pid, pid);
         assert!(!execution.attempt.is_empty());
         assert!(!execution.node_session.is_empty());
@@ -3124,51 +2997,26 @@ mod tests {
 
     #[test]
     fn step_exit_resume_with_expired_deadline_observes_only_once_converges_unknown() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("exit-resume");
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new("exit-resume");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
 
         // The resume path reloads the original admin socket before any Observe
         // or Fence, even when the saved phase deadline is already past.
         std::fs::write(
-            directory.join("original-process.json"),
+            h.directory.join("original-process.json"),
             serde_json::to_vec(&test_process()).unwrap(),
         )
         .unwrap();
 
         let expired_deadline = 1u64;
-        let mut task = prepared_task(
-            adxlet_submission("exit-resume", &service_id),
-            Phase::Unknown,
-            expired_deadline,
-        );
+        let mut task = h.task(Phase::Unknown, expired_deadline);
         task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 4242,
-            candidate_pid: None,
-            stage: "begin_intent".into(),
-            error: None,
             attempt: String::new(),
             node_session: "old".into(),
-            deadline_unix_ms: expired_deadline,
-            rollback_from: None,
+            ..target_execution(adxlet::Stage::Exiting, expired_deadline)
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-resume".into(),
-            worker_finished: true,
-        });
+        h.install(&task);
 
         // An expired replay is permitted exactly one fresh, bounded Observe to
         // confirm whether the old Child was already reaped. It never fences,
@@ -3176,43 +3024,27 @@ mod tests {
         let actor = runtime.spawn(async move {
             let command = receiver.recv().await.unwrap();
             match command.operation {
-                relay::Operation::Adxlet(adxlet::Operation::Observe { .. }) => command
+                actor::Operation::Observe { .. } => command
                     .reply
-                    .send(Ok(relay::Reply::State {
+                    .send(Ok(actor::Reply::State {
                         exited: false,
                         success: false,
-                        candidate_pid: None,
                     }))
                     .ok(),
                 _ => panic!("expired resume must Observe-only, never Fence/Begin/Start"),
             }
         });
 
-        let started = tasks
-            .handle(Request::Step {
-                task_id: "exit-resume".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+        let started = h
+            .tasks
+            .handle(step_request("exit-resume", Step::Exit, "", ""))
             .unwrap();
         assert_eq!(started.phase, Phase::Unknown);
         runtime.block_on(actor).unwrap();
-        for _ in 0..200 {
-            if tasks
-                .active
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|reservation| reservation.worker_finished)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let loaded = load(&directory).unwrap();
+        wait_worker(&h.tasks);
+        let loaded = load(&h.directory).unwrap();
         let execution = loaded.adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "exit_unknown");
+        assert_eq!(execution.stage, adxlet::Stage::Exiting);
         assert!(execution.attempt.is_empty());
         assert_eq!(execution.node_session, "old");
         assert!(execution.error.is_some());
@@ -3223,69 +3055,41 @@ mod tests {
         assert_eq!(loaded.phase, Phase::Unknown);
         // A durable Unknown outcome keeps the reservation so the maintenance
         // stays recoverable and re-runnable rather than being closed as failed.
-        let active = tasks.active.lock().unwrap();
+        let active = h.tasks.active.lock().unwrap();
         assert!(active.as_ref().unwrap().worker_finished);
     }
 
     #[test]
     fn step_exit_failed_outcome_without_durable_store_keeps_reservation() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("exit-store-fail");
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new("exit-store-fail");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
 
-        // No prepared executable: the first proof fails before begin_intent is
+        // No prepared executable: the first proof fails before Exiting is
         // persisted, so the worker converges on a terminal Failed phase without
         // issuing any relay command.
-        let submission = adxlet_submission("exit-store-fail", &service_id);
+        let submission = adxlet_submission("exit-store-fail", &h.service_id);
         let task = prepared_task(submission, Phase::Preparing, 1);
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-store-fail".into(),
-            worker_finished: true,
-        });
-        let before = std::fs::read(directory.join("state.json")).unwrap();
+        h.install(&task);
+        let before = std::fs::read(h.directory.join("state.json")).unwrap();
         // A pre-existing directory at the partial path makes the worker's
         // durable store fail, mirroring the Submit worker's release guard.
-        std::fs::create_dir(directory.join("state.partial")).unwrap();
+        std::fs::create_dir(h.directory.join("state.partial")).unwrap();
 
-        let started = tasks
-            .handle(Request::Step {
-                task_id: "exit-store-fail".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+        let started = h
+            .tasks
+            .handle(step_request("exit-store-fail", Step::Exit, "", ""))
             .unwrap();
         assert_eq!(started.phase, Phase::Preparing);
         assert!(receiver.try_recv().is_err());
-        for _ in 0..200 {
-            if tasks
-                .active
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|reservation| reservation.worker_finished)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_worker(&h.tasks);
         // A store failure never closes the task or releases the reservation:
         // the durable journal is unchanged and the outcome stays re-runnable.
-        assert_eq!(std::fs::read(directory.join("state.json")).unwrap(), before);
-        let active = tasks.active.lock().unwrap();
+        assert_eq!(
+            std::fs::read(h.directory.join("state.json")).unwrap(),
+            before
+        );
+        let active = h.tasks.active.lock().unwrap();
         let reservation = active.as_ref().unwrap();
         assert!(reservation.worker_finished);
         assert_eq!(reservation.task_id, "exit-store-fail");
@@ -3298,43 +3102,25 @@ mod tests {
         // the generated A stays A for an idempotent replay.
         let mut execution = adxlet::Execution {
             old_pid: 42,
-            candidate_pid: None,
-            stage: "exited".into(),
-            error: None,
-            attempt: "attempt".into(),
-            node_session: "next".into(),
-            deadline_unix_ms: 900_000,
-            rollback_from: None,
+            ..target_execution(adxlet::Stage::Exited, 900_000)
         };
         mark_exit_unknown(&mut execution, "exit outcome not durable");
         assert_eq!(execution.attempt, "attempt");
         assert_eq!(execution.node_session, "next");
-        assert_eq!(execution.stage, "exit_unknown");
+        assert_eq!(execution.stage, adxlet::Stage::Exiting);
         assert!(execution.error.is_some());
     }
 
     #[test]
     fn step_exit_replays_exit_unknown_with_same_minted_identity() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("exit-unknown-replay");
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new("exit-unknown-replay");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
 
-        // A durable `exit_unknown` still carries the minted A whose store had
+        // A durable `Exiting` still carries the minted A whose store had
         // failed. A replay must re-Observe and re-save the same A, never mint B.
         std::fs::write(
-            directory.join("original-process.json"),
+            h.directory.join("original-process.json"),
             serde_json::to_vec(&test_process()).unwrap(),
         )
         .unwrap();
@@ -3343,69 +3129,39 @@ mod tests {
             .unwrap()
             .as_millis() as u64
             + 60_000;
-        let mut task = prepared_task(
-            adxlet_submission("exit-unknown-replay", &service_id),
-            Phase::Unknown,
-            deadline_unix_ms,
-        );
+        let mut task = h.task(Phase::Unknown, deadline_unix_ms);
         task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 4242,
-            candidate_pid: None,
-            stage: "exit_unknown".into(),
             error: Some(journal_error(
                 "execution_unknown",
                 "exit outcome not durable",
             )),
-            attempt: "attempt".into(),
-            node_session: "next".into(),
-            deadline_unix_ms,
-            rollback_from: None,
+            ..target_execution(adxlet::Stage::Exiting, deadline_unix_ms)
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-unknown-replay".into(),
-            worker_finished: true,
-        });
+        h.install(&task);
 
         let actor = runtime.spawn(async move {
             let command = receiver.recv().await.unwrap();
             match command.operation {
-                relay::Operation::Adxlet(adxlet::Operation::Observe { .. }) => command
+                actor::Operation::Observe { .. } => command
                     .reply
-                    .send(Ok(relay::Reply::State {
+                    .send(Ok(actor::Reply::State {
                         exited: true,
                         success: true,
-                        candidate_pid: None,
                     }))
                     .ok(),
                 _ => panic!("replayed exit_unknown must Observe-first only"),
             }
         });
 
-        let started = tasks
-            .handle(Request::Step {
-                task_id: "exit-unknown-replay".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+        let started = h
+            .tasks
+            .handle(step_request("exit-unknown-replay", Step::Exit, "", ""))
             .unwrap();
         assert_eq!(started.phase, Phase::Unknown);
         runtime.block_on(actor).unwrap();
-        for _ in 0..200 {
-            if tasks
-                .active
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|reservation| reservation.worker_finished)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let execution = load(&directory).unwrap().adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "exited");
+        wait_worker(&h.tasks);
+        let execution = load(&h.directory).unwrap().adxlet_execution.unwrap();
+        assert_eq!(execution.stage, adxlet::Stage::Exited);
         assert_eq!(execution.attempt, "attempt");
         assert_eq!(execution.node_session, "next");
         assert!(execution.error.is_none());
@@ -3415,6 +3171,7 @@ mod tests {
     /// was actually delivered to this (owned) process.
     struct ReadyAfterBootstrapStub {
         delivered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[tonic::async_trait]
@@ -3438,7 +3195,10 @@ mod tests {
             tonic::Response<adx_protocol::relay::AdxletProcessState>,
             tonic::Status,
         > {
-            let ready = self.delivered.load(std::sync::atomic::Ordering::SeqCst);
+            let observed = self
+                .queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ready = self.delivered.load(std::sync::atomic::Ordering::SeqCst) && observed >= 2;
             Ok(tonic::Response::new(
                 adx_protocol::relay::AdxletProcessState {
                     identity: None,
@@ -3466,58 +3226,47 @@ mod tests {
     }
 
     #[test]
-    fn step_start_replays_same_attempt_after_lost_replies_and_completes_once() {
-        start_leg_replays_same_attempt_after_lost_replies(false);
-    }
-
-    #[test]
-    fn step_original_start_uses_pinned_original_and_preserves_rollback_deadline() {
-        start_leg_replays_same_attempt_after_lost_replies(true);
+    fn both_legs_replay_lost_start_replies_with_pinned_files_and_fixed_deadlines() {
+        for original in [false, true] {
+            start_leg_replays_same_attempt_after_lost_replies(original);
+        }
     }
 
     fn start_leg_replays_same_attempt_after_lost_replies(original: bool) {
         use adx_protocol::relay::adxlet_process_service_server::AdxletProcessServiceServer;
         use tonic::transport::Server;
         const ATTEMPT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(8);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
         let task_id = "a".repeat(64);
-        let directory = tasks.directory.join(&task_id);
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new(&task_id);
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 8);
         let target_bytes = b"owned prepared target executable bytes";
         let target_sha256 = sha256_hex(target_bytes);
-        std::fs::write(directory.join("executable"), target_bytes).unwrap();
-        let admin_socket = root.path().join("admin.sock");
+        std::fs::write(h.directory.join("executable"), target_bytes).unwrap();
+        let admin_socket = h.root.path().join("admin.sock");
         let original_bytes = b"different owned original executable bytes";
-        std::fs::write(directory.join("original"), original_bytes).unwrap();
-        let (original_process, target_process) = pin_snapshots(&directory, &admin_socket);
+        std::fs::write(h.directory.join("original"), original_bytes).unwrap();
+        let (original_process, target_process) = pin_snapshots(&h.directory, &admin_socket);
         let target = if original {
             original_process
         } else {
             target_process
         };
-        let executable = directory.join(if original { "original" } else { "executable" });
+        let executable = h
+            .directory
+            .join(if original { "original" } else { "executable" });
 
         // The owned Child is this test process so peer-credential checks on
         // the bootstrap and admin sockets see the actual candidate PID.
         let pid = std::process::id();
         let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = runtime
             .block_on(async { tokio::net::UnixListener::bind(&admin_socket) })
             .unwrap();
         let stub = ReadyAfterBootstrapStub {
             delivered: delivered.clone(),
+            queries: queries.clone(),
         };
         runtime.spawn(async move {
             Server::builder()
@@ -3526,7 +3275,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let bootstrap = root.path().join(format!("{}-start.sock", target.id));
+        let bootstrap = h.root.path().join(format!("{}-start.sock", target.id));
         let reader_path = bootstrap.clone();
         let reader_delivered = delivered.clone();
         let reader = runtime.spawn(async move {
@@ -3543,7 +3292,7 @@ mod tests {
             }
         });
 
-        let mut submission = adxlet_submission(&task_id, &service_id);
+        let mut submission = adxlet_submission(&task_id, &h.service_id);
         submission.sha256 = Some(target_sha256.clone());
         submission
             .process
@@ -3555,38 +3304,36 @@ mod tests {
         let mut task = prepared_task(submission, Phase::Unknown, deadline_unix_ms);
         task.prepared.as_mut().unwrap().binary_sha256 = target_sha256;
         task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 4242,
-            candidate_pid: None,
-            stage: if original { "rollback_ready" } else { "exited" }.into(),
-            error: None,
             attempt: ATTEMPT.into(),
-            node_session: "next".into(),
-            deadline_unix_ms,
-            rollback_from: original.then(|| adxlet::AttemptIdentity {
-                attempt: "target-attempt".into(),
-                node_session: "target-session".into(),
-            }),
+            leg: if original {
+                adxlet::ProcessLeg::Rollback {
+                    from: adxlet::AttemptIdentity {
+                        attempt: "target-attempt".into(),
+                        node_session: "target-session".into(),
+                    },
+                }
+            } else {
+                adxlet::ProcessLeg::Target
+            },
+            ..target_execution(adxlet::Stage::Exited, deadline_unix_ms)
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: task_id.clone(),
-            worker_finished: true,
-        });
+        h.install(&task);
 
         let target_config = target.clone();
         let actor = runtime.spawn(async move {
-            let (mut starts, mut completes, mut spawn_receipts) = (Vec::new(), 0, 0);
+            let (mut starts, mut completes, mut spawn_receipts, mut inspections) =
+                (Vec::new(), 0, 0, 0);
             loop {
                 let command = receiver.recv().await.unwrap();
                 match command.operation {
-                    relay::Operation::Adxlet(adxlet::Operation::Start {
+                    actor::Operation::Start {
                         attempt,
-                        bootstrap,
                         pid: old,
                         config,
                         binary,
+                        launch: Launch::Adxlet { bootstrap, .. },
                         ..
-                    }) => {
+                    } => {
                         assert_eq!(old, 4242);
                         assert_eq!(binary, executable);
                         assert_eq!(
@@ -3597,12 +3344,12 @@ mod tests {
                         // The Child is created, but the Start reply is lost.
                         drop(command.reply);
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Receipt {
+                    actor::Operation::Receipt {
                         pid: observed,
                         attempt,
                         old_pid,
                         ..
-                    }) => {
+                    } => {
                         assert_eq!((attempt.as_str(), old_pid), (ATTEMPT, 4242));
                         if observed.is_none() {
                             // The lost Start is resolved by observing first.
@@ -3611,14 +3358,15 @@ mod tests {
                         }
                         command
                             .reply
-                            .send(Ok(relay::Reply::Candidate { pid, exited: false }))
+                            .send(Ok(actor::Reply::Candidate { pid, exited: false }))
                             .ok();
                     }
-                    relay::Operation::RuntimeInspect => {
+                    actor::Operation::RuntimeInspect => {
+                        inspections += 1;
                         assert_eq!(command.expected_pid, Some(pid));
                         command
                             .reply
-                            .send(Ok(relay::Reply::Runtime {
+                            .send(Ok(actor::Reply::Runtime {
                                 config: Box::new(target_config.clone()),
                                 pid,
                                 executable: std::fs::File::open(&executable).unwrap(),
@@ -3628,21 +3376,22 @@ mod tests {
                             }))
                             .ok();
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Complete {
+                    actor::Operation::Commit {
                         pid: selected,
                         old_pid,
                         attempt,
+                        stage: CommitStage::Select,
                         ..
-                    }) => {
+                    } => {
                         assert_eq!((selected, old_pid, attempt.as_str()), (pid, 4242, ATTEMPT));
                         completes += 1;
                         // The first Complete reply is lost after the commit.
                         if completes > 1 {
                             command
                                 .reply
-                                .send(Ok(relay::Reply::Candidate { pid, exited: false }))
+                                .send(Ok(actor::Reply::Candidate { pid, exited: false }))
                                 .ok();
-                            return (starts, completes, spawn_receipts);
+                            return (starts, completes, spawn_receipts, inspections);
                         }
                     }
                     _ => panic!("Start must not Fence, Observe or StopFailed"),
@@ -3650,32 +3399,38 @@ mod tests {
             }
         });
 
-        let started = tasks
-            .handle(Request::Step {
-                task_id: task_id.clone(),
-                step: if original {
+        let started = h
+            .tasks
+            .handle(step_request(
+                &task_id,
+                if original {
                     Step::Rollback
                 } else {
                     Step::Start
                 },
-                attempt: if original { "target-attempt" } else { ATTEMPT }.into(),
-                node_session: if original { "target-session" } else { "next" }.into(),
-            })
+                if original { "target-attempt" } else { ATTEMPT },
+                if original { "target-session" } else { "next" },
+            ))
             .unwrap();
         assert_eq!(
             started.adxlet_execution.as_ref().unwrap().stage,
-            if original { "rollback_ready" } else { "exited" }
+            adxlet::Stage::Exited
         );
-        wait_worker(&tasks);
+        wait_worker(&h.tasks);
         assert_eq!(
-            load(&directory).unwrap().phase,
+            load(&h.directory).unwrap().phase,
             if original {
                 Phase::Failed
             } else {
                 Phase::Completed
             }
         );
-        let (starts, completes, spawn_receipts) = runtime.block_on(actor).unwrap();
+        let (starts, completes, spawn_receipts, inspections) = runtime.block_on(actor).unwrap();
+        assert!(queries.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        assert_eq!(
+            inspections, 1,
+            "verify the owned executable when ready, not every pending poll"
+        );
         assert_eq!(
             starts.len(),
             1,
@@ -3690,8 +3445,8 @@ mod tests {
         assert_eq!(payload["node_session"], "next");
         assert_eq!(payload["owner"]["local_task_id"], task_id);
         assert_eq!(payload["deadline_unix_millis"], deadline_unix_ms);
-        wait_worker(&tasks);
-        let loaded = load(&directory).unwrap();
+        wait_worker(&h.tasks);
+        let loaded = load(&h.directory).unwrap();
         assert_eq!(
             loaded.phase,
             if original {
@@ -3703,156 +3458,95 @@ mod tests {
         let execution = loaded.adxlet_execution.unwrap();
         assert_eq!(
             execution.stage,
-            if original {
-                "original_selected"
-            } else {
-                "completed"
-            }
+            adxlet::Stage::Selected { candidate_pid: pid }
         );
-        assert_eq!(execution.candidate_pid, Some(pid));
+        assert_eq!(execution.stage.candidate_pid(), Some(pid));
         assert_eq!(
             execution.deadline_unix_ms, deadline_unix_ms,
             "900s budget never refreshed"
         );
-        assert!(tasks.active.lock().unwrap().is_none());
+        assert!(h.tasks.active.lock().unwrap().is_none());
         assert!(!bootstrap.exists());
     }
 
     #[test]
     fn step_start_expired_commit_unknown_closes_by_receipt_only() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("start-commit");
-        private_directory(&directory).unwrap();
-        let mut task = prepared_task(
-            adxlet_submission("start-commit", &service_id),
-            Phase::Unknown,
-            1,
-        );
-        task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 4242,
-            candidate_pid: Some(77),
-            stage: "begin_intent".into(),
-            error: None,
-            attempt: "attempt".into(),
-            node_session: "next".into(),
-            deadline_unix_ms: 1,
-            rollback_from: None,
-        });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "start-commit".into(),
-            worker_finished: true,
-        });
-        let start = || Request::Step {
-            task_id: "start-commit".into(),
-            step: Step::Start,
-            attempt: "attempt".into(),
-            node_session: "next".into(),
-        };
+        let mut h = TestHarness::new("start-commit");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
+        let mut task = h.task(Phase::Unknown, 1);
+        task.adxlet_execution = Some(target_execution(adxlet::Stage::Exiting, 1));
+        h.install(&task);
+        let start = || step_request("start-commit", Step::Start, "attempt", "next");
         // Start never runs before a reaped Exit recorded the attempt.
-        let before = std::fs::read(directory.join("state.json")).unwrap();
-        assert_eq!(tasks.handle(start()).unwrap_err(), "conflict");
-        assert_eq!(std::fs::read(directory.join("state.json")).unwrap(), before);
+        let before = std::fs::read(h.directory.join("state.json")).unwrap();
+        assert_eq!(h.tasks.handle(start()).unwrap_err(), "conflict");
+        assert_eq!(
+            std::fs::read(h.directory.join("state.json")).unwrap(),
+            before
+        );
 
-        task.adxlet_execution.as_mut().unwrap().stage = "target_commit_unknown".into();
-        store(&directory, &task).unwrap();
+        task.adxlet_execution.as_mut().unwrap().stage =
+            adxlet::Stage::Committing { candidate_pid: 77 };
+        store(&h.directory, &task).unwrap();
         let actor = runtime.spawn(async move {
             let command = receiver.recv().await.unwrap();
             match command.operation {
-                relay::Operation::Adxlet(adxlet::Operation::Receipt { pid, attempt, .. }) => {
+                actor::Operation::Receipt { pid, attempt, .. } => {
                     assert_eq!((pid, attempt.as_str()), (Some(77), "attempt"));
-                    command.reply.send(Ok(relay::Reply::Committed)).ok();
+                    command.reply.send(Ok(actor::Reply::Committed)).ok();
                 }
                 _ => panic!("expired commit_unknown may only observe a Receipt"),
             }
         });
-        tasks.handle(start()).unwrap();
+        h.tasks.handle(start()).unwrap();
         runtime.block_on(actor).unwrap();
-        wait_worker(&tasks);
-        let loaded = load(&directory).unwrap();
+        wait_worker(&h.tasks);
+        let loaded = load(&h.directory).unwrap();
         assert_eq!(loaded.phase, Phase::Completed);
         let execution = loaded.adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "completed");
+        assert!(matches!(execution.stage, adxlet::Stage::Selected { .. }));
         assert_eq!(execution.deadline_unix_ms, 1);
     }
 
     #[test]
-    fn step_start_unpersisted_completed_falls_back_to_receipt_closure() {
-        unpersisted_selection_falls_back_to_receipt(false);
-    }
-
-    #[test]
-    fn step_original_selected_store_failure_closes_by_receipt_without_respawn() {
-        unpersisted_selection_falls_back_to_receipt(true);
+    fn both_legs_close_selection_store_failure_by_receipt_without_respawn() {
+        for original in [false, true] {
+            unpersisted_selection_falls_back_to_receipt(original);
+        }
     }
 
     fn unpersisted_selection_falls_back_to_receipt(original: bool) {
-        let commit_stage = if original {
-            "original_commit_unknown"
-        } else {
-            "target_commit_unknown"
-        };
-        let final_stage = if original {
-            "original_selected"
-        } else {
-            "completed"
-        };
+        let commit_stage = adxlet::Stage::Committing { candidate_pid: 77 };
+        let final_stage = adxlet::Stage::Selected { candidate_pid: 77 };
         let final_phase = if original {
             Phase::Failed
         } else {
             Phase::Completed
         };
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender.clone());
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("start-unstored");
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new("start-unstored");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
+        let sender = h.tasks.executor.as_ref().unwrap().clone();
         let deadline_unix_ms = adx_core::observation::now_millis().unwrap() + 60_000;
-        let mut task = prepared_task(
-            adxlet_submission("start-unstored", &service_id),
-            Phase::Unknown,
-            deadline_unix_ms,
-        );
+        let mut task = h.task(Phase::Unknown, deadline_unix_ms);
         task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 4242,
-            candidate_pid: Some(77),
-            stage: commit_stage.into(),
-            error: None,
-            attempt: "attempt".into(),
-            node_session: "next".into(),
-            deadline_unix_ms,
-            rollback_from: original.then(|| adxlet::AttemptIdentity {
-                attempt: "target-attempt".into(),
-                node_session: "target-session".into(),
-            }),
+            leg: if original {
+                adxlet::ProcessLeg::Rollback {
+                    from: adxlet::AttemptIdentity {
+                        attempt: "target-attempt".into(),
+                        node_session: "target-session".into(),
+                    },
+                }
+            } else {
+                adxlet::ProcessLeg::Target
+            },
+            ..target_execution(
+                adxlet::Stage::Committing { candidate_pid: 77 },
+                deadline_unix_ms,
+            )
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "start-unstored".into(),
-            worker_finished: true,
-        });
+        h.install(&task);
 
         // The actor commits (and clears its rollout reservation); afterwards
         // it only answers an observing Receipt for the same pid/attempt and
@@ -3861,27 +3555,30 @@ mod tests {
             let mut operations = Vec::new();
             while let Some(command) = receiver.recv().await {
                 let reply = match command.operation {
-                    relay::Operation::Adxlet(adxlet::Operation::Complete {
-                        pid, attempt, ..
-                    }) if operations.is_empty() => {
+                    actor::Operation::Commit {
+                        pid,
+                        attempt,
+                        stage: CommitStage::Select,
+                        ..
+                    } if operations.is_empty() => {
                         assert_eq!((pid, attempt.as_str()), (77, "attempt"));
-                        relay::Reply::Candidate { pid, exited: false }
+                        actor::Reply::Candidate { pid, exited: false }
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Receipt {
+                    actor::Operation::Receipt {
                         pid,
                         old_pid,
                         attempt,
                         ..
-                    }) => {
+                    } => {
                         assert_eq!(
                             (pid, old_pid, attempt.as_str()),
                             (Some(77), 4242, "attempt")
                         );
-                        relay::Reply::Committed
+                        actor::Reply::Committed
                     }
                     _ => panic!("selected target must never be re-started or stopped"),
                 };
-                let receipt = matches!(reply, relay::Reply::Committed);
+                let receipt = matches!(reply, actor::Reply::Committed);
                 operations.push(receipt);
                 command.reply.send(Ok(reply)).ok();
                 if receipt {
@@ -3892,9 +3589,9 @@ mod tests {
         });
 
         // The `completed` store fails (the rename may or may not be durable).
-        let unwritable = root.path().join("missing").join("start-unstored");
+        let unwritable = h.root.path().join("missing").join("start-unstored");
         let stopped = std::sync::atomic::AtomicBool::new(false);
-        let mut worker_task = load(&directory).unwrap();
+        let mut worker_task = load(&h.directory).unwrap();
         let result = runtime.block_on(adxlet::start(
             &mut worker_task,
             &unwritable,
@@ -3908,18 +3605,18 @@ mod tests {
         assert_eq!(execution.stage, commit_stage);
         assert_eq!(
             (
-                execution.candidate_pid,
+                execution.stage.candidate_pid(),
                 execution.old_pid,
                 execution.attempt.as_str()
             ),
             (Some(77), 4242, "attempt")
         );
         // Even an in-memory `completed` that never reached disk is demoted to
-        // the Receipt closure, never to a re-startable `start_unknown`.
+        // the Receipt closure, never to a re-startable `Starting`.
         let mut completed: Task =
             serde_json::from_value(serde_json::to_value(&worker_task).unwrap()).unwrap();
         completed.phase = final_phase;
-        completed.adxlet_execution.as_mut().unwrap().stage = final_stage.into();
+        completed.adxlet_execution.as_mut().unwrap().stage = final_stage;
         record_step_failure(&mut completed, Step::Start, "state store failed");
         assert_eq!(
             serde_json::to_value(&completed).unwrap(),
@@ -3927,62 +3624,49 @@ mod tests {
         );
 
         // The worker's final store then succeeds; Query closes it by Receipt.
-        store(&directory, &worker_task).unwrap();
-        let queried = tasks
+        store(&h.directory, &worker_task).unwrap();
+        let queried = h
+            .tasks
             .handle(Request::Query {
                 task_id: "start-unstored".into(),
             })
             .unwrap();
         assert_eq!(runtime.block_on(actor).unwrap(), vec![false, true]);
         assert_eq!(queried.phase, final_phase);
-        let loaded = load(&directory).unwrap();
+        let loaded = load(&h.directory).unwrap();
         assert_eq!(loaded.phase, final_phase);
         let execution = loaded.adxlet_execution.unwrap();
         assert_eq!(execution.stage, final_stage);
-        assert_eq!(execution.candidate_pid, Some(77));
-        assert!(tasks.active.lock().unwrap().is_none());
+        assert_eq!(execution.stage.candidate_pid(), Some(77));
+        assert!(h.tasks.active.lock().unwrap().is_none());
     }
 
     #[test]
     fn query_restores_finished_terminal_and_releases_only_after_durable_store() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let tasks = Tasks::new(&deployment).unwrap();
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("terminal-held");
-        private_directory(&directory).unwrap();
+        let h = TestHarness::new("terminal-held");
         // The worker durably wrote Completed, then its final finish/store
         // failed and it kept the finished reservation.
-        let mut task = prepared_task(
-            adxlet_submission("terminal-held", &service_id),
-            Phase::Completed,
-            1,
-        );
+        let mut task = h.task(Phase::Completed, 1);
         task.finished = None;
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "terminal-held".into(),
-            worker_finished: true,
-        });
+        h.install(&task);
         let query = || Request::Query {
             task_id: "terminal-held".into(),
         };
 
         // While the store keeps failing the reservation stays held.
-        std::fs::create_dir(directory.join("state.partial")).unwrap();
-        assert_eq!(tasks.handle(query()).unwrap_err(), "state_unavailable");
-        assert!(tasks.active.lock().unwrap().is_some());
-        assert!(load(&directory).unwrap().finished.is_none());
+        std::fs::create_dir(h.directory.join("state.partial")).unwrap();
+        assert_eq!(h.tasks.handle(query()).unwrap_err(), "state_unavailable");
+        assert!(h.tasks.active.lock().unwrap().is_some());
+        assert!(load(&h.directory).unwrap().finished.is_none());
 
-        std::fs::remove_dir(directory.join("state.partial")).unwrap();
-        let queried = tasks.handle(query()).unwrap();
+        std::fs::remove_dir(h.directory.join("state.partial")).unwrap();
+        let queried = h.tasks.handle(query()).unwrap();
         assert_eq!(queried.phase, Phase::Completed);
         assert!(queried.finished.is_some());
-        let loaded = load(&directory).unwrap();
+        let loaded = load(&h.directory).unwrap();
         assert_eq!(loaded.phase, Phase::Completed);
         assert!(loaded.finished.is_some());
-        assert!(tasks.active.lock().unwrap().is_none());
+        assert!(h.tasks.active.lock().unwrap().is_none());
     }
 
     struct BeginPendingStub {
@@ -4025,30 +3709,18 @@ mod tests {
         use adx_protocol::relay::adxlet_process_service_server::AdxletProcessServiceServer;
         use tonic::transport::Server;
 
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<relay::Command>(4);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join("exit-begin-deadline");
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new("exit-begin-deadline");
+        let runtime = test_runtime(2);
+        let mut receiver = h.executor(&runtime, 4);
 
         // The resume path reloads the original admin socket, which must point at
         // the local UDS stub served by this same process so peer-PID matching
         // passes against `old_pid == std::process::id()`.
-        let admin_socket = root.path().join("admin.sock");
+        let admin_socket = h.root.path().join("admin.sock");
         let mut process = test_process();
         process.admin_socket = Some(admin_socket.clone());
         std::fs::write(
-            directory.join("original-process.json"),
+            h.directory.join("original-process.json"),
             serde_json::to_vec(&process).unwrap(),
         )
         .unwrap();
@@ -4082,38 +3754,24 @@ mod tests {
             .unwrap()
             .as_millis() as u64
             + 1000;
-        let mut task = prepared_task(
-            adxlet_submission("exit-begin-deadline", &service_id),
-            Phase::Unknown,
-            deadline_unix_ms,
-        );
+        let mut task = h.task(Phase::Unknown, deadline_unix_ms);
         task.adxlet_execution = Some(adxlet::Execution {
             old_pid: std::process::id(),
-            candidate_pid: None,
-            stage: "begin_intent".into(),
-            error: None,
             attempt: String::new(),
             node_session: "old".into(),
-            deadline_unix_ms,
-            rollback_from: None,
+            ..target_execution(adxlet::Stage::Exiting, deadline_unix_ms)
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: "exit-begin-deadline".into(),
-            worker_finished: true,
-        });
+        h.install(&task);
 
         let actor = runtime.spawn(async move {
             loop {
                 let command = receiver.recv().await.unwrap();
                 match command.operation {
-                    relay::Operation::Adxlet(adxlet::Operation::Observe { .. })
-                    | relay::Operation::Adxlet(adxlet::Operation::Fence { .. }) => command
+                    actor::Operation::Observe { .. } | actor::Operation::Fence { .. } => command
                         .reply
-                        .send(Ok(relay::Reply::State {
+                        .send(Ok(actor::Reply::State {
                             exited: false,
                             success: false,
-                            candidate_pid: None,
                         }))
                         .ok(),
                     _ => panic!("unexpected exit worker command"),
@@ -4121,27 +3779,12 @@ mod tests {
             }
         });
 
-        let started = tasks
-            .handle(Request::Step {
-                task_id: "exit-begin-deadline".into(),
-                step: Step::Exit,
-                attempt: String::new(),
-                node_session: String::new(),
-            })
+        let started = h
+            .tasks
+            .handle(step_request("exit-begin-deadline", Step::Exit, "", ""))
             .unwrap();
         assert_eq!(started.phase, Phase::Unknown);
-        for _ in 0..500 {
-            if tasks
-                .active
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|reservation| reservation.worker_finished)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_worker(&h.tasks);
 
         // The worker had to actually connect and reach the Begin RPC before the
         // saved phase deadline ended the attempt.
@@ -4150,9 +3793,9 @@ mod tests {
             "Exit must reach the Begin RPC before the phase deadline"
         );
 
-        let loaded = load(&directory).unwrap();
+        let loaded = load(&h.directory).unwrap();
         let execution = loaded.adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "exit_unknown");
+        assert_eq!(execution.stage, adxlet::Stage::Exiting);
         assert!(
             execution.attempt.is_empty(),
             "no reap before the deadline, so no identity is minted"
@@ -4165,7 +3808,7 @@ mod tests {
         );
         assert_eq!(loaded.phase, Phase::Unknown);
         assert!(
-            tasks
+            h.tasks
                 .active
                 .lock()
                 .unwrap()
@@ -4190,22 +3833,14 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         Tasks,
-        tokio::sync::mpsc::Receiver<relay::Command>,
+        tokio::sync::mpsc::Receiver<actor::Command>,
     ) {
-        let root = tempfile::tempdir().unwrap();
-        let (mut deployment, service_id) = paired_adxlet();
-        deployment.state_dir = root.path().into();
-        let mut tasks = Tasks::new(&deployment).unwrap();
-        tasks.runtime = Some(runtime.handle().clone());
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        tasks.set_executor(sender);
-        private_directory(&tasks.directory).unwrap();
-        let directory = tasks.directory.join(task_id);
-        private_directory(&directory).unwrap();
+        let mut h = TestHarness::new(task_id);
+        let receiver = h.executor(runtime, 8);
         let original = b"fixed original executable";
-        std::fs::write(directory.join("original"), original).unwrap();
-        pin_snapshots(&directory, &root.path().join("original.sock"));
-        let mut submission = adxlet_submission(task_id, &service_id);
+        std::fs::write(h.directory.join("original"), original).unwrap();
+        pin_snapshots(&h.directory, &h.root.path().join("original.sock"));
+        let mut submission = adxlet_submission(task_id, &h.service_id);
         submission
             .process
             .as_mut()
@@ -4215,42 +3850,36 @@ mod tests {
         let deadline_unix_ms = adx_core::observation::now_millis().unwrap() + 900_000;
         let mut task = prepared_task(submission, Phase::Unknown, deadline_unix_ms);
         task.adxlet_execution = Some(adxlet::Execution {
-            old_pid: 4242,
-            candidate_pid: Some(77),
-            stage: "start_unknown".into(),
             error: Some("target failed".into()),
             attempt: "A".into(),
             node_session: "session-A".into(),
-            deadline_unix_ms,
-            rollback_from: None,
+            ..target_execution(
+                adxlet::Stage::Starting {
+                    candidate_pid: Some(77),
+                },
+                deadline_unix_ms,
+            )
         });
-        store(&directory, &task).unwrap();
-        *tasks.active.lock().unwrap() = Some(Reservation {
-            task_id: task_id.into(),
-            worker_finished: true,
-        });
-        (root, tasks, receiver)
+        h.install(&task);
+        (h.root, h.tasks, receiver)
     }
 
     #[test]
-    fn rollback_v2_external_start_rejects_original_b_without_effects() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
+    fn rollback_external_start_rejects_original_b_without_effects() {
+        let runtime = test_runtime(2);
         let (_root, tasks, mut receiver) = rollback_fixture("rollback-private-b", &runtime);
         let directory = tasks.directory.join("rollback-private-b");
         let mut task = load(&directory).unwrap();
         let execution = task.adxlet_execution.as_mut().unwrap();
-        execution.stage = "rollback_ready".into();
+        execution.stage = adxlet::Stage::Exited;
         execution.attempt = "B".into();
         execution.node_session = "session-B".into();
-        execution.candidate_pid = None;
-        execution.rollback_from = Some(adxlet::AttemptIdentity {
-            attempt: "A".into(),
-            node_session: "session-A".into(),
-        });
+        execution.leg = adxlet::ProcessLeg::Rollback {
+            from: adxlet::AttemptIdentity {
+                attempt: "A".into(),
+                node_session: "session-A".into(),
+            },
+        };
         store(&directory, &task).unwrap();
         let before = std::fs::read(directory.join("state.json")).unwrap();
         let result = tasks.step("rollback-private-b", Step::Start, "B", "session-B");
@@ -4264,11 +3893,7 @@ mod tests {
 
     #[test]
     fn rollback_waits_for_reap_then_starts_original_and_replays_same_b() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = test_runtime(2);
         let (_root, tasks, mut receiver) = rollback_fixture("rollback-replay", &runtime);
         let directory = tasks.directory.join("rollback-replay");
         let actor_directory = directory.clone();
@@ -4284,47 +3909,48 @@ mod tests {
                 let command = receiver.recv().await.unwrap();
                 let execution = load(&actor_directory).unwrap().adxlet_execution.unwrap();
                 let reply = match command.operation {
-                    relay::Operation::Adxlet(adxlet::Operation::StopFailed {
+                    actor::Operation::StopFailed {
                         pid,
                         old_pid,
                         attempt,
                         ..
-                    }) => {
+                    } => {
                         assert_eq!((pid, old_pid, attempt.as_str()), (Some(77), 4242, "A"));
                         stops += 1;
-                        assert_eq!(execution.stage, "rollback_intent");
+                        assert!(matches!(
+                            execution.stage,
+                            adxlet::Stage::StoppingForRollback { .. }
+                        ));
                         assert!(execution.deadline_unix_ms >= before + 599_000);
                         assert!(execution.deadline_unix_ms <= before + 601_000);
                         saved_deadline = Some(execution.deadline_unix_ms);
-                        relay::Reply::Candidate {
+                        actor::Reply::Candidate {
                             pid: 77,
                             exited: false,
                         }
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Receipt {
-                        attempt, pid, ..
-                    }) if attempt == "A" => {
+                    actor::Operation::Receipt { attempt, pid, .. } if attempt == "A" => {
                         assert_eq!(pid, Some(77));
                         observations += 1;
                         assert_eq!(execution.attempt, "A", "B requires a confirmed reap");
-                        assert!(execution.rollback_from.is_none());
+                        assert!(execution.leg.source().is_none());
                         if let Some(deadline) = saved_deadline {
                             assert_eq!(execution.deadline_unix_ms, deadline);
                         }
                         reaped = stops == 1 && observations >= 3;
-                        relay::Reply::Candidate {
+                        actor::Reply::Candidate {
                             pid: 77,
                             exited: reaped,
                         }
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Start {
+                    actor::Operation::Start {
                         binary,
-                        mut executable,
                         config,
                         attempt,
                         pid,
+                        launch: Launch::Adxlet { mut executable, .. },
                         ..
-                    }) => {
+                    } => {
                         use std::io::{Read, Seek};
                         assert!(reaped, "Start(B) must wait for real A reap");
                         starts += 1;
@@ -4338,7 +3964,7 @@ mod tests {
                         assert_eq!(config.role, Role::Adxlet);
                         assert_eq!(attempt, execution.attempt);
                         assert_ne!(attempt, "A");
-                        assert_eq!(execution.rollback_from.as_ref().unwrap().attempt, "A");
+                        assert_eq!(execution.leg.source().unwrap().attempt, "A");
                         assert_eq!(execution.deadline_unix_ms, saved_deadline.unwrap());
                         saved_b = Some(attempt);
                         started_tx.send(()).unwrap();
@@ -4346,21 +3972,19 @@ mod tests {
                         release_rx
                             .recv_timeout(std::time::Duration::from_secs(5))
                             .unwrap();
-                        relay::Reply::Candidate {
+                        actor::Reply::Candidate {
                             pid: 88,
                             exited: false,
                         }
                     }
-                    relay::Operation::Adxlet(adxlet::Operation::Receipt {
-                        attempt, pid, ..
-                    }) => {
+                    actor::Operation::Receipt { attempt, pid, .. } => {
                         assert_eq!(Some(&attempt), saved_b.as_ref());
                         assert_eq!(execution.attempt, attempt);
                         assert_eq!(execution.deadline_unix_ms, saved_deadline.unwrap());
                         b_receipts += 1;
                         assert_eq!(pid, if b_receipts == 2 { None } else { Some(88) });
                         // The second worker observes the same owned Child; no Start.
-                        relay::Reply::Candidate {
+                        actor::Reply::Candidate {
                             pid: 88,
                             exited: true,
                         }
@@ -4374,19 +3998,14 @@ mod tests {
                 }
             }
         });
-        let request = || Request::Step {
-            task_id: "rollback-replay".into(),
-            step: Step::Rollback,
-            attempt: "A".into(),
-            node_session: "session-A".into(),
-        };
+        let request = || step_request("rollback-replay", Step::Rollback, "A", "session-A");
         tasks.handle(request()).unwrap();
         started_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let live = std::fs::read(directory.join("state.json")).unwrap();
         let replay = tasks.handle(request()).unwrap();
-        assert_eq!(replay.adxlet_execution.unwrap().candidate_pid, None);
+        assert_eq!(replay.adxlet_execution.unwrap().stage.candidate_pid(), None);
         assert_eq!(std::fs::read(directory.join("state.json")).unwrap(), live);
         assert!(
             !tasks
@@ -4401,20 +4020,17 @@ mod tests {
         wait_worker(&tasks);
         let first = load(&directory).unwrap();
         let execution = first.adxlet_execution.as_ref().unwrap();
-        assert_eq!(execution.stage, "original_start_unknown");
-        assert_eq!(execution.candidate_pid, Some(88));
-        assert_eq!(
-            execution.rollback_from.as_ref().unwrap().node_session,
-            "session-A"
-        );
+        assert!(matches!(execution.stage, adxlet::Stage::Starting { .. }));
+        assert_eq!(execution.stage.candidate_pid(), Some(88));
+        assert_eq!(execution.leg.source().unwrap().node_session, "session-A");
         assert_eq!(
             tasks
-                .handle(Request::Step {
-                    task_id: "rollback-replay".into(),
-                    step: Step::Start,
-                    attempt: "A".into(),
-                    node_session: "session-A".into(),
-                })
+                .handle(step_request(
+                    "rollback-replay",
+                    Step::Start,
+                    "A",
+                    "session-A"
+                ))
                 .unwrap_err(),
             "conflict"
         );
@@ -4426,92 +4042,163 @@ mod tests {
         assert_eq!(restored.attempt, b);
         assert_eq!(restored.node_session, execution.node_session);
         assert_eq!(restored.deadline_unix_ms, deadline);
-        assert_eq!(restored.rollback_from, execution.rollback_from);
-        assert_eq!(restored.stage, "original_start_unknown");
+        assert_eq!(restored.leg, execution.leg);
+        assert!(matches!(restored.stage, adxlet::Stage::Starting { .. }));
     }
 
     #[test]
     fn rollback_committed_target_closes_success_without_stopping_or_minting() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = test_runtime(1);
         let (_root, tasks, mut receiver) = rollback_fixture("rollback-committed", &runtime);
         let directory = tasks.directory.join("rollback-committed");
         let mut task = load(&directory).unwrap();
-        task.adxlet_execution.as_mut().unwrap().stage = "target_commit_unknown".into();
+        task.adxlet_execution.as_mut().unwrap().stage =
+            adxlet::Stage::Committing { candidate_pid: 77 };
+        task.adxlet_execution.as_mut().unwrap().deadline_unix_ms = 1;
         let deadline = task.adxlet_execution.as_ref().unwrap().deadline_unix_ms;
         store(&directory, &task).unwrap();
         let actor = runtime.spawn(async move {
             let command = receiver.recv().await.unwrap();
             assert!(matches!(
                 command.operation,
-                relay::Operation::Adxlet(adxlet::Operation::Receipt { pid: Some(77), .. })
+                actor::Operation::Receipt { pid: Some(77), .. }
             ));
-            command.reply.send(Ok(relay::Reply::Committed)).ok();
+            command.reply.send(Ok(actor::Reply::Committed)).ok();
         });
         tasks
-            .handle(Request::Step {
-                task_id: "rollback-committed".into(),
-                step: Step::Rollback,
-                attempt: "A".into(),
-                node_session: "session-A".into(),
-            })
+            .handle(step_request(
+                "rollback-committed",
+                Step::Rollback,
+                "A",
+                "session-A",
+            ))
             .unwrap();
         runtime.block_on(actor).unwrap();
         wait_worker(&tasks);
         let task = load(&directory).unwrap();
         assert_eq!(task.phase, Phase::Completed);
         let execution = task.adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "completed");
+        assert!(matches!(execution.stage, adxlet::Stage::Selected { .. }));
         assert_eq!(execution.attempt, "A");
-        assert!(execution.rollback_from.is_none());
+        assert!(execution.leg.source().is_none());
         assert_eq!(execution.deadline_unix_ms, deadline);
     }
 
     #[test]
     fn rollback_unknown_receipt_keeps_candidate_and_never_assumes_not_created() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let (_root, tasks, mut receiver) = rollback_fixture("rollback-unknown", &runtime);
+        let runtime = test_runtime(1);
+        for committing in [false, true] {
+            let (_root, tasks, mut receiver) = rollback_fixture("rollback-unknown", &runtime);
+            if committing {
+                let directory = tasks.directory.join("rollback-unknown");
+                let mut task = load(&directory).unwrap();
+                let execution = task.adxlet_execution.as_mut().unwrap();
+                execution.stage = adxlet::Stage::Committing { candidate_pid: 77 };
+                execution.deadline_unix_ms = 1;
+                store(&directory, &task).unwrap();
+            }
+            let actor = runtime.spawn(async move {
+                let command = receiver.recv().await.unwrap();
+                assert!(matches!(
+                    command.operation,
+                    actor::Operation::Receipt { pid: Some(77), .. }
+                ));
+                command.reply.send(Err("receipt unavailable".into())).ok();
+            });
+            tasks
+                .handle(step_request(
+                    "rollback-unknown",
+                    Step::Rollback,
+                    "A",
+                    "session-A",
+                ))
+                .unwrap();
+            runtime.block_on(actor).unwrap();
+            wait_worker(&tasks);
+            let task = load(&tasks.directory.join("rollback-unknown")).unwrap();
+            assert_eq!(task.phase, Phase::Unknown);
+            let execution = task.adxlet_execution.unwrap();
+            assert_eq!(execution.attempt, "A");
+            assert_eq!(execution.stage.candidate_pid(), Some(77));
+            assert!(execution.leg.source().is_none());
+            assert!(tasks.active.lock().unwrap().is_some());
+            if committing {
+                assert_eq!(
+                    execution.stage,
+                    adxlet::Stage::Committing { candidate_pid: 77 }
+                );
+                assert_eq!(execution.deadline_unix_ms, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_freezes_budget_before_unavailable_receipt_and_never_refreshes_it() {
+        let runtime = test_runtime(1);
+        let (_root, tasks, mut receiver) = rollback_fixture("rollback-budget", &runtime);
+        let directory = tasks.directory.join("rollback-budget");
         let actor = runtime.spawn(async move {
-            let command = receiver.recv().await.unwrap();
-            assert!(matches!(
-                command.operation,
-                relay::Operation::Adxlet(adxlet::Operation::Receipt { pid: Some(77), .. })
-            ));
-            command.reply.send(Err("receipt unavailable".into())).ok();
+            for index in 0..3 {
+                let Some(command) = receiver.recv().await else {
+                    return;
+                };
+                assert!(matches!(
+                    command.operation,
+                    actor::Operation::Receipt { pid: Some(77), .. }
+                ));
+                let reply = if index < 2 {
+                    Err("receipt unavailable".into())
+                } else {
+                    Ok(actor::Reply::Candidate {
+                        pid: 77,
+                        exited: false,
+                    })
+                };
+                command.reply.send(reply).ok();
+            }
         });
-        tasks
-            .handle(Request::Step {
-                task_id: "rollback-unknown".into(),
-                step: Step::Rollback,
-                attempt: "A".into(),
-                node_session: "session-A".into(),
-            })
-            .unwrap();
+        let advance = || {
+            tasks
+                .handle(step_request(
+                    "rollback-budget",
+                    Step::Rollback,
+                    "A",
+                    "session-A",
+                ))
+                .unwrap();
+            wait_worker(&tasks);
+            load(&directory).unwrap().adxlet_execution.unwrap()
+        };
+        let before = adx_core::observation::now_millis().unwrap();
+        let first = advance();
+        assert_eq!(
+            first.stage,
+            adxlet::Stage::StoppingForRollback {
+                candidate_pid: Some(77)
+            }
+        );
+        assert!((before + 599_000..=before + 601_000).contains(&first.deadline_unix_ms));
+        assert_eq!(advance().deadline_unix_ms, first.deadline_unix_ms);
+        let mut expired = load(&directory).unwrap();
+        expired.adxlet_execution.as_mut().unwrap().deadline_unix_ms = 1;
+        store(&directory, &expired).unwrap();
+        let expired = advance();
         runtime.block_on(actor).unwrap();
-        wait_worker(&tasks);
-        let task = load(&tasks.directory.join("rollback-unknown")).unwrap();
-        assert_eq!(task.phase, Phase::Unknown);
-        let execution = task.adxlet_execution.unwrap();
-        assert_eq!(execution.attempt, "A");
-        assert_eq!(execution.candidate_pid, Some(77));
-        assert!(execution.rollback_from.is_none());
+        assert_eq!(expired.deadline_unix_ms, 1);
+        assert_eq!(
+            expired.stage,
+            adxlet::Stage::StoppingForRollback {
+                candidate_pid: Some(77)
+            }
+        );
+        assert_eq!(expired.attempt, "A");
+        assert_eq!(expired.leg, adxlet::ProcessLeg::Target);
         assert!(tasks.active.lock().unwrap().is_some());
     }
 
     #[test]
     fn rollback_mint_store_failure_preserves_and_resaves_same_b() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = test_runtime(1);
         let (_root, tasks, mut receiver) = rollback_fixture("rollback-store", &runtime);
         let directory = tasks.directory.join("rollback-store");
         let actor_directory = directory.clone();
@@ -4519,11 +4206,11 @@ mod tests {
             let receipt = receiver.recv().await.unwrap();
             assert!(matches!(
                 receipt.operation,
-                relay::Operation::Adxlet(adxlet::Operation::Receipt { .. })
+                actor::Operation::Receipt { .. }
             ));
             receipt
                 .reply
-                .send(Ok(relay::Reply::Candidate {
+                .send(Ok(actor::Reply::Candidate {
                     pid: 77,
                     exited: true,
                 }))
@@ -4531,13 +4218,13 @@ mod tests {
             let stop = receiver.recv().await.unwrap();
             assert!(matches!(
                 stop.operation,
-                relay::Operation::Adxlet(adxlet::Operation::StopFailed { pid: Some(77), .. })
+                actor::Operation::StopFailed { pid: Some(77), .. }
             ));
             // Make the B store fail after closure/reap, retaining its in-memory
             // identity just as an ambiguous rename/fsync failure must.
             std::fs::create_dir(actor_directory.join("state.partial")).unwrap();
             stop.reply
-                .send(Ok(relay::Reply::Candidate {
+                .send(Ok(actor::Reply::Candidate {
                     pid: 77,
                     exited: true,
                 }))
@@ -4556,8 +4243,8 @@ mod tests {
             task.adxlet_execution
                 .as_ref()
                 .unwrap()
-                .rollback_from
-                .as_ref()
+                .leg
+                .source()
                 .unwrap()
                 .attempt,
             "A"
@@ -4565,7 +4252,9 @@ mod tests {
         record_step_failure(&mut task, Step::Rollback, "B store unavailable");
         assert_eq!(
             task.adxlet_execution.as_ref().unwrap().stage,
-            "original_start_unknown"
+            adxlet::Stage::Starting {
+                candidate_pid: None
+            }
         );
         std::fs::remove_dir(directory.join("state.partial")).unwrap();
         stopped.store(true, std::sync::atomic::Ordering::Release);
@@ -4586,12 +4275,12 @@ mod tests {
             .stopped
             .store(true, std::sync::atomic::Ordering::Release);
         let replay = tasks
-            .handle(Request::Step {
-                task_id: "rollback-store".into(),
-                step: Step::Rollback,
-                attempt: "A".into(),
-                node_session: "session-A".into(),
-            })
+            .handle(step_request(
+                "rollback-store",
+                Step::Rollback,
+                "A",
+                "session-A",
+            ))
             .unwrap();
         assert_eq!(replay.adxlet_execution.unwrap().attempt, minted);
         wait_worker(&tasks);
@@ -4602,17 +4291,15 @@ mod tests {
 
     #[test]
     fn rollback_replay_keeps_saved_deadline_before_stop_and_after_mint() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = test_runtime(1);
         let (_root, tasks, mut receiver) = rollback_fixture("rollback-deadline", &runtime);
         let directory = tasks.directory.join("rollback-deadline");
         let mut task = load(&directory).unwrap();
         let deadline = adx_core::observation::now_millis().unwrap() + 30_000;
         let execution = task.adxlet_execution.as_mut().unwrap();
-        execution.stage = "rollback_unknown".into();
+        execution.stage = adxlet::Stage::StoppingForRollback {
+            candidate_pid: execution.stage.candidate_pid(),
+        };
         execution.deadline_unix_ms = deadline;
         store(&directory, &task).unwrap();
         let actor_directory = directory.clone();
@@ -4620,7 +4307,7 @@ mod tests {
             let receipt = receiver.recv().await.unwrap();
             receipt
                 .reply
-                .send(Ok(relay::Reply::Candidate {
+                .send(Ok(actor::Reply::Candidate {
                     pid: 77,
                     exited: true,
                 }))
@@ -4628,7 +4315,7 @@ mod tests {
             let stop = receiver.recv().await.unwrap();
             assert!(matches!(
                 stop.operation,
-                relay::Operation::Adxlet(adxlet::Operation::StopFailed { .. })
+                actor::Operation::StopFailed { .. }
             ));
             assert_eq!(
                 load(&actor_directory)
@@ -4644,16 +4331,13 @@ mod tests {
                     <= std::time::Duration::from_secs(30)
             );
             stop.reply
-                .send(Ok(relay::Reply::Candidate {
+                .send(Ok(actor::Reply::Candidate {
                     pid: 77,
                     exited: true,
                 }))
                 .ok();
             let start = receiver.recv().await.unwrap();
-            assert!(matches!(
-                start.operation,
-                relay::Operation::Adxlet(adxlet::Operation::Start { .. })
-            ));
+            assert!(matches!(start.operation, actor::Operation::Start { .. }));
             assert_eq!(
                 load(&actor_directory)
                     .unwrap()
@@ -4662,20 +4346,20 @@ mod tests {
                     .deadline_unix_ms,
                 deadline
             );
-            start.reply.send(Ok(relay::Reply::NeverCreated)).ok();
+            start.reply.send(Ok(actor::Reply::NeverCreated)).ok();
         });
         tasks
-            .handle(Request::Step {
-                task_id: "rollback-deadline".into(),
-                step: Step::Rollback,
-                attempt: "A".into(),
-                node_session: "session-A".into(),
-            })
+            .handle(step_request(
+                "rollback-deadline",
+                Step::Rollback,
+                "A",
+                "session-A",
+            ))
             .unwrap();
         runtime.block_on(actor).unwrap();
         wait_worker(&tasks);
         let execution = load(&directory).unwrap().adxlet_execution.unwrap();
-        assert_eq!(execution.stage, "original_start_unknown");
+        assert!(matches!(execution.stage, adxlet::Stage::Starting { .. }));
         assert_eq!(execution.deadline_unix_ms, deadline);
     }
 }

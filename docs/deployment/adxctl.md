@@ -1,6 +1,6 @@
 # `adxctl` 部署指南
 
-Pod/process 发布、ConfigMap 输入 CAS/abort 恢复及显式 ready 提升的命令与恢复合同统一见 [Rollout Publisher](../../build/release/NODE-ROLLOUT.md)。两个 apply 入口以 `--batch-index`、`--promote-ready` 二选一，后者只能独立操作已完成发布的原 plan/journal，不自动推进批次。
+Pod/process 发布命令与恢复合同见 [Rollout Publisher](../../build/release/NODE-ROLLOUT.md)。每次 apply 用 `--batch-index` 推进明确的一批；配置输入由 IaC 或运维准备。
 
 当前发布包默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay；同时提供 `adx-ingress` 和 `adx-relay`，供显式分进程部署。调试用 `adx-data-plane-forward` 不随包发布。
 
@@ -33,15 +33,11 @@ Execd 主动控制连接是节点服务的可选配置，见[运行时控制流�
 
 ## 命令
 
-Adxlet 和 Relay 将已确认的配置解析或纯语义校验失败标记为退出码 `78`（共享 `CONFIGURATION_EXIT_CODE`）。使用 ConfigMap版本声明初始化时，观察到本组实际 owned Child 以该状态退出后，以 Preserve 停止完整 ADX 组并等待真实 reap，然后返回配置失败；target 配置错误不尝试 ready，ready 配置错误也不再回退。普通运行初始化失败仍可按下述合同尝试一次完整 ready 组。配置文件读取 IO、权限、TLS/key 文件、目录 IO、端口绑定、网络和 OS 资源不可用不按配置错误猜测；未观察到退出或仅 proof 不可达也不能认定为 78。Relay FD 预算资源不足与 OS syscall 错误仍为运行失败，仅明确的环境解析错误归入配置错误。主动进程升级的失败恢复保持原 Process 合同，不因候选退出 78 而跳过恢复。
+部署 YAML 可通过可选绝对路径 `external_declaration: /mounted/target.yaml` 读取 schema 1 版本声明。supervisor 在任何 Child spawn 前，用固定 900 秒准备声明、制品和私有配置；成功后直接进入普通进程启动与自动重启，重启复用已准备的 Process。声明、摘要、下载或渲染失败直接返回错误。
 
-ConfigMap版本声明提供 `target.yaml`、制品 URL + SHA 及配套配置，通过部署 YAML 的可选绝对挂载路径 `external_declaration: /mounted/target.yaml` 读取。部署模式仍为 embedded 或 standalone，`external_declaration` 只是声明输入路径，不是新增部署模式。未设置时保留原 image 启动入口，不下载声明制品。显式配置时，supervisor 在锁、基线渲染和可执行文件预检后、任何 Child spawn 前，准备 schema 1 YAML 声明中的 target/ready 两个完整节点组；声明、摘要、下载或渲染失败直接返回错误，不回退 image 或 ready。
+声明的 `components` 必须包含 `adxlet`、`relay`，每项包含 40 位小写十六进制 `version`、`artifact: {url, sha256}` 和 `config: {mount_path}`。制品 SHA 认证整个包，目标二进制 SHA 从认证 manifest 派生。声明与每份配置均限 4 MiB，通过固定 FD 读取 regular file。配置是按路径读取并固定为本轮私有快照的 `ServiceOverride` JSON；Relay 只接受 env，`ADX_POD_UID`、`ADX_SUPERVISOR_*` 及受保护的节点和控制面边界保持部署基线。
 
-声明的 `components` 与 `ready.components` 均要求 `adxlet`、`relay`；每个组件包含 `version`（40 位小写十六进制 commit）、`release_id`、`artifact: {url, sha256}` 与 `config: {mount_path, sha256}`。制品 SHA 认证整个包，实际运行二进制 SHA 由本机 adxctl准备时从已认证的 manifest 派生，不需要用户手抄。声明与每份配置均限 4 MiB，显式投射路径打开后通过固定 FD 读取并检查 regular file。配置文件是 SHA 认证的原始 `ServiceOverride` JSON，Relay 仅接受 env payload；`ADX_POD_UID` 和 `ADX_SUPERVISOR_*` 不允许声明注入。embedded 两个角色必须选择同一版本、标签及完整包，只准备运行 Adxlet，并合入不冲突的 Relay env；两个角色的实际 binary SHA 均是 owned Adxlet SHA。standalone 准备两个实际 Process。配置输入摘要与渲染后的有效配置/env 摘要分别记录，运行目录和受保护的节点、控制面边界保持部署基线。两个组共享首次准备起算的 900 秒期限，复用 schema 1 完整包验证与固定二进制安全复制。
-
-启动先尝试完整 target 组，自首次 spawn 前固定 300 秒。后台 proof 通过 supervisor 的 owned Child 观察、NodeAdmin 普通注册 ACK/catalog/ready 及实际 executable SHA 确认整组；单次观察总界限为 5 秒。初始化 pending 期间仍处理 status、Query、runtime 观察和停止，但禁止主动 rollout 与 ADX 自动重启。明确 spawn/Child 退出失败或期限届满后，仅向 owned ADX Child 发送 Preserve 停止信号并按固定停止期限升级；只有真实 reap 完整组后才尝试一次完整 ready 组，使用独立固定 300 秒期限，不混搭角色或回到 target。未确认停止不会启动下一组。成功后冻结所选 Process，普通 restart 不重读投射配置；node-info 的 `external_startup.selection` 区分 `target` 与 `ready_fallback` 并保留组件摘要事实。
-
-以下是 ConfigMap版本声明中可解析的 embedded `target.yaml` 形状。示例 URL、摘要、commit 和挂载路径须替换为实际发布事实；配套 config 文件的内容仍是 `ServiceOverride` JSON，不是 YAML。每个组内两个角色选择同一个完整包，target 与 ready 可以选择不同包。
+embedded 两个角色选择同一版本和完整包，只准备 Adxlet，并合入不冲突的 Relay env；standalone 准备两个实际 Process。以下示例的 URL、摘要、commit 和挂载路径须替换为实际发布值：
 
 ```yaml
 schema: 1
@@ -49,49 +45,21 @@ mode: embedded
 components:
   adxlet:
     version: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    release_id: "release-target"
     artifact:
       url: "https://releases.example.invalid/target.tar.gz"
       sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     config:
       mount_path: /mounted/target-adxlet.json
-      sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   relay:
     version: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    release_id: "release-target"
     artifact:
       url: "https://releases.example.invalid/target.tar.gz"
       sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     config:
       mount_path: /mounted/target-relay.json
-      sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-ready:
-  components:
-    adxlet:
-      version: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-      release_id: "release-ready"
-      artifact:
-        url: "https://releases.example.invalid/ready.tar.gz"
-        sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      config:
-        mount_path: /mounted/ready-adxlet.json
-        sha256: "1111111111111111111111111111111111111111111111111111111111111111"
-    relay:
-      version: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-      release_id: "release-ready"
-      artifact:
-        url: "https://releases.example.invalid/ready.tar.gz"
-        sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      config:
-        mount_path: /mounted/ready-relay.json
-        sha256: "2222222222222222222222222222222222222222222222222222222222222222"
 ```
 
-`effective_config_sha256` 表示渲染后的版本有效配置和 env，不包含随后注入的瞬态 `ADX_SUPERVISOR_*` 父控制键，也不是全部 OS 环境的摘要。`external_startup` 仅记录初始启动选择事实，不是持续的 current binary/config 证明。
-
-NodeInfo 组件独立的可选 `sources` 按 Role 公示已启动 owned Process 的认证来源，不从当前 ConfigMap版本声明或 `external_startup` 推断。每项仅有可独立 unknown 的 `version`（已认证 manifest commit）、`archive_sha256`（下载并校验的整个包）和 `raw_config_sha256`（固定 FD 读取并校验的 ServiceOverride 原始 bytes）。成功观察的初始镜像 sources 为空 map，观察失败为 null；embedded 唯一 Adxlet Process 保留两个角色各自的配置来源，不构造 Relay Child 或未执行的 Relay binary SHA。binary-only 更新保留 actual 配置来源并替换 binary 来源，local 制品不沿用旧 archive 摘要。来源来自同一次 owned FD/PID/config/NodeAdmin ready proof，recheck 发现来源变化同样返回 unknown，不增加 RPC 或 ExpectedRuntime/Submission 字段。来源 unknown 不抹掉 actual runtime、不禁止升级，但不能作为完整 ready promotion 的证明。
-
-当前仅支持上述窄 schema；`format`、`ref`、`binary_path`、`size` 等未使用字段不接受。
+NodeInfo 组件的可选 `sources` 按角色记录实际 Process 的认证来源：manifest `version`、整包 `archive_sha256` 和原始配置 `raw_config_sha256`，各项可独立 unknown。路径配置输入不要求预设摘要，新的 `raw_config_sha256` 来源记录为 unknown；实际生效配置仍由内部 `configuration_sha256` 核对。embedded 在同一 Adxlet Process 上保留两个角色的配置来源；binary-only 更新保留实际配置来源，本地制品不沿用旧 archive 摘要。来源与 runtime 共用实际 owned Process 的观察和复核。
 
 ```sh
 # 首次生成默认单机配置：全角色＋adxctl 托管的本地 Redis
@@ -149,48 +117,17 @@ adxctl -c /srv/adx/node.yaml validate
 
 ### 本机进程升级
 
-standalone 单组件升级可提供成对 `--component-config-path` / `--component-config-sha256`，指向 ConfigMap版本声明配套的 `ServiceOverride` JSON。不提供时保留当前实际配置；提供时以 supervisor 启动时固定的部署基线加该覆盖生成私有快照，不继承上个版本未声明的业务调参。输入读取、摘要或保护边界校验失败发生在退出前，不退回旧配置继续升级。另一组件不因此重启。
+standalone 单组件升级可提供 `--component-config-path`，指向已挂载的 `ServiceOverride` JSON。不提供时保留当前实际配置；提供时以 supervisor 启动时固定的部署基线加该覆盖生成私有快照，不继承上个版本未声明的业务调参。输入读取、解析或保护边界校验失败发生在退出前，不退回旧配置继续升级。另一组件不因此重启。
 
 实际运行证据的 `configuration_sha256` 与准备结果中的同名字段表示排序规范化后的渲染 JSON 和显式 env，不是全部 OS 继承环境摘要；父控制键及父进程改写的 Relay route socket 不参与版本摘要。候选验收同时比对二进制与配置摘要，失败恢复使用原实际完整配置。
 
-远端制品首版源码为 `adxctl rollout submit` 和 `node_rollout.py plan-process`
-增加成对 `--archive-url` / `--archive-sha256`。未指定时仍使用已安装 releases；
-指定时每节点 Submission 增加 `{url, archive_sha256}`，角色二进制 `--sha256` 可省略，
-由本机 adxctl准备时从整包 SHA 认证且完整校验的 manifest 派生；显式提供时仍严格比对。
-镜像自带版本的已安装 releases 路径无 archive 时仍要求角色 SHA。发布脚本不下载包，
-只发送指令并维护发布流程。原 Submission 不回填派生值，Query/同 task 重放精确比较完整来源；
-准备结果以 `task.prepared.binary_sha256` 在首次退出或封存前持久化，缺失或无效时不得推进或验收目标成功。
-只接受无用户信息/fragment 的 HTTPS，
-不跟随 redirect，不读取 proxy 环境，不附加认证。下载、最多三次请求和退避、双遍解压、
-全文件 SHA 与原复制共同使用原 900 秒准备期限及 stopped；准备失败不退出 old Child。
-HTTP connect 10 秒、无数据读取 30 秒；仅 transport/429/500/502/503/504 可重试。
-可重试 HTTP 回复保留 Retry-After，支持 delta-seconds 和标准 HTTP-date；过去日期可零等待，
-无效/缺失使用原 1/2 秒退避。有效等待超过本 task 剩余期限（含极大数字溢出）直接准备失败，
-不提前重试或刷新期限，等待仍可 stop 取消。IO/大小/SHA/取消为终止错误，保留底层 IO/transport 原因。
-Python planning 在 maintenance 前拒 host 禁止字符、控制字符和无效 percent escape，
-仍接受标准 DNS、IPv4、带方括号 IPv6 和合法 archive 路径。
-task 私有 archive/unpacked 排他创建，不翻 current、不全局安装、不共享 cache。
-压缩上限 512 MiB，实际展开（含 header/padding）2 GiB，最多 10000 headers。
-沿 schema1 manifest（4 MiB、files JSON 键唯一、全 regular file exact set/SHA），
-允许 builder extra 字段；双遍标准 tar 支持真实 `./` 和不超过 4096 字节 GNU L 长名，
-不支持 PAX/GNU longlink/sparse/link/device，拒路径穿越/重复/冲突与非零目录 payload。
-必须完整双 zero tar 尾、gzip CRC/ISIZE、单 member 且无压缩尾垃圾，不执行包内脚本。
-全文件校验使用迭代相对路径队列、常数目录 FD 和单份 hash buffer，不递归目录树；
-从固定 package DirFD 逐 component NOFOLLOW 重开，每 component/file chunk 检查原期限和 stop。
-深/宽目录与小私有 decoded cap 边界均有测试源码，生产两个 pass 仍固定 2 GiB。
+`adxctl rollout submit` 和 `node_rollout.py plan-process` 支持成对 `--archive-url` / `--archive-sha256`。远端包可省略角色 `--sha256`，由本机从 manifest 派生；显式提供时严格比对。未指定 archive 时使用预装 releases，仍须角色 SHA。manifest 必须匹配 commit、Linux host target 和目标 `bin/{role}` 摘要。原 Submission 保持完整来源，Query/同 task 重放精确比较；准备结果以 `task.prepared.binary_sha256` 在首次退出或封存前持久化，验收目标时核对该事实。
 
-`adxctl rollout node-info --declaration-path /mounted/target.yaml` 只读观察
-ConfigMap版本声明；省略参数时使用部署的 `external_declaration`，两者都未设置时
-响应的 `external_declaration` 为 null。该参数不启用声明初始化、不改变启动选版，
-也不 watch 或自动提交升级。声明仍须包含完整 target/ready 双角色，新增可选
-`upgrade_components` 默认为空，最多一个 `adxlet` 或 `relay`；embedded 必须为空。
+制品 URL 只接受无用户信息、fragment 或非法转义的 HTTPS；下载不跟随 redirect、不读取 proxy 环境。最多三次请求与退避、解压和目标复制共用固定 900 秒准备期限及 stop 取消。HTTP connect 为 10 秒、无数据读取为 30 秒；仅 transport、429、500、502、503、504 可重试。`Retry-After` 仅识别数字秒，其他格式或缺失使用 1/2 秒退避；等待超过剩余期限或数字溢出直接失败。
 
-只读观察使用一个固定 FD、4 MiB 输入上限和不刷新的 5 秒预算，不读取组件配置正文，
-不执行本机取包、渲染或启动。成功返回 `{path,raw_sha256,desired}`，其中 desired
-是官方 typed 声明，artifact 固定为 `{url,sha256}`，不是当前 running 身份。
-失败仅返回 `{path,error:{code}}` 静态错误码，不返回 parser 原文；desired 序列化
-超过 64 KiB 也只返回该观测错误，不抹掉 actual runtime、`external_startup` 或
-顶层 `ok`。此入口只读，publisher 的输入修改与恢复使用独立的有 journal CAS 流程。
+整包 SHA 验证后，压缩包保存在 task 私有 `archive.partial`，单遍读取 tar，仅将目标二进制流写 `executable.partial` 并计算目标 SHA；SDK 等其他文件不解压落盘、不逐个计算 SHA。本地已安装包也只校验 manifest 与所选二进制。压缩包与目标各限 512 MiB，展开总量含 header/padding 限 2 GiB，最多 10000 个原始 tar 头，manifest 限 4 MiB 且文件键唯一。仅接受 regular file、directory 和不超过 4096 字节的 GNU 长名头；拒绝 PAX、链接、其他扩展类型、不安全路径与重复名称。
+
+manifest 可位于目标之后；读取完整 tar 尾和 gzip EOF、校验 CRC/ISIZE 并拒第二 member 或尾随垃圾后，核对目标摘要，`sync_all` 后原子 rename。失败清理本次私有文件，准备失败保留原 Child。发布脚本只发送指令和维护发布流程，不下载或全局安装制品。
 
 `adxctl rollout node-info`、`submit`、`query` 使用现有 supervisor 私有 UDS，
 不增加公开监听。socket 为 `0600`，受 flock 保护的 `state_dir` 为 `0700`。
@@ -253,7 +190,7 @@ original，因此没有可达的 late-original register_source 分支，也不�
 original session 直接拒绝，不猜 session 或改写冻结身份。
 partial abort 对 normal 已 verified 的 target Pod 保留业务，仅同身份 verify 明确成功收尾，
 不重新强制 quiesce/疏散；未 verified replacement 才严格验空/new permit/verify，不开启
-Aborting migration。CM 输入恢复在确认 freeze 后、放行 cleanup 前完成。
+Aborting migration。
 仅 `Aborting` 且 `rollback=true` 的收尾 verify 可不要求跨节点恢复指纹；真实注册、可路由且未 fenced、有效 checkpoint scope、未 verified 节点的验空与 permit、操作收敛和暂停归属仍须满足。
 此收尾保留目标版本并报告 partial，不授予缺指纹节点后续迁移/恢复资格；普通 Active verify 即使携带 rollback=true 仍检查完整恢复能力。
 Pod inventory 统一读取 `kubectl get --raw /api/v1/namespaces/NAMESPACE/pods`，冻结 context，
@@ -303,7 +240,7 @@ sudo adxctl rollout query --task-id relay-1
 commit 为 40 位小写十六进制，SHA-256 为该可执行文件的 64 位摘要，
 不是归档或 manifest 的摘要。schema-1 manifest 须匹配 commit、Linux host target
 及所选文件摘要；这不是全包校验或 publisher 签名认证。
-复制时拒绝路径符号链接，复制后再次校验私有文件，不执行目标包校验程序。
+复制时拒绝路径符号链接，在流写私有文件时校验目标摘要，不执行包内脚本。
 不要用会切换全局 `current` 的普通安装器只准备单个组件；远端包可走上述 task 私有准备入口。
 supervisor 启动时解析固定 package 路径，后续 `current` 变化不会改其重启选择。
 
@@ -339,48 +276,62 @@ sudo adxctl rollout step --task-id adxlet-1 --step exit
 sudo adxctl rollout step --task-id adxlet-1 --step start --attempt "$ATTEMPT" --node-session "$SESSION"
 ```
 
-`rollout step` 对已准备任务按 `exit`、`start`、`rollback` 发出请求；
-仅首个 `exit` 不带 attempt/session，`start` 仅接受目标 A，须与任务记录完全一致且无 rollback_from，期望 runtime 只取任务
-提交时冻结的值。`exit`、`start` 与 `rollback` 共用同任务的异步 worker。
-`start` 仅接受 Exit 已真实 reap 后记录的 attempt/node_session，沿用 Exit 保存的绝对执行期限
-（不刷新）；使用任务目录中准备时固定的 target Process 快照、私有配置副本与 executable，
-spawn 前重核配置有效摘要与 executable SHA。Start 请求回复丢失或失败时先以同 attempt 只读回执查询：
-已记录的 Child 以同 PID 继续，NeverCreated 作为事实返回，仍未知时才再发同 attempt 的幂等 Start。
-bootstrap 仅交付给实际 owned Child PID；ready 要求该 PID 的实际配置摘要、executable SHA
-及 admin socket `Query` 报告 `ready` 且 node_session 与保存值一致，然后 Complete。
-Complete 成功但 `completed` 写盘失败时记录退回 `target_commit_unknown`（PID/attempt 不变），
-由回执收敛；worker 已写入终态但最终写盘失败而保留槽时，同任务 Query 重写终态，写盘成功才释放槽。
+`rollout step` 对已准备任务按 `exit`、`start`、`rollback` 发出请求，共用同任务的异步 worker。
+`exit` 使用空 attempt/session；外部 `start` 仅接受目标 A，须与任务记录完全一致且
+`leg={"kind":"target"}`，期望 runtime 只取提交时冻结的值。
 
-目标候选 A 失败后，publisher 用 A 的 attempt/node_session 发出 `rollback`。
-worker 先查询同任务 actor 回执：目标已 Committed 时收口为 Completed/completed，不停止已选进程；
-回执未知不作为未创建或已退出的证明。真正进入回退前保存一次固定 600 秒绝对期限，
-阶段为 `rollback_intent`；失败不确定时保留 `rollback_unknown` 和同一期限。
-actor 先封闭 A，再证明 NeverCreated 或等待该 owned Child 的真实 reap。
-尚未执行的迟到 Start(A) 也由同一 spawn receipt 的 closed 记录拒绝，不会复活。
-只有上述证明成立、准备时固定的 original 文件及私有配置重新验证通过，才生成并保存身份 B，
-阶段为 `rollback_ready`。`adxlet_execution` 新增可选字段
-`rollback_from: {"attempt":"A","node_session":"session-A"}`，只保存这一个来源身份。
-若 B 的首次写盘失败，重试保留并重存同 B，不生成 C。
+`adxlet_execution` 的公共字段为 `old_pid`、`error`、`attempt`、`node_session`、
+`deadline_unix_ms`；`stage` 通过 serde 扁平序列化，仅有以下六值：
 
-`rollback` 始终用来源 A 的 attempt/node_session 重放；已有 B 时重存并继续同一个 B，
-已有活动 worker 时不创建第二个 worker/Child，不停止 B 或生成 C。外部 Start(B) 被拒绝。
-publisher 首次提交 rollback 前核实同 owner 的 Yield 和已知 current_session；
-本地 worker 保存 B 后直接复用现有 Start/bootstrap/ready/Complete 路径，使用固定的
-original executable、Process 和私有配置副本，不再等待 publisher 发 Start(B)。
-因此已接收的 rollback 可在脚本断连后启动 B；Coordinator 不可达时也可先启动 B 等待注册，
-publisher 保持 pending，维护不会自动解除。同 owner 只部署一个 publisher 是部署约定，
-journal flock 仅约束使用相同 journal/lock 路径的调用，不提供跨路径的单执行者保证。
-原版阶段依次为 `original_start_intent`、`original_start_unknown`、`original_commit_unknown`，
-成功写 Failed/original_selected。Complete 丢回执或 original_selected 写盘失败时保留
-`original_commit_unknown`，由同一 B 的回执收口，不重新启动或停止可能已选的原版。
-600 秒包括 A stop/reap 和原版 Start/bootstrap/ready，所有重试和查询不刷新期限。
-publisher 即使首次观察到已完成的 B，也先校验 rollback_from 并采用 B，再核实际原版
-PID、配置、executable、注册 session 和独立 Relay session，最后 release 并按升级失败停止后续批次。
-原版失败或超时保留维护，不递归回退。
+| stage | candidate_pid 与含义 |
+| --- | --- |
+| `exiting` | 不携带；旧进程退出尚未证实，attempt/session 可尚未生成，或已生成但写盘结果未知。重试保留同一身份。 |
+| `exited` | 不携带；已证实旧进程真实 reap，当前 leg 的新身份已保存，可进入 Start。 |
+| `starting` | 可空；同一身份的 Start、bootstrap 与 ready 检查。 |
+| `committing` | 必有；ready 证据已核对，正在选择该候选或等待选择回执，不可回退。 |
+| `stopping_for_rollback` | 可空；封闭目标 A，并等待 actor 证明 NeverCreated 或真实 reap。 |
+| `selected` | 必有；已选择该候选，结果由 Task.phase 区分：目标为 Completed，原版恢复为 Failed。 |
 
-adxlet process publisher journal 使用 schema 2；Relay/Pod journal 和 process plan 仍为 schema 1。
-旧 adxlet schema-1 journal 在任何远端效果前拒绝，无迁移器；进行中的任务须用原版本收口后再升级。
-旧 `rollback_stop` 命令不保留别名。
+`leg` 为 `{"kind":"target"}` 或
+`{"kind":"rollback","from":{"attempt":"A","node_session":"A_SESSION"}}`。
+回退 leg 的公共 attempt/node_session 表示 B，`from` 固定其来源 A。
+`error` 记录失败事实，阶段继续描述物理进度，不再用 `*_unknown` 微阶段表达错误。
+
+`start` 仅接受 Exit 已真实 reap 后记录的 attempt/node_session，沿用 Exit 保存的绝对执行期限。
+目标和原版恢复共用 Start/bootstrap/ready/Select 路径，分别使用准备时固定的 target 或 original
+Process 快照、私有配置副本与 executable；spawn 前重核配置有效摘要与 executable SHA。
+Start 回复丢失或失败时先查同 attempt 的 actor Receipt：已记录的 Child 以同 PID 继续，
+NeverCreated 作为事实返回，仍未知时才重放同 attempt 的幂等 Start。
+bootstrap 仅交付给实际 owned Child PID；每轮保留 Child 回执与 UDS PID 检查。
+admin socket `Query` 报告 `ready` 且 node_session 与保存值一致后，在同一期限内核对
+该 owned Child 的实际 PID、配置摘要和 `/proc/<pid>/exe` SHA，再进入 `committing` 并 Select；
+未就绪轮询不反复计算文件摘要。Select 成功但终态写盘失败时保留 `committing` 与同一 PID/身份，
+由 Receipt 收敛；终态持久化成功才释放槽。
+
+目标候选 A 失败后，publisher 先保存 `rollback_intent`，始终用 A 的 attempt/node_session 发出
+`rollback`。worker 先查询 actor Receipt；A 已 Committed 时收口为 Completed/selected，
+不停止已选进程。`committing` 不进入回退，期限后仅查 Receipt。
+真正进入回退前保存一次固定 600 秒绝对期限和 `stopping_for_rollback`；
+actor StopFailed 封闭 A，再证明 NeverCreated 或等待该 owned Child 的真实 reap。
+尚未执行的迟到 Start(A) 由同一 spawn receipt 的 closed 记录拒绝。
+只有上述证明成立、准备时固定的 original 文件及私有配置重新验证通过，才生成并保存 B，
+以回退 leg 的 `exited` 进入同一启动路径。B 首次写盘结果未知时重存同 B，不生成 C。
+
+已有 B 时，`rollback` 仍重放来源 A，由本地 worker 继续同一个 B；外部 Start(B) 被拒绝。
+已有活动 worker 时不创建第二个 worker/Child，不停止 B。publisher 首次请求回退前核实
+同 owner 的 Yield 和已知 current_session；已接收的回退由本地 worker 继续执行，
+脚本断连或 Coordinator 不可达不阻止本地 B 启动等待注册，维护保持到显式 release。
+600 秒包括 A stop/reap 和 B Start/bootstrap/ready/Select，所有重试和查询不刷新期限。
+原版失败或超时保留维护，不递归回退；原版选中为 Failed/selected。
+
+publisher journal 只冻结 A 的 `attempt`/`node_session`，不保存 B 身份或独立的原版启动阶段；
+`rollback_intent` 始终发 Rollback(A)。B 身份从 Task 查询取得，并核对
+`leg.from` 等于冻结的 A；终态还须核对实际 PID、配置、executable、注册 session 和独立 Relay session。
+`release_intent` 冻结真实结束 session 和 outcome；原版恢复释放维护后按升级失败停止后续批次。
+同 owner 只部署一个 publisher；journal flock 仅串行化相同 journal/lock 路径的调用。
+
+adxlet process publisher journal 保持 schema 2；Relay/Pod journal 和 process plan 保持 schema 1，
+`step_protocol` 保持 2。本轮首次整套升级直接采用新状态结构，不提供旧阶段映射或兼容路径。
 Node admin 校验启动及当前 parent PID，
 bootstrap socket 校验 parent PID/UID，candidate admin 连接校验实际 owned Child PID。
 管理地址仍为 `<state_dir>/<service_id>-admin.sock`，启动信息交付使用固定的
@@ -400,12 +351,12 @@ Coordinator 只保存 per-node owner、保护、session handoff 和 release rece
 Start 同 task/attempt/内容重放不重复 spawn；迟到 closed attempt 不得复活。
 目标与原文件共用候选启动路径，每个 attempt 使用 fresh Node session。
 未知创建、端口不可达、超时或丢 ACK 不证明退出，保留 Unknown 和维护保护。
-精确 ready 后 Complete 丢 ACK 只重放同 attempt；期限后只读已完成回执，
-不能以 `target_commit_unknown` 或 `original_commit_unknown` 停掉可能已选中的 candidate 或启动竞争候选。
-worker 结束后，Query 或同参数 Submit 可用本机 actor 的精确只读完成回执收敛任务：
-目标 leg 写 Completed/completed，原文件 leg 写 Failed/original_selected，写盘成功才释放槽。
+精确 ready 后进入 `committing`，Select 丢 ACK 只收敛同 attempt；期限后仅查 Receipt，
+不停止可能已选中的 candidate 或启动竞争候选。
+worker 结束后，Query 或同参数 Submit 可用本机 actor 的精确只读完成回执收敛为 `selected`：
+目标 leg 写 Completed，回退 leg 写 Failed，写盘成功才释放槽。
 活 worker 的 Query 仍纯读；回执未知、观察超时、写盘失败或重启丢失 actor 记录时保留 Unknown，
-后续查询可以重试观察，不发送 Complete/Stop/Start，也不刷新执行期限。
+后续查询可以重试观察，不发送 Select/Stop/Start，也不刷新执行期限。
 
 publisher 在确认本轮 Yield 和本机真实 reap 后用保存的身份调用 Start；
 启动前不要求 Coordinator 的 current_session 已等于新 session。
@@ -440,8 +391,18 @@ HTTP release 回执不能替代上述本地恢复；日志中的 `successor regi
 排查通用 Conflict 时应结合该阶段与 node/session/任务关联字段，不直接认定是 Coordinator CAS 失败。
 
 独立 Relay 升级不暂停 Node 调度，不借用 Coordinator maintenance。
-Begin 拒新流并确认业务/health listener 释放；候选使用固定业务端口及分代控制 UDS。
-旧 CONNECT 与双代撤权保留，释放时固定 120 秒收尾，重试不刷新。
+`adx.node.v1.RelayUpgradeService.BeginDrain` 按 `task_id/proxy_session_id` 幂等接收排水。
+服务循环释放业务 TCP listener，并等待 health 服务退出后，才返回
+原 task/session、`listeners_released=true` 和固定的 `drain_deadline_unix_ms`。
+同参重放返回同一释放回执；调用取消不撤回服务循环已接收的排水。
+候选使用固定业务端口及分代控制 UDS。
+`RelayHandoffService` 提供 `Reserve`、`Cancel`、`Switch`、`Finish`：Cancel 要求父 supervisor
+确认尚未发送 BeginDrain；Switch 携带旧端释放或 owned Child 真实 reap 的证据，
+更换失败候选时还须携带该候选 Child 的真实 reap 证据；Finish 要求旧 Child 已真实 reap。
+候选通过普通 `BeginBindings`/`ReplaceBindings` 完成首个全量同步并开放准入。
+首个 snapshot 结果未知时保留并重放冻结内容；精确 ready 后只同步 canonical 最新增量，
+保留 owner/epoch 校验和旧端真实退休 ACK 屏障。
+已有 CONNECT 继续到自然结束或真实关闭；监听释放后固定 120 秒收尾，重试不刷新。
 自然归零、强制关闭、打断和失败分别记录；自然退出不保证每条业务请求成功。
 分代 route socket 不改变活动发布目录，socket 清理须确认 owned Child 退出及 inode。
 升级使用 `<state_dir>/s/r-<key>/route.sock`，回退使用同级的 `o-<key>/route.sock`；
@@ -734,7 +695,7 @@ Ingress → Relay 数据链路改为明文；组件角色和节点 ID 由请求�
 ### 管理员 Key 的生成、读取与轮换
 
 Key 由部署者生成并写入受保护文件，Coordinator 继续通过
-`bootstrap_credentials[].key_file` 读取。配置和渲染结果只包含文件路径。
+`bootstrap_credentials[].key_file` 读取。配置和渲染结果只包含文件路径。初始管理员 Key 由部署配置集合管理，不通过租户 Key 删除接口管理。
 例如首次部署时生成密钥（已有文件应复用，不要在每次启动时重新生成）：
 
 ```sh
@@ -755,22 +716,3 @@ Coordinator；仅修改文件不会触发热重载。部署者从新文件读取
 
 API Server 和 Ingress 的既有认证缓存可能继续接受旧 Key 直到缓存到期；默认
 示例为 10 秒，在途认证另受 RPC 超时限制。轮换不撤销已建立的长连接。
-
-## 验证边界
-
-2026-11-14 的记录属于此前 publisher mTLS 方案：deployment lib 86 项、adxlet 进程预检 4 项、
-Coordinator 交接与暂停恢复 5 项及 Pod 回归 2 项；发布脚本 162 项，以及真实
-mTLS 客户端 24 项。已通过四模块 all-targets/all-features 编译、workspace
-Clippy（`-D warnings`）、格式、文档和差异检查。该版本修改的六个 Python 文件
-Ruff/Pylint 均通过；面向 PR 基线的全量 Python 预检仍有 388 条既有诊断，
-未将该全量检查记为通过。完整命令和日志保存在本次工作区
-`out/adx-grpc-handoff-20261113/RESULT.md`。
-
-2026-11-16 本轮通过：publisher 68 项、Pod 发布工具 101 项、交接/存储 5 项、自动注册 RPC 2 项及原普通重启注册 RPC 1 项；三份 Python 文件 Ruff/Pylint、全仓格式和 workspace all-targets/all-features Clippy（`-D warnings`）均通过。完整命令和日志见 `out/publisher-http-20261116/RESULT.md`。
-这些是本地单元、组件及故障注入证据，未验证管理网络隔离、实际集群升级、跨 Worker 恢复、
-生产下载或新镜像；这轮本地检查没有操作北京集群。
-
-2026-11-16 后续独立部署会话已验证空 replacement 的中止收口：更新 Coordinator 后，原任务 `pod-retest-20261116-1700` 按原 plan/journal 收口为 `Aborted / partial`，Node0 保留目标镜像及 UID/session，Node1 保留原 Pod/镜像，模板恢复、本轮维护解除，两个节点 Ready，Environment 均为0。现场没有管理员暂停；暂停保留仍以本地矩阵测试为证。此记录不代表正常升级完成、新恢复指纹已生效、跨 Worker Environment 恢复或旧版本全量回滚。证据索引见 `out/pod-abort-cleanup-20261116/RESULT.md`。
-初始管理员 Key 不由租户 Key 删除接口管理，而由上述部署配置集合管理。
-
-2026-11-16 随后的空 Node0 现场验证已通过正常 Active verify：新 PATH 镜像和新 immutable ConfigMap 生效，恢复指纹正常生成，Pod 从 Worker .168 替换到 .210；Node1 未升级。本轮仅完成 batch0，随后收口为 Aborted/partial，未验收整轮 Completed 或业务 Environment 迁移/跨 Worker 恢复。镜像复用已有 Rust 二进制和 rootfs，不代表全部最新 Node 源码已部署。已终态任务不能继续 batch1，后续验证须新建任务。证据及表述复核见 `out/pod-normal-verify-20261116/REVIEW.md`。

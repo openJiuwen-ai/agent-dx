@@ -1,4 +1,4 @@
-//! Standalone-only lifecycle and candidate binding control.
+//! Standalone Relay drain and preserving controller takeover.
 use super::route_control::{proto, BindingService};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{watch, Mutex};
@@ -9,19 +9,20 @@ pub(crate) struct UpgradeService {
     bindings: Arc<BindingService>,
     state: Mutex<UpgradeState>,
     accepted: watch::Sender<bool>,
+    released: watch::Sender<Option<Result<proto::RelayUpgradeState, Status>>>,
 }
 #[derive(Default)]
 struct UpgradeState {
     closed: bool,
-    task: Option<proto::RelayUpgradeState>,
+    task: Option<proto::RelayUpgradeRequest>,
 }
 impl UpgradeService {
     pub(crate) fn new(bindings: Arc<BindingService>) -> Arc<Self> {
-        let (accepted, _) = watch::channel(false);
         Arc::new(Self {
             bindings,
             state: Mutex::new(UpgradeState::default()),
-            accepted,
+            accepted: watch::channel(false).0,
+            released: watch::channel(None).0,
         })
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
@@ -32,10 +33,9 @@ impl UpgradeService {
         state.closed = true;
         state.task.is_some()
     }
-    async fn request(
+    async fn begin_drain(
         &self,
         request: proto::RelayUpgradeRequest,
-        begin: bool,
     ) -> Result<proto::RelayUpgradeState, Status> {
         if request.task_id.trim().is_empty()
             || request.proxy_session_id != self.bindings.inspect().await.proxy_session_id
@@ -44,44 +44,61 @@ impl UpgradeService {
                 "task and current Relay session required",
             ));
         }
-        let mut state = self.state.lock().await;
-        if let Some(current) = state.task.as_ref() {
-            if current.task_id != request.task_id {
-                return Err(Status::failed_precondition(
-                    "another Relay upgrade owns this session",
-                ));
+        {
+            let mut state = self.state.lock().await;
+            if let Some(current) = &state.task {
+                if current != &request {
+                    return Err(Status::failed_precondition(
+                        "another Relay upgrade owns this session",
+                    ));
+                }
+            } else {
+                if state.closed {
+                    return Err(Status::failed_precondition("Relay is stopping"));
+                }
+                state.task = Some(request);
+                self.bindings.start_process_drain();
+                // The listener owner consumes this independently of the RPC future.
+                self.accepted.send_replace(true);
             }
-            return Ok(current.clone());
         }
-        if !begin {
-            return Err(Status::not_found("Relay upgrade not accepted"));
+        let mut released = self.released.subscribe();
+        loop {
+            if let Some(result) = released.borrow_and_update().clone() {
+                return result;
+            }
+            released
+                .changed()
+                .await
+                .map_err(|_| Status::unavailable("Relay listener owner stopped"))?;
         }
-        if state.closed {
-            return Err(Status::failed_precondition("Relay is stopping"));
-        }
-        let current = proto::RelayUpgradeState {
-            task_id: request.task_id,
-            proxy_session_id: request.proxy_session_id,
-            phase: "accepted".into(),
-            listeners_released: false,
-            drain_deadline_unix_ms: 0,
-        };
-        state.task = Some(current.clone());
-        self.bindings.start_process_drain();
-        self.accepted.send_replace(true);
-        Ok(current)
     }
     pub(crate) async fn released(&self, deadline: u64) {
-        if let Some(state) = self.state.lock().await.task.as_mut() {
-            state.listeners_released = true;
-            state.drain_deadline_unix_ms = deadline;
-            state.phase = "draining".into();
+        if let Some(task) = &self.state.lock().await.task {
+            self.released.send_if_modified(|receipt| {
+                if receipt.is_some() {
+                    return false;
+                }
+                *receipt = Some(Ok(proto::RelayUpgradeState {
+                    task_id: task.task_id.clone(),
+                    proxy_session_id: task.proxy_session_id.clone(),
+                    listeners_released: true,
+                    drain_deadline_unix_ms: deadline,
+                }));
+                true
+            });
         }
     }
     pub(crate) async fn finish(&self, phase: &str) {
-        if let Some(state) = self.state.lock().await.task.as_mut() {
-            state.phase = phase.into();
-        }
+        self.released.send_if_modified(|receipt| {
+            if receipt.is_some() {
+                return false;
+            }
+            *receipt = Some(Err(Status::unavailable(format!(
+                "Relay stopped before listener release: {phase}"
+            ))));
+            true
+        });
     }
 }
 #[tonic::async_trait]
@@ -96,33 +113,13 @@ impl proto::relay_upgrade_service_server::RelayUpgradeService for Arc<UpgradeSer
         }
         Ok(Response::new(self.bindings.takeover(r.into_inner()).await?))
     }
-    async fn install_candidate_bindings(
-        &self,
-        r: Request<proto::BindingSnapshot>,
-    ) -> Result<Response<proto::BindingState>, Status> {
-        Ok(Response::new(
-            self.bindings.install_candidate(r.into_inner()).await?,
-        ))
-    }
-    async fn open_candidate_bindings(
-        &self,
-        r: Request<proto::BindingState>,
-    ) -> Result<Response<proto::BindingState>, Status> {
-        Ok(Response::new(
-            self.bindings.open_candidate(r.into_inner()).await?,
-        ))
-    }
-    async fn begin(
+    async fn begin_drain(
         &self,
         r: Request<proto::RelayUpgradeRequest>,
     ) -> Result<Response<proto::RelayUpgradeState>, Status> {
-        Ok(Response::new(self.request(r.into_inner(), true).await?))
-    }
-    async fn query(
-        &self,
-        r: Request<proto::RelayUpgradeRequest>,
-    ) -> Result<Response<proto::RelayUpgradeState>, Status> {
-        Ok(Response::new(self.request(r.into_inner(), false).await?))
+        Ok(Response::new(
+            UpgradeService::begin_drain(self, r.into_inner()).await?,
+        ))
     }
 }
 
@@ -132,50 +129,7 @@ mod tests {
     use crate::{common::protocol::GatewayPolicy, node::Relay};
 
     #[tokio::test]
-    async fn closing_admission_rejects_late_begin_but_keeps_accepted_replays() {
-        for begin_first in [false, true] {
-            let bindings = Arc::new(BindingService::new(Arc::new(Relay::new(
-                GatewayPolicy::new(Vec::new()),
-            ))));
-            let request = proto::RelayUpgradeRequest {
-                task_id: "release".into(),
-                proxy_session_id: bindings.inspect().await.proxy_session_id,
-            };
-            let upgrade = UpgradeService::new(bindings);
-            if begin_first {
-                upgrade.request(request.clone(), true).await.unwrap();
-            }
-            assert_eq!(upgrade.close_admission().await, begin_first);
-            assert_eq!(upgrade.close_admission().await, begin_first);
-            if begin_first {
-                upgrade.finish("interrupted").await;
-                assert_eq!(
-                    upgrade.request(request.clone(), true).await.unwrap().phase,
-                    "interrupted"
-                );
-                assert_eq!(
-                    upgrade.request(request, false).await.unwrap().phase,
-                    "interrupted"
-                );
-            } else {
-                assert_eq!(
-                    upgrade
-                        .request(request.clone(), true)
-                        .await
-                        .unwrap_err()
-                        .code(),
-                    tonic::Code::FailedPrecondition
-                );
-                assert_eq!(
-                    upgrade.request(request, false).await.unwrap_err().code(),
-                    tonic::Code::NotFound
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn accepted_is_not_release_and_replays_preserve_lifecycle_evidence() {
+    async fn cancelled_begin_survives_and_replays_one_release_receipt() {
         let bindings = Arc::new(BindingService::new(Arc::new(Relay::new(
             GatewayPolicy::new(Vec::new()),
         ))));
@@ -184,46 +138,29 @@ mod tests {
             proxy_session_id: bindings.inspect().await.proxy_session_id,
         };
         let upgrade = UpgradeService::new(bindings);
-        assert_eq!(
-            upgrade
-                .request(request.clone(), false)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::NotFound
+        let mut accepted = upgrade.subscribe();
+        let pending = {
+            let upgrade = upgrade.clone();
+            let request = request.clone();
+            tokio::spawn(async move { upgrade.begin_drain(request).await })
+        };
+        accepted.changed().await.unwrap();
+        assert!(
+            !pending.is_finished(),
+            "acceptance alone must not acknowledge release"
         );
-        let accepted = upgrade.request(request.clone(), true).await.unwrap();
-        assert_eq!(accepted.phase, "accepted");
-        assert!(!accepted.listeners_released);
-        assert_eq!(accepted.drain_deadline_unix_ms, 0);
-        assert_eq!(
-            upgrade.request(request.clone(), true).await.unwrap(),
-            accepted
-        );
+        pending.abort();
+        assert!(upgrade.close_admission().await);
         upgrade.released(123_000).await;
-        let draining = upgrade.request(request.clone(), false).await.unwrap();
-        assert!(draining.listeners_released);
-        assert_eq!(draining.phase, "draining");
-        assert_eq!(
-            upgrade.request(request.clone(), true).await.unwrap(),
-            draining
-        );
-        for phase in ["completed", "forced", "interrupted", "failed"] {
-            upgrade.finish(phase).await;
-            let replay = upgrade.request(request.clone(), true).await.unwrap();
-            assert_eq!(replay.phase, phase);
-            assert_eq!(replay.drain_deadline_unix_ms, 123_000);
-        }
-        let mut wrong = request.clone();
+        let receipt = upgrade.begin_drain(request.clone()).await.unwrap();
+        assert!(receipt.listeners_released);
+        upgrade.released(999_000).await;
+        upgrade.finish("completed").await;
+        assert_eq!(upgrade.begin_drain(request.clone()).await.unwrap(), receipt);
+        let mut wrong = request;
         wrong.task_id = "other".into();
         assert_eq!(
-            upgrade.request(wrong, true).await.unwrap_err().code(),
-            tonic::Code::FailedPrecondition
-        );
-        let mut wrong = request;
-        wrong.proxy_session_id = "other".into();
-        assert_eq!(
-            upgrade.request(wrong, false).await.unwrap_err().code(),
+            upgrade.begin_drain(wrong).await.unwrap_err().code(),
             tonic::Code::FailedPrecondition
         );
     }

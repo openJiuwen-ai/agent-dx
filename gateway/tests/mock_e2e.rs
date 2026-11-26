@@ -64,8 +64,7 @@ async fn mock_full_data_plane_protocol_matrix() {
         route.instance_id.clone(),
         route.environment_id.clone(),
         route.environment_ip.parse().unwrap(),
-    )
-    .await;
+    );
     store.put(route.clone());
     let resolver = Arc::new(IngressRouteResolver::new(store.clone()));
     let connector = DataPlaneL4Connector::new(H2PoolConfig {
@@ -194,16 +193,12 @@ async fn assert_node_drain(
         target_port: target.port(),
         request_id: format!("{workload}-request"),
     };
-    gateway
-        .activate_route(
-            "drain-existing-instance".into(),
-            "drain-existing".into(),
-            target.ip(),
-        )
-        .await;
-    gateway
-        .activate_route("drain-new-instance".into(), "drain-new".into(), target.ip())
-        .await;
+    gateway.activate_route(
+        "drain-existing-instance".into(),
+        "drain-existing".into(),
+        target.ip(),
+    );
+    gateway.activate_route("drain-new-instance".into(), "drain-new".into(), target.ip());
     let (_existing_cancel, existing_cancelled) = watch::channel(false);
     let mut existing = connector
         .connect_stream(
@@ -244,13 +239,11 @@ async fn assert_node_route_retirement(
         target_port: target.port(),
         request_id: "route-request".into(),
     };
-    gateway
-        .activate_route(
-            "route-instance".into(),
-            "route-workload".into(),
-            target.ip(),
-        )
-        .await;
+    gateway.activate_route(
+        "route-instance".into(),
+        "route-workload".into(),
+        target.ip(),
+    );
     let (_old_cancel, old_cancelled) = watch::channel(false);
     let mut old = connector
         .connect_stream(&node.to_string(), &make_target(), old_cancelled)
@@ -260,9 +253,7 @@ async fn assert_node_route_retirement(
     let mut echoed = [0; 3];
     old.read_exact(&mut echoed).await.unwrap();
 
-    gateway
-        .retire_route("route-instance".into(), "route-workload".into())
-        .await;
+    gateway.retire_route("route-instance".into(), "route-workload".into());
     timeout(Duration::from_secs(2), async {
         let mut byte = [0u8; 1];
         loop {
@@ -282,13 +273,11 @@ async fn assert_node_route_retirement(
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
-    gateway
-        .activate_route(
-            "route-instance".into(),
-            "route-workload".into(),
-            target.ip(),
-        )
-        .await;
+    gateway.activate_route(
+        "route-instance".into(),
+        "route-workload".into(),
+        target.ip(),
+    );
     let (_active_cancel, active_cancelled) = watch::channel(false);
     connector
         .connect_stream(&node.to_string(), &make_target(), active_cancelled)
@@ -730,8 +719,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
     };
     let store = Arc::new(RouteStore::new());
     for id in ["instance-a", "instance-b"] {
-        node.activate_route(id.into(), id.into(), backend_address.ip())
-            .await;
+        node.activate_route(id.into(), id.into(), backend_address.ip());
         store.put(RouteInfo {
             private_service_ports: Vec::new(),
             instance_id: id.into(),

@@ -307,13 +307,11 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
         }
     });
     let route:crate::common::route::RouteInfo=serde_json::from_value(json!({"instanceID":target.binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":current.tenant,"environmentID":"runtime-local","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
-    relay
-        .activate_route(
-            route.instance_id.clone(),
-            route.environment_id.clone(),
-            route.environment_ip.parse().unwrap(),
-        )
-        .await;
+    relay.activate_route(
+        route.instance_id.clone(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
+    );
     let routes = Arc::new(RouteStore::new());
     routes.set_ready(true);
     routes.put(route);

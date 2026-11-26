@@ -215,7 +215,6 @@ dependencies = [
  "adx-transport",
  "clap",
  "flate2",
- "httpdate",
  "hyper-util",
  "libc",
  "redis",

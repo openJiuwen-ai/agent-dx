@@ -636,100 +636,6 @@ fn io_error(error: std::io::Error) -> Error {
 }
 
 impl crate::Adxlet {
-    /// Fails with `Error::Conflict` when the identity is incomplete or the node
-    /// inventory is not provably stable, and with `Error::Unavailable` when an
-    /// inventory source cannot be read.
-    pub(crate) async fn process_preflight(
-        &self,
-        identity: adx_protocol::control::ProcessPreflightRequest,
-        inspection: &adx_protocol::control::NodeUpgradeInspection,
-    ) -> Result<()> {
-        if identity.rollout_id.trim().is_empty()
-            || identity.local_task_id.trim().is_empty()
-            || identity.epoch == 0
-            || identity.old_relay_session.is_empty()
-        {
-            return Err(Error::Conflict);
-        }
-        let lifecycle = self.lifecycle_ready.read().await;
-        process_inventory_ready(
-            inspection.unknown,
-            *lifecycle,
-            self.authority_reconciling.load(Ordering::Acquire),
-            inspection.holds,
-            inspection.authority_tasks,
-        )?;
-        if !self
-            .services
-            .upgrade
-            .activity
-            .by_id
-            .lock()
-            .map_err(|_| Error::Unavailable("execution activity unavailable".into()))?
-            .is_empty()
-        {
-            return Err(Error::Conflict);
-        }
-        let handles: Vec<_> = self
-            .environments
-            .lock()
-            .map_err(|_| Error::Unavailable("environment registry unavailable".into()))?
-            .values()
-            .map(|(_, _, handle)| handle.clone())
-            .collect();
-        let mut records = Vec::new();
-        for handle in handles {
-            let (record, durability) = handle.view();
-            if durability != Some(crate::Durability::Published) {
-                return Err(Error::Conflict);
-            }
-            records.push(record);
-        }
-        let inventory = tokio::time::timeout(
-            self.services.operation_timeout,
-            self.services.runtime.inventory(),
-        )
-        .await
-        .map_err(|_| Error::Unavailable("process inventory deadline".into()))??;
-        if inventory.iter().any(|runtime| {
-            !records.iter().any(|record| {
-                record.spec.id == runtime.environment_id
-                    && record.runtime.id == runtime.runtime_id
-                    && record.resources_held
-            })
-        }) || records
-            .iter()
-            .filter(|record| record.resources_held)
-            .any(|record| {
-                !inventory.iter().any(|runtime| {
-                    runtime.environment_id == record.spec.id
-                        && runtime.runtime_id == record.runtime.id
-                })
-            })
-        {
-            return Err(Error::Conflict);
-        }
-        process_inventory_ready(
-            false,
-            *lifecycle,
-            self.authority_reconciling.load(Ordering::Acquire),
-            scoped_count(&self.local_holds, None, String::as_str)?,
-            scoped_count(&self.authority_tasks, None, |key| key.0.as_str())?,
-        )?;
-        if !self
-            .services
-            .upgrade
-            .activity
-            .by_id
-            .lock()
-            .map_err(|_| Error::Unavailable("execution activity unavailable".into()))?
-            .is_empty()
-        {
-            return Err(Error::Conflict);
-        }
-        Ok(())
-    }
-
     /// Configure a durable mirror before starting reconciliation or RPC services.
     pub fn with_upgrade_control(mut self, path: PathBuf, session: String) -> Result<Self> {
         Arc::get_mut(&mut self.services)
@@ -885,19 +791,6 @@ fn count(value: usize) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::Unavailable("upgrade inventory count overflow".into()))
 }
 
-fn process_inventory_ready(
-    unknown: bool,
-    ready: bool,
-    reconciling: bool,
-    holds: u64,
-    tasks: u64,
-) -> Result<()> {
-    if unknown || !ready || reconciling || holds != 0 || tasks != 0 {
-        return Err(Error::Conflict);
-    }
-    Ok(())
-}
-
 fn scoped_count<K: Ord, V>(
     registry: &Mutex<std::collections::BTreeMap<K, V>>,
     environment: Option<&str>,
@@ -915,7 +808,7 @@ fn scoped_count<K: Ord, V>(
 }
 
 #[cfg(test)]
-mod process_preflight_tests {
+mod process_upgrade_tests {
     #[test]
     fn observed_pod_identity_is_not_durable_authority() {
         let mut gate = super::UpgradeGate::unmanaged();
@@ -1065,18 +958,4 @@ mod process_preflight_tests {
         );
     }
     use super::*;
-
-    #[test]
-    fn process_preflight_rejects_unknown_claim_or_authority_without_requiring_empty_node() {
-        assert!(process_inventory_ready(false, true, false, 0, 0).is_ok());
-        for (unknown, ready, reconciling, holds, tasks) in [
-            (true, true, false, 0, 0),
-            (false, false, false, 0, 0),
-            (false, true, true, 0, 0),
-            (false, true, false, 1, 0),
-            (false, true, false, 0, 1),
-        ] {
-            assert!(process_inventory_ready(unknown, ready, reconciling, holds, tasks).is_err());
-        }
-    }
 }

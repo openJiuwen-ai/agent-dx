@@ -18,12 +18,27 @@ struct State {
     node_calls: usize,
     fail_node: bool,
     transient_network_failures: usize,
+    transient_lifecycle_failures: usize,
+    lifecycle_requests: Vec<(String, u64)>,
     reject_network_before_admission: Option<tonic::Code>,
     transfer_on_lookup: bool,
     unsupported_pause: bool,
     unsupported_snapshot: bool,
     bump_on_lookup: Option<usize>,
     last_request: Option<pb::UpdateNetworkPolicyRequest>,
+}
+
+impl Service {
+    fn lifecycle_ready(&self, id: &str, revision: u64) -> bool {
+        let mut state = self.0.lock().unwrap();
+        state.node_calls += 1;
+        state.lifecycle_requests.push((id.into(), revision));
+        if state.transient_lifecycle_failures > 0 {
+            state.transient_lifecycle_failures -= 1;
+            return false;
+        }
+        true
+    }
 }
 
 macro_rules! service_impl {
@@ -138,10 +153,13 @@ use futures_util::StreamExt;
 service_impl!(pb::node_service_server::NodeService, {
     async fn pause_environment(
         &self,
-        _: Request<pb::PauseEnvironmentRequest>,
+        request: Request<pb::PauseEnvironmentRequest>,
     ) -> Result<Response<pb::EnvironmentResult>, Status> {
-        let mut state = self.0.lock().unwrap();
-        state.node_calls += 1;
+        let request = request.into_inner();
+        if !self.lifecycle_ready(&request.operation_id, request.expected_revision) {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let state = self.0.lock().unwrap();
         if state.unsupported_pause {
             return Err(adx_protocol::status(
                 adx_core::Error::UnsupportedCapability(
@@ -154,16 +172,30 @@ service_impl!(pb::node_service_server::NodeService, {
 
     async fn create_snapshot(
         &self,
-        _: Request<pb::CreateSnapshotRequest>,
+        request: Request<pb::CreateSnapshotRequest>,
     ) -> Result<Response<pb::CreateSnapshotResponse>, Status> {
-        let mut state = self.0.lock().unwrap();
-        state.node_calls += 1;
+        let request = request.into_inner();
+        if !self.lifecycle_ready(&request.operation_id, request.expected_revision) {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let state = self.0.lock().unwrap();
         if state.unsupported_snapshot {
             return Err(adx_protocol::status(
                 adx_core::Error::UnsupportedCapability(
                     adx_core::UnsupportedCapability::CheckpointRestore,
                 ),
             ));
+        }
+        Err(Status::unimplemented("unused test RPC"))
+    }
+
+    async fn reload_environment(
+        &self,
+        request: Request<pb::ReloadEnvironmentRequest>,
+    ) -> Result<Response<pb::EnvironmentResult>, Status> {
+        let request = request.into_inner();
+        if !self.lifecycle_ready(&request.operation_id, request.expected_revision) {
+            return Err(Status::unavailable("node is reconciling"));
         }
         Err(Status::unimplemented("unused test RPC"))
     }
@@ -223,7 +255,6 @@ service_impl!(pb::node_service_server::NodeService, {
     delete_environment(DeleteEnvironmentRequest) -> EnvironmentResult,
     resume_environment(ResumeEnvironmentRequest) -> EnvironmentResult,
     ensure_environment_running(EnsureEnvironmentRunningRequest) -> EnvironmentResult,
-    reload_environment(ReloadEnvironmentRequest) -> EnvironmentResult,
     collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
     collect_checkpoint_cleanup(CollectCheckpointCleanupRequest) -> CollectCheckpointCleanupResponse,
 ]);
@@ -250,6 +281,8 @@ impl Fixture {
             node_calls: 0,
             fail_node: false,
             transient_network_failures: 0,
+            transient_lifecycle_failures: 0,
+            lifecycle_requests: Vec::new(),
             reject_network_before_admission: None,
             transfer_on_lookup: false,
             unsupported_pause: false,
@@ -438,6 +471,61 @@ async fn native_network_update_waits_for_reconciling_node() {
     let request = state.last_request.as_ref().unwrap();
     assert_eq!(request.operation_id, "network-handoff");
     assert_eq!(request.expected_revision, 9);
+}
+
+#[tokio::test]
+async fn native_lifecycle_calls_wait_for_reconciling_node() {
+    use adx_apiserver::operations::Kind;
+    for kind in [Kind::Pause, Kind::Snapshot, Kind::Reload] {
+        let fixture = Fixture::new().await;
+        fixture.state.lock().unwrap().transient_lifecycle_failures = 2;
+        let error = fixture
+            .api
+            .environment_service
+            .execute(
+                kind,
+                "sandbox",
+                "original-operation",
+                json!({}),
+                &pb::CallerContext {
+                    tenant_id: "tenant".into(),
+                    administrator: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        // Once the node becomes reachable, preserve its terminal capability error.
+        assert_eq!(error.code(), tonic::Code::Unimplemented, "{kind:?}");
+        assert_eq!(
+            fixture.state.lock().unwrap().lifecycle_requests,
+            vec![("original-operation".into(), 9); 3],
+            "{kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_lifecycle_retry_keeps_a_fixed_budget() {
+    let fixture = Fixture::new().await;
+    fixture.state.lock().unwrap().transient_lifecycle_failures = usize::MAX;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.api.environment_service.execute(
+            adx_apiserver::operations::Kind::Pause,
+            "sandbox",
+            "original-operation",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        ),
+    )
+    .await
+    .expect("retries must not refresh the two-second fixture budget")
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(fixture.state.lock().unwrap().node_calls >= 3);
 }
 
 #[tokio::test]

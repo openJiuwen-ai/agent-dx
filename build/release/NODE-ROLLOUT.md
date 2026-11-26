@@ -36,12 +36,12 @@ The planner resolves local kubectl through `shutil.which` to an absolute path.
 It issues Pod GETs and argv-only `kubectl exec ... -- adxctl --config CFG rollout
 node-info`, with explicit context/namespace/container and no shell. Both use the
 shared bounded JSON reader (8 MiB, 15-second process timer, kill/wait cleanup).
-Each selected Pod and NodeInfo is read twice. Pod UID, namespace/name, nodeName,
-non-terminating state, containerID, restartCount and running state must agree.
+规划时每个选中 Pod 和 NodeInfo 各读取一次，记录 Pod UID、namespace/name、nodeName、
+非终止状态、containerID、restartCount 和运行状态。
 Exactly one role/node-ID component must be standalone, upgradeable, and have a
 complete runtime. NodeInfo and runtime Pod UIDs must equal Kubernetes UID, boot
-nonces must match, and PID/executable hash/node and relay sessions must remain
-unchanged. This is not an atomic snapshot or proof against later changes.
+nonces must match. PID、可执行文件摘要以及 node/relay session 冻结在计划中，执行前重新核对。
+This is not an atomic snapshot or proof against later changes.
 
 Runtime observation now uses the existing parent-authorized NodeAdmin `Inspect`
 in both embedded and standalone Adxlet modes. It returns the actual node/session,
@@ -63,31 +63,19 @@ may be observed without an independent Relay Child, but `can_upgrade` remains fa
 Process Begin/Query and Relay handoff remain standalone-only. ExpectedRuntime
 includes the actual `configuration_sha256`; `ready` is not a frozen Submission parameter.
 No observation is synchronously awaited before the supervisor actor loop starts.
-NodeInfo components expose an independent optional `sources` map keyed by role.
-These are authenticated facts of the actual owned Process, not the current
-ConfigMap版本声明 or historical startup selection: manifest `version`, verified
-whole-package `archive_sha256`, and verified ServiceOverride bytes'
-`raw_config_sha256` are independently nullable. Image processes have unknown
-sources. Embedded mode retains both roles' configuration contributions on the
-single owned Adxlet Process. Binary-only updates preserve actual configuration
-provenance but replace binary provenance; local artifacts have no known archive
-digest. Sources and runtime share the existing owned-generation/ready proof and
-recheck, without another RPC observation or any ExpectedRuntime input expansion.
-Unknown sources do not prevent runtime observation or upgrades, but cannot prove
-full ready promotion without complete current source facts.
-ConfigMap版本声明 supports initial target/ready selection and private configuration
-snapshots. Active standalone updates may supply paired `--component-config-path`
-and `--component-config-sha256`; omission preserves the current actual configuration.
-An explicit descriptor renders the fixed deployment baseline plus that override,
-while preserving current parent control wiring. Target acceptance matches both
-prepared binary and configuration SHA; recovery restores the original full configuration.
+NodeInfo 的可选 `sources` 按角色记录实际 Process 的认证版本、整包摘要和原始配置摘要，各项可独立 unknown；来源与 runtime 共用 owned Process 观察及复核。
+配置输入由 IaC 或运维准备。主动升级可提供 `--component-config-path`，读取容器内已挂载的
+`ServiceOverride` JSON；描述仅包含 `mount_path`，不要求配置文件摘要，省略时保留实际配置。
+显式配置以固定部署基线生成私有快照并保留父控制边界，目标验收核对二进制与实际配置摘要，失败恢复使用原完整配置。
+同一计划的所有批次使用相同的远端归档和配置输入描述；配置输入与各节点固定部署基线合并，
+因此实际配置摘要允许因节点而不同。发布器在任何副作用前拒绝无法无损转换为 CLI 参数的 Submission。
 
 Success emits compact schema-version-1 process JSON, freezing context, namespace,
 container, config, role, commit, binary SHA-256, rollout ID, epoch and adxlet-only
 origin. Nodes are sorted by ADX node ID. The first node is a separate canary batch;
 remaining nodes are split by positive `--batch-size` (default 1). Batches reference
 ADX node IDs, not local task IDs. Each node contains only `node_id`, Kubernetes/
-container evidence in `kube` (including both observed resourceVersions), and the
+container evidence in `kube` (including the observed resourceVersion), and the
 exact Rust `submission`. Runtime, local task ID and service ID have one source of
 truth: `submission.selection.expected`, `submission.task_id` and
 `submission.service_id`. The 64-hex local ID is a canonical SHA-256
@@ -112,8 +100,7 @@ python build/release/node_rollout.py apply-process \
 Batch indexes are zero-based. A later invocation must explicitly select the next
 batch, and all earlier batches must be successfully completed and, for adxlet,
 released. Nodes in the selected batch run sequentially. No automatic batch
-progression is performed. Input restore follows the failure contract below;
-ready promotion is an independent explicit action.
+progression is performed.
 Without archive flags, executables must already exist in the supervisor's configured local releases.
 
 For role `adxlet`, `plan-process` and every `apply-process` observation before a
@@ -130,10 +117,16 @@ publisher-controlled `rollback` that locally starts the saved original-version a
 unproven outcome or a failed original-version recovery retains maintenance and
 returns pending; there is no recursive rollback. Local fixtures are not cluster validation.
 
-A completed standalone Relay upgrade may be followed by a separate adxlet
-process upgrade against that serving Relay, preserving its existing Environment
-bindings. An installed candidate that has not opened admission still rejects
-adxlet takeover. Finish the Relay handoff before starting the adxlet upgrade.
+独立 Relay 先完成交接，再对正在服务的 Relay 执行单独的 adxlet 进程升级，保留已有
+Environment 绑定。候选通过普通 `BeginBindings`/`ReplaceBindings` 完成全量同步并开放准入；
+首个 snapshot 结果未知时重放冻结内容，精确 ready 后只同步 canonical 最新增量。
+交接保持 owner/epoch 校验与旧端真实退休 ACK，父 supervisor 证明旧 Child 已真实 reap 后
+才能 Finish；未完成交接时仍拒绝 adxlet takeover。
+
+Relay 升级使用 `adx.node.v1` 的 `BeginDrain` 和 `Reserve`/`Cancel`/`Switch`/`Finish`。
+BeginDrain 的成功回执证明业务 TCP 与 health 监听均已真实释放，同 task/session 重放返回
+相同释放回执和固定期限；取消调用不撤回已接收排水。Switch 同时携带旧端释放或真实 reap
+证据，更换失败候选时还须携带该候选 Child 的真实 reap 证据。
 
 If both the target and original-version recovery budgets expire, Query and
 same-A Start and rollback requests only observe existing results; they do not restart a
@@ -164,9 +157,7 @@ reachable from the publishing Job and designated operator sources, and that a
 workload outside those sources cannot reach it. Verify that no public API or
 Ingress route exposes it. Deployment isolation has not been verified for this
 revision. The publisher has no dedicated gRPC client, generated rollout stubs,
-Supervisor certificate configuration or session-approval phase. The former
-`--handoff-config`, `--handoff-stubs` and `--handoff-timeout` options are removed;
-process promotion checks receipts through the same HTTP query.
+Supervisor certificate configuration or session-approval phase.
 
 ### Remote Archive Preparation
 
@@ -178,148 +169,24 @@ compare the complete Submission, including the archive source. A changed URL or
 archive digest under the same task ID conflicts. URLs require anonymous HTTPS
 with a host and no fragment; redirects and proxy-environment forwarding are disabled.
 
-With a remote archive, omit `--sha256` to let 本机adxctl准备 derive the selected
-fixed executable digest from the schema 1 manifest authenticated by the whole-package
-SHA. An explicit expected executable SHA remains a strict check. Without an archive,
-the 镜像自带版本 installed-release path still requires `--sha256`. The publisher
-script sends instructions and maintains rollout state; it does not download packages.
-Before any exit or sealing action, the single worker persists
-`task.prepared.binary_sha256` with the existing journal fsync contract. It never
-fills the derived value back into Submission, so exact replay remains unchanged.
-Target success and retained-candidate acceptance require this prepared fact; missing
-or invalid prepared identity is not inferred from plan input or a listening endpoint.
+远端包可省略 `--sha256`，由本机 adxctl 从整包 SHA 认证的 schema 1 manifest 派生目标摘要；显式提供时严格比对。本地已安装版本仍要求角色 SHA。单个 worker 在退出或封存前将 `task.prepared.binary_sha256` 持久化，原 Submission 保持不变；目标验收核对该准备事实。
 
-### Read-Only Version Declaration
-
-`plan-process --declaration-candidate candidate.json --configmap NAME` adds GET-only
-candidate planning; `--declaration-key` defaults to `target.yaml`. The candidate
-must be strict JSON (also valid YAML), with standalone schema 1, complete target
-and ready roles and exactly one `upgrade_components` entry. Do not combine this
-input with manual role, commit, binary SHA, archive or component-config flags.
-Manual planning still requires its original role and target inputs.
-
-The selected target derives the existing Submission's version, remote archive and
-component config descriptor, without supplying a binary SHA. The plan freezes one
-ConfigMap UID/resourceVersion/key and the exact original and candidate UTF-8 texts,
-plus each node's declaration mount path. Only an unambiguous direct ConfigMap
-volume/mount is supported; projected, subPath, subPathExpr and shadowed paths are
-refused. Both existing runtime observations invoke node-info with this path and
-verify the old declaration SHA against the current ConfigMap text, not the candidate.
-A final GET requires the same UID and old text; metadata-only resourceVersion
-changes are accepted and the fresh version is frozen. Old YAML is not parsed in Python.
-
-`apply-process` uses the same process journal and frozen Submissions for candidate
-plans. A single global, fsynced ConfigMap intent records a UID/resourceVersion/value
-JSONPatch CAS before sending it through stdin. Only the selected data key changes;
-an uncertain ACK is reconciled by GET, not by assuming the command failed. Foreign
-UIDs/text and a candidate without this rollout's remote ownership marker are
-refused. The first write requires the frozen source RV; metadata changes before
-that write require replanning, not a fresh-RV takeover. The shared annotation
-`adx.dev/rollout-input-fence` contains the canonical immutable full-plan SHA plus
-`:applied` or `:restored`, atomically written with the selected data key under
-UID/RV CAS. Confirmation requires matching UID, data and marker. Restored closes
-the rollout irreversibly; later foreign markers are never overwritten by old tasks.
-
-Image startup does not require a pre-created declaration key: an authoritative
-ConfigMap GET may freeze `original_text: null`. A binaryData key is never treated
-as absent. Missing data maps are supported; invalid/empty existing text is refused.
-For an existing old declaration, both node observations require its pinned SHA and
-successful typed observation, without imposing its desired mode on actual runtime.
-For an absent key no mounted old SHA or successful desired observation is invented.
-Candidate raw UTF-8 is limited to 4 MiB and normalized official desired JSON to
-64 KiB; writes and projection SHA checks use the exact frozen candidate text.
-
-Before the first write, unstarted nodes are freshly checked against original
-Pod/container/runtime identities. Only new/preparation stages wait, bounded per
-observation, for the frozen direct mount and exact candidate SHA/desired. Existing
-submit intents retain Query/exact replay and accepted tasks retain release even
-when the declaration later becomes invalid. No server preparation/recovery deadline
-is refreshed by projection observation.
-
-Failed batches restore input only after a fresh exact task Query and actual runtime
-prove original selection/rollback or never-begin with the full original identity.
-Adxlet also requires the current released-session maintenance receipt. Retained
-candidates, unknown tasks and missing evidence do not authorize restoration. The
-owned candidate key is CAS-restored to old text, or removed when originally absent;
-other keys remain intact. An outstanding forward CAS is fenced by metadata CAS when
-necessary before recognizing already-original input. Restoration ACK loss is
-reconciled on re-entry; the batch remains failed and does not expand.
-
-
-`adxctl rollout node-info --declaration-path /mounted/target.yaml` observes a
-ConfigMap版本声明 only. Without this option it uses the deployment's
-`external_declaration`; without either path the response field is null. This
-option does not enable startup selection, watch inputs or submit an upgrade.
-Startup still requires complete target and ready groups. Optional
-`upgrade_components` defaults to an empty list and permits at most one `adxlet`
-or `relay`; embedded declarations require an empty list. Both groups validate
-absolute component config paths and lowercase 64-hex digests without reading
-component config bodies.
-
-The observation shares the startup declaration reader: one pinned FD, a 4 MiB
-input limit and a fixed five-second observation budget. It does not perform
-本机取包, render configuration or start processes. Success adds
-`external_declaration: {path, raw_sha256, desired}` using the official typed
-schema, including `artifact: {url, sha256}`. Desired state is not running identity.
-Read/validation errors and desired JSON exceeding 64 KiB return only
-`{path, error: {code}}` with a static code, never parser input or raw configuration.
-Actual runtimes, `external_startup` and top-level `ok` remain independently
-observable, including when the declaration changes or becomes invalid.
-
-
-The dedicated rollout worker uses the existing Tokio runtime for HTTP, with
-10-second connect and 30-second stalled-read limits. At most three requests retry
-transport failures, 429, 500, 502, 503 or 504. Download, retry/backoff, both archive
-passes, every manifest file hash and executable copy share the original monotonic
-900-second preparation deadline and supervisor stop flag. Preparation failure
-does not enter the Child replacement flow or stop the original process.
-For retryable HTTP responses, valid `Retry-After` delta-seconds or HTTP-date
-headers override the 1/2-second fallback. Past dates permit zero delay; absent or
-invalid headers use the fallback. A valid delay exceeding the remaining task
-budget, including an overflowing numeric value, fails preparation rather than
-retrying early. Waiting remains cancellable and never refreshes the deadline.
-Terminal I/O, cancellation, size and digest errors are not transport retries;
-local I/O and exhausted transport failures retain their original error causes.
-Planning rejects host forbidden/control characters and malformed percent escapes
-before maintenance, while retaining standard DNS, IPv4 and bracketed IPv6 URLs.
-
-Task-private exclusive `archive.partial` and `unpacked.partial` replace no global
-installation, current symlink or shared cache. Actual compressed bytes are capped
-at 512 MiB, checked against HTTP length and the frozen archive SHA-256 before
-extraction. Two gzip/tar passes cap actual decoded bytes at 2 GiB including headers
-and padding, require two zero headers, zero-only tar padding, valid gzip CRC/ISIZE,
-and exactly one gzip member without compressed trailing data.
-
-The first raw-header pass accepts at most 10,000 headers: ordinary files,
-zero-payload directories and GNU longname `L` metadata up to 4096 bytes. The second
-standard tar pass resolves GNU longnames, including CI SDK wheel names over 100
-characters. This is not general tar metadata support: PAX, GNU longlink, sparse,
-links and devices are rejected. A single leading `./` and the real `./` root
-directory are supported; duplicate canonical targets, traversal, empty internal
-components, backslashes and file/directory conflicts are rejected. Package modes
-and scripts are never applied or executed.
-
-Packages retain schema-1 `manifest.json` with `schema_version`, `commit`, `target`
-and `files`; builder extras such as profile/with_afs remain accepted. The manifest
-limit is 4 MiB. Duplicate JSON file keys fail; all ordinary files except the root
-manifest must exactly match the manifest key set and hashes. Host target, commit
-and selected role digest retain their existing checks and copy/publication path.
-Full-file validation uses an iterative relative-path queue, a single hash read
-buffer and constant open directory descriptors. Each queued path is reopened
-component by component with NOFOLLOW from the pinned package directory; deep or
-wide input does not create recursive worker stack frames or retain child FDs.
-Traversal components and file chunks check the same preparation deadline/stop.
-Source fixtures cover deep/wide trees and decoded limits with small private caps;
-both production archive passes retain the fixed 2 GiB limit.
+File preparation is owned by the local adxctl worker. Downloads, retries,
+archive/manifest validation and private executable copies share one fixed
+900-second preparation budget; a preparation failure leaves the original process
+running. The publisher neither downloads nor unpacks artifacts. Download limits,
+Retry-After handling, supported archive entries and validation rules are documented
+in [the adxctl manual](../../docs/deployment/adxctl.md).
 
 The plan is immutable canonical-hash input. Plan/journal reads reject symlinks,
 nonregular files and JSON larger than 8 MiB. A Linux `fcntl` side lock is held for
 the entire invocation. Journal writes use a mode-0600 temporary file, fsync,
 atomic replace and directory fsync. Keep the same plan, journal and lock location
-for recovery; do not delete the journal to retry an uncertain task. The journal
-stores publisher action stages, first submit time, the local Task's attempt and
-node session after Exit, the frozen A identity in `rollback_from` during recovery,
-and a frozen release session and outcome. It does not duplicate owners, Submissions or complete Query responses.
+for recovery; do not delete the journal to retry an uncertain task.
+Journal 保存 publisher 动作阶段、首次 Submit 时间，以及 Exit 后冻结的目标 A 的
+`attempt`/`node_session`；不镜像 B 身份、owner、Submission 或完整 Query 响应。
+`rollback_intent` 始终重放 Rollback(A)，B 仅从本机 Task 查询取得；
+`release_intent` 单独冻结真实结束 session 和 outcome。
 
 Before initial operations the frozen runtime and Pod/container identity must
 match. Submit intent and first-submit timestamp are durable before argv-only
@@ -351,8 +218,8 @@ the first-submit timestamp as its execution clock: the local Task owns the
 refresh. A prepared Task waiting for maintenance does not restart preparation or
 expire merely because its original preparation window has elapsed. Neither
 timestamp nor timeout proves process exit. Unrecognized outcomes and transport
-errors stop the current invocation with pending. Reentry queries first; the
-recognized local intent/unknown stages below resume only their existing identity.
+errors stop the current invocation with pending. Reentry queries first.
+下述本机阶段只继续已保存的身份；`error` 表示失败事实，不派生额外 unknown 阶段。
 Interrupting the publisher is resumable, not a permanent rollout stop.
 
 Once adxlet files are prepared, prepare intent is saved before POSTing the exact
@@ -366,15 +233,27 @@ An uncertain prepare acknowledgement first queries that marker; only a valid
 `status:absent` permits the same prepare body to be replayed. Conflict, errors and
 unknown responses retain pending state. Every subsequent mutation has its intent saved first.
 
-Exit is `adxctl rollout step --task-id TASK --step exit --attempt ''
---node-session ''`. The publisher queries the same Task until its existing
-`adxlet_execution.stage=exited` proves local reap, checks the original PID and
-local attempt/session/deadline, and separately queries Coordinator's yielded
-marker. It freezes that local attempt/session, then calls Start with the same
-Task/attempt/session after confirming this owner's Yield and local reap. Before
-Start, Coordinator's current session may still be the origin; no replacement
-session must be reserved. Start owns bootstrap, readiness, actual
-binary/configuration checks and Complete. The new adxlet registers with its
+Exit 使用 `adxctl rollout step --task-id TASK --step exit --attempt '' --node-session ''`。
+Publisher Query 同一 Task，等待 `adxlet_execution.stage=exited` 证明本机真实 reap，
+核对旧 PID、新 attempt/session 和固定 deadline，再单独核实同 owner 的 Yield。
+Journal 此时冻结目标 A 的 attempt/session，并以同一身份发 Start；启动前不要求
+Coordinator 的 current_session 已切为 A，也不预留 replacement session。
+本机 `starting` 拥有 Start、bootstrap、ready 和实际 executable/configuration 检查；
+核对完成后先持久化 `committing`，再发 Select。
+
+`adxlet_execution` 以公共字段 `old_pid`、`error`、`attempt`、`node_session`、
+`deadline_unix_ms` 加扁平 `stage` 描述进度。stage 仅有 `exiting`、`exited`、
+`starting`、`committing`、`stopping_for_rollback`、`selected`：
+`candidate_pid` 在 starting/stopping_for_rollback 可空，在 committing/selected 必有，
+exiting/exited 不携带。Exiting 可尚未生成新身份，或身份已生成但写盘结果未知；
+重试始终保存同一身份，不因失败换 attempt/session。`error` 保留失败事实。
+`leg={"kind":"target"}` 使用目标文件；原版恢复使用
+`leg={"kind":"rollback","from":{"attempt":"A","node_session":"A_SESSION"}}`，
+其公共 attempt/session 为 B，from 固定 A。两种 leg 共用同一 Start/bootstrap/ready/Select 路径。
+Selected 的结果由 Task.phase 区分：目标为 Completed，原版恢复为 Failed。
+Select 已成功而终态写盘失败时保留 Committing，直到同一 Receipt 收口。
+
+The new adxlet registers with its
 saved identity. Coordinator authenticates the Node, checks the unchanged RPC and
 Relay addresses, confirmed Yield and initial reconciling/closed-admission report,
 then calls existing `GetSession` to verify the actual process. Expired heartbeats
@@ -399,69 +278,45 @@ or startup ordering is introduced. Standalone Relay upgrade and rollback use
 the 32-character key is derived from the complete task ID. Preparation checks
 both Relay paths and the target/original adxlet bootstrap paths against the
 100-byte absolute-path limit before any old-process exit operation.
-Publisher does not invoke Yield, registration or Complete itself. An uncertain
-Exit/Start acknowledgement first queries the same Task and
-maintenance identity; proven completed steps are not repeated. `exit_unknown`
-replays Exit's original empty attempt/session input, including the local read-only
-observation after expiry. The local operation retains any already minted identity
-and fixed deadline. A Task merely marked exited with an unexplained live process
-remains pending; null runtime alone is never process-exit proof.
+Publisher 不直接调用 Yield、注册或 Select。Exit/Start 回复未知时先查同一 Task 和维护身份；
+已证明完成的步骤不重复。Exiting 重放 Exit 的空 attempt/session 输入，保留已生成身份和固定期限，
+期限后只做本机只读观察。仅有 exited 标记但仍观察到无法解释的活动进程时保持 pending；
+null runtime 不能证明退出。
 
-Target Start replays the same saved attempt/session A for local `start_intent`
-and `start_unknown`, using local idempotency. `target_commit_unknown` only
-reconciles that same A through Start's Complete/Receipt path; after expiry the
-local replay is Receipt-only. Publisher does not request Rollback for this
-unresolved commit stage. A completed Task and current runtime always take the
-success path, including a late committed receipt. The publisher does not start
-a new target after the local 900-second deadline. A target Start failure
-that remains unresolved after same-A replay, or exhaustion of that target window,
-can enter the single original-version recovery below.
+目标 Start 对 exited/starting 重放保存的 A；同 attempt 的 actor Start 不重复 spawn。
+Committing 只继续同 A 的 Select/Receipt，期限后仅查 Receipt，不允许回退或启动竞争候选。
+即使较晚收到已 Committed 回执，也按 Completed/selected 和当前实际 runtime 走成功路径。
+目标的 900 秒期限不刷新；Starting 的失败事实经同 A 重放仍未解决，或目标窗口耗尽，
+才可请求下面的一次原版恢复。
 
-Rollback is saved as publisher intent with the frozen A identity before
-`step --task-id TASK --step rollback --attempt A --node-session A_SESSION`.
-The publisher checks the same owner's yielded maintenance marker before first
-submitting rollback. Local Rollback first reconciles A's receipt: committed A
-finishes successfully without stopping it. An ambiguous known candidate remains
-protected. Before the first StopFailed, the worker saves one absolute 600-second
-deadline covering sealing A, real reap, original Start, bootstrap and readiness.
-`rollback_intent` and `rollback_unknown` preserve A and that deadline.
+Publisher 在保存 `rollback_intent` 后始终调用
+`step --task-id TASK --step rollback --attempt A --node-session A_SESSION`，
+首次调用前核实同 owner 已 Yield 的维护 marker。Worker 先查 A 的 Receipt：
+已 Committed 则成功收口，不停止它；未知回执不能证明未创建或已退出。
+第一次 StopFailed 前持久化固定 600 秒期限及 `stopping_for_rollback`，
+由 actor 封闭 A 并证明 NeverCreated 或真实 reap；迟到 Start(A) 不得复活。
+只有上述证明成立且准备时固定的 original executable/configuration 重新验证通过，
+才保存 B 和带 from=A 的 rollback leg，以 `exited` 进入同一启动路径。
+若 B 写盘结果未知，重存同 B，不生成 C。
 
-Only after the actor confirms A sealed and truly reaped or NeverCreated, and the
-pinned original executable/configuration are verified, does the worker mint and
-save B at `rollback_ready` with `rollback_from={attempt:A, node_session:A_SESSION}`.
-It then runs the existing Start path internally using those original files.
-External Start accepts only target A; publisher never sends Start(B). An accepted
-rollback can start B even if the script disconnects. Coordinator unavailability
-also does not prevent local B startup: B can wait for registration while publisher
-remains pending. It never releases maintenance automatically.
+本机 worker 接收回退后直接启动/继续 B，外部 Start(B) 被拒绝；
+脚本断连或 Coordinator 不可达时仍可本机启动 B 等待注册，维护不自动解除。
+已有 B 时 journal 仍只保存 A，重放 Rollback(A)，从 Task 校验 leg.from=A 并取得 B；
+活动 worker 不重复启动。600 秒覆盖 A stop/reap 与 B Start/bootstrap/ready/Select，
+重试或查询不刷新期限。B 的 Committing 期限后仅查 Receipt；失败或超时保留维护，不递归回退。
 
-Replaying rollback always names A, including when B already exists. The local
-worker reuses the saved B and deadline, resaving after an ambiguous write and
-continuing its Start/Receipt path. A live same-task worker is not duplicated.
-`original_start_intent`, `original_start_unknown` and `original_commit_unknown`
-refer to that B; after expiry its replay observes Receipt without spawning or
-refreshing the budget. A failed original retains maintenance without a recursive
-rollback or new identity C. The publisher validates B's exact source and adopts
-its identity before terminal classification, even if B is already selected when
-the first rollback response is observed. It still verifies current actual runtime
-and registered session before release.
+Adxlet process journal 保持 schema 2，Relay/Pod journal 和 process plan 保持 schema 1，
+`step_protocol` 保持 2。本轮首次整套升级直接采用新状态结构，不提供旧阶段映射或兼容路径。
+首次升级前需盘点各节点 `state_dir/rollout/` 下的历史任务。确认任务已终态且不再需要重放后，
+按明确目录清单归档并移出该目录；旧任务格式会使新 Submit 的任务扫描失败。
+活动任务或结果未知时先用原版本收口，保留正在使用的二进制、配置和共享数据。
+同 owner 只部署一个 publisher；非阻塞 journal flock 仅约束相同 journal/lock 路径。
 
-Adxlet process publisher journals use schema 2; Relay and Pod journals remain
-schema 1, and process plans remain schema 1. A schema-1 adxlet journal is refused
-before remote effects; finish in-progress work with its original publisher version
-before upgrading. There is no journal migration or old rollback alias. Deploy one
-publisher per owner: the nonblocking journal flock only serializes users of that
-same journal/lock path, and cannot enforce this convention across different paths.
-
-Original selection requires the current `failed/original_selected` Task,
-`rollback_from` naming A, B's candidate PID and session, the original binary and
-configuration hashes, and the unchanged independent Relay session. It releases
-this owner's maintenance restriction and reports failed. A cancellation after
-maintenance but before the first Exit may also release as failed only when the
-Task has no execution, its complete actual runtime exactly equals the frozen
-original, and Query proves the same owner/current original session is unyielded.
-An unknown exit, lost process or changed runtime does not qualify. Release does
-not change an administrator's independent pause.
+原版恢复成功要求 Task 为 Failed/selected、rollback leg.from 精确指向冻结的 A，
+并核对 B 的 candidate PID/session、原版 binary/configuration 摘要和未变化的独立 Relay session。
+通过后 release 本轮维护，报告升级失败并停止后续批次。首次 Exit 前的取消只有在 Task 无 execution、
+完整实际 runtime 等于冻结原版、Query 证明同 owner/current 原 session 尚未 Yield 时，
+才可按失败 release。未知退出、进程丢失或 runtime 变化不符合该条件；release 保留管理员独立 pause。
 
 Tracking rejects Pod UID/containerID/restart/nodeName or supervisor boot changes.
 Temporary null runtime or false upgrade eligibility does not imply process exit.
@@ -492,9 +347,7 @@ Relay completion checks target hash, candidate relay session and unchanged node
 session in the same incarnation. Original-file recovery checks original hash and
 the recovered candidate session. Retained-target loss and cancelled/pre-begin
 failures are failures, never permission to advance. Relay requires no maintenance
-release. A proven adxlet original-file recovery remains a failed batch even after
-its maintenance release succeeds. Failure stops later batches, and promotion requires all target
-batches to have succeeded.
+release. 已证明的 adxlet 原版恢复在维护解除后仍记为本批失败；失败阻止后续批次。
 
 Output is machine JSON with `status` equal to `completed`, `failed` or `pending`;
 only a completely successful selected batch exits zero. Invalid plan/journal or
@@ -507,51 +360,27 @@ intent and protection for the same command to resume.
 `--config` is required and is an absolute container-internal deployment YAML path.
 Planning reads existing NodeInfo through adxctl in embedded or standalone mode,
 binding actual node/session, parent boot and running container to Coordinator
-inspection. Original Pods may already have process sources or external startup;
-replacement provenance constraints do not apply to them.
+inspection.
 
-Optional `--declaration-candidate JSONFILE --configmap NAME --declaration-key target.yaml`
-uses shared strict JSON, direct mounts, 4 MiB raw/64 KiB desired limits and the CM
-CAS journal. Pod candidates require empty `upgrade_components`; embedded groups
-require the same package. A missing old key is frozen as null. Before a new DELETE,
-the owned candidate must be CAS-confirmed and observed at the bound projection.
-Already ambiguous DELETEs retain their fixed UID/RV reconciliation.
-Every actual resend while the old UID remains non-terminating rechecks the owned
-candidate and projection; a saved intent is not evidence that DELETE executed.
-Declaration desired observations normalize omitted `upgrade_components` to `[]`
-before the 64 KiB check, while original candidate bytes and raw SHA stay frozen.
+运行时 `status.imageID` 是非空的运行身份，随容器身份和父进程启动身份记录并复核。
+发布器将完整目标镜像引用与 PodSpec 精确比较；不将该引用与 `status.imageID` 比较，
+也不推导 OCI index 与平台镜像之间的映射。
 
-Replacement validation uses default NodeInfo without a path override. Image-only
-replacements require null external declaration/startup and explicitly empty actual
-sources maps. CM replacements require default initialization at the candidate
-path/raw SHA, target startup (not ready fallback), complete matching role sources,
-and actual binary/effective config digests matching the initially selected target.
-Runtime `status.imageID` is opaque nonempty identity, recorded and rechecked with
-container identity and parent boot. No OCI index-to-platform mapping is claimed;
-the target digest is compared to PodSpec, not status.imageID.
-
-Abort retains verified services and uses existing strict rollback verify for
-unfinished replacements without demanding candidate provenance, allowing valid
-ready fallback cleanup. Aborting cleanup does not require cross-node recovery
-fingerprints, while session, checkpoint scope, emptiness and permit checks remain.
-Template and owned CM restoration/late-write fences
-precede finalize; other CM keys are preserved. Stop starts no new deletion and
-leaves restoration to explicit abort.
-
-After confirmed abort freeze, owned CM restoration and its `rollout-input-fence`
-complete before original-template restoration, restore-original or cleanup release.
-Stop only freezes. Cleanup node reports include current component sources and
-actual executable/configuration SHA observations, or explicit unknown if NodeInfo
-cannot be observed; unknown does not invalidate historical Coordinator receipts.
-`mixed_images` describes image differences only. Equal images do not prove equal
-component versions or restored original components.
+目标镜像支持显式版本 tag 和现有完整 `@sha256:` 引用。tag 必须为 1–128 个 ASCII 字符，
+以字母、数字或下划线开头，后续只允许字母、数字、下划线、点和连字符；不接受任何大小写形式的
+`latest`、省略 tag、空白或控制字符。registry 端口不能替代镜像末段的 tag，
+例如 `registry.example:5000/adxlet:release-20261124-1` 有效，
+`registry.example:5000/adxlet` 无效。完整 digest 使用 64 个小写十六进制字符。
+使用 tag 发布时，每次发布使用唯一新 tag，禁止覆盖已有 tag；tag 字符串校验不证明镜像内容不可变。
+任务、计划、journal 和替换 Pod 仍绑定同一个完整镜像引用，发布器不查询 registry 解析 digest。
 
 `node_rollout.py plan-pod` uses only Python's standard library. It reads a native
 DaemonSet or StatefulSet and its current controller-owned Pods through
 `kubectl get`, and reads Coordinator management capabilities and each mapped
 node's inspection through HTTP GET. `--daemonset NAME` and `--statefulset NAME`
-are mutually exclusive; StatefulSet plans freeze `workload.kind` explicitly while
-legacy DaemonSet plans omit it and default to DaemonSet. Planning itself performs
+are mutually exclusive. Both workload types record `workload.kind` explicitly;
+replacement journals require their recorded `replacement_host`. Missing fields
+are refused rather than inferred. Planning itself performs
 no POST or Kubernetes mutation; `apply-pod` is a separate normal-path publisher
 command described below.
 
@@ -569,7 +398,7 @@ remain in inventory for state-specific reconciliation, not disappearance proof.
 python build/release/node_rollout.py plan-pod \
   --context production --origin http://coordinator:9090 \
   --namespace platform --daemonset adxlet --container adxlet --config /opt/adx/config/deployment.yaml \
-  --target-image registry.example/adxlet@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-image registry.example:5000/adxlet:release-20261124-1 \
   --task-id release-20261110 --epoch 1 \
   --node adxlet-abc=registered-adx-node-a \
   --node adxlet-def=registered-adx-node-b > plan.json
@@ -660,8 +489,8 @@ template or environment values. Only the selected container image differs in
 these fingerprints. Source Pods are ordered by name; the first is a separate
 canary, followed by fixed batches of positive `--batch-size` (default 1).
 
-Objects are read twice and node sessions/rootfs/actual Pod UID evidence are rechecked. This is
-not an atomic cross-system snapshot or a guarantee against later changes.
+规划时每个对象读取一次，并绑定 node session、rootfs 与实际 Pod UID 证据；
+执行前重新核对当前对象和运行身份。这不是跨系统原子快照，也不保证之后不发生变化。
 The publisher revalidates identity and uses current UID/RV CAS conditions;
 the saved RV is not authorization to delete. HTTP connectivity and even
 `strict_empty` in this output are not proof or permission to delete a Pod.
@@ -671,6 +500,13 @@ cross-node recovery compatibility.
 
 
 ## Pod Apply
+
+Pod task ID 必须是 1–128 个 ASCII 字符，仅允许字母、数字、`.`、`_`、`~`、`-`，且不能完整等于
+`.` 或 `..`；epoch 必须是正 u64。规划与计划消费使用相同规则，保证 Coordinator 原始 URL 路径可精确寻址。
+消费计划时还会核对 StatefulSet 规范序号名、源宿主机和镜像、原始与目标模板指纹。
+首次 Begin 若明确返回 HTTP 400 `InvalidArgument`，journal 记录拒绝；stop/abort 只有在原 task 查询
+明确返回 HTTP 404 `NotFound` 后才本地收口，且不重发无效 Begin。查询或传输结果未知时保留 pending；
+未知首次结果之后的重放即使收到 400，也不能据此声明远端未执行。
 
 The normal-path Linux publisher advances one explicitly selected batch:
 
@@ -735,14 +571,12 @@ nonterminating original Pod has a different RV, the publisher journals and
 revokes the old authorization, checks that the node is still strictly empty,
 then obtains and confirms a new permit before issuing a DELETE for the new RV.
 A terminating original waits for authoritative disappearance even when its RV changes.
-Replacement must have the same controller UID, target digest, Downward UID and a
-fresh authenticated session, with protocol 3, unknown=false, isolated,
-task/epoch-matching inspection and four zero inventory counts before replacement
-quiesce and new-permit verify. A DaemonSet replacement must stay on the source
-host; a StatefulSet replacement keeps its stable Pod name and may move to another
-host, recording that host. Legacy DaemonSet journals that predate the recorded
-host resume the source host; StatefulSet always requires its recorded replacement
-host and never assumes the source host.
+替换 Pod 必须匹配原控制器 UID、完整目标镜像引用和 Downward UID，并使用新的认证会话。
+其检查结果必须满足 protocol 3、unknown=false、isolated、task/epoch 匹配及四项库存计数为零，
+随后才可为替换 Pod 执行 quiesce 并用新 permit 验证。DaemonSet 替换 Pod 必须留在原宿主机；
+StatefulSet 替换 Pod 保持稳定名称，可以迁移至其他宿主机并记录该宿主机。
+尚未记录替换宿主机的已有 DaemonSet journal 沿用原宿主机；StatefulSet 始终要求已记录的
+替换宿主机，不会假定仍在原宿主机。
 Local verification requires an explicit successful, complete verify-node HTTP
 task reply with the exact owner/epoch and verified replacement UID/session.
 Task GET phase verified, fresh actual verified control and a scheduling boolean
@@ -759,8 +593,6 @@ After binding, Quiescing evidence must include strict_empty=true and the exact
 new permit/revision.
 
 本机 adxctl run 下载并准备版本包；发布脚本只发送指令和维护发布流程。
-初始化与主动升级的失败恢复会先确认本机启动的进程退出，再启动相应完整配置。
-ConfigMap版本声明的 ready 提升使用上述独立显式入口。
 Do not delete journals or switch owners to bypass an
 uncertain outcome.
 
@@ -825,74 +657,10 @@ late-original registration branch here, so register_source is unnecessary and no
 new inputs are accepted. Unknown or newly substituted original sessions are
 refused, never guessed or used to rewrite frozen identity.
 
-## Ready Promotion
-
-After completing all batches and the operator's business observation, invoke
-`apply-process --plan PLAN --journal JOURNAL --promote-ready` or
-`apply-pod --plan PLAN --journal JOURNAL --promote-ready`. This is a separate
-invocation, separate from batch progression. Promotion requires an existing matching, locked journal and a
-ConfigMap candidate. Failed, retained, unknown, stopped or aborted work cannot
-promote. Process tasks are freshly queried with the exact frozen Submission and
-prepared digests; Adxlet also requires its exact historical released receipt.
-Pod promotion requires the completed task and all verified nodes/completed moves.
-
-Current whole-owned-group NodeInfo, not historical startup selection, must prove
-every candidate version/archive/raw-config source. Standalone checks both owned
-roles; embedded checks both contributions on its one Adxlet Child. Runtime binary
-and config digests must be valid; the selected process role also matches its
-historical prepared content. Ordinary Child restart within the same container and
-resident parent is allowed, including new PID/sessions, but Pod/container/parent
-scope changes are refused. Peer binary content is not guessed or downloaded.
-
-Promotion changes only `ready.components` to the complete target components in
-deterministic official JSON. The frozen plan/candidate are unchanged. A durable
-promotion intent precedes UID/RV/value CAS of data plus this plan's `:promoted`
-ownership marker, followed by bound projection raw/typed observation. Unknown
-writes repeat fresh group and frozen scope proof. If only metadata advances RV
-while this plan still owns the exact candidate, a refreshed CAS intent is saved
-before retrying. Confirmed own-promoted effects still recheck frozen scope, but
-do not require target sources again and are never rewritten. Foreign ownership, including identical text,
-is refused.
-
 ## Verification Boundary
 
-The recorded 2026-11-14 checks apply to the preceding publisher mTLS design:
-162 process/Pod publisher tests, 24 real mTLS client tests, 86 deployment lib
-tests, four adxlet process preflight tests, five
-Coordinator handoff/pause tests and two Pod regression tests. Four-module
-all-targets/all-features compilation, workspace Clippy with `-D warnings`, format,
-documentation and diff checks also passed. Ruff/Pylint passed for the six Python
-files changed by that revision. The full PR-base Python precheck still reports 388
-pre-existing diagnostics and is not recorded as passing. Exact commands and logs
-are retained in this workspace at `out/adx-grpc-handoff-20261113/RESULT.md`.
-
-For the 2026-11-16 HTTP and automatic-registration revision, 68 process and 101 Pod
-publisher tests, five handoff/storage tests, two new real-RPC maintenance tests
-and one existing ordinary-restart RPC regression passed locally. Ruff/Pylint for
-the three changed Python files, workspace format checking and all-targets/all-features
-Clippy with `-D warnings` also passed. Commands and complete logs are in
-`out/publisher-http-20261116/RESULT.md`. Local unit,
-component and fault-injection checks do not validate management-network isolation,
-a cluster upgrade, cross-Worker recovery, production downloads or a new image.
-That local verification run performed no Beijing cluster operation or image build.
-
-A separate deployment-session record on 2026-11-16 confirmed abort cleanup for
-`pod-retest-20261116-1700`: the patched Coordinator processed the original
-plan/journal to `Aborted / partial`, retained the replacement Node0 UID/session
-and target image, left Node1 on its original Pod/image, restored the workload
-template and released this task's maintenance. Both nodes were Ready and had no
-Environments; no administrator pause was set in that field case. This validates
-that empty-replacement cleanup case, not normal upgrade completion, new recovery
-profile activation, cross-Worker Environment migration or a full version rollback.
-Local evidence and the deployment handoff are indexed in
-`out/pod-abort-cleanup-20261116/RESULT.md`.
-
-A subsequent empty-Node0 field run on the same date passed normal Active
-`verify-node` with complete measured recovery evidence, a new bootstrap ConfigMap
-and a PATH-fixed Node image. The replacement moved from Worker .168 to .210;
-Node1 was unchanged. Only batch0 was selected, then the remaining task was
-deliberately aborted to `partial`; the full task did not become Completed.
-The image reused existing Rust binaries/rootfs. This verifies the empty single-node
-upgrade path, not live Environment migration, cross-Worker restore, a full
-two-node release or deployment of every latest Node source change. Evidence and
-review corrections are in `out/pod-normal-verify-20261116/REVIEW.md`.
+Current local and cluster acceptance requirements are documented in
+[process deployment testing](../../docs/testing/process-deployment.md).
+Keep each run's exact source snapshot, commands, test counts and failures with its
+results. Historical runs do not verify later source changes. Local unit/component
+checks do not validate management-network isolation or a cluster upgrade.

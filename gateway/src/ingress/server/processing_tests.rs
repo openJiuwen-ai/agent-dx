@@ -52,14 +52,7 @@ async fn download_request(ingress: Arc<Ingress>, query: &str, headers: &str) -> 
 }
 
 async fn send_request(ingress: Arc<Ingress>, request: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (socket, peer) = listener.accept().await.unwrap();
-        let _ = ingress
-            .serve_http_connection(socket, peer, IngressSecurity::Tls)
-            .await;
-    });
+    let (address, server) = serve_frontend_once(ingress).await;
     let mut socket = TcpStream::connect(address).await.unwrap();
     socket.write_all(request.as_bytes()).await.unwrap();
     let mut bytes = Vec::new();
@@ -72,6 +65,80 @@ async fn send_request(ingress: Arc<Ingress>, request: &str) -> String {
     read.expect("Ingress must return within the processing deadline")
         .unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+async fn serve_frontend_once(
+    ingress: Arc<Ingress>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, peer) = listener.accept().await.unwrap();
+        let _ = ingress
+            .serve_http_connection(socket, peer, IngressSecurity::Tls)
+            .await;
+    });
+    (address, server)
+}
+
+fn test_ingress(resolver: IngressRouteResolver, port: u16, pool: H2PoolConfig) -> Arc<Ingress> {
+    Arc::new(Ingress::new(
+        Arc::new(resolver),
+        DataPlaneL4Connector::new(pool),
+        IngressAuthenticator::disabled(),
+        port,
+        8765,
+        "127.0.0.1:1",
+        vec![],
+    ))
+}
+
+#[cfg(feature = "mock-e2e")]
+fn running_route(relay_address: impl ToString, runtime: &str) -> crate::common::route::RouteInfo {
+    use crate::common::route::{EnvironmentStatus, RouteInfo};
+    RouteInfo {
+        private_service_ports: vec![],
+        e2b: None,
+        instance_id: "environment".into(),
+        tenant_id: "tenant".into(),
+        environment_id: runtime.into(),
+        environment_ip: "127.0.0.1".into(),
+        relay_address: relay_address.to_string(),
+        environment_status: EnvironmentStatus {
+            code: 3,
+            ..Default::default()
+        },
+        tunnel_security_mode: Default::default(),
+        port_forward_security_mode: Default::default(),
+        port_forward_routes: vec![],
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+fn mock_relay() -> Arc<crate::node::Relay> {
+    use crate::common::protocol::GatewayPolicy;
+    Arc::new(
+        crate::node::Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+            .parse()
+            .unwrap()]))
+        .with_route_enforcement(),
+    )
+}
+
+#[cfg(feature = "mock-e2e")]
+async fn read_http_head<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    received: Option<&AtomicUsize>,
+) -> io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let byte = stream.read_u8().await?;
+        if let Some(received) = received {
+            received.fetch_add(1, Ordering::SeqCst);
+        }
+        head.push(byte);
+    }
+    Ok(head)
 }
 
 #[cfg(feature = "mock-e2e")]
@@ -108,25 +175,19 @@ fn ingress_with_progress(delay: u64) -> (Arc<Ingress>, Arc<AtomicBool>) {
     let completed = Arc::new(AtomicBool::new(false));
     let store = Arc::new(RouteStore::new());
     store.set_ready(true);
-    let ingress = Arc::new(Ingress::new(
-        Arc::new(
-            IngressRouteResolver::new(store)
-                .stream_only()
-                .with_demand_resolver(Arc::new(SlowDemand {
-                    delay: std::time::Duration::from_millis(delay),
-                    completed: completed.clone(),
-                })),
-        ),
-        DataPlaneL4Connector::new(H2PoolConfig {
+    let ingress = test_ingress(
+        IngressRouteResolver::new(store)
+            .stream_only()
+            .with_demand_resolver(Arc::new(SlowDemand {
+                delay: std::time::Duration::from_millis(delay),
+                completed: completed.clone(),
+            })),
+        50090,
+        H2PoolConfig {
             tls_config: None,
             ..Default::default()
-        }),
-        IngressAuthenticator::disabled(),
-        50090,
-        8765,
-        "127.0.0.1:1",
-        vec![],
-    ));
+        },
+    );
     (ingress, completed)
 }
 
@@ -162,26 +223,31 @@ async fn route_wait_uses_the_remaining_processing_deadline() {
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
 async fn migration_after_a_stale_connect_uses_the_original_processing_deadline() {
-    migration_after_stale_connect(false).await;
+    migration_after_stale_connect(false, false).await;
 }
 
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
 async fn migration_after_stale_connect_waits_when_only_dormant_metadata_exists() {
-    migration_after_stale_connect(true).await;
+    migration_after_stale_connect(true, false).await;
 }
 
 #[cfg(feature = "mock-e2e")]
-async fn migration_after_stale_connect(remove_old_route: bool) {
-    use crate::common::protocol::GatewayPolicy;
-    use crate::common::route::{EnvironmentStatus, RouteInfo};
-    use crate::node::Relay;
+#[tokio::test]
+async fn raw_connect_metadata_only_resume_keeps_original_request_budget() {
+    migration_after_stale_connect(true, true).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+async fn migration_after_stale_connect(remove_old_route: bool, raw_connect: bool) {
+    use crate::common::route::RouteInfo;
     use std::time::Duration;
 
     struct Migrating {
         store: Arc<RouteStore>,
         successor: RouteInfo,
         remove_old_route: bool,
+        wake_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -217,6 +283,7 @@ async fn migration_after_stale_connect(remove_old_route: bool) {
         }
 
         async fn ensure_running(&self, _: &RouteHandle) -> Result<String, ResolveError> {
+            self.wake_calls.fetch_add(1, Ordering::SeqCst);
             // The new execution becomes routable after the old connection
             // budget elapses, but before the caller's request budget.
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -229,10 +296,7 @@ async fn migration_after_stale_connect(remove_old_route: bool) {
     let port = backend.local_addr().unwrap().port();
     let backend = tokio::spawn(async move {
         let (mut socket, _) = backend.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            request.push(socket.read_u8().await.unwrap());
-        }
+        let _request = read_http_head(&mut socket, None).await.unwrap();
         let mut body = [0; 2];
         socket.read_exact(&mut body).await.unwrap();
         assert_eq!(&body, b"{}");
@@ -245,40 +309,18 @@ async fn migration_after_stale_connect(remove_old_route: bool) {
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_address = listener.local_addr().unwrap();
-    let relay = Arc::new(
-        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
-            .parse()
-            .unwrap()]))
-        .with_route_enforcement(),
+    let relay = mock_relay();
+    relay.activate_route(
+        "environment".into(),
+        "new".into(),
+        "127.0.0.1".parse().unwrap(),
     );
-    relay
-        .activate_route(
-            "environment".into(),
-            "new".into(),
-            "127.0.0.1".parse().unwrap(),
-        )
-        .await;
     let server_relay = relay.clone();
     let relay_task = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         server_relay.serve_h2(socket).await.unwrap();
     });
-    let successor = RouteInfo {
-        private_service_ports: vec![],
-        instance_id: "environment".into(),
-        environment_status: EnvironmentStatus {
-            code: 3,
-            ..Default::default()
-        },
-        tenant_id: "tenant".into(),
-        environment_id: "new".into(),
-        relay_address: relay_address.to_string(),
-        environment_ip: "127.0.0.1".into(),
-        tunnel_security_mode: Default::default(),
-        port_forward_security_mode: Default::default(),
-        port_forward_routes: vec![],
-        e2b: None,
-    };
+    let successor = running_route(relay_address, "new");
     let store = Arc::new(RouteStore::new());
     store.put(RouteInfo {
         environment_id: "old".into(),
@@ -294,28 +336,32 @@ async fn migration_after_stale_connect(remove_old_route: bool) {
             store.delete("environment");
         })
     });
+    let wake_calls = Arc::new(AtomicUsize::new(0));
     let resolver = IngressRouteResolver::new(store.clone())
         .stream_only()
         .with_demand_resolver(Arc::new(Migrating {
             store,
             successor,
             remove_old_route,
+            wake_calls: wake_calls.clone(),
         }));
-    let gateway = Arc::new(Ingress::new(
-        Arc::new(resolver),
-        DataPlaneL4Connector::new(H2PoolConfig {
+    let gateway = test_ingress(
+        resolver,
+        port,
+        H2PoolConfig {
             connect_timeout: Duration::from_millis(100),
             connections_per_node: 1,
             max_connections_per_node: 1,
             ..Default::default()
-        }),
-        IngressAuthenticator::disabled(),
-        port,
-        8765,
-        "127.0.0.1:1",
-        vec![],
-    ));
-    let response = request(gateway, "X-ADX-Processing-Timeout-Ms: 600\r\n").await;
+        },
+    );
+    let response = if raw_connect {
+        send_request(gateway, &format!(
+            "CONNECT environment:{port} HTTP/1.1\r\nHost: environment:{port}\r\nX-ADX-Processing-Timeout-Ms: 600\r\n\r\nPOST /invoke HTTP/1.1\r\nHost: environment\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}"
+        )).await
+    } else {
+        request(gateway, "X-ADX-Processing-Timeout-Ms: 600\r\n").await
+    };
     if let Some(remove) = remove {
         tokio::time::timeout(Duration::from_millis(100), remove)
             .await
@@ -324,6 +370,7 @@ async fn migration_after_stale_connect(remove_old_route: bool) {
     }
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.ends_with("migrated!"), "{response}");
+    assert_eq!(wake_calls.load(Ordering::SeqCst), 1);
     backend.await.unwrap();
     relay_task.abort();
 }
@@ -354,21 +401,13 @@ async fn running_backend(
     Vec<tokio::task::JoinHandle<()>>,
     Arc<AtomicUsize>,
 ) {
-    use crate::common::protocol::GatewayPolicy;
-    use crate::common::route::{EnvironmentStatus, RouteInfo};
-    use crate::node::Relay;
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = backend.local_addr().unwrap().port();
     let count = Arc::new(AtomicUsize::new(0));
     let executions = count.clone();
     let backend_task = tokio::spawn(async move {
         let (mut stream, _) = backend.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        let mut byte = [0; 1];
-        while !bytes.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).await.unwrap();
-            bytes.extend_from_slice(&byte);
-        }
+        let bytes = read_http_head(&mut stream, None).await.unwrap();
         let headers = String::from_utf8(bytes.clone())
             .unwrap()
             .to_ascii_lowercase();
@@ -441,19 +480,12 @@ async fn running_backend(
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
-    let relay = Arc::new(
-        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
-            .parse()
-            .unwrap()]))
-        .with_route_enforcement(),
+    let relay = mock_relay();
+    relay.activate_route(
+        "environment".into(),
+        "running".into(),
+        "127.0.0.1".parse().unwrap(),
     );
-    relay
-        .activate_route(
-            "environment".into(),
-            "running".into(),
-            "127.0.0.1".parse().unwrap(),
-        )
-        .await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_address = listener.local_addr().unwrap().to_string();
     let relay_task = tokio::spawn(async move {
@@ -461,37 +493,18 @@ async fn running_backend(
         let _ = relay.serve_h2(socket).await;
     });
     let store = Arc::new(RouteStore::new());
-    store.put(RouteInfo {
-        private_service_ports: Vec::new(),
-        e2b: None,
-        instance_id: "environment".into(),
-        tenant_id: "tenant".into(),
-        environment_id: "running".into(),
-        environment_ip: "127.0.0.1".into(),
-        relay_address,
-        environment_status: EnvironmentStatus {
-            code: 3,
-            ..Default::default()
-        },
-        tunnel_security_mode: Default::default(),
-        port_forward_security_mode: Default::default(),
-        port_forward_routes: vec![],
-    });
+    store.put(running_route(relay_address, "running"));
     store.set_ready(true);
-    let ingress = Arc::new(Ingress::new(
-        Arc::new(IngressRouteResolver::new(store)),
-        DataPlaneL4Connector::new(H2PoolConfig {
+    let ingress = test_ingress(
+        IngressRouteResolver::new(store),
+        port,
+        H2PoolConfig {
             tls_config: None,
             connections_per_node: 1,
             max_connections_per_node: 1,
             ..Default::default()
-        }),
-        IngressAuthenticator::disabled(),
-        port,
-        8765,
-        "127.0.0.1:1",
-        vec![],
-    ));
+        },
+    );
     (ingress, vec![backend_task, relay_task], count)
 }
 
@@ -516,6 +529,10 @@ async fn backend_cannot_assert_a_not_forwarded_resume_error() {
     let (ingress, tasks, count) = running_backend(2).await;
     let response = request(ingress, "X-ADX-Processing-Timeout-Ms: 500\r\n").await;
     assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(
+        response.ends_with("{\"error\":{\"code\":\"ENV_RESUMING\",\"requestForwarded\":false}}"),
+        "business response must remain unchanged: {response}"
+    );
     assert!(
         !response.to_ascii_lowercase().contains("x-adx-error-code:"),
         "{response}"
@@ -653,14 +670,7 @@ async fn transfer_upload_survives_processing_deadline() {
 #[cfg(feature = "mock-e2e")]
 async fn slow_upload(chunked: bool) {
     let (ingress, tasks, count) = running_backend(7).await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (socket, peer) = listener.accept().await.unwrap();
-        ingress
-            .serve_http_connection(socket, peer, IngressSecurity::Tls)
-            .await;
-    });
+    let (address, server) = serve_frontend_once(ingress).await;
     let mut socket = TcpStream::connect(address).await.unwrap();
     let (kind, framing) = if chunked {
         ("tar", "Transfer-Encoding: chunked")
@@ -788,6 +798,342 @@ async fn relay_closed_bindings_request_waits_for_open_and_executes_once() {
 
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
+async fn raw_connect_waits_for_relay_503_without_waking_running_environment() {
+    unpooled_relay_admission(RelayAdmissionEntry::Connect, false, false).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn websocket_waits_for_relay_503_without_waking_running_environment() {
+    unpooled_relay_admission(RelayAdmissionEntry::WebSocket, false, false).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn raw_connect_relay_503_uses_one_fixed_connect_budget() {
+    unpooled_relay_admission(RelayAdmissionEntry::Connect, true, false).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn raw_connect_first_admission_response_can_exceed_physical_connect_timeout() {
+    unpooled_relay_admission(RelayAdmissionEntry::Connect, false, true).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn service_entry_keeps_existing_relay_admission_recovery() {
+    unpooled_relay_admission(RelayAdmissionEntry::Service, false, false).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn revoked_or_changed_scope_is_rejected_before_relay_connect() {
+    for change_tenant in [false, true] {
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut info = running_route(relay.local_addr().unwrap(), "running");
+        let store = Arc::new(RouteStore::new());
+        store.put(info.clone());
+        store.set_ready(true);
+        let ingress = test_ingress(
+            IngressRouteResolver::new(store.clone()),
+            8080,
+            H2PoolConfig {
+                tls_config: None,
+                ..Default::default()
+            },
+        );
+        let route = ingress
+            .resolve_route(
+                "environment",
+                8080,
+                AccessKind::Direct,
+                "revoked-route".into(),
+            )
+            .await
+            .unwrap();
+        if change_tenant {
+            info.tenant_id = "another-tenant".into();
+            store.put(info);
+        } else {
+            store.delete("environment");
+        }
+        assert!(ingress.resolver.current_route_revision(&route).is_none());
+        let error = ingress
+            .open_current_stream(route, false)
+            .await
+            .err()
+            .expect("invalidated authorization must reject before connecting");
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<IngressOpenError>()),
+            Some(IngressOpenError::RouteChanged)
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), relay.accept())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[derive(Clone, Copy)]
+enum RelayAdmissionEntry {
+    Connect,
+    WebSocket,
+    Service,
+}
+
+#[cfg(feature = "mock-e2e")]
+struct AlreadyRunning {
+    wakes: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "mock-e2e")]
+#[async_trait::async_trait]
+impl DemandResolver for AlreadyRunning {
+    async fn describe(
+        &self,
+        _: &str,
+        _: u16,
+        _: AccessKind,
+        _: String,
+    ) -> Result<RouteHandle, ResolveError> {
+        Err(ResolveError::NotFound)
+    }
+
+    async fn ensure_running(&self, route: &RouteHandle) -> Result<String, ResolveError> {
+        assert_eq!(route.target.instance_id, "environment");
+        assert_eq!(route.target.workload_id, "running");
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        Ok(route.target.workload_id.clone())
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+async fn unpooled_relay_admission(
+    entry: RelayAdmissionEntry,
+    exhaust_budget: bool,
+    delay_first_response: bool,
+) {
+    use tokio::sync::oneshot;
+    let websocket = matches!(entry, RelayAdmissionEntry::WebSocket);
+    let service = matches!(entry, RelayAdmissionEntry::Service);
+
+    const PING: &[u8] = &[0x81, 0x84, 1, 2, 3, 4, 0x71, 0x6b, 0x6d, 0x63];
+    const PONG: &[u8] = b"\x81\x04pong";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_address = listener.local_addr().unwrap().to_string();
+    let admitted = Arc::new(AtomicBool::new(delay_first_response));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let business_bytes = Arc::new(AtomicUsize::new(0));
+    let (rejected, repeated_rejection) = oneshot::channel();
+    let ready = admitted.clone();
+    let received = executions.clone();
+    let received_bytes = business_bytes.clone();
+    let relay = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let mut rejected = Some(rejected);
+        let mut rejections = 0;
+        while let Some(request) = connection.accept().await {
+            let (request, mut response) = request.unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            if !ready.load(Ordering::Acquire) {
+                response
+                    .send_response(Response::builder().status(503).body(()).unwrap(), true)
+                    .unwrap();
+                rejections += 1;
+                if rejections == 2 {
+                    let _ = rejected.take().unwrap().send(());
+                }
+                continue;
+            }
+            let received = received.clone();
+            let received_bytes = received_bytes.clone();
+            tokio::spawn(async move {
+                if delay_first_response {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                let mut response = response
+                    .send_response(Response::builder().status(200).body(()).unwrap(), false)
+                    .unwrap();
+                let mut body = request.into_body();
+                let mut business = Vec::new();
+                while !business.ends_with(b"\r\n\r\n") {
+                    let data = body.data().await.unwrap().unwrap();
+                    body.flow_control().release_capacity(data.len()).unwrap();
+                    received_bytes.fetch_add(data.len(), Ordering::SeqCst);
+                    business.extend_from_slice(&data);
+                }
+                received.fetch_add(1, Ordering::SeqCst);
+                if websocket {
+                    assert!(business.starts_with(b"GET /socket HTTP/1.1\r\n"));
+                    response
+                        .send_data(Bytes::from_static(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), false)
+                        .unwrap();
+                    let mut frame = Vec::new();
+                    while frame.len() < PING.len() {
+                        let data = body.data().await.unwrap().unwrap();
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                        frame.extend_from_slice(&data);
+                    }
+                    assert_eq!(frame.as_slice(), PING);
+                    response.send_data(Bytes::from_static(PONG), true).unwrap();
+                } else {
+                    assert_eq!(
+                        business.as_slice(),
+                        b"GET /state HTTP/1.1\r\nHost: environment\r\n\r\n"
+                    );
+                    response
+                        .send_data(Bytes::from_static(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nstate:ok"), true)
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let store = Arc::new(RouteStore::new());
+    store.put(running_route(relay_address, "running"));
+    store.set_ready(true);
+    let wake_calls = Arc::new(AtomicUsize::new(0));
+    let ingress = test_ingress(
+        IngressRouteResolver::new(store).with_demand_resolver(Arc::new(AlreadyRunning {
+            wakes: wake_calls.clone(),
+        })),
+        8080,
+        H2PoolConfig {
+            tls_config: None,
+            connections_per_node: 1,
+            max_connections_per_node: 1,
+            connect_timeout: std::time::Duration::from_millis(
+                if exhaust_budget || delay_first_response {
+                    100
+                } else {
+                    400
+                },
+            ),
+            ..Default::default()
+        },
+    );
+    let service_ingress = ingress.clone();
+    let (address, frontend) = serve_frontend_once(ingress).await;
+    let client = tokio::spawn(async move {
+        if service {
+            let route = service_ingress
+                .resolve_route(
+                    "environment",
+                    8080,
+                    AccessKind::Direct,
+                    "service-entry".into(),
+                )
+                .await
+                .unwrap();
+            let error = service_ingress
+                .open_service_http_stream(route)
+                .await
+                .err()
+                .expect("closed Relay must not admit service traffic");
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<crate::ingress::pool::RelayConnectError>()),
+                Some(crate::ingress::pool::RelayConnectError::Rejected(
+                    StatusCode::SERVICE_UNAVAILABLE
+                ))
+            ));
+            return;
+        }
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let request = if websocket {
+            "GET /environment/8080/socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-ADX-Processing-Timeout-Ms: 600\r\n\r\n"
+        } else {
+            "CONNECT environment:8080 HTTP/1.1\r\nHost: environment:8080\r\nX-ADX-Processing-Timeout-Ms: 600\r\n\r\n"
+        };
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let response = read_http_head(&mut socket, None).await.unwrap();
+        if exhaust_budget {
+            assert!(response.starts_with(b"HTTP/1.1 504"), "{response:?}");
+            return;
+        }
+        if websocket {
+            assert!(response.starts_with(b"HTTP/1.1 101"), "{response:?}");
+            socket.write_all(PING).await.unwrap();
+            let mut pong = [0; 6];
+            socket.read_exact(&mut pong).await.unwrap();
+            assert_eq!(pong.as_slice(), PONG);
+        } else {
+            assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+            socket
+                .write_all(b"GET /state HTTP/1.1\r\nHost: environment\r\n\r\n")
+                .await
+                .unwrap();
+            assert!(read_http_head(&mut socket, None)
+                .await
+                .unwrap()
+                .starts_with(b"HTTP/1.1 200"));
+            let mut body = [0; 8];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"state:ok");
+        }
+    });
+
+    if service {
+        tokio::time::timeout(std::time::Duration::from_secs(2), client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wake_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(business_bytes.load(Ordering::SeqCst), 0);
+        frontend.abort();
+        relay.abort();
+        return;
+    }
+    if !delay_first_response {
+        tokio::time::timeout(std::time::Duration::from_secs(2), repeated_rejection)
+            .await
+            .unwrap()
+            .unwrap();
+        if exhaust_budget {
+            // Keep Relay closed. This watchdog is well above the 100ms connect
+            // budget but below the unchanged 600ms request budget.
+            tokio::time::timeout(std::time::Duration::from_millis(350), client)
+                .await
+                .expect("503 retries must not renew the connection budget")
+                .unwrap();
+            assert_eq!(wake_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            assert_eq!(business_bytes.load(Ordering::SeqCst), 0);
+            frontend.abort();
+            relay.abort();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            wake_calls.load(Ordering::SeqCst),
+            0,
+            "Relay 503 is not an Env wake request"
+        );
+        assert!(!client.is_finished(), "admission must remain retryable");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(business_bytes.load(Ordering::SeqCst), 0);
+        admitted.store(true, Ordering::Release);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(wake_calls.load(Ordering::SeqCst), 0);
+    frontend.abort();
+    relay.abort();
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
 async fn relay_recovery_exhausts_one_fixed_connect_budget_without_sending() {
     relay_http_recovery(RelayRecoveryCase::ConnectBudget).await;
 }
@@ -867,14 +1213,18 @@ enum RelayRecoveryCase {
 
 #[cfg(feature = "mock-e2e")]
 async fn relay_http_recovery(case: RelayRecoveryCase) {
-    use crate::common::protocol::GatewayPolicy;
-    use crate::common::route::{EnvironmentStatus, RouteInfo};
     use crate::node::{route_control::proto as pb, route_control::BindingService, Relay};
     use tokio::sync::{oneshot, watch, Notify};
     use tokio::task::{JoinHandle, JoinSet};
 
     #[derive(Clone)]
     struct RetryLog(Arc<Mutex<Vec<u8>>>, Arc<Notify>);
+    impl RetryLog {
+        fn contains(&self, needle: &str) -> bool {
+            let bytes = self.0.lock().unwrap();
+            std::str::from_utf8(&bytes).unwrap().contains(needle)
+        }
+    }
     impl io::Write for RetryLog {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
@@ -895,65 +1245,40 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
         .finish();
     let _subscriber = tracing::subscriber::set_default(subscriber);
 
-    struct AlreadyRunning {
-        wakes: Arc<AtomicUsize>,
-    }
-    #[async_trait::async_trait]
-    impl DemandResolver for AlreadyRunning {
-        async fn describe(
-            &self,
-            _: &str,
-            _: u16,
-            _: AccessKind,
-            _: String,
-        ) -> Result<RouteHandle, ResolveError> {
-            Err(ResolveError::NotFound)
-        }
-        async fn ensure_running(&self, route: &RouteHandle) -> Result<String, ResolveError> {
-            assert_eq!(route.target.instance_id, "environment");
-            assert_eq!(route.target.workload_id, "running");
-            self.wakes.fetch_add(1, Ordering::SeqCst);
-            Ok(route.target.workload_id.clone())
-        }
-    }
-
-    fn relay() -> Arc<Relay> {
-        Arc::new(
-            Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
-                .parse()
-                .unwrap()]))
-            .with_route_enforcement(),
-        )
-    }
-
     async fn install(relay: Arc<Relay>, candidate: bool) -> (BindingService, pb::BindingState) {
         let bindings = BindingService::new(relay);
         let mut initial = bindings.inspect().await;
         initial.controller_session_id = "diagnostic-controller".into();
         let state = bindings.begin(initial).await.unwrap();
-        let snapshot = pb::BindingSnapshot {
-            proxy_session_id: state.proxy_session_id.clone(),
-            sync_epoch: state.sync_epoch,
-            bindings: vec![pb::UpdateBindingRequest {
-                proxy_session_id: state.proxy_session_id,
-                sync_epoch: state.sync_epoch,
-                environment_id: "environment".into(),
-                ownership_generation: 1,
-                binding_revision: 1,
-                binding: Some(pb::update_binding_request::Binding::Active(
-                    pb::RuntimeTarget {
-                        runtime_id: "running".into(),
-                        ip: "127.0.0.1".into(),
-                    },
-                )),
-            }],
-        };
         let state = if candidate {
-            bindings.install_candidate(snapshot).await.unwrap()
+            state
         } else {
-            bindings.replace(snapshot).await.unwrap()
+            synchronize(&bindings, state).await
         };
         (bindings, state)
+    }
+
+    async fn synchronize(bindings: &BindingService, state: pb::BindingState) -> pb::BindingState {
+        bindings
+            .replace(pb::BindingSnapshot {
+                proxy_session_id: state.proxy_session_id.clone(),
+                sync_epoch: state.sync_epoch,
+                bindings: vec![pb::UpdateBindingRequest {
+                    proxy_session_id: state.proxy_session_id,
+                    sync_epoch: state.sync_epoch,
+                    environment_id: "environment".into(),
+                    ownership_generation: 1,
+                    binding_revision: 1,
+                    binding: Some(pb::update_binding_request::Binding::Active(
+                        pb::RuntimeTarget {
+                            runtime_id: "running".into(),
+                            ip: "127.0.0.1".into(),
+                        },
+                    )),
+                }],
+            })
+            .await
+            .unwrap()
     }
 
     fn accept_relay(
@@ -1008,15 +1333,10 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
                     let ids = backend_ids.clone();
                     connections.spawn(async move {
                         loop {
-                            let mut head = Vec::new();
-                            while !head.ends_with(b"\r\n\r\n") {
-                                let mut byte = [0u8; 1];
-                                if socket.read_exact(&mut byte).await.is_err() {
-                                    return;
-                                }
-                                bytes.fetch_add(1, Ordering::SeqCst);
-                                head.push(byte[0]);
-                            }
+                            let head = match read_http_head(&mut socket, Some(bytes.as_ref())).await {
+                                Ok(head) => head,
+                                Err(_) => return,
+                            };
                             let head = String::from_utf8(head).unwrap();
                             assert!(head.starts_with("GET /cgi-bin/state HTTP/1.1\r\n"));
                             let id = head.lines().find_map(|line| {
@@ -1046,7 +1366,7 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
         }
     });
 
-    let old = relay();
+    let old = mock_relay();
     let (_old_bindings, old_state) = install(old.clone(), false).await;
     assert!(old_state.ready && old.ready());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1054,46 +1374,25 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
     let (old_task, close_old, old_released) = accept_relay(listener, old.clone());
 
     let store = Arc::new(RouteStore::new());
-    let route_info = RouteInfo {
-        private_service_ports: Vec::new(),
-        e2b: None,
-        instance_id: "environment".into(),
-        tenant_id: "tenant".into(),
-        environment_id: "running".into(),
-        environment_ip: "127.0.0.1".into(),
-        relay_address: relay_address.to_string(),
-        environment_status: EnvironmentStatus {
-            code: 3,
-            ..Default::default()
-        },
-        tunnel_security_mode: Default::default(),
-        port_forward_security_mode: Default::default(),
-        port_forward_routes: vec![],
-    };
+    let route_info = running_route(relay_address, "running");
     store.put(route_info.clone());
     store.set_ready(true);
     let wake_calls = Arc::new(AtomicUsize::new(0));
-    let ingress = Arc::new(Ingress::new(
-        Arc::new(
-            IngressRouteResolver::new(store.clone())
-                .stream_only()
-                .with_demand_resolver(Arc::new(AlreadyRunning {
-                    wakes: wake_calls.clone(),
-                })),
-        ),
-        DataPlaneL4Connector::new(H2PoolConfig {
+    let ingress = test_ingress(
+        IngressRouteResolver::new(store.clone())
+            .stream_only()
+            .with_demand_resolver(Arc::new(AlreadyRunning {
+                wakes: wake_calls.clone(),
+            })),
+        port,
+        H2PoolConfig {
             tls_config: None,
             connections_per_node: 1,
             max_connections_per_node: 1,
             connect_timeout: std::time::Duration::from_millis(250),
             ..Default::default()
-        }),
-        IngressAuthenticator::disabled(),
-        port,
-        8765,
-        "127.0.0.1:1",
-        vec![],
-    ));
+        },
+    );
 
     let warmup = send_request(
         ingress.clone(),
@@ -1143,7 +1442,7 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
         close_backend.send(()).unwrap();
         backend_release_ack.await.unwrap();
     }
-    let candidate = relay();
+    let candidate = mock_relay();
     let (candidate_bindings, closed) = install(candidate.clone(), true).await;
     assert!(!closed.ready && !candidate.ready());
     let mut candidates = Vec::new();
@@ -1156,10 +1455,7 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
             candidate.clone(),
         ));
         if matches!(case, RelayRecoveryCase::BackendRefused) {
-            candidate_bindings
-                .open_candidate(closed.clone())
-                .await
-                .unwrap();
+            synchronize(&candidate_bindings, closed.clone()).await;
         }
     }
 
@@ -1186,11 +1482,7 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let changed = log.1.notified();
-                let observed = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-                if observed.contains("relay_http_connect_retry")
-                    && observed.contains("request_id=gap-A")
-                {
-                    println!("case={case:?} observed genuine Relay retry:\n{observed}");
+                if log.contains("relay_http_connect_retry") && log.contains("request_id=gap-A") {
                     break;
                 }
                 changed.await;
@@ -1235,9 +1527,13 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
                 candidate.clone(),
             ));
         } else {
-            assert!(wake_calls.load(Ordering::SeqCst) >= 1);
+            assert_eq!(
+                wake_calls.load(Ordering::SeqCst),
+                0,
+                "Relay CONNECT 503 must not request an Environment wake"
+            );
         }
-        let opened = candidate_bindings.open_candidate(closed).await.unwrap();
+        let opened = synchronize(&candidate_bindings, closed).await;
         assert!(opened.ready && candidate.ready());
     }
 
@@ -1245,7 +1541,6 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
         .await
         .expect("request must recover within the processing budget")
         .unwrap();
-    println!("case={case:?} request_id=gap-A response={recovered:?}");
     match case {
         RelayRecoveryCase::Rebind | RelayRecoveryCase::OpenBindings => {
             assert!(
@@ -1253,6 +1548,7 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
                 "recovered: {recovered}"
             );
             assert!(recovered.ends_with("state:ok"), "recovered: {recovered}");
+            assert_eq!(wake_calls.load(Ordering::SeqCst), 0);
             assert_eq!(
                 business_requests.load(Ordering::SeqCst),
                 2,
@@ -1288,9 +1584,7 @@ async fn relay_http_recovery(case: RelayRecoveryCase) {
             }
             if matches!(case, RelayRecoveryCase::BackendRefused) {
                 assert!(recovered.starts_with("HTTP/1.1 502"), "{recovered}");
-                assert!(!String::from_utf8(log.0.lock().unwrap().clone())
-                    .unwrap()
-                    .contains("relay_http_connect_retry"));
+                assert!(!log.contains("relay_http_connect_retry"));
                 assert_eq!(candidate.metrics().connect_errors, 1);
                 assert!(started.elapsed() < std::time::Duration::from_millis(250));
             }

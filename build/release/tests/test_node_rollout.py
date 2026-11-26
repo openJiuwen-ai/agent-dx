@@ -15,27 +15,28 @@ rollout = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rollout)
 
 
-class PlanTests(unittest.TestCase):
-    def test_process_apply_needs_no_handoff_options(self):
-        base = ["apply-process", "--plan", "plan.json", "--journal", "journal.json", "--batch-index", "0"]
-        parsed = rollout.parser().parse_args(base)
-        for name in ("handoff_config", "handoff_stubs", "handoff_timeout"):
-            self.assertFalse(hasattr(parsed, name))
+def patched_resource(case, target, changes, check_write=None):
+    staged = copy.deepcopy(target)
+    for change in changes:
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in change["path"].strip("/").split("/")]
+        parent = staged
+        for part in parts[:-1]:
+            parent = parent[int(part)] if isinstance(parent, list) else parent[part]
+        key = int(parts[-1]) if isinstance(parent, list) else parts[-1]
+        if change["op"] == "test":
+            case.assertEqual(parent[key], change["value"])
+        else:
+            if check_write is not None:
+                check_write(change, parent, key)
+            if change["op"] == "remove":
+                del parent[key]
+            else:
+                case.assertIn(change["op"], ("add", "replace"))
+                parent[key] = change["value"]
+    return staged
 
-    def test_apply_actions_are_mutually_exclusive(self):
-        for command in ("apply-process", "apply-pod"):
-            base = [command, "--plan", "plan.json", "--journal", "journal.json"]
-            self.assertTrue(rollout.parser().parse_args([*base, "--promote-ready"]).promote_ready)
-            self.assertEqual(rollout.parser().parse_args([*base, "--batch-index", "0"]).batch_index, 0)
-            for choices in ([], ["--prune"], ["--promote-ready", "--batch-index", "0"]):
-                selected_parser = rollout.parser()
-                with self.subTest(command=command, choices=choices), \
-                        patch.object(rollout.argparse.ArgumentParser, "error", side_effect=ValueError) as error, \
-                        self.assertRaises(ValueError):
-                    selected_parser.parse_args([*base, *choices])
 
-                error.assert_called_once()
-
+class PodFixture(unittest.TestCase):
     def setUp(self):
         self.ds = {
             "apiVersion": "apps/v1", "kind": "DaemonSet",
@@ -69,7 +70,7 @@ class PlanTests(unittest.TestCase):
         self.args = rollout.parser().parse_args([
             "plan-pod", "--context", "test-cluster", "--origin", "http://coordinator:9090", "--namespace", "ns",
             "--daemonset", "workers", "--container", "adxlet", "--config", "/etc/adx/deployment.yaml", "--target-image",
-            f"registry/worker@sha256:{'b' * 64}", "--task-id", "release-1",
+            "registry:5000/worker:release-20261124-1", "--task-id", "release-1",
             "--epoch", "1", "--node", "workers-a=adx-node"])
         self.calls = []
 
@@ -87,7 +88,7 @@ class PlanTests(unittest.TestCase):
     def plan(self):
         return rollout.plan_pod(self.args, self.kube, self.get, self.local)
 
-    def local(self, name, declaration_path=None):
+    def local(self, name):
         pod = next(p for p in self.pods["items"] if p["metadata"]["name"] == name)
         uid = pod["metadata"]["uid"]
         bindings = getattr(self, "snapshot", {}).get("pods", [])
@@ -104,8 +105,89 @@ class PlanTests(unittest.TestCase):
         return dict(ok=True, node_info=dict(schema_version=1, boot_nonce=runtime["boot_nonce"], pod_uid=uid,
                     components=[dict(role="adxlet", mode="embedded", node_id=node, service_id="node",
                                      runtime=runtime, sources={} if replacement else {"adxlet": {
-                                         "version": "a" * 40, "archive_sha256": None, "raw_config_sha256": None}})]),
-                    external_declaration=None, external_startup=None)
+                                         "version": "a" * 40, "archive_sha256": None, "raw_config_sha256": None}})]))
+
+    def sts(self):
+        self.ds["kind"] = "StatefulSet"
+        self.pods["items"][0]["metadata"].update(name="workers-0")
+        self.pods["items"][0]["metadata"]["ownerReferences"][0].update(kind="StatefulSet")
+        self.args = rollout.parser().parse_args([
+            "plan-pod", "--context", "test-cluster", "--origin", "http://coordinator:9090", "--namespace", "ns",
+            "--statefulset", "workers", "--container", "adxlet", "--config", "/etc/adx/deployment.yaml",
+            "--target-image", "registry:5000/worker:release-20261124-1", "--task-id", "release-1",
+            "--epoch", "1", "--node", "workers-0=adx-node"])
+
+
+class PlanTests(PodFixture):
+    def test_pod_task_identity_is_addressable_before_planning_or_consumption(self):
+        snapshot = self.plan()
+        for task_id in ("release/1", "a%20b", "a?b", "a#b", "a b", "\u4e2d", ".", "..", "a" * 129):
+            with self.subTest(task_id=task_id):
+                changed = copy.deepcopy(snapshot)
+                changed["begin"]["task_id"] = task_id
+                with self.assertRaisesRegex(rollout.Refusal, "task ID"):
+                    rollout.validate_pod_plan(changed)
+                self.args.task_id = task_id
+                with self.assertRaisesRegex(rollout.Refusal, "task ID"):
+                    self.plan()
+        for epoch in (0, -1, True, 2**64):
+            with self.subTest(epoch=epoch):
+                changed = copy.deepcopy(snapshot)
+                changed["begin"]["epoch"] = epoch
+                with self.assertRaisesRegex(rollout.Refusal, "epoch"):
+                    rollout.validate_pod_plan(changed)
+        for task_id in ("release-1._~", "-release", "a" * 128):
+            snapshot["begin"]["task_id"] = task_id
+            rollout.validate_pod_plan(snapshot)
+            self.args.task_id = task_id
+            self.assertEqual(self.plan()["begin"]["task_id"], task_id)
+
+    def test_pod_consumption_requires_local_workload_evidence(self):
+        snapshot = self.plan()
+        changes = (("workload", "original_template_hash", "bad"),
+                   ("workload", "target_template_hash", None), ("workload", "original_image", ""),
+                   ("pod", "kubernetes_node_name", ""), ("pod", "original_image", None))
+        for section, key, value in changes:
+            with self.subTest(section=section, key=key):
+                changed = copy.deepcopy(snapshot)
+                target = changed["workload"] if section == "workload" else changed["pods"][0]
+                target[key] = value
+                with self.assertRaises(rollout.Refusal):
+                    rollout.validate_pod_plan(changed)
+        self.sts()
+        snapshot = self.plan()
+        for name in ("workers-00", "workers-debug"):
+            with self.subTest(name=name):
+                snapshot["pods"][0]["name"] = name
+                with self.assertRaisesRegex(rollout.Refusal, "canonical ordinal"):
+                    rollout.validate_pod_plan(snapshot)
+
+    def test_process_apply_needs_no_handoff_options(self):
+        base = ["apply-process", "--plan", "plan.json", "--journal", "journal.json", "--batch-index", "0"]
+        parsed = rollout.parser().parse_args(base)
+        for name in ("handoff_config", "handoff_stubs", "handoff_timeout"):
+            self.assertFalse(hasattr(parsed, name))
+
+    def test_apply_actions_are_mutually_exclusive(self):
+        rejected = []
+        for command in ("apply-process", "apply-pod"):
+            base = [command, "--plan", "plan.json", "--journal", "journal.json"]
+            self.assertEqual(rollout.parser().parse_args([*base, "--batch-index", "0"]).batch_index, 0)
+            rejected.extend([base, [*base, "--promote-ready"], [*base, "--batch-index", "0", "--restore-input"]])
+        for command in ("plan-process", "plan-pod"):
+            base = [command, "--context", "cluster", "--namespace", "ns", "--container", "adxlet",
+                    "--config", "/config.yaml", "--task-id", "release", "--epoch", "1", "--node", "pod=node"]
+            if command == "plan-pod":
+                base.extend(["--origin", "http://coordinator", "--daemonset", "workers", "--target-image", "node:v1"])
+            else:
+                base.extend(["--role", "adxlet", "--commit", "c" * 40])
+            rejected.append([*base, "--declaration-candidate", "candidate.json"])
+        for argv in rejected:
+            with self.subTest(argv=argv), \
+                    patch.object(rollout.argparse.ArgumentParser, "error", side_effect=ValueError) as error, \
+                    self.assertRaises(ValueError):
+                rollout.parser().parse_args(argv)
+            error.assert_called_once()
 
     def test_begin_payload_and_snapshot(self):
         result = self.plan()
@@ -123,6 +205,20 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(len(result["workload"]["original_template_hash"]), 64)
         self.assertNotEqual(result["workload"]["original_template_hash"],
                             result["workload"]["target_template_hash"])
+
+    def test_target_image_syntax_is_validated_by_coordinator(self):
+        for target in ("worker", "worker:latest", "worker:-1"):
+            with self.subTest(target=target):
+                self.args.target_image = target
+                plan = self.plan()
+                rollout.validate_pod_plan(plan)
+                self.assertEqual(plan["begin"]["target_image"], target)
+
+    def test_changed_pod_target_tag_rejected_by_plan_validation(self):
+        plan = self.plan()
+        plan["pods"][0]["target_image"] = "registry:5000/worker:release-20261124-2"
+        with self.assertRaisesRegex(rollout.Refusal, "Pod plan binding differs"):
+            rollout.validate_pod_plan(plan)
 
     def test_wrong_owner_is_not_a_source(self):
         self.pods["items"][0]["metadata"]["ownerReferences"][0]["uid"] = "other"
@@ -142,16 +238,6 @@ class PlanTests(unittest.TestCase):
             self.pods["items"][0]["metadata"]["ownerReferences"] = [dict(base), dict(base)]
             with self.assertRaises(rollout.Refusal):
                 self.plan()
-
-    def sts(self):
-        self.ds["kind"] = "StatefulSet"
-        self.pods["items"][0]["metadata"].update(name="workers-0")
-        self.pods["items"][0]["metadata"]["ownerReferences"][0].update(kind="StatefulSet")
-        self.args = rollout.parser().parse_args([
-            "plan-pod", "--context", "test-cluster", "--origin", "http://coordinator:9090", "--namespace", "ns",
-            "--statefulset", "workers", "--container", "adxlet", "--config", "/etc/adx/deployment.yaml",
-            "--target-image", f"registry/worker@sha256:{'b' * 64}", "--task-id", "release-1",
-            "--epoch", "1", "--node", "workers-0=adx-node"])
 
     def test_statefulset_daemonset_mutually_exclusive(self):
         base = ["plan-pod", "--context", "c", "--origin", "http://o", "--namespace", "ns",
@@ -202,286 +288,12 @@ class PlanTests(unittest.TestCase):
         result = self.plan()
         self.assertEqual(result["pods"][0]["name"], "workers-7")
 
-    def test_replacement_image_provenance_and_opaque_content_identity(self):
-        snapshot = self.plan()
+    def test_replacement_opaque_content_identity(self):
         pod = self.pods["items"][0]
         pod["metadata"].update(name="workers-new", uid="new-uid")
         response = self.local("workers-new")
-        actual = rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot, "new-session")
+        actual = rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, "new-session")
         self.assertEqual(actual["image_id"], "opaque-runtime-content-id")
-        component = response["node_info"]["components"][0]
-        for sources in (None, {"adxlet": {"version": "a" * 40}}):
-            component["sources"] = sources
-            with self.assertRaises(rollout.Refusal):
-                rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot)
-        del component["sources"]
-        with self.assertRaises(rollout.Refusal):
-            rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot)
-        component["sources"] = {}
-        response["external_startup"] = {"selection": "ready_fallback"}
-        with self.assertRaises(rollout.Refusal):
-            rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot)
-
-    def test_cm_replacement_requires_default_target_and_actual_sources(self):
-        snapshot = self.plan()
-        pod = self.pods["items"][0]
-        pod["metadata"].update(name="workers-new", uid="new-uid")
-        pod["spec"]["volumes"] = [{"name": "declaration", "configMap": {"name": "versions"}}]
-        pod["spec"]["containers"][0]["volumeMounts"] = [{"name": "declaration", "mountPath": "/versions"}]
-        component = dict(version="a" * 40, release_id="target", artifact=dict(
-            url="https://example.invalid/package.tar.gz", sha256="b" * 64),
-            config=dict(mount_path="/config/adxlet.json", sha256="e" * 64))
-        relay = copy.deepcopy(component)
-        relay["config"] = dict(mount_path="/config/relay.json", sha256="f" * 64)
-        desired = dict(schema=1, mode="embedded", components=dict(adxlet=component, relay=relay),
-                       ready=dict(components=dict(adxlet=component, relay=relay)))
-        raw = rollout.canonical(desired)
-        snapshot["declaration"] = dict(candidate_text=raw, name="versions", key="target.yaml")
-        response = self.local("workers-new")
-        response["external_declaration"] = dict(
-            path="/versions/target.yaml", desired=dict(desired, upgrade_components=[]),
-            raw_sha256=rollout.hashlib.sha256(raw.encode("utf-8")).hexdigest())
-        response["external_startup"] = dict(selection="target", mode="embedded", components=[
-            dict(role=role, version=target["version"], release_id="target",
-                 raw_config_sha256=target["config"]["sha256"], binary_sha256="c" * 64,
-                 effective_config_sha256="d" * 64) for role, target in desired["components"].items()])
-        sources = {role: dict(version=target["version"], archive_sha256="b" * 64,
-                             raw_config_sha256=target["config"]["sha256"])
-                   for role, target in desired["components"].items()}
-        response["node_info"]["components"][0]["sources"] = sources
-        rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot)
-        response["external_startup"]["selection"] = "ready_fallback"
-        with self.assertRaises(rollout.Refusal):
-            rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot)
-        response["external_startup"]["selection"] = "target"
-        sources["relay"]["raw_config_sha256"] = None
-        with self.assertRaises(rollout.Refusal):
-            rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response, snapshot)
-
-    def test_owned_cm_lost_ack_and_absent_key_restore_preserves_other_data(self):
-        plan = dict(declaration=dict(name="versions", namespace="ns", uid="cm-uid", resource_version="7",
-                    key="target.yaml", original_text=None, candidate_text="candidate"))
-        cm = dict(apiVersion="v1", kind="ConfigMap", metadata=dict(name="versions", namespace="ns",
-                  uid="cm-uid", resourceVersion="7"), data={"other": "untouched"})
-        journal = {}
-        saved = []
-
-        def save():
-            saved.append(copy.deepcopy(journal))
-
-        def kube(_):
-            return copy.deepcopy(cm)
-
-        def mutate(_, body):
-            self.assertTrue(saved)
-            staged = copy.deepcopy(cm)
-            for change in body:
-                parts = [part.replace("~1", "/").replace("~0", "~") for part in change["path"].strip("/").split("/")]
-                parent = staged
-                for part in parts[:-1]:
-                    parent = parent[part]
-                key = parts[-1]
-                if change["op"] == "test":
-                    self.assertEqual(parent[key], change["value"])
-                elif change["op"] == "remove":
-                    del parent[key]
-                else:
-                    self.assertIn(change["op"], ("add", "replace"))
-                    parent[key] = change["value"]
-            staged["metadata"]["resourceVersion"] = str(int(staged["metadata"]["resourceVersion"]) + 1)
-            cm.clear()
-            cm.update(staged)
-            raise TimeoutError("lost CM ACK")
-
-        with self.assertRaises(TimeoutError):
-            rollout.declaration_write(plan, journal, save, kube, mutate)
-        late_forward = copy.deepcopy(journal["declaration_write"]["body"])
-        rollout.declaration_write(plan, journal, save, kube, mutate)
-        with self.assertRaises(TimeoutError):
-            rollout.declaration_write(plan, journal, save, kube, mutate, restore=True)
-        self.assertEqual(cm["data"], {"other": "untouched"})
-        self.assertEqual(cm["metadata"]["annotations"]["adx.dev/rollout-input-fence"],
-                         rollout.template_hash(plan) + ":restored")
-        with self.assertRaises(AssertionError):
-            mutate([], late_forward)
-        with self.assertRaises(rollout.Refusal):
-            rollout.declaration_write(plan, {}, save, kube, mutate)
-        next_plan = dict(plan, rollout_id="another-rollout")
-        next_plan["declaration"] = dict(plan["declaration"], resource_version=cm["metadata"]["resourceVersion"])
-        next_journal = {}
-        with self.assertRaises(TimeoutError):
-            rollout.declaration_write(next_plan, next_journal, save, kube, mutate)
-        before = copy.deepcopy(cm)
-        with self.assertRaises(rollout.Refusal):
-            rollout.declaration_write(plan, journal, save, kube, mutate, restore=True)
-        self.assertEqual(cm, before)
-
-    def test_same_frozen_rv_loser_with_intent_cannot_claim_same_candidate(self):
-        source = dict(name="versions", namespace="ns", uid="cm-uid", resource_version="7",
-                      key="target.yaml", original_text="old", candidate_text="candidate")
-        first = dict(task_id="first", declaration=source)
-        second = dict(task_id="second", declaration=source)
-        marker = "adx.dev/rollout-input-fence"
-        cm = dict(apiVersion="v1", kind="ConfigMap", metadata=dict(name="versions", namespace="ns",
-                  uid="cm-uid", resourceVersion="7"), data={"target.yaml": "old", "other": "keep"})
-        loser = {}
-
-        def read(_):
-            return copy.deepcopy(cm)
-
-        def lost_before_wire(_, body):
-            raise TimeoutError("not sent")
-
-        with self.assertRaises(TimeoutError):
-            rollout.declaration_write(second, loser, lambda: None, read, lost_before_wire)
-
-        def mutate(_, body):
-            self.assertEqual(body[:3], [dict(op="test", path="/metadata/uid", value=cm["metadata"]["uid"]),
-                dict(op="test", path="/metadata/resourceVersion", value=cm["metadata"]["resourceVersion"]),
-                dict(op="test", path="/data/target.yaml", value=cm["data"]["target.yaml"])])
-            staged = copy.deepcopy(cm)
-            staged["data"]["target.yaml"] = body[3]["value"]
-            staged["metadata"]["annotations"] = body[4]["value"]
-            staged["metadata"]["resourceVersion"] = "8"
-            cm.clear()
-            cm.update(staged)
-
-        rollout.declaration_write(first, {}, lambda: None, read, mutate)
-        self.assertEqual(cm["metadata"]["annotations"][marker], rollout.template_hash(first) + ":applied")
-        before = copy.deepcopy(cm)
-        with self.assertRaises(rollout.Refusal):
-            rollout.declaration_write(second, loser, lambda: None, read, mutate)
-        self.assertEqual(cm, before)
-
-    def test_ready_promotion_current_group_restart_and_owned_ack_replay(self):
-        def exercise(mode):
-            self.setUp()
-            snapshot = self.plan()
-            pod = self.pods["items"][0]
-            pod["metadata"].update(name="workers-new", uid="new-uid")
-            pod["spec"]["containers"][0]["image"] = self.args.target_image
-            pod["spec"]["volumes"] = [{"name": "versions", "configMap": {"name": "versions"}}]
-            pod["spec"]["containers"][0]["volumeMounts"] = [{"name": "versions", "mountPath": "/versions"}]
-            target = dict(version="a" * 40, release_id="release", artifact=dict(
-                url="https://example.invalid/package.tar.gz", sha256="b" * 64),
-                config=dict(mount_path="/config/adxlet.json", sha256="e" * 64))
-            peer = copy.deepcopy(target)
-            peer["config"] = dict(mount_path="/config/relay.json", sha256="f" * 64)
-            desired = dict(schema=1, mode=mode, components=dict(adxlet=target, relay=peer),
-                           ready=dict(components=dict(adxlet=target, relay=peer)))
-            raw = rollout.canonical(desired)
-            snapshot["declaration"] = dict(name="versions", namespace="ns", uid="cm-uid",
-                resource_version="7", key="target.yaml", original_text=None, candidate_text=raw)
-            snapshot["pods"][0]["declaration_path"] = "/versions/target.yaml"
-            response = self.local("workers-new")
-            owner = response["node_info"]["components"][0]
-            owner["mode"] = mode
-            sources = {role: dict(version="a" * 40, archive_sha256="b" * 64,
-                raw_config_sha256=component["config"]["sha256"])
-                for role, component in desired["components"].items()}
-            owner["sources"] = sources if mode == "embedded" else {"adxlet": sources["adxlet"]}
-            if mode == "standalone":
-                relay = copy.deepcopy(owner)
-                relay.update(role="relay", service_id="relay", sources={"relay": sources["relay"]})
-                response["node_info"]["components"].append(relay)
-            actual = rollout.pod_actual(pod, "ns", "adxlet", "adx-node", response)
-            journal = dict(stage="completed", nodes={"adx-node": dict(stage="verified",
-                replacement_uid="new-uid", replacement_actual=actual)})
-            task = dict(snapshot["begin"], protocol_version=3, kind="pod", phase="Completed", operations={},
-                nodes={"adx-node": dict(node_id="adx-node", original_pod_uid="pod-uid",
-                    original_session_id="session-1", phase="verified")})
-            marker = "adx.dev/rollout-input-fence"
-            cm = dict(apiVersion="v1", kind="ConfigMap", metadata=dict(name="versions", namespace="ns",
-                uid="cm-uid", resourceVersion="8", annotations={marker: rollout.template_hash(snapshot)
-                + ":applied", "keep": "yes"}), data={"target.yaml": raw, "other": "keep"})
-            writes = []
-            attempts = []
-
-            def kube(args):
-                if "configmap" in args:
-                    return copy.deepcopy(cm)
-                if len(args) >= 3 and args[:2] == ["get", "pod"]:
-                    return copy.deepcopy(self.pods["items"][0])
-                return self.kube(args)
-
-            def local(name, declaration_path=None):
-                value = copy.deepcopy(response)
-                value["external_declaration"] = dict(path="/versions/target.yaml",
-                    raw_sha256=rollout.template_hash(rollout.decode(cm["data"]["target.yaml"].encode())),
-                    desired=rollout.declaration_candidate(rollout.decode(cm["data"]["target.yaml"].encode())))
-                return value
-
-            def mutate(_, body):
-                self.assertIn("ready_intent", journal)
-                attempts.append(copy.deepcopy(body))
-                if len(attempts) == 1:
-                    cm["metadata"]["resourceVersion"] = "9"
-                    raise TimeoutError("metadata advanced before promotion CAS")
-                self.assertEqual(body[:3], [dict(op="test", path="/metadata/uid", value="cm-uid"),
-                    dict(op="test", path="/metadata/resourceVersion", value=cm["metadata"]["resourceVersion"]),
-                    dict(op="test", path="/data/target.yaml", value=cm["data"]["target.yaml"])])
-                staged = copy.deepcopy(cm)
-                staged["data"]["target.yaml"] = body[3]["value"]
-                staged["metadata"]["annotations"] = body[4]["value"]
-                staged["metadata"]["resourceVersion"] = "10"
-                cm.clear()
-                cm.update(staged)
-                writes.append(body)
-                raise TimeoutError("ready ACK lost")
-
-            def promote():
-                return rollout.promote_ready(snapshot, journal, lambda: None, kube, local, mutate,
-                                             lambda _: None, get=lambda _: copy.deepcopy(task))
-
-            journal["stage"] = "nodes"
-            with self.assertRaises(rollout.Refusal):
-                promote()
-            journal["stage"] = "completed"
-            owner["sources"] = None
-            with self.assertRaises(rollout.Refusal):
-                promote()
-            owner["sources"] = sources if mode == "embedded" else {"adxlet": sources["adxlet"]}
-            for field in ("boot_nonce", "container_id"):
-                saved = journal["nodes"]["adx-node"]["replacement_actual"][field]
-                journal["nodes"]["adx-node"]["replacement_actual"][field] = "changed"
-                with self.assertRaises(rollout.Refusal):
-                    promote()
-                journal["nodes"]["adx-node"]["replacement_actual"][field] = saved
-            for component in response["node_info"]["components"]:
-                component["runtime"].update(pid=456, node_session="restarted", relay_session="restarted-relay")
-            with self.assertRaises(TimeoutError):
-                promote()
-            with self.assertRaises(TimeoutError):
-                promote()
-            self.assertEqual([body[1]["value"] for body in attempts], ["8", "9"])
-            self.assertTrue(promote()["ready_promoted"])
-            self.assertEqual(len(writes), 1)
-            owner["sources"] = None
-            self.assertTrue(promote()["ready_promoted"])
-            for field in ("boot_nonce", "container_id"):
-                saved = journal["nodes"]["adx-node"]["replacement_actual"][field]
-                journal["nodes"]["adx-node"]["replacement_actual"][field] = "changed"
-                with self.assertRaises(rollout.Refusal):
-                    promote()
-                journal["nodes"]["adx-node"]["replacement_actual"][field] = saved
-            cm["metadata"]["annotations"][marker] = "another-round:promoted"
-            with self.assertRaises(rollout.Refusal):
-                promote()
-            self.assertEqual(len(writes), 1)
-
-        for mode in ("embedded", "standalone"):
-            with self.subTest(mode=mode):
-                exercise(mode)
-
-    def test_metadata_change_before_first_cm_write_requires_replan(self):
-        plan = dict(task_id="task", declaration=dict(name="versions", namespace="ns", uid="cm-uid",
-                    resource_version="7", key="target.yaml", original_text="old", candidate_text="candidate"))
-        cm = dict(apiVersion="v1", kind="ConfigMap", metadata=dict(name="versions", namespace="ns",
-                  uid="cm-uid", resourceVersion="8"), data={"target.yaml": "old"})
-        mutation = MagicMock()
-        with self.assertRaises(rollout.Refusal):
-            rollout.declaration_write(plan, {}, lambda: None, lambda _: copy.deepcopy(cm), mutation)
-        mutation.assert_not_called()
 
     def test_context_required_before_io(self):
         self.args.context = None
@@ -543,37 +355,11 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(rollout.Refusal):
             self.plan()
 
-    def test_object_or_session_changes_fail_closed(self):
-        for change in ("pod", "ds", "session", "observed_uid", "rootfs"):
-            with self.subTest(change=change):
-                counts = {"kube": 0, "inspect": 0}
-
-                def kube(args, changing=change, *, counters):
-                    counters["kube"] += 1
-                    value = self.kube(args)
-                    if counters["kube"] > 2:
-                        if changing == "pod" and "--raw" in args:
-                            value["items"][0]["metadata"]["resourceVersion"] = "21"
-                        if changing == "ds" and "daemonset" in args:
-                            value["metadata"]["uid"] = "new-ds"
-                    return value
-                kube = partial(kube, counters=counts)
-
-                def get(path, changing=change, *, counters):
-                    value = self.get(path)
-                    if path.endswith("inspect"):
-                        counters["inspect"] += 1
-                        if changing == "session" and counters["inspect"] > 1:
-                            value["node_session_id"] = "session-2"
-                        if changing == "observed_uid" and counters["inspect"] > 1:
-                            value["observed_pod_uid"] = "other-pod"
-                        if changing == "rootfs" and counters["inspect"] > 1:
-                            value["runtime_rootfs_sha256"] = "c" * 64
-                    return value
-                get = partial(get, counters=counts)
-
-                with self.assertRaises(rollout.Refusal):
-                    rollout.plan_pod(self.args, kube, get, self.local)
+    def test_plan_records_one_inventory_and_coordinator_observation(self):
+        result = self.plan()
+        self.assertEqual(sum(isinstance(call, list) for call in self.calls), 2)
+        self.assertEqual(sum(isinstance(call, str) and call.endswith("inspect") for call in self.calls), 1)
+        self.assertEqual(result["pods"][0]["inspection"]["node_session_id"], "session-1")
 
     def test_untrusted_origin_and_digest_rejected_before_io(self):
         self.args.origin = "http://user:secret@coordinator"
@@ -661,19 +447,21 @@ class PlanTests(unittest.TestCase):
         _, evidence, host = rollout.pod_replacement(snapshot, snapshot["pods"][0], [moved])
         self.assertEqual((evidence["uid"], host), ("new-uid", "kube-node-2"))
 
-    def test_replacement_host_legacy_daemonset_fallback_and_statefulset_strict(self):
-        # DaemonSet legacy journals may fall back to the source host; StatefulSet
-        # must keep its recorded replacement host rather than assuming no move.
-        self.assertEqual(rollout.replacement_host({"kind": "DaemonSet"}, "host-a", {}), "host-a")
-        self.assertEqual(rollout.replacement_host(
-            {"kind": "DaemonSet"}, "host-a", {"replacement_host": "host-b"}), "host-b")
-        self.assertEqual(rollout.replacement_host(
-            {"kind": "StatefulSet"}, "host-a", {"replacement_host": "host-b"}), "host-b")
-        with self.assertRaises(rollout.Refusal):
-            rollout.replacement_host({"kind": "StatefulSet"}, "host-a", {})
+    def test_workload_kind_must_be_explicit(self):
+        for kind in ("DaemonSet", "StatefulSet"):
+            self.assertEqual(rollout.workload_kind({"kind": kind}), kind)
+        for workload in ({}, {"kind": "Deployment"}):
+            with self.subTest(workload=workload), self.assertRaises(rollout.Refusal):
+                rollout.workload_kind(workload)
+
+    def test_replacement_host_must_be_recorded(self):
+        self.assertEqual(rollout.replacement_host({"replacement_host": "host-b"}), "host-b")
+        for state in ({}, {"replacement_host": ""}, {"replacement_host": None}):
+            with self.subTest(state=state), self.assertRaises(rollout.Refusal):
+                rollout.replacement_host(state)
 
 
-class ApplyTests(PlanTests):
+class ApplyTests(PodFixture):
     def setUp(self):
         super().setUp()
         self.snapshot = self.plan()
@@ -832,23 +620,16 @@ class ApplyTests(PlanTests):
             self.assertEqual(args[2], target["metadata"]["name"])
             self.assertEqual(changes[0], dict(op="test", path="/metadata/uid", value=target["metadata"]["uid"]))
             self.assertEqual(changes[1]["path"], "/metadata/resourceVersion")
-            staged = copy.deepcopy(target)
-            for change in changes:
-                parts = [p.replace("~1", "/").replace("~0", "~") for p in change["path"].strip("/").split("/")]
-                value = staged
-                for part in parts[:-1]:
-                    value = value[int(part)] if isinstance(value, list) else value[part]
-                key = int(parts[-1]) if isinstance(value, list) else parts[-1]
-                if change["op"] == "test":
-                    self.assertEqual(value[key], change["value"])
-                else:
-                    self.assertIn(change["op"], ("add", "replace"))
-                    self.assertTrue(change["path"] == "/spec/template/spec/containers/0/image"
-                                    or change["path"] == "/metadata/annotations"
-                                    or change["path"].startswith("/metadata/annotations/adx.dev~1rollout-"))
-                    if change["op"] == "replace":
-                        self.assertIn(key, value)
-                    value[key] = change["value"]
+
+            def check_write(change, parent, key):
+                self.assertIn(change["op"], ("add", "replace"))
+                self.assertTrue(change["path"] == "/spec/template/spec/containers/0/image"
+                                or change["path"] == "/metadata/annotations"
+                                or change["path"].startswith("/metadata/annotations/adx.dev~1rollout-"))
+                if change["op"] == "replace":
+                    self.assertIn(key, parent)
+
+            staged = patched_resource(self, target, changes, check_write)
             staged["metadata"]["resourceVersion"] = str(int(staged["metadata"]["resourceVersion"]) + 1)
             if args[1] != "pod":
                 self.ds = staged
@@ -876,6 +657,37 @@ class ApplyTests(PlanTests):
         self.assertEqual(self.task["phase"], "Completed")
         self.assertTrue(self.deleted)
         self.assertFalse(any(isinstance(p, str) and p.endswith("/migrate") for p, _ in self.writes))
+
+    def test_version_tag_plan_validate_apply(self):
+        rollout.validate_pod_plan(self.snapshot)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = self.drive(Path(directory) / "rollout.json")
+        self.assertEqual(journal["stage"], "completed")
+        target = "registry:5000/worker:release-20261124-1"
+        self.assertEqual(self.task["target_image"], target)
+        self.assertEqual(rollout.image(self.ds["spec"]["template"], "adxlet"), target)
+        self.assertEqual(rollout.image(self.pods["items"][0], "adxlet"), target)
+
+    def test_changed_target_tag_cannot_reuse_journal(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
+            path = Path(directory) / "journal.json"
+            self.drive(path)
+            changed = copy.deepcopy(self.snapshot)
+            target = "registry:5000/worker:release-20261124-2"
+            changed["begin"]["target_image"] = target
+            changed["pods"][0]["target_image"] = target
+            before = len(self.writes)
+            with self.assertRaisesRegex(rollout.Refusal, "Pod journal plan hash differs"):
+                rollout.apply_pod(changed, path, 0, rollout.PodClients(
+                    self.kube, self.get_live, self.post, self.mutate), local=self.local)
+            self.assertEqual(len(self.writes), before)
+
+    def test_changed_task_target_tag_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.drive(Path(directory) / "journal.json")
+        self.task["target_image"] = "registry:5000/worker:release-20261124-2"
+        with self.assertRaisesRegex(rollout.Refusal, "task owner differs"):
+            rollout.pod_task(self.snapshot, self.get_live)
 
     def test_single_populated_worker_without_target_keeps_original_pod(self):
         self.instance = dict(instanceID="env", node_id="adx-node", generation=0, revision=0,
@@ -1327,6 +1139,66 @@ class ApplyTests(PlanTests):
             self.assertEqual(len(begins), 3)
             self.assertTrue(all(b == self.snapshot["begin"] for b in begins))
 
+    def test_confirmed_initial_begin_rejection_allows_local_cleanup_without_replay(self):
+        for stop in (False, True):
+            with self.subTest(stop=stop):
+                journal = dict(stage="new", nodes={})
+                connection = HttpJsonTests.response(400, rollout.canonical({"error": {
+                    "code": "InvalidArgument", "message": "invalid target image",
+                }}).encode("utf-8"))
+
+                def post(path, body):
+                    return rollout.http_json("http://coordinator:9090", path, body)
+
+                with patch.object(rollout.http.client, "HTTPConnection", return_value=connection):
+                    with self.assertRaises(rollout.Refusal):
+                        rollout.advance_pod(self.snapshot, journal, lambda: None, 0,
+                                            rollout.PodClients(self.kube, self.get_live, post, self.mutate),
+                                            local=self.local)
+                post_again = MagicMock(side_effect=AssertionError("replayed rejected Begin"))
+                unknown = MagicMock(side_effect=OSError("query unavailable"))
+                with self.assertRaises(OSError):
+                    rollout.advance_pod_cleanup(self.snapshot, journal, lambda: None, self.kube,
+                                                unknown, post_again, self.mutate, stop=stop)
+                self.post("/v1/node-upgrades/tasks", self.snapshot["begin"])
+                existing = copy.deepcopy(journal)
+                self.assertIsNone(rollout.advance_pod_cleanup(self.snapshot, existing, lambda: None, self.kube,
+                                                              self.get_live, post_again, self.mutate, stop=stop))
+                self.assertEqual(existing["stage"], "template")
+                self.assertNotIn("local_terminal", existing["cleanup"])
+                self.task = None
+                missing = HttpJsonTests.response(404, rollout.canonical({"error": {
+                    "code": "NotFound", "message": "task unavailable",
+                }}).encode("utf-8"))
+
+                def get(path):
+                    return rollout.http_json("http://coordinator:9090", path)
+
+                with patch.object(rollout.http.client, "HTTPConnection", return_value=missing):
+                    outcome = rollout.advance_pod_cleanup(self.snapshot, journal, lambda: None, self.kube,
+                                                          get, post_again, self.mutate, stop=stop)
+                self.assertEqual(outcome, dict(status="stopped" if stop else "aborted",
+                                               remote_task=False, effects=False))
+                post_again.assert_not_called()
+
+    def test_ambiguous_begin_replay_rejection_keeps_remote_outcome_unknown(self):
+        self.post("/v1/node-upgrades/tasks", self.snapshot["begin"])
+        journal = dict(stage="begin_intent", nodes={})
+        connection = HttpJsonTests.response(400, rollout.canonical({"error": {
+            "code": "InvalidArgument", "message": "replay rejected",
+        }}).encode("utf-8"))
+
+        def post(path, body):
+            return rollout.http_json("http://coordinator:9090", path, body)
+
+        with patch.object(rollout.http.client, "HTTPConnection", return_value=connection):
+            with self.assertRaises(rollout.Refusal):
+                rollout.advance_pod_cleanup(self.snapshot, journal, lambda: None, self.kube,
+                                            self.get_live, post, self.mutate)
+        self.assertNotIn("begin_rejected", journal)
+        self.assertNotIn("local_terminal", journal["cleanup"])
+        self.assertEqual(self.task["phase"], "Active")
+
     def test_cleanup_lost_action_success_replays_same_body(self):
         for loss in ("freeze", "revoke-delete", "restore-original", "verify-node", "finalize"):
             with self.subTest(loss=loss), tempfile.TemporaryDirectory() as directory:
@@ -1547,32 +1419,6 @@ class ApplyTests(PlanTests):
             self.assertEqual(outcome["current_images"]["adx-node"], self.args.target_image)
             self.assertFalse(any(isinstance(p, str) and p.endswith("/migrate") for p, _ in self.writes))
 
-    def test_legacy_daemonset_verify_without_replacement_host_continues(self):
-        # Pre-replacement_host journals are still resumed at the source host for
-        # DaemonSet, where the host can never change; the verify leg must not stall.
-        with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
-            path = Path(directory) / "journal.json"
-            self.deleted = True
-            self.mutate(["delete", "--raw", "/api/v1/namespaces/ns/pods/workers-a", "-f", "-"],
-                        dict(apiVersion="v1", kind="DeleteOptions",
-                             preconditions=dict(uid="pod-uid", resourceVersion="20")))
-            self.ds["spec"]["template"]["spec"]["containers"][0]["image"] = self.args.target_image
-            self.post("/v1/node-upgrades/tasks", self.snapshot["begin"])
-            node = self.task["nodes"]["adx-node"]
-            node.update(pod_uid="new-uid", node_session_id="new-session", phase="verified",
-                        control_revision=1, permit_id=None)
-            candidate = self.pods["items"][0]
-            actual = rollout.pod_actual(candidate, "ns", "adxlet", "adx-node",
-                                        self.local("workers-new"), self.snapshot, "new-session")
-            rollout.write_journal(path, dict(
-                schema_version=1, plan_hash=rollout.template_hash(self.snapshot), stage="nodes",
-                nodes={"adx-node": dict(stage="verify", replacement_uid="new-uid",
-                                        replacement_session="new-session", replacement_actual=actual,
-                                        permit_id="new-permit", control_revision=1)}))
-            journal = self.drive(path)
-        self.assertEqual(journal["stage"], "completed")
-        self.assertEqual(journal["nodes"]["adx-node"]["stage"], "verified")
-
     def test_daemonset_cross_host_replacement_is_rejected(self):
         self.replacement_host = "kube-node-2"
         with tempfile.TemporaryDirectory() as directory, patch.object(rollout.sys, "platform", "linux"):
@@ -1629,7 +1475,7 @@ class ApplyTests(PlanTests):
                 self.assertEqual(outcome["status"], "pending")
                 self.assertFalse(any(isinstance(p, str) and p.endswith("/verify-node") for p, _ in self.writes))
 
-    def test_batch_admission_and_no_automatic_promotion(self):
+    def test_batch_admission_does_not_advance_next_batch(self):
         second = copy.deepcopy(self.snapshot["pods"][0])
         second.update(name="workers-b", uid="uid-b", node_id="node-b", kubernetes_node_name="host-b")
         second["inspection"].update(node_id="node-b", observed_pod_uid="uid-b", node_session_id="session-b")
@@ -1699,6 +1545,8 @@ class HttpJsonTests(unittest.TestCase):
             rollout.http_json("http://coordinator:9090", "/v1/node-upgrades/tasks/task/verify-node", {})
         self.assertEqual(str(rejected.exception), "management request returned HTTP 400: InvalidArgument: "
                          "node recovery capabilities are unavailable or unverified")
+        self.assertIsInstance(rejected.exception, rollout.ManagementError)
+        self.assertEqual((rejected.exception.status, rejected.exception.code), (400, "InvalidArgument"))
         connection.request.assert_called_once()
         connection.close.assert_called_once()
 

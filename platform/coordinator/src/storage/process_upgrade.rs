@@ -183,20 +183,10 @@ impl Session {
         &self,
         owner: MaintenanceOwner,
     ) -> Result<MaintenanceStatus> {
-        let key = owner.release_key()?;
         let field = format!("process-upgrade:{}", owner.node_id);
-        let [header, marker, receipt] = self
-            .store
-            .fields([HEADER.into(), field.clone(), key.clone()])
-            .await?;
-        self.header(&header)?;
+        let (marker, receipt) = self.maintenance_snapshot(&owner).await?;
         // The exact task's receipt survives a subsequent task taking maintenance.
         if let Some(receipt) = receipt {
-            let receipt: MaintenanceRelease = decode(&receipt)?;
-            receipt.validate_metadata_key(&key)?;
-            if receipt.owner != owner {
-                return Err(Error::Conflict);
-            }
             return Ok(MaintenanceStatus::Released {
                 owner,
                 node_session: receipt.node_session,
@@ -256,12 +246,72 @@ impl Session {
         &self,
         owner: &MaintenanceOwner,
     ) -> Result<Option<MaintenanceRelease>> {
-        let [header, value] = self
-            .store
-            .fields([HEADER.into(), owner.release_key()?])
-            .await?;
-        self.header(&header)?;
-        value.as_deref().map(decode).transpose()
+        Ok(self.maintenance_snapshot(owner).await?.1)
+    }
+    fn process_releases_key(&self) -> String {
+        format!("{}:process-releases", self.store.key)
+    }
+    async fn maintenance_snapshot(
+        &self,
+        owner: &MaintenanceOwner,
+    ) -> Result<(Option<String>, Option<MaintenanceRelease>)> {
+        let key = owner.release_key()?;
+        for _ in 0..ATTEMPTS {
+            let mut read = redis::cmd("EVAL");
+            read.arg(
+                r#"
+                return {redis.call('HGET',KEYS[1],'header'),
+                    redis.call('HGET',KEYS[1],ARGV[1]),
+                    redis.call('HGET',KEYS[1],ARGV[2]),
+                    redis.call('HGET',KEYS[2],ARGV[2])}
+            "#,
+            )
+            .arg(2)
+            .arg(&self.store.key)
+            .arg(self.process_releases_key())
+            .arg(format!("process-upgrade:{}", owner.node_id))
+            .arg(&key);
+            let [header, marker, hot, cold]: [Option<String>; 4] = self.store.query(read).await?;
+            self.header(&header)?;
+            let mut receipt = None;
+            for value in [hot.as_deref(), cold.as_deref()].into_iter().flatten() {
+                let saved: MaintenanceRelease = decode(value)?;
+                saved.validate_metadata_key(&key)?;
+                if saved.owner != *owner || receipt.as_ref().is_some_and(|old| old != &saved) {
+                    return Err(Error::Conflict);
+                }
+                receipt = Some(saved);
+            }
+            let Some(hot) = hot else {
+                return Ok((marker, receipt));
+            };
+            // Move only a validated exact owner's existing receipt. Both copies
+            // and the Coordinator epoch are compared before either Hash changes.
+            let mut transfer = redis::cmd("EVAL");
+            transfer
+                .arg(
+                    r#"
+                if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1]
+                    or redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3]
+                    or (redis.call('HGET',KEYS[2],ARGV[2]) or '') ~= ARGV[4] then return 0 end
+                redis.call('HSET',KEYS[2],ARGV[2],ARGV[3])
+                redis.call('HDEL',KEYS[1],ARGV[2]); return 1
+            "#,
+                )
+                .arg(2)
+                .arg(&self.store.key)
+                .arg(self.process_releases_key())
+                .arg(self.epoch.to_string())
+                .arg(&key)
+                .arg(hot)
+                .arg(cold.unwrap_or_default());
+            if self.store.query::<u8>(transfer).await? == 1 {
+                return Ok((marker, receipt));
+            }
+        }
+        Err(Error::Unavailable(
+            "concurrent release receipt transfer; retry exact owner".into(),
+        ))
     }
     pub(crate) async fn prepare_process_maintenance(
         &self,
@@ -279,10 +329,13 @@ impl Session {
         marker.validate()?;
         let field = format!("process-upgrade:{}", owner.node_id);
         for _ in 0..ATTEMPTS {
+            if self.maintenance_release(&owner).await?.is_some() {
+                return Err(Error::Conflict);
+            }
             let raw = self.store.raw().await?;
             let mut header = self.header(&raw.get(HEADER).cloned())?;
             if raw.contains_key(&owner.release_key()?) {
-                return Err(Error::Conflict);
+                continue;
             }
             if let Some(saved) = raw.get(&field) {
                 let saved: NodeMaintenance = decode(saved)?;
@@ -400,13 +453,33 @@ impl Session {
             if raw.get(&token) != Some(&expected) {
                 return Err(Error::Conflict);
             }
+            let ownership = format!("node-ownership:{}", owner.node_id);
+            let mut checks = [
+                HEADER.to_owned(),
+                field.clone(),
+                node_field.clone(),
+                token.clone(),
+                ownership,
+            ]
+            .into_iter()
+            .map(|key| {
+                let value = raw.get(&key).cloned();
+                (key, value)
+            })
+            .collect::<Vec<_>>();
             let mut routes = BTreeMap::new();
             for (key, value) in &raw {
                 if !key.starts_with("environment:") {
                     continue;
                 }
                 let stored: StoredEnvironment = decode(value)?;
-                if stored.assignment.node_id != owner.node_id || stored.invalidated {
+                if stored.assignment.node_id != owner.node_id {
+                    continue;
+                }
+                // Existing ownership must not move/disappear after this read;
+                // the membership counter also fences newly assigned objects.
+                checks.push((key.clone(), Some(value.clone())));
+                if stored.invalidated {
                     continue;
                 }
                 if let Some(record) = &stored.result {
@@ -445,13 +518,6 @@ impl Session {
             node.node.available = false;
             marker.yielded = true;
             header.advance()?;
-            let mut checks = raw
-                .iter()
-                .map(|(key, value)| (key.clone(), Some(value.clone())))
-                .collect::<Vec<_>>();
-            let ownership = format!("node-ownership:{}", owner.node_id);
-            checks.retain(|(key, _)| key != &ownership);
-            checks.push((ownership.clone(), raw.get(&ownership).cloned()));
             if self
                 .maintenance_cas(
                     &header,
@@ -554,14 +620,17 @@ impl Session {
         let receipt_field = request.owner.release_key()?;
         let field = format!("process-upgrade:{}", request.owner.node_id);
         for _ in 0..ATTEMPTS {
-            let raw = self.store.raw().await?;
-            let mut header = self.header(&raw.get(HEADER).cloned())?;
-            if let Some(value) = raw.get(&receipt_field) {
-                return if decode::<MaintenanceRelease>(value)? == request {
+            if let Some(receipt) = self.maintenance_release(&request.owner).await? {
+                return if receipt == request {
                     Ok(request)
                 } else {
                     Err(Error::Conflict)
                 };
+            }
+            let raw = self.store.raw().await?;
+            let mut header = self.header(&raw.get(HEADER).cloned())?;
+            if raw.contains_key(&receipt_field) {
+                continue;
             }
             let marker: NodeMaintenance = decode(raw.get(&field).ok_or(Error::Conflict)?)?;
             if marker.owner != request.owner || marker.current_session != request.node_session {
@@ -625,6 +694,14 @@ impl Session {
         checks: &[(String, Option<String>)],
         writes: &[(String, Option<String>)],
     ) -> Result<bool> {
+        if checks
+            .iter()
+            .any(|(key, expected)| key.starts_with("process-release:") && expected.is_some())
+        {
+            return Err(Error::Invalid(
+                "release receipt CAS only supports absence checks".into(),
+            ));
+        }
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -632,17 +709,21 @@ impl Session {
             for _,c in ipairs(cjson.decode(ARGV[1])) do
                 local v=redis.call('HGET',KEYS[1],c[1])
                 if c[2]==cjson.null then if v then return 0 end elseif v~=c[2] then return 0 end
+                if string.sub(c[1],1,16)=='process-release:'
+                    and redis.call('HEXISTS',KEYS[2],c[1]) ~= 0 then return 0 end
             end
             redis.call('HSET',KEYS[1],'header',ARGV[2])
             for _,w in ipairs(cjson.decode(ARGV[3])) do
-                if w[2]==cjson.null then redis.call('HDEL',KEYS[1],w[1])
-                else redis.call('HSET',KEYS[1],w[1],w[2]) end
+                local target=string.sub(w[1],1,16)=='process-release:' and KEYS[2] or KEYS[1]
+                if w[2]==cjson.null then redis.call('HDEL',target,w[1])
+                else redis.call('HSET',target,w[1],w[2]) end
             end
             return 1
         "#,
             )
-            .arg(1)
+            .arg(2)
             .arg(&self.store.key)
+            .arg(self.process_releases_key())
             .arg(encode(&checks)?)
             .arg(encode(header)?)
             .arg(encode(&writes)?);
@@ -667,6 +748,397 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owner(epoch: u64) -> MaintenanceOwner {
+        MaintenanceOwner {
+            node_id: "node".into(),
+            rollout_id: "rollout".into(),
+            local_task_id: format!("task-{epoch}"),
+            epoch,
+        }
+    }
+
+    fn release_receipt(owner: MaintenanceOwner) -> MaintenanceRelease {
+        MaintenanceRelease {
+            owner,
+            node_session: "a".into(),
+        }
+    }
+
+    async fn hash_set(store: &RedisStore, key: &str, field: &str, value: &impl Serialize) {
+        let mut command = redis::cmd("HSET");
+        command.arg(key).arg(field).arg(encode(value).unwrap());
+        store.query::<u8>(command).await.unwrap();
+    }
+
+    async fn hash_get(store: &RedisStore, key: &str, field: &str) -> Option<String> {
+        let mut command = redis::cmd("HGET");
+        command.arg(key).arg(field);
+        store.query(command).await.unwrap()
+    }
+
+    async fn active_owner(session: &Session) -> MaintenanceOwner {
+        session
+            .process_upgrade("node")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner
+    }
+
+    async fn register_process_node(session: &Session, id: &str) {
+        session
+            .register_session(
+                Node {
+                    id: id.into(),
+                    runtime_classes: vec!["runsc".into()],
+                    capacity: Default::default(),
+                    available: true,
+                    labels: Default::default(),
+                    devices: vec![],
+                },
+                "node:1".into(),
+                "node:2".into(),
+                Some(NodeSession {
+                    id: "a".into(),
+                    sequence: 1,
+                    routable: true,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn running_process_environment(
+        session: &Session,
+        id: &str,
+        node_id: &str,
+    ) -> EnvironmentRecord {
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id":id, "tenant_id":"tenant", "image":"image", "runtime_class":"runsc",
+            "priority":0, "resources":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0}
+        }))
+        .unwrap();
+        let assignment = Assignment {
+            environment_id: id.into(),
+            node_id: node_id.into(),
+            shard_id: session.get_node(node_id).await.unwrap().shard_id,
+            generation: 1,
+            devices: vec![],
+        };
+        let mut record = session
+            .reserve(spec, assignment)
+            .await
+            .unwrap()
+            .effective_record();
+        record.state = EnvironmentState::Running;
+        record.revision = 2;
+        record.resources_held = true;
+        record.runtime.id = format!("{id}-1");
+        record.runtime.ip = Some("10.0.0.1".parse().unwrap());
+        session.commit(record.clone()).await.unwrap();
+        record
+    }
+
+    async fn eval_calls(store: &RedisStore) -> u64 {
+        let mut command = redis::cmd("INFO");
+        command.arg("commandstats");
+        let info: String = store.query(command).await.unwrap();
+        info.lines()
+            .find_map(|line| line.strip_prefix("cmdstat_eval:calls="))
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    async fn hold_node_write<F: std::future::Future>(
+        session: &Session,
+        operation: F,
+    ) -> (catalog::PublicationWrite, std::pin::Pin<Box<F>>) {
+        let held = session
+            .store
+            .publication_prepare(session.epoch, vec!["node:node".into()])
+            .await;
+        let lock = session
+            .store
+            .connection
+            .publication_locks
+            .lock()
+            .unwrap()
+            .get("node:node")
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let owners = Arc::strong_count(&lock);
+        let mut operation = Box::pin(operation);
+        // The operation queues on this held lock after its Redis snapshot.
+        // Its queued Arc proves that snapshot was captured without a sleep/hook.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    _ = operation.as_mut() => panic!("operation completed before the held Node write"),
+                    _ = tokio::task::yield_now() => {
+                        if Arc::strong_count(&lock) > owners {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        (held, operation)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn yield_cas_ignores_unrelated_environment_and_fences_changed_or_new_owned_environment() {
+        for change in ["unrelated", "owned", "new-owned"] {
+            let rig = transport_test_redis::Redis::new().await;
+            let store = rig.store().await;
+            let session = store.begin(1).await.unwrap();
+            register_process_node(&session, "node").await;
+            register_process_node(&session, "other").await;
+            let mut owned = running_process_environment(&session, "owned", "node").await;
+            let mut unrelated = running_process_environment(&session, "unrelated", "other").await;
+            session
+                .prepare_process_maintenance(owner(1), "a".into())
+                .await
+                .unwrap();
+            let (held, yielding) =
+                hold_node_write(&session, session.yield_node_session(owner(1), "a".into())).await;
+            match change {
+                "unrelated" => {
+                    unrelated.revision += 1;
+                    session.commit(unrelated).await.unwrap();
+                }
+                "owned" => {
+                    owned.revision += 1;
+                    owned.runtime.ip = Some("10.0.0.2".parse().unwrap());
+                    session.commit(owned).await.unwrap();
+                }
+                "new-owned" => {
+                    running_process_environment(&session, "new", "node").await;
+                }
+                _ => unreachable!(),
+            }
+            let before = eval_calls(&store).await;
+            held.finish(false, vec![]);
+            assert!(yielding.await.unwrap().yielded);
+            assert_eq!(
+                eval_calls(&store).await - before,
+                if change == "unrelated" { 1 } else { 2 },
+                "Yield checked an unrelated field or failed to fence relevant changes: {change}"
+            );
+            let node = session.get_node("node").await.unwrap();
+            let routes = &node
+                .upgrade_pause
+                .as_ref()
+                .unwrap()
+                .route_hold
+                .as_ref()
+                .unwrap()
+                .routes;
+            assert_eq!(
+                routes["owned"].ip,
+                if change == "owned" {
+                    "10.0.0.2"
+                } else {
+                    "10.0.0.1"
+                }
+                .parse::<std::net::IpAddr>()
+                .unwrap()
+            );
+            assert_eq!(routes.contains_key("new"), change == "new-owned");
+            assert!(!routes.contains_key("unrelated"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn process_release_receipts_stay_cold_persistent_and_replay_across_tasks_and_restart() {
+        let rig = transport_test_redis::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        register_process_node(&session, "node").await;
+        for epoch in [1, 2] {
+            session
+                .prepare_process_maintenance(owner(epoch), "a".into())
+                .await
+                .unwrap();
+            session
+                .release_process_maintenance(release_receipt(owner(epoch)))
+                .await
+                .unwrap();
+        }
+        let hot = store.raw().await.unwrap();
+        let header = session.header(&hot.get(HEADER).cloned()).unwrap();
+        assert!(matches!(
+            session
+                .maintenance_cas(
+                    &header,
+                    &[(owner(1).release_key().unwrap(), Some(String::new()))],
+                    &[],
+                )
+                .await,
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(store.raw().await.unwrap(), hot);
+        assert!(
+            hot.keys().all(|key| !key.starts_with("process-release:")),
+            "historical receipts must not grow the hot control Hash"
+        );
+        let mut ttl = redis::cmd("PTTL");
+        ttl.arg(format!("{}:process-releases", store.key));
+        assert_eq!(store.query::<i64>(ttl).await.unwrap(), -1);
+        let current = store.begin(1).await.unwrap();
+        current
+            .prepare_process_maintenance(owner(3), "a".into())
+            .await
+            .unwrap();
+        for epoch in [1, 2] {
+            let receipt = release_receipt(owner(epoch));
+            assert_eq!(
+                current.maintenance_release(&owner(epoch)).await.unwrap(),
+                Some(receipt.clone())
+            );
+            assert!(matches!(
+                current
+                    .process_maintenance_status(owner(epoch))
+                    .await
+                    .unwrap(),
+                MaintenanceStatus::Released { .. }
+            ));
+            assert_eq!(
+                current
+                    .release_process_maintenance(receipt)
+                    .await
+                    .unwrap()
+                    .owner,
+                owner(epoch)
+            );
+            assert!(matches!(
+                current
+                    .prepare_process_maintenance(owner(epoch), "a".into())
+                    .await,
+                Err(Error::Conflict)
+            ));
+        }
+        assert_eq!(active_owner(&current).await, owner(3));
+        assert!(matches!(
+            session.maintenance_release(&owner(1)).await,
+            Err(Error::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn existing_hot_release_moves_atomically_and_rejects_conflicting_cold_receipt() {
+        let rig = transport_test_redis::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        register_process_node(&session, "node").await;
+        let receipt = release_receipt(owner(1));
+        let receipt_field = owner(1).release_key().unwrap();
+        let cold = format!("{}:process-releases", store.key);
+        hash_set(&store, &store.key, &receipt_field, &receipt).await;
+        session
+            .prepare_process_maintenance(owner(2), "a".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            session.maintenance_release(&owner(1)).await.unwrap(),
+            Some(receipt.clone())
+        );
+        assert!(hash_get(&store, &store.key, &receipt_field).await.is_none());
+        assert_eq!(
+            hash_get(&store, &cold, &receipt_field).await,
+            Some(encode(&receipt).unwrap())
+        );
+        assert_eq!(
+            session
+                .release_process_maintenance(receipt.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(active_owner(&session).await, owner(2));
+        session
+            .release_process_maintenance(release_receipt(owner(2)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            session
+                .prepare_process_maintenance(owner(1), "a".into())
+                .await,
+            Err(Error::Conflict)
+        ));
+        let conflict = MaintenanceRelease {
+            node_session: "other".into(),
+            ..receipt
+        };
+        hash_set(&store, &store.key, &receipt_field, &conflict).await;
+        assert!(matches!(
+            session.maintenance_release(&owner(1)).await,
+            Err(Error::Conflict)
+        ));
+        assert!(matches!(
+            session.process_maintenance_status(owner(1)).await,
+            Err(Error::Conflict)
+        ));
+        assert!(
+            hash_get(&store, &store.key, &receipt_field).await.is_some(),
+            "conflicting data must not be discarded"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn release_epoch_change_leaves_pause_and_receipt_unmodified() {
+        let rig = transport_test_redis::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        register_process_node(&session, "node").await;
+        session
+            .prepare_process_maintenance(owner(1), "a".into())
+            .await
+            .unwrap();
+        let receipt = release_receipt(owner(1));
+        let (held, release) = hold_node_write(
+            &session,
+            session.release_process_maintenance(receipt.clone()),
+        )
+        .await;
+        let current = store.begin(1).await.unwrap();
+        held.finish(false, vec![]);
+        assert!(matches!(release.await, Err(Error::Conflict)));
+        assert_eq!(current.maintenance_release(&owner(1)).await.unwrap(), None);
+        assert_eq!(active_owner(&current).await, owner(1));
+        assert!(current
+            .get_node("node")
+            .await
+            .unwrap()
+            .upgrade_pause
+            .is_some());
+        assert_eq!(
+            current
+                .release_process_maintenance(receipt.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert!(current.process_upgrade("node").await.unwrap().is_none());
+        assert!(current
+            .get_node("node")
+            .await
+            .unwrap()
+            .upgrade_pause
+            .is_none());
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated real Redis"]
     async fn unspawned_reservation_rebinds_actual_volume_session_and_fences_late_commit() {
@@ -834,27 +1306,7 @@ mod tests {
         let rig = transport_test_redis::Redis::new().await;
         let store = rig.store().await;
         let session = store.begin(1).await.unwrap();
-        let node = Node {
-            id: "node".into(),
-            runtime_classes: vec!["runsc".into()],
-            capacity: Default::default(),
-            available: true,
-            labels: Default::default(),
-            devices: vec![],
-        };
-        session
-            .register_session(
-                node,
-                "node:1".into(),
-                "node:2".into(),
-                Some(NodeSession {
-                    id: "a".into(),
-                    sequence: 1,
-                    routable: true,
-                }),
-            )
-            .await
-            .unwrap();
+        register_process_node(&session, "node").await;
         let owner = MaintenanceOwner {
             node_id: "node".into(),
             rollout_id: "r".into(),
@@ -879,10 +1331,7 @@ mod tests {
             assert_eq!(pause.original_paused, admin_paused);
         }
         session
-            .release_process_maintenance(MaintenanceRelease {
-                owner: owner.clone(),
-                node_session: "a".into(),
-            })
+            .release_process_maintenance(release_receipt(owner.clone()))
             .await
             .unwrap();
         let released = session.get_node("node").await.unwrap();
@@ -914,15 +1363,7 @@ mod tests {
             yielded: false,
             replacement: None,
         };
-        let client = redis::Client::open(rig.url.as_str()).unwrap();
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-        let _: usize = redis::cmd("HSET")
-            .arg("adx:{test}:control:v1")
-            .arg("process-upgrade:node")
-            .arg(encode(&foreign).unwrap())
-            .query_async(&mut conn)
-            .await
-            .unwrap();
+        hash_set(&store, &store.key, "process-upgrade:node", &foreign).await;
         assert!(matches!(
             session.set_node_scheduling("node", true, false).await,
             Err(Error::Conflict)

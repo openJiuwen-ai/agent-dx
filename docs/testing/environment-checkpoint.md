@@ -48,6 +48,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 ## 失败与重试
 
 - API/RPC 断线不会取消已进入实例队列的操作。暂停等节点操作重试保持原始身份/版本；恢复重试复用 Redis 中的固定意图。已暂停对象节点失效后继续休眠，等待需求、TTL 或删除。
+- Coordinator 后台扫描在实例锁内重读候选的恢复意图；意图已完成、消失或更换时跳过，不为旧候选生成新的唤醒需求。
 - 正常结果记录只保留最近成功操作。Node RPC 拒绝旧预期版本；客户端不能在一个后续操作已改变状态后，把旧请求换成新版本重新执行。
 - checkpoint 已完成而 Coordinator 提交失败时，节点按 [SQLite 降级契约](node-lifecycle.md) 保存待补交结果。同一操作重试只补交；Journaled 不返回集群成功，重启后先等待 Coordinator 权威对账。
 - 可复用 Snapshot 在同一次节点请求内等待 Journaled 状态达到 Published：只补交相同记录和版本，不重新运行后端 capture。等待占用该次 checkpoint 的剩余预算，后端收到扣除等待时间后的超时。真实归属／版本冲突立即返回；预算耗尽后保留待补交记录和制品引用，不把本地 journal 当作 Snapshot 成功。此规则不放宽 Coordinator 的 CAS、归属和制品引用校验。
@@ -61,6 +62,8 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 ## 验证
 
 组件测试覆盖状态与资源转换、丢失提交回复、过期清理、恢复失败、回滚、真实 sandboxd 协议的 UDS 调用、Execd HTTP 身份切换和 Ingress 版本检查。Redis 集成测试使用独立真实 Redis。
+
+`rpc::publication_tests::stale_pending_resume_does_not_create_a_new_wake_after_pause` 使用独立 Redis，先固定后台扫描取得的旧候选，再正常完成原恢复并再次暂停，断言旧扫描不会生成新意图，持久记录保持不变。它不使用真实沙箱或 Kubernetes，不替代现场升级验收。
 可复用 Snapshot 的真实 SQLite JournalSink 回归还覆盖暂时发布失败后成功、只 capture 一次、原预算耗尽及不重试永久冲突；组件结果不替代并发集群验收。
 
 `platform/coordinator/tests/rpc.rs` 的 `shared_checkpoint` 用例覆盖自动跨节点恢复和休眠后的 Ingress 按需恢复，使用真实 Redis、mTLS、独占 Volume 授权及内存对象存储；断言恢复后原 spec 不变、卷 UID 不变、目标执行独占卷、旧归属提交被拒绝及重复请求不重复恢复。`platform/adxlet/tests/pause_resume.rs` 另注入临时准入错误，验证保留恢复点并在错误解除后只 restore 一次；通过表驱动用例覆盖无到期时间的恢复点在 manifest/数据对象缺失、后端拒绝、restore 初始化超时或准入权限拒绝时进入 Failed，重复恢复请求不再次调用后端。授权后错误场景由真实 Coordinator 完成 Redis 授权后在测试 RPC 包装层替换回复，断言 Paused 提交立即释放独占占用、保存已释放 runtime 身份且后续授权接受该 previous runtime；它不注入调度器内部故障。协议测试单独验证 `Unauthenticated`、`PermissionDenied` 的错误码与原因保留，以及 `Internal` 保留诊断并继续映射为 `Unavailable`。这些用例的 RuntimeDriver 是夹具，不构成真实 sandboxd、共享文件系统或 Kubernetes 验收。

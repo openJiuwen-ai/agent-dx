@@ -587,8 +587,7 @@ impl Ingress {
                 "private service requires an approved HTTP policy",
             ));
         }
-        self.open_authorized_stream_with_activity(route, false, false)
-            .await
+        self.open_unpooled_authorized_stream(route).await
     }
 
     // Called only after the HTTP service policy has authorized this request.
@@ -613,11 +612,131 @@ impl Ingress {
             Ok(stream) => return Ok(stream),
             Err(error) => error,
         };
-        if defer_binding_recovery && relay_binding_rejected(&error) {
+        if defer_binding_recovery
+            && matches!(
+                error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<super::pool::RelayConnectError>()),
+                Some(super::pool::RelayConnectError::Rejected(
+                    StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+                ))
+            )
+        {
             return Err(error);
         }
         let replacement = self.recover_stream_route(&route, passive, error).await?;
         self.open_current_stream(replacement, passive).await
+    }
+
+    async fn open_unpooled_authorized_stream(
+        &self,
+        mut route: RouteHandle,
+    ) -> io::Result<IngressStream> {
+        let processing_at = route.processing.as_ref().map(|processing| processing.at);
+        let deadline_for_retry = || {
+            tokio::time::Instant::now()
+                .checked_add(self.connector.connect_timeout())
+                .map(|deadline| processing_at.map_or(deadline, |at| deadline.min(at)))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Relay deadline is out of range",
+                    )
+                })
+        };
+        let mut retry_deadline = None;
+        let mut recovered = false;
+        let timed_out = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Relay connection admission timed out",
+            )
+        };
+        loop {
+            let attempt_deadline = retry_deadline.or(processing_at);
+            if attempt_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(timed_out());
+            }
+            let revision = self.resolver.current_route_revision(&route);
+            let attempt = self.open_current_stream(route.clone(), false);
+            // An ordinary first CONNECT response keeps its original wait
+            // semantics. The shorter window starts only after a confirmed 503.
+            let result = if let Some(deadline) = attempt_deadline {
+                tokio::time::timeout_at(deadline, attempt)
+                    .await
+                    .map_err(|_| timed_out())?
+            } else {
+                attempt.await
+            };
+            let error = match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => error,
+            };
+            if matches!(
+                error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<super::pool::RelayConnectError>()),
+                Some(super::pool::RelayConnectError::Rejected(
+                    StatusCode::SERVICE_UNAVAILABLE
+                ))
+            ) {
+                if !self.ready() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        IngressOpenError::RouteChanged,
+                    ));
+                }
+                if revision.is_some() && self.resolver.current_route_revision(&route) == revision {
+                    let connect_deadline = match retry_deadline {
+                        Some(deadline) => deadline,
+                        None => {
+                            let deadline = deadline_for_retry()?;
+                            retry_deadline = Some(deadline);
+                            deadline
+                        }
+                    };
+                    // No application bytes precede CONNECT acceptance. Retry this
+                    // binding under one budget without manufacturing wake demand.
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + std::time::Duration::from_millis(25))
+                            .min(connect_deadline),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+            if recovered {
+                return Err(error);
+            }
+            // A real lifecycle transition uses the original request budget,
+            // independently of the shorter connection-admission budget.
+            let replacement = self.recover_stream_route(&route, false, error).await?;
+            let replacement = if replacement.needs_resume {
+                // recover_stream_route checked the candidate's authorization
+                // scope before this side-effecting wake. prepare_route also
+                // checks the resulting scope after the lifecycle transition.
+                self.prepare_route(replacement, &route.tenant_id)
+                    .await
+                    .map_err(|error| match error {
+                        IngressOpenError::Resolve(ResolveError::Unavailable(message)) => {
+                            io::Error::new(io::ErrorKind::NotConnected, message)
+                        }
+                        IngressOpenError::Resolve(ResolveError::NotReady) => io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "resume service is not ready",
+                        ),
+                        IngressOpenError::Resolve(error) => io::Error::other(error),
+                        error => io::Error::new(io::ErrorKind::PermissionDenied, error),
+                    })?
+            } else {
+                replacement
+            };
+            if self.resolver.current_route_revision(&replacement) != revision {
+                retry_deadline = None;
+            }
+            route = replacement;
+            recovered = true;
+        }
     }
 
     async fn recover_stream_route(

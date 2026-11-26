@@ -1063,8 +1063,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
             route.instance_id.clone(),
             route.environment_id.clone(),
             route.environment_ip.parse().unwrap(),
-        )
-        .await;
+        );
         routes.put(route);
     }
     let api = Arc::new(AgentApi {
@@ -1530,8 +1529,7 @@ async fn jiuwen_cold_start_waits_for_backend_listener_before_ws_handshake() {
         route.instance_id.clone(),
         route.environment_id.clone(),
         route.environment_ip.parse().unwrap(),
-    )
-    .await;
+    );
     routes.put(route.clone());
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
     let access = super::super::agent_service::AgentV2Access::new(Arc::new(
@@ -1654,8 +1652,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         route.instance_id.clone(),
         route.environment_id.clone(),
         route.environment_ip.parse().unwrap(),
-    )
-    .await;
+    );
     routes.put(route.clone());
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
     let access = super::super::agent_service::AgentV2Access::new(Arc::new(

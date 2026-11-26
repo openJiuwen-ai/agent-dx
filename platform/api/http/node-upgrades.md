@@ -182,9 +182,19 @@ separate failure cases; this protocol does not promise transparent stream migrat
 | `POST /tasks/{task_id}/complete` | Release verified node gates and complete the task. |
 | `POST /tasks/{task_id}/abort` | Freeze, restore an untouched original Pod, or finalize rollback. |
 
-Begin takes `task_id`, positive executor `epoch`, `namespace`, `daemonset_uid`,
-`target_image` fixed by SHA-256 digest, and `nodes` containing `node_id`,
-`pod_uid`, `node_session_id`. A task ID cannot be reused for another release.
+Begin 接受 `task_id`、正数执行器 `epoch`、`namespace`、`daemonset_uid`、
+`target_image`，以及包含 `node_id`、`pod_uid`、`node_session_id` 的 `nodes`。
+`task_id` 为 1–128 字节的 ASCII 字母、数字或 `._~-`，且不能整体为 `.` 或 `..`；
+Coordinator 在写入任务前拒绝不能按原路径查询和操作的身份。
+`target_image` 支持显式非 `latest` 版本 tag（含 registry 端口），或现有完整
+`@sha256:` 引用。tag 为 1–128 个 ASCII 字符，首字符为字母、数字或下划线，
+后续只允许字母、数字、下划线、点和连字符；`latest` 按大小写不敏感规则拒绝。
+省略末段 tag、空白和控制字符均无效；digest 必须为 64 个小写十六进制字符。
+例如 `registry.example:5000/adxlet:release-20261124-1` 有效，
+`registry.example:5000/adxlet` 无效。tag 发布使用唯一新 tag，不覆盖已有 tag；
+tag 本身不证明镜像内容不可变，管理接口不解析 registry 或生成 digest。
+任务原样保存并精确绑定完整镜像引用。同一任务的相同身份请求可重放，
+修改 `target_image` 返回 409；不同发布不得复用同一 task ID。
 Task queries do not reconcile operations. After an ambiguous result, retry the
 same operation ID to reconcile durable ownership and local progress.
 An Environment with an unsettled migration rejects another operation ID.

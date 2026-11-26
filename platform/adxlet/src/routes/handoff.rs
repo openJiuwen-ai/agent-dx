@@ -5,29 +5,17 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Beginning,
-    Installing,
-    Installed,
-    Opening,
     ActiveFenced,
     Completed,
     Cancelled,
 }
 impl Phase {
-    fn installed(self) -> bool {
-        matches!(
-            self,
-            Self::Installed | Self::Opening | Self::ActiveFenced | Self::Completed
-        )
-    }
     fn may_serve(self) -> bool {
-        matches!(self, Self::Opening | Self::ActiveFenced | Self::Completed)
+        matches!(self, Self::ActiveFenced | Self::Completed)
     }
     fn name(self) -> &'static str {
         match self {
             Self::Beginning => "beginning",
-            Self::Installing => "installing",
-            Self::Installed => "installed",
-            Self::Opening => "opening",
             Self::ActiveFenced => "active_fenced",
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
@@ -42,9 +30,8 @@ pub(super) struct Task {
     old_pending: BTreeMap<String, UpdateBindingRequest>,
     // ACK removes pending work, but must not forget an old-endpoint fence.
     old_retired: BTreeMap<String, (u64, u64)>,
-    candidate_pending: BTreeMap<String, UpdateBindingRequest>,
     proof: Option<pb::RelayHandoffProof>,
-    replacement: Option<pb::RelayReplacementRequest>,
+    replacement: Option<(pb::RelayHandoffRequest, pb::RelayReplacement)>,
 }
 impl Task {
     pub(super) fn is_completed(&self) -> bool {
@@ -62,18 +49,17 @@ impl Task {
             snapshot: None,
             old_pending: BTreeMap::new(),
             old_retired: BTreeMap::new(),
-            candidate_pending: BTreeMap::new(),
             proof: None,
             replacement: None,
         }
     }
-    fn freeze_snapshot(&mut self, local: &Local) -> &pb::BindingSnapshot {
+    fn freeze_snapshot(&mut self, local: &mut Local) -> &pb::BindingSnapshot {
         if self.snapshot.is_none() {
             // Pre-snapshot changes are included in the exact frozen request.
-            self.candidate_pending.clear();
+            local.unconfirmed.clear();
         }
         let session = &self.identity.candidate_proxy_session_id;
-        let epoch = 1; // Fresh candidate's first Begin, including a replacement.
+        let epoch = 1; // Fresh candidate's first BeginBindings, including a replacement.
         self.snapshot.get_or_insert_with(|| pb::BindingSnapshot {
             proxy_session_id: session.clone(),
             sync_epoch: epoch,
@@ -90,8 +76,6 @@ impl Task {
         })
     }
     fn queue(&mut self, old: Option<&UpdateBindingRequest>, next: &UpdateBindingRequest) {
-        self.candidate_pending
-            .insert(next.environment_id.clone(), next.clone());
         let availability = old.is_some_and(|old| {
             matches!((&old.binding, &next.binding),
                 (Some(Binding::Active(a)), Some(Binding::Suspended(b)))
@@ -136,6 +120,34 @@ impl Task {
             && state.controller_session_id == self.identity.old_controller_session_id
             && state.sync_epoch == 1
     }
+    fn accept_proof(&mut self, proof: pb::RelayHandoffProof) -> Result<()> {
+        let task = self;
+        if proof
+            .identity
+            .as_ref()
+            .is_none_or(|identity| !task.same_reservation(identity))
+            || proof.old_pid == 0
+            || proof.identity.as_ref().is_some_and(|identity| {
+                !identity.candidate_proxy_session_id.is_empty()
+                    && !task.identity.candidate_proxy_session_id.is_empty()
+                    && identity.candidate_proxy_session_id
+                        != task.identity.candidate_proxy_session_id
+            })
+            || !(proof.listeners_released || proof.old_exited)
+            || task.proof.as_ref().is_some_and(|old| {
+                old.old_pid != proof.old_pid
+                    || (old.old_exited && !proof.old_exited)
+                    || (old.listeners_released && !proof.listeners_released)
+            })
+        {
+            return Err(Error::Conflict);
+        }
+        if proof.old_exited {
+            task.old_pending.clear();
+        }
+        task.proof = Some(proof);
+        Ok(())
+    }
     fn state(&self) -> pb::RelayHandoffState {
         pb::RelayHandoffState {
             identity: Some(self.identity.clone()),
@@ -145,49 +157,6 @@ impl Task {
     }
 }
 impl UdsRoutes {
-    pub async fn replace_failed_candidate(
-        &self,
-        request: pb::RelayReplacementRequest,
-    ) -> Result<pb::RelayHandoffState> {
-        let _topology = self.topology.write().await;
-        let mut slot = self.handoff.lock().await;
-        let task = slot.as_mut().ok_or(Error::NotFound)?;
-        if let Some(previous) = task.replacement.as_ref() {
-            if previous != &request {
-                return Err(Error::Conflict);
-            }
-            return Ok(task.state());
-        }
-        let path = PathBuf::from(&request.replacement_socket);
-        if request.identity.as_ref().is_none_or(|identity| {
-            !task.same_reservation(identity)
-                || (!task.identity.candidate_proxy_session_id.is_empty()
-                    && identity.candidate_proxy_session_id
-                        != task.identity.candidate_proxy_session_id)
-        }) || request.failed_pid == 0
-            || !request.failed_exited
-            || task.phase == Phase::Cancelled
-            || !path.is_absolute()
-            || path.as_os_str().len() > 100
-            || request.replacement_socket == task.identity.old_socket
-            || request.replacement_socket == task.identity.candidate_socket
-        {
-            return Err(Error::Conflict);
-        }
-        // Retain original-generation revocations and proof while fencing every
-        // delayed Open/Switch addressed to the dead candidate identity.
-        task.identity.candidate_socket = request.replacement_socket.clone();
-        task.identity.candidate_proxy_session_id.clear();
-        if let Some(proof) = task.proof.as_mut() {
-            proof.identity = Some(task.identity.clone());
-        }
-        task.phase = Phase::Beginning;
-        task.snapshot = None;
-        task.candidate_pending.clear();
-        task.replacement = Some(request);
-        self.activity.disconnect();
-        Ok(task.state())
-    }
     pub(super) async fn require_stable_topology(&self) -> Result<()> {
         if self
             .handoff
@@ -266,54 +235,20 @@ impl UdsRoutes {
         self.path.send_modify(|_| {});
         Ok(task.state())
     }
-    pub async fn prove_handoff(
-        &self,
-        proof: pb::RelayHandoffProof,
-    ) -> Result<pb::RelayHandoffState> {
-        let _topology = self.topology.write().await;
-        let mut slot = self.handoff.lock().await;
-        let task = slot.as_mut().ok_or(Error::NotFound)?;
-        if proof
-            .identity
-            .as_ref()
-            .is_none_or(|identity| !task.same_reservation(identity))
-            || proof.old_pid == 0
-            || proof.identity.as_ref().is_some_and(|identity| {
-                !identity.candidate_proxy_session_id.is_empty()
-                    && !task.identity.candidate_proxy_session_id.is_empty()
-                    && identity.candidate_proxy_session_id
-                        != task.identity.candidate_proxy_session_id
-            })
-            || !(proof.listeners_released || (proof.begin_accepted && proof.old_exited))
-            || task.proof.as_ref().is_some_and(|old| {
-                old.old_pid != proof.old_pid
-                    || (old.old_exited && !proof.old_exited)
-                    || (old.listeners_released && !proof.listeners_released)
-                    || (old.begin_accepted && !proof.begin_accepted)
-            })
-        {
-            return Err(Error::Conflict);
-        }
-        if proof.old_exited {
-            task.old_pending.clear();
-        }
-        task.proof = Some(proof);
-        Ok(task.state())
-    }
     pub async fn finish_handoff(
         &self,
         proof: pb::RelayHandoffProof,
     ) -> Result<pb::RelayHandoffState> {
-        self.prove_handoff(proof.clone()).await?;
         let _topology = self.topology.write().await;
         let mut slot = self.handoff.lock().await;
         let task = slot.as_mut().ok_or(Error::NotFound)?;
+        task.accept_proof(proof.clone())?;
         if task.phase == Phase::Completed {
             return Ok(task.state());
         }
         if task.phase != Phase::ActiveFenced
             || !proof.old_exited
-            || !task.candidate_pending.is_empty()
+            || !self.local.lock().await.unconfirmed.is_empty()
         {
             return Err(Error::Conflict);
         }
@@ -387,9 +322,16 @@ impl UdsRoutes {
             sync_epoch: 1,
             ready: true,
         };
+        let old_exited = task.proof.as_ref().is_some_and(|proof| proof.old_exited);
+        let candidate_may_serve = task.phase.may_serve() || task.snapshot.is_some();
+        let mut local = self.local.lock().await;
+        let pending = |rows: &BTreeMap<String, UpdateBindingRequest>| match environment {
+            Some(id) => rows.contains_key(id),
+            None => !rows.is_empty(),
+        };
         let (old_result, candidate_result) = tokio::join!(
             async {
-                if task.proof.as_ref().is_some_and(|proof| proof.old_exited) {
+                if old_exited {
                     return Ok(());
                 }
                 self.flush_endpoint(
@@ -401,12 +343,24 @@ impl UdsRoutes {
                 )
                 .await
             },
-            async {
-                if task.phase.installed() {
+            tokio::time::timeout_at(deadline, async {
+                if !pending(&local.unconfirmed) {
+                    return Ok(());
+                }
+                if candidate_may_serve {
+                    let mut client = Self::connect_at(
+                        PathBuf::from(&task.identity.candidate_socket),
+                        self.timeout,
+                    )
+                    .await?;
+                    let state = self.remote(&mut client).await?;
+                    if state != candidate {
+                        return Err(unavailable("candidate full synchronization pending"));
+                    }
                     self.flush_endpoint(
                         &task.identity.candidate_socket,
                         &candidate,
-                        &mut task.candidate_pending,
+                        &mut local.unconfirmed,
                         environment,
                         deadline,
                     )
@@ -414,17 +368,13 @@ impl UdsRoutes {
                 } else {
                     Ok(())
                 }
-            }
+            })
         );
         // Join both endpoints before propagating either failure: both journals
         // must retain actual ACK progress even when the other side times out.
         old_result?;
-        candidate_result?;
-        let pending = |rows: &BTreeMap<String, UpdateBindingRequest>| match environment {
-            Some(id) => rows.contains_key(id),
-            None => !rows.is_empty(),
-        };
-        if pending(&task.old_pending) || pending(&task.candidate_pending) {
+        candidate_result.map_err(|_| unavailable("handoff flush budget exhausted"))??;
+        if pending(&task.old_pending) || pending(&local.unconfirmed) {
             return Err(unavailable(
                 "handoff updates pending; retry same task or binding",
             ));
@@ -462,6 +412,9 @@ impl UdsRoutes {
                 task.old_pending.clear();
             }
             local
+                .unconfirmed
+                .insert(next.environment_id.clone(), next.clone());
+            local
                 .bindings
                 .insert(next.environment_id.clone(), next.clone());
         }
@@ -476,63 +429,79 @@ impl UdsRoutes {
     }
     pub async fn switch_handoff(
         &self,
-        request: pb::RelayHandoffRequest,
+        request: pb::RelaySwitchRequest,
     ) -> Result<pb::RelayHandoffState> {
+        let proof = request.proof.ok_or(Error::Conflict)?;
+        let identity = proof.identity.as_ref().ok_or(Error::Conflict)?.clone();
         let _topology = self.topology.write().await;
         let mut slot = self.handoff.lock().await;
-        if slot.as_ref().is_none_or(|task| task.proof.is_none()) {
+        let task = slot.as_mut().ok_or(Error::NotFound)?;
+        if task.phase == Phase::Cancelled {
             return Err(Error::Conflict);
         }
-        if let Some(task) = slot.as_mut() {
-            if !task.same_reservation(&request) {
-                return Err(Error::Conflict);
-            }
-            if task.phase == Phase::Cancelled {
-                return Err(Error::Conflict);
-            }
-            if task.identity.candidate_proxy_session_id.is_empty() {
-                if request.candidate_proxy_session_id.is_empty() {
+        if let Some(replacement) = request.replacement {
+            if let Some(previous) = &task.replacement {
+                if previous != &(identity, replacement)
+                    || task
+                        .proof
+                        .as_ref()
+                        .is_none_or(|old| old.old_pid != proof.old_pid)
+                {
                     return Err(Error::Conflict);
                 }
-                task.identity.candidate_proxy_session_id =
-                    request.candidate_proxy_session_id.clone();
-            } else if task.identity != request {
-                return Err(Error::Conflict);
-            }
-        }
-        if let Some(task) = slot.as_ref() {
-            if task.phase == Phase::Completed {
+                // Replay is a historical receipt, not new Child liveness evidence.
                 return Ok(task.state());
             }
-            if task.phase == Phase::ActiveFenced {
-                let task = slot.as_mut().ok_or(Error::Conflict)?;
-                self.flush_handoff(task, None).await?;
-                return Ok(task.state());
-            }
-        }
-        let channel =
-            Self::channel_at(PathBuf::from(&request.candidate_socket), self.timeout).await?;
-        let mut candidate = RelayServiceClient::new(channel.clone())
-            .max_encoding_message_size(64 * 1024 * 1024)
-            .max_decoding_message_size(64 * 1024 * 1024);
-        let mut candidate_upgrade =
-            pb::relay_upgrade_service_client::RelayUpgradeServiceClient::new(channel)
-                .max_encoding_message_size(64 * 1024 * 1024)
-                .max_decoding_message_size(64 * 1024 * 1024);
-        let mut state = self.remote(&mut candidate).await?;
-        let task = slot.as_mut().ok_or(Error::Conflict)?;
-        if !task.matches_candidate(&state) {
-            if task.phase != Phase::Beginning {
-                return Err(Error::Conflict);
-            }
-            if state.proxy_session_id != request.candidate_proxy_session_id
-                || state.ready
-                || state.sync_epoch != 0
-                || !state.controller_session_id.is_empty()
+            task.accept_proof(proof)?;
+            let path = PathBuf::from(&replacement.replacement_socket);
+            if replacement.failed_pid == 0
+                || !replacement.failed_exited
+                || !path.is_absolute()
+                || path.as_os_str().len() > 100
+                || replacement.replacement_socket == task.identity.old_socket
+                || replacement.replacement_socket == task.identity.candidate_socket
             {
                 return Err(Error::Conflict);
             }
-            state.controller_session_id = request.old_controller_session_id.clone();
+            // The reaped Child can never own the replacement identity.
+            task.identity.candidate_socket = replacement.replacement_socket.clone();
+            task.identity.candidate_proxy_session_id.clear();
+            if let Some(proof) = task.proof.as_mut() {
+                proof.identity = Some(task.identity.clone());
+            }
+            task.phase = Phase::Beginning;
+            task.snapshot = None;
+            task.replacement = Some((identity, replacement));
+            self.local.lock().await.unconfirmed.clear();
+            self.activity.disconnect();
+            return Ok(task.state());
+        }
+        task.accept_proof(proof)?;
+        if task.identity.candidate_proxy_session_id.is_empty() {
+            if identity.candidate_proxy_session_id.is_empty() {
+                return Err(Error::Conflict);
+            }
+            task.identity.candidate_proxy_session_id = identity.candidate_proxy_session_id.clone();
+        } else if task.identity != identity {
+            return Err(Error::Conflict);
+        }
+        if task.phase == Phase::Completed {
+            return Ok(task.state());
+        }
+        let mut candidate =
+            Self::connect_at(PathBuf::from(&identity.candidate_socket), self.timeout).await?;
+        let mut state = self.remote(&mut candidate).await?;
+        if !task.matches_candidate(&state) {
+            if state.proxy_session_id != identity.candidate_proxy_session_id
+                || state.ready
+                || state.sync_epoch != 0
+                || !state.controller_session_id.is_empty()
+                || task.snapshot.is_some()
+                || task.phase.may_serve()
+            {
+                return Err(Error::Conflict);
+            }
+            state.controller_session_id = identity.old_controller_session_id.clone();
             state = candidate
                 .begin_bindings(self.request(state))
                 .await
@@ -543,34 +512,19 @@ impl UdsRoutes {
             }
         }
         if state.ready {
-            if !task.phase.may_serve() {
+            // An uncertain Replace may already have opened this exact identity.
+            if task.snapshot.is_none() && !task.phase.may_serve() {
                 return Err(Error::Conflict);
             }
-            task.snapshot = None;
-        } else if !task.phase.installed() {
-            task.phase = Phase::Installing;
-            let local = self.local.lock().await;
-            let snapshot = task.freeze_snapshot(&local).clone();
+        } else {
+            if task.phase.may_serve() {
+                return Err(Error::Conflict);
+            }
+            let mut local = self.local.lock().await;
+            let snapshot = task.freeze_snapshot(&mut local).clone();
             drop(local);
-            state = candidate_upgrade
-                .install_candidate_bindings(self.request(snapshot))
-                .await
-                .map_err(rpc_error)?
-                .into_inner();
-            if !task.matches_candidate(&state) || state.ready {
-                return Err(Error::Conflict);
-            }
-            task.snapshot = None;
-            task.phase = Phase::Installed;
-        }
-        // Bounded, acknowledged progress; retries never restart a whole catalog replay.
-        self.flush_handoff(task, None).await?;
-        if !state.ready {
-            // Record uncertainty before Open. A lost reply is resolved by the
-            // exact Get above; a closed candidate first receives latest deltas.
-            task.phase = Phase::Opening;
-            state = candidate_upgrade
-                .open_candidate_bindings(self.request(state))
+            state = candidate
+                .replace_bindings(self.request(snapshot))
                 .await
                 .map_err(rpc_error)?
                 .into_inner();
@@ -578,10 +532,13 @@ impl UdsRoutes {
                 return Err(Error::Conflict);
             }
         }
+        // A ready candidate receives only latest canonical deltas, never another full install.
+        self.flush_handoff(task, None).await?;
         self.local.lock().await.session = Some(state);
         self.path
-            .send_replace(PathBuf::from(&request.candidate_socket));
+            .send_replace(PathBuf::from(&identity.candidate_socket));
         self.activity.disconnect();
+        task.snapshot = None;
         task.phase = Phase::ActiveFenced;
         Ok(task.state())
     }
@@ -591,59 +548,91 @@ impl UdsRoutes {
 mod tests {
     use super::*;
 
-    struct HandoffEndpoints {
-        routes: UdsRoutes,
-        _directory: tempfile::TempDir,
-        servers: Vec<tokio::task::JoinHandle<()>>,
+    struct RelayEndpoint {
+        socket: String,
+        state: pb::BindingState,
+        server: tokio::task::JoinHandle<()>,
     }
 
-    impl HandoffEndpoints {
-        async fn new(initial: &UpdateBindingRequest) -> Self {
+    impl RelayEndpoint {
+        async fn new(directory: &std::path::Path, name: &str, controller: &str) -> Self {
             use data_plane_gateway::node::route_control::{proto as relay_pb, BindingService};
             use data_plane_gateway::{common::protocol::GatewayPolicy, node::Relay};
             use tokio_stream::wrappers::UnixListenerStream;
 
-            let directory = tempfile::tempdir().unwrap();
-            let mut identity = request();
-            let mut servers = Vec::new();
-            for old in [true, false] {
-                let service = Arc::new(BindingService::new(Arc::new(
-                    Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
-                )));
-                let mut state = service.inspect().await;
-                state.controller_session_id = identity.old_controller_session_id.clone();
-                let state = service.begin(state).await.unwrap();
-                service
-                    .replace(relay_pb::BindingSnapshot {
-                        proxy_session_id: state.proxy_session_id.clone(),
-                        sync_epoch: state.sync_epoch,
-                        bindings: vec![],
-                    })
+            let service = Arc::new(BindingService::new(Arc::new(
+                Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
+            )));
+            let mut state = service.inspect().await;
+            state.controller_session_id = controller.into();
+            let state = service.begin(state).await.unwrap();
+            service
+                .replace(relay_pb::BindingSnapshot {
+                    proxy_session_id: state.proxy_session_id.clone(),
+                    sync_epoch: state.sync_epoch,
+                    bindings: vec![],
+                })
+                .await
+                .unwrap();
+            let socket = directory.join(name);
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(
+                        relay_pb::relay_service_server::RelayServiceServer::from_arc(service),
+                    )
+                    .serve_with_incoming(UnixListenerStream::new(listener))
                     .await
                     .unwrap();
-                let path = directory
-                    .path()
-                    .join(if old { "old.sock" } else { "new.sock" });
-                let listener = tokio::net::UnixListener::bind(&path).unwrap();
-                if old {
-                    identity.old_socket = path.to_str().unwrap().into();
-                    identity.old_proxy_session_id = state.proxy_session_id;
-                    identity.old_sync_epoch = state.sync_epoch;
-                } else {
-                    identity.candidate_socket = path.to_str().unwrap().into();
-                    identity.candidate_proxy_session_id = state.proxy_session_id;
-                    assert_eq!(state.sync_epoch, 1);
-                }
-                servers.push(tokio::spawn(async move {
-                    tonic::transport::Server::builder()
-                        .add_service(
-                            relay_pb::relay_service_server::RelayServiceServer::from_arc(service),
-                        )
-                        .serve_with_incoming(UnixListenerStream::new(listener))
-                        .await
-                        .unwrap();
-                }));
+            });
+            Self {
+                socket: socket.to_str().unwrap().into(),
+                state: pb::BindingState {
+                    proxy_session_id: state.proxy_session_id,
+                    controller_session_id: state.controller_session_id,
+                    sync_epoch: state.sync_epoch,
+                    ready: true,
+                },
+                server,
             }
+        }
+    }
+
+    impl Drop for RelayEndpoint {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    struct HandoffEndpoints {
+        routes: UdsRoutes,
+        old: RelayEndpoint,
+        _candidate: RelayEndpoint,
+        _directory: tempfile::TempDir,
+    }
+
+    impl HandoffEndpoints {
+        async fn new(initial: &UpdateBindingRequest) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let mut identity = request();
+            let old = RelayEndpoint::new(
+                directory.path(),
+                "old.sock",
+                &identity.old_controller_session_id,
+            )
+            .await;
+            let candidate = RelayEndpoint::new(
+                directory.path(),
+                "new.sock",
+                &identity.old_controller_session_id,
+            )
+            .await;
+            identity.old_socket = old.socket.clone();
+            identity.old_proxy_session_id = old.state.proxy_session_id.clone();
+            identity.old_sync_epoch = old.state.sync_epoch;
+            identity.candidate_socket = candidate.socket.clone();
+            identity.candidate_proxy_session_id = candidate.state.proxy_session_id.clone();
+            assert_eq!(candidate.state.sync_epoch, 1);
             let routes =
                 UdsRoutes::new(identity.old_socket.clone().into(), Duration::from_secs(2)).unwrap();
             let mut task = Task::new(identity);
@@ -654,26 +643,10 @@ mod tests {
                 .await
                 .bindings
                 .insert(initial.environment_id.clone(), initial.clone());
-            task.freeze_snapshot(&*routes.local.lock().await);
-            for old in [true, false] {
-                let state = pb::BindingState {
-                    proxy_session_id: if old {
-                        &task.identity.old_proxy_session_id
-                    } else {
-                        &task.identity.candidate_proxy_session_id
-                    }
-                    .clone(),
-                    controller_session_id: task.identity.old_controller_session_id.clone(),
-                    sync_epoch: if old { task.identity.old_sync_epoch } else { 1 },
-                    ready: true,
-                };
-                let path = if old {
-                    &task.identity.old_socket
-                } else {
-                    &task.identity.candidate_socket
-                };
+            task.freeze_snapshot(&mut *routes.local.lock().await);
+            for endpoint in [&old, &candidate] {
                 routes
-                    .update_at(path, &state, initial.clone())
+                    .update_at(&endpoint.socket, &endpoint.state, initial.clone())
                     .await
                     .unwrap();
             }
@@ -681,21 +654,14 @@ mod tests {
             Self {
                 routes,
                 _directory: directory,
-                servers,
+                old,
+                _candidate: candidate,
             }
         }
 
         async fn old_update(&self, binding: UpdateBindingRequest) -> Result<()> {
-            let slot = self.routes.handoff.lock().await;
-            let task = slot.as_ref().unwrap();
-            let state = pb::BindingState {
-                proxy_session_id: task.identity.old_proxy_session_id.clone(),
-                controller_session_id: task.identity.old_controller_session_id.clone(),
-                sync_epoch: task.identity.old_sync_epoch,
-                ready: true,
-            };
             self.routes
-                .update_at(&task.identity.old_socket, &state, binding)
+                .update_at(&self.old.socket, &self.old.state, binding)
                 .await
         }
 
@@ -708,17 +674,9 @@ mod tests {
                 "real old Relay ACK is required"
             );
             assert!(
-                task.candidate_pending.is_empty(),
+                self.routes.local.lock().await.unconfirmed.is_empty(),
                 "real candidate Relay ACK is required"
             );
-        }
-    }
-
-    impl Drop for HandoffEndpoints {
-        fn drop(&mut self) {
-            for server in &self.servers {
-                server.abort();
-            }
         }
     }
 
@@ -849,28 +807,30 @@ mod tests {
         let proof = pb::RelayHandoffProof {
             identity: Some(identity.clone()),
             old_pid: 7,
-            begin_accepted: true,
             listeners_released: true,
             old_exited: false,
         };
-        routes.prove_handoff(proof.clone()).await.unwrap();
-        routes.handoff.lock().await.as_mut().unwrap().phase = Phase::Opening;
-        let replacement = pb::RelayReplacementRequest {
-            identity: Some(identity.clone()),
-            failed_pid: 42,
-            failed_exited: true,
-            replacement_socket: "/run/rollback.sock".into(),
+        let replacement = pb::RelaySwitchRequest {
+            proof: Some(proof.clone()),
+            replacement: Some(pb::RelayReplacement {
+                failed_pid: 42,
+                failed_exited: true,
+                replacement_socket: "/run/rollback.sock".into(),
+            }),
         };
-        let first = routes
-            .replace_failed_candidate(replacement.clone())
-            .await
-            .unwrap();
+        let first = routes.switch_handoff(replacement.clone()).await.unwrap();
         let mut replacement_identity = identity.clone();
         replacement_identity.candidate_socket = "/run/rollback.sock".into();
         replacement_identity.candidate_proxy_session_id.clear();
         assert_eq!(first.identity.as_ref(), Some(&replacement_identity));
+        let mut wrong_pid = replacement.clone();
+        wrong_pid.proof.as_mut().unwrap().old_pid += 1;
+        assert!(matches!(
+            routes.switch_handoff(wrong_pid).await,
+            Err(Error::Conflict)
+        ));
         assert_eq!(
-            routes.replace_failed_candidate(replacement).await.unwrap(),
+            routes.switch_handoff(replacement.clone()).await.unwrap(),
             first
         );
         let mut replacement_proof = proof;
@@ -879,8 +839,18 @@ mod tests {
             routes.handoff.lock().await.as_ref().unwrap().proof.as_ref(),
             Some(&replacement_proof)
         );
+        replacement_proof.old_exited = true;
+        routes
+            .handoff
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .accept_proof(replacement_proof.clone())
+            .unwrap();
+        assert_eq!(routes.switch_handoff(replacement).await.unwrap(), first);
         assert!(matches!(
-            routes.switch_handoff(identity).await,
+            routes.switch_handoff(switch_request(identity)).await,
             Err(Error::Conflict)
         ));
         let slot = routes.handoff.lock().await;
@@ -924,7 +894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_proof_is_task_exact_and_finish_is_replayable() {
+    async fn reaped_old_relay_without_begin_reply_is_task_exact_and_finish_is_replayable() {
         let routes = UdsRoutes::new("/run/old.sock".into(), Duration::from_secs(1)).unwrap();
         let identity = request();
         let mut task = Task::new(identity.clone());
@@ -933,13 +903,27 @@ mod tests {
         let mut proof = pb::RelayHandoffProof {
             identity: Some(identity.clone()),
             old_pid: 42,
-            begin_accepted: true,
-            listeners_released: true,
+            listeners_released: false,
             old_exited: true,
         };
         proof.identity.as_mut().unwrap().task_id = "wrong".into();
         assert!(routes.finish_handoff(proof.clone()).await.is_err());
         proof.identity = Some(identity.clone());
+        assert_eq!(
+            routes.finish_handoff(proof.clone()).await.unwrap().phase,
+            "completed"
+        );
+        let recorded = routes
+            .handoff
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .proof
+            .clone()
+            .unwrap();
+        assert!(recorded.old_exited);
+        assert!(!recorded.listeners_released);
         assert_eq!(
             routes.finish_handoff(proof.clone()).await.unwrap().phase,
             "completed"
@@ -953,9 +937,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_generation_does_not_starve_other_generation_ack() {
-        use data_plane_gateway::node::route_control::{proto as relay_pb, BindingService};
-        use data_plane_gateway::{common::protocol::GatewayPolicy, node::Relay};
-        use tokio_stream::wrappers::UnixListenerStream;
         for stall_old in [true, false] {
             let directory = tempfile::tempdir().unwrap();
             let stalled_path = directory.path().join("stalled.sock");
@@ -967,47 +948,25 @@ mod tests {
                     sockets.push(stalled.accept().await.unwrap().0);
                 }
             });
-            let bindings = Arc::new(BindingService::new(Arc::new(
-                Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
-            )));
-            let mut initial = bindings.inspect().await;
-            initial.controller_session_id = "controller".into();
-            let state = bindings.begin(initial).await.unwrap();
-            bindings
-                .replace(relay_pb::BindingSnapshot {
-                    proxy_session_id: state.proxy_session_id.clone(),
-                    sync_epoch: state.sync_epoch,
-                    bindings: vec![],
-                })
-                .await
-                .unwrap();
-            let live_path = directory.path().join("live.sock");
-            let live = tokio::net::UnixListener::bind(&live_path).unwrap();
-            let live_server = tokio::spawn(async move {
-                tonic::transport::Server::builder()
-                    .add_service(
-                        relay_pb::relay_service_server::RelayServiceServer::from_arc(bindings),
-                    )
-                    .serve_with_incoming(UnixListenerStream::new(live))
-                    .await
-                    .unwrap();
-            });
-            let routes = UdsRoutes::new(live_path.clone(), Duration::from_secs(2)).unwrap();
+            let live = RelayEndpoint::new(directory.path(), "live.sock", "controller").await;
+            let state = &live.state;
+            let routes =
+                UdsRoutes::new(live.socket.clone().into(), Duration::from_secs(2)).unwrap();
             let mut identity = request();
-            let live = live_path.to_str().unwrap().to_string();
+            let live_socket = live.socket.clone();
             let stalled = stalled_path.to_str().unwrap().to_string();
             if stall_old {
                 identity.old_socket = stalled;
-                identity.candidate_socket = live;
-                identity.candidate_proxy_session_id = state.proxy_session_id;
+                identity.candidate_socket = live_socket;
+                identity.candidate_proxy_session_id = state.proxy_session_id.clone();
             } else {
-                identity.old_socket = live;
-                identity.old_proxy_session_id = state.proxy_session_id;
+                identity.old_socket = live_socket;
+                identity.old_proxy_session_id = state.proxy_session_id.clone();
                 identity.old_sync_epoch = state.sync_epoch;
                 identity.candidate_socket = stalled;
             }
             let mut task = Task::new(identity);
-            task.phase = Phase::Installed;
+            task.phase = Phase::ActiveFenced;
             let retired = UpdateBindingRequest {
                 environment_id: "env".into(),
                 ownership_generation: 1,
@@ -1016,17 +975,33 @@ mod tests {
                 ..Default::default()
             };
             task.old_pending.insert("env".into(), retired.clone());
-            task.candidate_pending.insert("env".into(), retired.clone());
+            routes
+                .local
+                .lock()
+                .await
+                .unconfirmed
+                .insert("env".into(), retired.clone());
             assert!(routes.flush_handoff(&mut task, None).await.is_err());
             if stall_old {
                 assert_eq!(task.old_pending["env"], retired);
-                assert!(task.candidate_pending.is_empty());
+                assert!(routes.local.lock().await.unconfirmed.is_empty());
             } else {
                 assert!(task.old_pending.is_empty());
-                assert_eq!(task.candidate_pending["env"], retired);
+                assert_eq!(routes.local.lock().await.unconfirmed["env"], retired);
             }
             stalled_server.abort();
-            live_server.abort();
+        }
+    }
+
+    fn switch_request(identity: pb::RelayHandoffRequest) -> pb::RelaySwitchRequest {
+        pb::RelaySwitchRequest {
+            proof: Some(pb::RelayHandoffProof {
+                identity: Some(identity),
+                old_pid: 42,
+                listeners_released: true,
+                old_exited: false,
+            }),
+            replacement: None,
         }
     }
 
@@ -1040,26 +1015,6 @@ mod tests {
             candidate_socket: "/run/new.sock".into(),
             candidate_proxy_session_id: "new".into(),
         }
-    }
-
-    #[test]
-    fn installation_uncertainty_does_not_imply_open_uncertainty() {
-        let mut task = Task::new(request());
-        let local = Local::default();
-        task.freeze_snapshot(&local);
-        assert!(!task.phase.may_serve());
-        assert!(task.snapshot.is_some());
-        let mut state = pb::BindingState {
-            proxy_session_id: "new".into(),
-            sync_epoch: 1,
-            controller_session_id: "controller".into(),
-            ready: true,
-        };
-        assert!(task.matches_candidate(&state));
-        task.phase = Phase::Opening; // Recorded before issuing Open, including a lost reply.
-        assert!(task.matches_candidate(&state) && task.phase.may_serve());
-        state.sync_epoch += 1;
-        assert!(!task.matches_candidate(&state));
     }
 
     #[tokio::test]
@@ -1097,9 +1052,9 @@ mod tests {
             controller_session_id: "controller".into(),
             ready: false,
         };
-        assert!(task.matches_candidate(&state)); // Lost Begin reply can resume.
+        assert!(task.matches_candidate(&state)); // Lost BeginBindings reply can resume.
         state.ready = true;
-        assert!(task.matches_candidate(&state)); // Lost Open reply must not reinstall.
+        assert!(task.matches_candidate(&state)); // Lost Replace reply must not reinstall.
         state.sync_epoch = 2;
         assert!(!task.matches_candidate(&state));
         state.sync_epoch = 1;
@@ -1125,16 +1080,17 @@ mod tests {
             ..Default::default()
         };
         local.bindings.insert("env".into(), original.clone());
-        let snapshot = task.freeze_snapshot(&local).clone();
-        assert!(task.candidate_pending.is_empty());
+        let snapshot = task.freeze_snapshot(&mut local).clone();
+        assert!(local.unconfirmed.is_empty());
         let mut retired = original.clone();
         retired.binding_revision = 3;
         retired.binding = Some(Binding::Retired(Retired {}));
         task.queue(Some(&original), &retired);
         local.bindings.insert("env".into(), retired.clone());
-        assert_eq!(task.freeze_snapshot(&local), &snapshot);
+        local.unconfirmed.insert("env".into(), retired.clone());
+        assert_eq!(task.freeze_snapshot(&mut local), &snapshot);
         assert_eq!(snapshot.bindings[0].binding_revision, 2);
-        assert_eq!(task.candidate_pending["env"], retired);
+        assert_eq!(local.unconfirmed["env"], retired);
     }
 
     #[tokio::test]
@@ -1145,7 +1101,7 @@ mod tests {
         )
         .unwrap();
         let mut task = Task::new(request());
-        task.phase = Phase::Opening;
+        task.phase = Phase::ActiveFenced;
         let retired = UpdateBindingRequest {
             environment_id: "other".into(),
             ownership_generation: 1,
@@ -1154,11 +1110,15 @@ mod tests {
             ..Default::default()
         };
         task.old_pending.insert("other".into(), retired.clone());
-        task.candidate_pending
+        routes
+            .local
+            .lock()
+            .await
+            .unconfirmed
             .insert("other".into(), retired.clone());
         routes.flush_handoff(&mut task, Some("env")).await.unwrap();
         assert_eq!(task.old_pending["other"], retired);
-        assert_eq!(task.candidate_pending["other"], retired);
+        assert_eq!(routes.local.lock().await.unconfirmed["other"], retired);
     }
 
     #[tokio::test]
@@ -1169,13 +1129,13 @@ mod tests {
         assert!(routes.require_stable_topology().await.is_err());
         let mut other = request.clone();
         other.candidate_proxy_session_id = "other".into();
-        assert!(routes.switch_handoff(other).await.is_err());
+        assert!(routes.switch_handoff(switch_request(other)).await.is_err());
     }
 
     #[test]
     fn pending_retirement_survives_same_version_retry_and_stale_ack() {
         let mut task = Task::new(request());
-        task.phase = Phase::Opening;
+        task.phase = Phase::ActiveFenced;
         let active = UpdateBindingRequest {
             environment_id: "env".into(),
             ownership_generation: 1,
@@ -1215,7 +1175,6 @@ mod tests {
         let latest = task.old_pending["env"].clone();
         Task::ack(&mut task.old_pending, &latest);
         assert!(task.old_pending.is_empty());
-        assert_eq!(task.candidate_pending["env"], retired);
     }
 
     #[test]
@@ -1257,7 +1216,7 @@ mod tests {
             let slot = routes.handoff.lock().await;
             let task = slot.as_ref().unwrap();
             assert_eq!(task.old_pending["env"], retired);
-            assert_eq!(task.candidate_pending["env"], retired);
+            assert_eq!(routes.local.lock().await.unconfirmed["env"], retired);
         }
     }
 }

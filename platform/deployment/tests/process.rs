@@ -27,7 +27,7 @@ fn install_test_binary(root: &Path, name: &str, script: &str) {
 }
 
 #[tokio::test]
-async fn invalid_explicit_external_declaration_never_spawns_image_or_fallback() {
+async fn invalid_external_declaration_never_spawns_process() {
     let root = tempfile::Builder::new()
         .prefix("adx-external-invalid-")
         .tempdir_in("/tmp")
@@ -42,11 +42,7 @@ async fn invalid_explicit_external_declaration_never_spawns_image_or_fallback() 
         json!([{"id":"coordinator","role":"coordinator","config":{}}]),
     );
     let declaration = root.path().join("target.yaml");
-    std::fs::write(
-        &declaration,
-        "schema: 1\nmode: embedded\ncomponents: {}\nready: {}\n",
-    )
-    .unwrap();
+    std::fs::write(&declaration, "schema: 1\nmode: embedded\ncomponents: {}\n").unwrap();
     deployment.external_declaration = Some(declaration);
     assert!(supervisor::run(deployment).await.is_err());
     assert!(!root.path().join("bin/adx-coordinator.spawned").exists());

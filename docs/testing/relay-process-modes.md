@@ -39,6 +39,18 @@ CLI 校验共进程的 `proxy_socket` 与控制目录一致，并拒绝同一部
 - Proxy 内部控制或健康服务异常退出会结束其服务，由 adxlet 报错退出并交给 supervisor 重启，避免控制服务已停而数据监听继续接收请求。
 - 正常退出先关闭 adxlet 的新分配与本地创建准入，Relay 停止新流量并按配置等待活跃流排空。排水期间持续运行原有心跳与运行时控制服务，完成后停止服务；preserve 不主动注销节点。CLI 默认使用 `preserve`，以 SIGUSR1 向 adxlet 传递本次意图，不因退出删除 Environment 或注销节点；显式 `stop --mode drain` 先通过 adxlet 清理本机实例，之后停止服务。
 
+## 独立 Relay 交接
+
+独立 Relay 的 `BeginDrain` 成功回执证明业务 TCP listener 已释放、health 服务已退出。
+同 task/session 重放返回同一释放回执与固定排水期限；调用取消不撤回服务循环已接收的排水。
+已有连接继续到自然结束或真实关闭，监听释放后的排水期限固定为 120 秒，重试不延长。
+
+adxlet 受保护管理 UDS 提供 `Reserve`、`Cancel`、`Switch`、`Finish`。父 supervisor 以
+真实监听释放或 owned Child 的真实 reap 证据驱动 Switch；Cancel 仅用于尚未发送 BeginDrain
+的预留，Finish 要求旧 Child 已真实 reap。候选走普通 `BeginBindings`/`ReplaceBindings`，
+首个 snapshot 结果未知时重放冻结内容，精确 ready 后同步 canonical 最新增量，保留
+owner/epoch 与旧端退休 ACK 屏障。完整流程见 [本机组件升级](../deployment/adxctl.md)。
+
 ## 验证
 
 `gateway/tests/node_service.rs` 使用真实监听和 UDS，验证初始绑定未就绪、服务停止后 TCP 监听和已建立控制连接都关闭。`out/ci/stage-6/composition-tests.log` 中 adxlet、Gateway、CLI 共157项测试通过，Clippy 通过。CLI 的 socket 归属校验随后通过8项测试与 Clippy。

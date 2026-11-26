@@ -1,6 +1,54 @@
 //! One durable rolling-upgrade owner, fenced by the normal Coordinator header CAS.
 use super::*;
 
+fn valid_target_image(value: &str) -> bool {
+    if !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return false;
+    }
+    let (name, valid_suffix) = if let Some((name, suffix)) = value.split_once('@') {
+        (
+            name,
+            suffix.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }),
+        )
+    } else if let Some((name, tag)) = value.rsplit_once(':') {
+        (
+            name,
+            name.rsplit('/')
+                .next()
+                .is_some_and(|part| !part.contains(':'))
+                && !tag.eq_ignore_ascii_case("latest")
+                && tag.len() <= 128
+                && tag
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                && tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')),
+        )
+    } else {
+        return false;
+    };
+    valid_suffix
+        && !name.is_empty()
+        && !name.starts_with('/')
+        && !name.ends_with(['/', ':'])
+        && !name.contains("//")
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b':' | b'/' | b'[' | b']' | b'-')
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpgradeNode {
@@ -236,26 +284,24 @@ impl UpgradeTask {
                     }))
     }
     pub fn validate(&self) -> Result<()> {
-        if self.task_id.trim().is_empty()
+        if self.task_id.is_empty()
             || self.task_id.len() > 128
+            || matches!(self.task_id.as_str(), "." | "..")
+            || !self
+                .task_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._~-".contains(&byte))
             || self.epoch == 0
             || self.namespace.is_empty()
             || self.daemonset_uid.is_empty()
-            || !self
-                .target_image
-                .rsplit_once("@sha256:")
-                .is_some_and(|(name, digest)| {
-                    !name.is_empty()
-                        && digest.len() == 64
-                        && digest.bytes().all(|b| b.is_ascii_hexdigit())
-                })
+            || !valid_target_image(&self.target_image)
             || self.nodes.is_empty()
             || self.nodes.iter().any(|(id, node)| {
                 id != &node.node_id || node.pod_uid.is_empty() || node.node_session_id.is_empty()
             })
         {
             return Err(Error::Invalid(
-                "upgrade identity, immutable image and node sessions required".into(),
+                "upgrade identity, an explicit non-latest image tag or SHA-256 digest, and node sessions required".into(),
             ));
         }
         Ok(())
@@ -638,6 +684,123 @@ impl Session {
         Err(Error::Unavailable(
             "concurrent upgrade update; query before retry".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod image_reference_tests {
+    use super::*;
+
+    fn task(target_image: &str) -> UpgradeTask {
+        UpgradeTask {
+            task_id: "upgrade".into(),
+            epoch: 1,
+            namespace: "test".into(),
+            daemonset_uid: "workload".into(),
+            target_image: target_image.into(),
+            nodes: [(
+                "node".into(),
+                UpgradeNode {
+                    node_id: "node".into(),
+                    pod_uid: "pod".into(),
+                    node_session_id: "session".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn version_tags_and_existing_digests_are_valid_task_targets() {
+        for target in [
+            "worker:1".into(),
+            "registry:5000/worker:release-20261124-1".into(),
+            "worker:_build.1".into(),
+            format!("worker:{}", "a".repeat(128)),
+            format!("registry/worker@sha256:{}", "b".repeat(64)),
+            format!("registry:5000/worker:1@sha256:{}", "b".repeat(64)),
+        ] {
+            assert!(task(&target).validate().is_ok(), "{target}");
+        }
+    }
+
+    #[test]
+    fn invalid_target_image_references_are_rejected() {
+        for target in [
+            "worker".into(),
+            "registry:5000/worker".into(),
+            "worker:".into(),
+            "worker:latest".into(),
+            "worker:LaTeSt".into(),
+            "worker:.1".into(),
+            "worker:-1".into(),
+            format!("worker:{}", "a".repeat(129)),
+            "worker:one:two".into(),
+            "worker:1/child".into(),
+            "http://registry/worker:1".into(),
+            "/worker:1".into(),
+            "registry//worker:1".into(),
+            "registry/:1".into(),
+            "worker:1?".into(),
+            "worker:1\n".into(),
+            "worker:1\0".into(),
+            "worker:1\t".into(),
+            "worker:\u{a0}1".into(),
+            format!("worker@sha256:{}", "b".repeat(63)),
+            format!("worker@sha256:{}", "B".repeat(64)),
+            format!("worker@sha512:{}", "b".repeat(64)),
+            format!("worker@other@sha256:{}", "b".repeat(64)),
+        ] {
+            assert!(task(&target).validate().is_err(), "{target:?}");
+        }
+    }
+    #[test]
+    fn task_ids_are_literal_addressable_path_segments() {
+        let mut candidate = task("node:release-1");
+        for id in ["release-1.2_~".to_owned(), "A".repeat(128)] {
+            candidate.task_id = id;
+            assert!(candidate.validate().is_ok());
+        }
+        for id in [
+            "",
+            ".",
+            "..",
+            "release/1",
+            "a%20b",
+            "a?b",
+            "a#b",
+            "a b",
+            "a\nb",
+            "a\0b",
+            "升级",
+            "a:b",
+        ] {
+            candidate.task_id = id.into();
+            assert!(
+                candidate.validate().is_err(),
+                "unaddressable task ID: {id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn invalid_path_id_cannot_occupy_the_upgrade_slot() {
+        let redis = transport_test_redis::Redis::new().await;
+        let store = redis.store().await;
+        let session = store.begin(1).await.unwrap();
+        let mut candidate = task("node:release-1");
+        candidate.protocol_version = 3;
+        candidate.phase = "Active".into();
+        candidate.nodes.get_mut("node").unwrap().phase = "pending".into();
+        candidate.task_id = "release/1".into();
+        assert!(matches!(
+            session.save_upgrade(candidate, None).await,
+            Err(Error::Invalid(_))
+        ));
+        assert!(session.upgrade_task().await.unwrap().is_none());
     }
 }
 

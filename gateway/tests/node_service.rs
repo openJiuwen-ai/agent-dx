@@ -127,33 +127,28 @@ async fn standalone_upgrade_fences_identity_and_confirms_released_ports() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(
-        upgrade.query(request.clone()).await.unwrap_err().code(),
-        tonic::Code::NotFound
-    );
     let mut wrong = request.clone();
     wrong.proxy_session_id = "wrong".into();
     assert_eq!(
-        upgrade.begin(wrong.clone()).await.unwrap_err().code(),
+        upgrade.begin_drain(wrong.clone()).await.unwrap_err().code(),
         tonic::Code::FailedPrecondition
     );
-    // Query must not release either listener.
+    // Rejected identity must not release either listener.
     assert!(tokio::net::TcpListener::bind(business).await.is_err());
     assert!(tokio::net::TcpListener::bind(health).await.is_err());
-    let accepted = upgrade.begin(request.clone()).await.unwrap().into_inner();
-    assert_eq!(accepted.task_id, request.task_id);
-    assert_eq!(accepted.proxy_session_id, request.proxy_session_id);
-    let released = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let state = upgrade.query(request.clone()).await.unwrap().into_inner();
-            if state.listeners_released {
-                break state;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let released = upgrade
+        .begin_drain(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(released.task_id, request.task_id);
+    assert_eq!(released.proxy_session_id, request.proxy_session_id);
+    assert!(
+        released.listeners_released,
+        "successful BeginDrain must release both listeners before replying"
+    );
+    assert!(released.drain_deadline_unix_ms > 0);
+    // Bind immediately after BeginDrain returns.
     let mut next_config = config(root.path());
     next_config.bind = business;
     next_config.health_bind = health;
@@ -163,20 +158,24 @@ async fn standalone_upgrade_fences_identity_and_confirms_released_ports() {
         .unwrap();
     assert_eq!(next.local_addr().unwrap(), business);
     assert_eq!(next.health_addr().unwrap(), health);
-    let replay = upgrade.begin(request.clone()).await.unwrap().into_inner();
+    let replay = upgrade
+        .begin_drain(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(
         replay.drain_deadline_unix_ms,
         released.drain_deadline_unix_ms
     );
     assert!(replay.listeners_released);
     assert_eq!(
-        upgrade.query(wrong).await.unwrap_err().code(),
+        upgrade.begin_drain(wrong).await.unwrap_err().code(),
         tonic::Code::FailedPrecondition
     );
     let mut other = request;
     other.task_id = "release-b".into();
     assert_eq!(
-        upgrade.begin(other).await.unwrap_err().code(),
+        upgrade.begin_drain(other).await.unwrap_err().code(),
         tonic::Code::FailedPrecondition
     );
     // The original binding service and its session remain available after TCP release.

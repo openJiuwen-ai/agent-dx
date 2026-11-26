@@ -61,19 +61,16 @@ def without_steps(name, role, marker=KeyError):
 
 
 def plan(args, change_pod=None, change_info=None):
-    calls = {}
-
     def kube(argv):
         name = argv[2]
-        calls[name] = calls.get(name, 0) + 1
         value = pod(name)
-        if change_pod and calls[name] == 2:
+        if change_pod:
             change_pod(value)
         return value
 
     def local(name):
         value = info(name, args.role)
-        if change_info and calls[name] == 2:
+        if change_info:
             change_info(value)
         return value
 
@@ -81,257 +78,67 @@ def plan(args, change_pod=None, change_info=None):
 
 
 class ProcessPlanTests(unittest.TestCase):
-    def test_promotion_rejects_failed_retained_history_before_current_proof(self):
-        snapshot = plan(arguments("relay", ("pod-a=node-a",)))
-        target = dict(version="c" * 40, release_id="release", artifact=dict(
-            url="https://example.invalid/package.tar.gz", sha256="b" * 64),
-            config=dict(mount_path="/config.json", sha256="e" * 64))
-        desired = dict(schema=1, mode="standalone", upgrade_components=["relay"],
-                       components=dict(adxlet=target, relay=target),
-                       ready=dict(components=dict(adxlet=target, relay=target)))
-        raw = rollout.canonical(desired)
-        snapshot["declaration"] = dict(name="versions", namespace="platform", uid="cm-uid",
-            resource_version="7", key="target.yaml", original_text=None, candidate_text=raw)
-        cm = dict(apiVersion="v1", kind="ConfigMap", metadata=dict(name="versions", namespace="platform",
-            uid="cm-uid", resourceVersion="8", annotations={"adx.dev/rollout-input-fence":
-                rollout.template_hash(snapshot) + ":applied"}), data={"target.yaml": raw})
-        journal = dict(nodes={"node-a": dict(stage="failed")})
-        cli, local, mutate = MagicMock(), MagicMock(), MagicMock()
-        with self.assertRaises(rollout.Refusal):
-            rollout.promote_ready(snapshot, journal, lambda: None, lambda _: copy.deepcopy(cm),
-                                  local, mutate, lambda _: None, cli=cli)
-        journal["nodes"]["node-a"]["stage"] = "completed"
-        cli.return_value = dict(ok=True, task=dict(submission=snapshot["nodes"][0]["submission"],
-            phase="failed", execution=dict(phase="failed_retained")))
-        with self.assertRaises(rollout.Refusal):
-            rollout.promote_ready(snapshot, journal, lambda: None, lambda _: copy.deepcopy(cm),
-                                  local, mutate, lambda _: None, cli=cli)
-        local.assert_not_called()
-        mutate.assert_not_called()
-
-    def test_candidate_freezes_old_source_and_derives_submission(self):
-        component = {"version": "c" * 40, "release_id": "release",
-                     "artifact": {"url": "https://packages.example/release.tar.gz", "sha256": "b" * 64},
-                     "config": {"mount_path": "/mounted/relay.json", "sha256": "e" * 64}}
-        candidate = {"schema": 1, "mode": "standalone", "upgrade_components": ["relay"],
-                     "components": {"adxlet": component, "relay": component},
-                     "ready": {"components": {"adxlet": component, "relay": component}}}
-        old = copy.deepcopy(candidate)
-        old["upgrade_components"] = []
-        old["components"]["relay"]["version"] = "a" * 40
-        original_text = json.dumps(old, indent=2) + "\n"
-        cm = {"apiVersion": "v1", "kind": "ConfigMap",
-              "metadata": {"name": "versions", "namespace": "platform", "uid": "cm-uid",
-                           "resourceVersion": "1"}, "data": {"target.yaml": original_text}}
-        mounted = pod("pod-a")
-        mounted["spec"]["volumes"] = [{"name": "versions", "configMap": {
-            "name": "versions", "items": [{"key": "target.yaml", "path": "release/target.yaml"}]}},
-            {"name": "data", "emptyDir": {}}]
-        mounted["spec"]["containers"][0]["volumeMounts"] = [
-            {"name": "data", "mountPath": "/data"},
-            {"name": "versions", "mountPath": "/data/config"}]
-        calls = []
-
-        def kube(argv):
-            calls.append(argv.copy())
-            if argv[1] == "configmap":
-                return copy.deepcopy(cm)
-            return copy.deepcopy(mounted)
-
-        def local(name, path=None):
-            path = path or "/data/config/release/target.yaml"
-            self.assertEqual(path, "/data/config/release/target.yaml")
-            result = info(name, "relay")
-            result["external_startup"] = None
-            result["external_declaration"] = {
-                "path": path, "raw_sha256": rollout.hashlib.sha256(original_text.encode()).hexdigest(),
-                "desired": old}
-            return result
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "candidate.json"
-            candidate_text = json.dumps(candidate, indent=2) + "\n"
-            path.write_text(candidate_text, encoding="utf-8")
-
-            def args():
-                value = arguments("relay", ("pod-a=node-a",))
-                value.role = value.commit = value.sha256 = None
-                value.declaration_candidate, value.configmap = str(path), "versions"
-                return value
-
-            snapshot = rollout.plan_process(args(), kube, local)
-            rollout.validate_process_plan(snapshot)
-            self.assertEqual([call[1] for call in calls], ["configmap", "pod", "pod", "configmap"])
-            self.assertEqual(snapshot["declaration"]["candidate_text"], candidate_text)
-            self.assertEqual(snapshot["declaration"]["original_text"], original_text)
-            self.assertEqual(snapshot["declaration"]["resource_version"], "1")
-            submission = snapshot["nodes"][0]["submission"]
-            self.assertNotIn("sha256", submission)
-            self.assertEqual(submission["commit"], component["version"])
-            self.assertEqual(submission["component_config"], component["config"])
-            self.assertEqual(submission["remote_archive"]["archive_sha256"], "b" * 64)
-            with self.assertRaises(rollout.Refusal):
-                rollout.declaration_gate(snapshot, snapshot["nodes"][0], kube, local, lambda _: None)
-            journal = {}
-            saved, patches = [], []
-
-            def mutate(argv, body):
-                patches.append(copy.deepcopy(body))
-                self.assertEqual(body[0], {"op": "test", "path": "/metadata/uid", "value": "cm-uid"})
-                self.assertEqual(body[1], {"op": "test", "path": "/metadata/resourceVersion",
-                                          "value": cm["metadata"]["resourceVersion"]})
-                self.assertEqual(body[2], {"op": "test", "path": "/data/target.yaml",
-                                          "value": cm["data"]["target.yaml"]})
-                self.assertEqual(body[-2]["value"], candidate_text)
-                cm["data"]["target.yaml"] = candidate_text
-                cm["metadata"]["annotations"] = body[-1]["value"].copy()
-                cm["metadata"]["resourceVersion"] = str(int(cm["metadata"]["resourceVersion"]) + 1)
-                raise OSError("lost patch ACK")
-
-            def save():
-                saved.append(copy.deepcopy(journal))
-            with self.assertRaises(OSError):
-                rollout.declaration_write(snapshot, journal, save, kube, mutate)
-            self.assertEqual(len(saved), 1)
-            rollout.declaration_write(snapshot, journal, save, kube, mutate)
-            self.assertEqual(len(patches), 1)
-            projected = local("pod-a", "/data/config/release/target.yaml")
-            projected["external_declaration"] = {
-                "path": "/data/config/release/target.yaml",
-                "raw_sha256": rollout.hashlib.sha256(candidate_text.encode()).hexdigest(), "desired": candidate}
-            observations = iter([local("pod-a", "/data/config/release/target.yaml"), projected])
-            rollout.declaration_gate(snapshot, snapshot["nodes"][0], kube,
-                                             lambda _: next(observations), lambda _: None)
-            cm["metadata"]["uid"] = "foreign"
-            with self.assertRaises(rollout.Refusal):
-                rollout.declaration_write(snapshot, journal, save, kube, mutate)
-            cm["metadata"]["uid"] = "cm-uid"
-            cm["data"]["target.yaml"] = "foreign text"
-            with self.assertRaises(rollout.Refusal):
-                rollout.declaration_write(snapshot, journal, save, kube, mutate)
-            cm["data"]["target.yaml"] = original_text
-            # Image startup has no declaration key; actual runtime remains observable.
-            del cm["data"]["target.yaml"]
-            mounted["spec"]["volumes"][0]["configMap"].pop("items")
-
-            def image_local(name, path):
-                self.assertEqual(path, "/data/config/target.yaml")
-                result = info(name, "relay")
-                result["external_declaration"] = {"path": path, "error": {"code": "declaration_unavailable"}}
-                return result
-
-            image_plan = rollout.plan_process(args(), kube, image_local)
-            self.assertIsNone(image_plan["declaration"]["original_text"])
-            image_journal, image_patches = {}, []
-
-            def image_mutate(argv, body):
-                image_patches.append(copy.deepcopy(body))
-                self.assertEqual(body[0], {"op": "test", "path": "/metadata/uid",
-                                          "value": cm["metadata"]["uid"]})
-                self.assertEqual(body[1], {"op": "test", "path": "/metadata/resourceVersion",
-                                          "value": cm["metadata"]["resourceVersion"]})
-                for operation in body[2:-2]:
-                    self.assertEqual(operation, {"op": "test", "path": "/data/target.yaml",
-                                                 "value": cm["data"]["target.yaml"]})
-                operation = body[-2]
-                if operation["op"] == "remove":
-                    del cm["data"]["target.yaml"]
-                else:
-                    self.assertNotIn("target.yaml", cm["data"])
-                    cm["data"]["target.yaml"] = operation["value"]
-                cm["metadata"]["annotations"] = body[-1]["value"].copy()
-                cm["metadata"]["resourceVersion"] = str(int(cm["metadata"]["resourceVersion"]) + 1)
-
-            rollout.declaration_write(image_plan, image_journal, lambda: None, kube, image_mutate)
-            self.assertEqual(image_patches[0][-2]["op"], "add")
-            projected["external_declaration"]["path"] = "/data/config/target.yaml"
-            rollout.declaration_gate(image_plan, image_plan["nodes"][0], kube,
-                                             lambda _: projected, lambda _: None)
-            image_node = image_plan["nodes"][0]
-            failed = {"phase": "failed", "submission": image_node["submission"], "execution": None}
-            rollout.process_declaration_restore(
-                image_plan, image_node, {"stage": "failed"}, image_journal, lambda: None,
-                kube, lambda _: info("pod-a", "relay"), lambda *_: {"ok": True, "task": failed},
-                MagicMock(), image_mutate)
-            self.assertEqual(image_patches[-1][-2]["op"], "remove")
-            self.assertNotIn("target.yaml", cm["data"])
-            failed["execution"] = {"phase": "failed_retained"}
-            with self.assertRaises(rollout.Refusal):
-                rollout.process_declaration_restore(
-                    image_plan, image_node, {"stage": "failed"}, image_journal, lambda: None,
-                    kube, lambda _: info("pod-a", "relay"), lambda *_: {"ok": True, "task": failed},
-                    MagicMock(), image_mutate)
-            failed["phase"] = "unknown"
-            with self.assertRaises(rollout.Refusal):
-                rollout.process_declaration_restore(
-                    image_plan, image_node, {"stage": "failed"}, image_journal, lambda: None,
-                    kube, lambda _: info("pod-a", "relay"), lambda *_: {"ok": True, "task": failed},
-                    MagicMock(), image_mutate)
-            cm["data"]["target.yaml"] = original_text
-            mounted["spec"]["volumes"][0]["configMap"]["items"] = [
-                {"key": "target.yaml", "path": "release/target.yaml"}]
-            with self.assertRaises(rollout.Refusal):
-                rollout.plan_process(args(), kube, lambda name, path: dict(
-                    local(name, path), external_declaration={"path": path, "raw_sha256": "0" * 64,
-                                                           "desired": old}))
-            mounted["spec"]["containers"][0]["volumeMounts"][1]["subPath"] = "target.yaml"
-            with self.assertRaises(rollout.Refusal):
-                rollout.plan_process(args(), kube, MagicMock())
-            path.write_text('{"schema":1,"schema":1}', encoding="utf-8")
-            reader = MagicMock()
-            with self.assertRaises(rollout.Refusal):
-                rollout.plan_process(args(), reader, MagicMock())
-            reader.assert_not_called()
-
-    def test_unlanded_forward_intent_requires_metadata_fence_before_restore(self):
-        source = dict(name="versions", namespace="platform", uid="cm-uid", resource_version="7",
-                      key="target.yaml", original_text="old", candidate_text="candidate")
-        cm = {"apiVersion": "v1", "kind": "ConfigMap",
-              "metadata": {"name": "versions", "namespace": "platform", "uid": "cm-uid",
-                           "resourceVersion": "7", "annotations": {"keep": "value"}},
-              "data": {"target.yaml": "old", "other": "untouched"}}
-        snapshot = {"declaration": source}
-        fence = dict(keep="value", **{"adx.dev/rollout-input-fence": rollout.template_hash(snapshot) + ":applied"})
-        journal = {"declaration_write": dict(rv="7", data_present=True, fence=fence, before="old",
-                    body=rollout.declaration_patch(source, "7", "old", "candidate", fence=fence))}
-        saved, patches = [], []
-
-        def mutate(argv, body):
-            self.assertTrue(saved)
-            self.assertEqual(body[:3], [
-                {"op": "test", "path": "/metadata/uid", "value": cm["metadata"]["uid"]},
-                {"op": "test", "path": "/metadata/resourceVersion",
-                 "value": cm["metadata"]["resourceVersion"]},
-                {"op": "test", "path": "/data/target.yaml", "value": cm["data"]["target.yaml"]}])
-            self.assertEqual(body[-1]["op"], "add")
-            self.assertEqual(body[-1]["path"], "/metadata/annotations")
-            patches.append(copy.deepcopy(body))
-            cm["metadata"]["annotations"] = body[-1]["value"].copy()
-            cm["metadata"]["resourceVersion"] = "8"
-            raise OSError("lost restored marker ACK")
-
-        with self.assertRaises(OSError):
-            rollout.declaration_write(
-                snapshot, journal, lambda: saved.append(copy.deepcopy(journal)),
-                lambda _: copy.deepcopy(cm), mutate, restore=True)
-        rollout.declaration_write(
-            snapshot, journal, lambda: saved.append(copy.deepcopy(journal)),
-            lambda _: copy.deepcopy(cm), mutate, restore=True)
-        with self.assertRaises(AssertionError):
-            mutate([], journal["declaration_write"]["body"])
-        self.assertEqual(len(patches), 1)
-        self.assertEqual(cm["metadata"]["resourceVersion"], "8")
-        self.assertEqual(cm["metadata"]["annotations"]["keep"], "value")
-        self.assertEqual(cm["data"], {"target.yaml": "old", "other": "untouched"})
+    def test_submission_adapter_refuses_lossy_json_before_any_execution(self):
+        args = arguments()
+        args.archive_url, args.archive_sha256 = "https://packages.example/release.tar.gz", "e" * 64
+        args.component_config_path = "/mounted/node.json"
+        snapshot = plan(args)
+        changes = (((), "extra", True), (("selection",), "extra", True),
+                   (("selection", "expected"), "extra", True), (("process",), "extra", True),
+                   (("process", "identity"), "extra", True), (("remote_archive",), "extra", True),
+                   (("component_config",), "sha256", "f" * 64), ((), "sha256", None),
+                   ((), "remote_archive", None), ((), "component_config", None), ((), "process", None),
+                   ((), "commit", 42), (("remote_archive",), "url", 42),
+                   (("component_config",), "mount_path", "bad\x00path"))
+        for path, key, value in changes:
+            with self.subTest(path=path, key=key, value=value):
+                changed = copy.deepcopy(snapshot)
+                submission = changed["nodes"][0]["submission"]
+                target = submission
+                for part in path:
+                    target = target[part]
+                target[key] = value
+                with self.assertRaises(rollout.Refusal):
+                    rollout.submit_arguments(submission)
+                with self.assertRaises(rollout.Refusal):
+                    rollout.validate_process_plan(changed)
 
     def test_process_plan_rejects_different_node_archive_sources(self):
         args = arguments("relay")
         args.archive_url, args.archive_sha256 = "https://packages.example/release.tar.gz", "e" * 64
         snapshot = plan(args)
-        rollout.validate_process_plan(snapshot)
-        snapshot["nodes"][1]["submission"]["remote_archive"]["url"] += "?different"
-        with self.assertRaises(rollout.Refusal):
+        snapshot["nodes"][-1]["submission"]["remote_archive"]["url"] += "?different"
+        with self.assertRaisesRegex(rollout.Refusal, "archive"):
             rollout.validate_process_plan(snapshot)
+
+    def test_process_plan_keeps_global_config_descriptor_and_node_runtime_config(self):
+        args = arguments()
+        args.component_config_path = "/mounted/node.json"
+        snapshot = plan(args)
+        snapshot["nodes"][-1]["submission"]["selection"]["expected"]["configuration_sha256"] = "b" * 64
+        rollout.validate_process_plan(snapshot)
+        snapshot["nodes"][-1]["submission"]["component_config"]["mount_path"] = "/mounted/different.json"
+        with self.assertRaisesRegex(rollout.Refusal, "configuration"):
+            rollout.validate_process_plan(snapshot)
+
+    def test_node_info_schema_and_sessions_are_checked_by_consumer(self):
+        for marker in (None, True, 2):
+            with self.subTest(schema_version=marker):
+                response = info("pod-a", "adxlet")
+                response["node_info"]["schema_version"] = marker
+                with self.assertRaisesRegex(rollout.Refusal, "schema"):
+                    rollout.process_component(response, "adxlet", "node-a", "uid-pod-a")
+        for key in ("node_session", "relay_session"):
+            with self.subTest(session=key):
+                response = info("pod-a", "adxlet")
+                response["node_info"]["components"][0]["runtime"][key] = ""
+                with self.assertRaisesRegex(rollout.Refusal, "session"):
+                    rollout.process_component(response, "adxlet", "node-a", "uid-pod-a")
+        response = info("pod-a", "adxlet")
+        response["node_info"]["components"][0]["mode"] = "embedded"
+        response["node_info"]["components"][0]["runtime"]["relay_session"] = ""
+        rollout.process_component(response, "adxlet", "node-a", "uid-pod-a", modes=("embedded",))
+
 
     def test_remote_omits_expected_binary_digest_but_local_requires_it(self):
         args = arguments("relay")
@@ -362,6 +169,7 @@ class ProcessPlanTests(unittest.TestCase):
         args = arguments("relay")
         args.archive_url = "https://packages.example/release.tar.gz"
         args.archive_sha256 = "e" * 64
+        args.component_config_path = "/mounted/relay.json"
         snapshot = plan(args)
         rollout.validate_process_plan(snapshot)
         self.assertNotIn("remote_archive", snapshot)
@@ -369,20 +177,31 @@ class ProcessPlanTests(unittest.TestCase):
             submission = node["submission"]
             self.assertEqual(submission["remote_archive"], {
                 "url": args.archive_url, "archive_sha256": args.archive_sha256})
+            self.assertEqual(submission["component_config"], {"mount_path": args.component_config_path})
             argv = rollout.submit_arguments(submission)
+            self.assertEqual(argv[argv.index("--component-config-path") + 1], args.component_config_path)
+            self.assertNotIn("--component-config-sha256", argv)
             self.assertEqual(argv[argv.index("--archive-url") + 1], args.archive_url)
             self.assertEqual(argv[argv.index("--archive-sha256") + 1], args.archive_sha256)
         changed = copy.deepcopy(snapshot)
         changed["nodes"][0]["submission"]["remote_archive"]["url"] += "?changed"
         self.assertNotEqual(rollout.canonical(snapshot), rollout.canonical(changed))
 
-    def test_remote_invalid_or_unpaired_before_reads(self):
-        for url, digest in [("http://host/a", "a" * 64), ("https://user@host/a", "a" * 64),
-                            ("https://host/a#", "a" * 64), ("https:///a", "a" * 64),
-                            ("https://host/a", "A" * 64), (None, "a" * 64), ("https://host/a", None),
-                            ("https://[broken/a", "a" * 64), ("https://host:invalid/a", "a" * 64),
-                            ("https://host\\other/a", "a" * 64), ("https://bad^host/a", "a" * 64),
-                            ("https://%zz/a", "a" * 64), ("https://bad\x00host/a", "a" * 64)]:
+    def test_component_config_path_requires_no_digest_argument(self):
+        argv = ["plan-process", "--context", "cluster", "--namespace", "platform", "--container", "supervisor",
+                "--config", "/etc/adx/deployment.yaml", "--role", "relay", "--commit", "c" * 40,
+                "--sha256", "d" * 64, "--task-id", "release", "--epoch", "2", "--node", "pod-a=node-a",
+                "--component-config-path", "/mounted/relay.json"]
+        snapshot = plan(rollout.parser().parse_args(argv))
+        self.assertEqual(snapshot["nodes"][0]["submission"]["component_config"],
+                         {"mount_path": "/mounted/relay.json"})
+        with patch.object(rollout.argparse.ArgumentParser, "error", side_effect=ValueError) as error:
+            with self.assertRaises(ValueError):
+                rollout.parser().parse_args([*argv, "--component-config-sha256", "e" * 64])
+        error.assert_called_once()
+
+    def test_remote_unpaired_before_reads(self):
+        for url, digest in ((None, "a" * 64), ("https://host/a", None)):
             with self.subTest(url=url, digest=digest):
                 args = arguments()
                 args.archive_url, args.archive_sha256 = url, digest
@@ -393,7 +212,8 @@ class ProcessPlanTests(unittest.TestCase):
                 local.assert_not_called()
 
     def test_remote_standard_hosts_and_archive_paths_remain_accepted(self):
-        for url in ("https://packages.example/archive.tar.gz", "https://127.0.0.1:8443/archive.tar.gz",
+        for url in ("http://host/a", "https://user@host/a", "https://packages.example/archive.tar.gz",
+                    "https://127.0.0.1:8443/archive.tar.gz",
                     "https://[2001:db8::1]:8443/sdk/aarch64/long%20wheel.tar.gz?version=1",
                     "https://%65xample.com/archive.tar.gz"):
             with self.subTest(url=url):
@@ -431,22 +251,6 @@ class ProcessPlanTests(unittest.TestCase):
                 kube.assert_not_called()
                 local.assert_not_called()
 
-    def test_unicode_runtime_fields_use_utf8_byte_limits(self):
-        for key in ("boot_nonce", "pod_uid", "node_session", "relay_session"):
-            with self.subTest(key=key):
-                args = arguments(nodes=("pod-a=node-a",))
-                kube_pod = pod("pod-a")
-                view = info("pod-a", args.role)
-                oversized = "\u4e2d" * 43
-                view["node_info"]["components"][0]["runtime"][key] = oversized
-                if key == "boot_nonce":
-                    view["node_info"][key] = oversized
-                if key == "pod_uid":
-                    view["node_info"][key] = oversized
-                    kube_pod["metadata"]["uid"] = oversized
-                with self.assertRaises(rollout.Refusal):
-                    rollout.plan_process(args, MagicMock(return_value=kube_pod), MagicMock(return_value=view))
-
     def test_exact_submissions_for_both_roles(self):
         for role in ("adxlet", "relay"):
             with self.subTest(role=role):
@@ -483,14 +287,12 @@ class ProcessPlanTests(unittest.TestCase):
         changes = [
             ("metadata", "uid", "replacement"), ("metadata", "name", "other"),
             ("metadata", "namespace", "other"), ("metadata", "deletionTimestamp", "now"),
-            ("spec", "nodeName", "other"),
         ]
         for section, key, value in changes:
             with self.subTest(section=section, key=key):
                 with self.assertRaises(rollout.Refusal):
                     plan(arguments(), change_pod=lambda obj, s=section, k=key, v=value: obj[s].update({k: v}))
-        for key, value in [("containerID", "other"), ("restartCount", 1),
-                           ("state", {"terminated": {}}), ("name", "other")]:
+        for key, value in [("state", {"terminated": {}}), ("name", "other")]:
             with self.subTest(key=key):
                 with self.assertRaises(rollout.Refusal):
 
@@ -500,8 +302,7 @@ class ProcessPlanTests(unittest.TestCase):
                     plan(arguments(), change_pod=change)
 
     def test_runtime_and_component_changes_refused(self):
-        for key, value in [("boot_nonce", "new"), ("node_session", "new"), ("relay_session", "new"),
-                           ("pod_uid", "forged"), ("pid", 43), ("executable_sha256", "b" * 64)]:
+        for key, value in [("boot_nonce", "new"), ("pod_uid", "forged")]:
             with self.subTest(key=key):
 
                 def change(obj, k=key, v=value):
@@ -525,7 +326,7 @@ class ProcessPlanTests(unittest.TestCase):
         with self.assertRaises(rollout.Refusal):
             plan(arguments(), change_info=forged)
 
-    def test_consistent_boot_change_and_ambiguous_component_refused(self):
+    def test_initial_boot_is_frozen_and_ambiguous_component_refused(self):
         def reboot(obj):
             obj["node_info"]["boot_nonce"] = "reboot"
             obj["node_info"]["components"][0]["runtime"]["boot_nonce"] = "reboot"
@@ -534,14 +335,22 @@ class ProcessPlanTests(unittest.TestCase):
             components = obj["node_info"]["components"]
             components.append(copy.deepcopy(components[0]))
 
-        for change in (reboot, duplicate):
-            with self.assertRaises(rollout.Refusal):
-                plan(arguments(), change_info=change)
+        snapshot = plan(arguments(), change_info=reboot)
+        self.assertEqual(snapshot["nodes"][0]["submission"]["selection"]["expected"]["boot_nonce"], "reboot")
+        with self.assertRaises(rollout.Refusal):
+            plan(arguments(), change_info=duplicate)
 
-    def test_resource_version_is_evidence_not_incarnation(self):
-        result = plan(arguments(), change_pod=lambda obj: obj["metadata"].update(resourceVersion="2"))
+    def test_plan_records_one_observation_and_runtime_fence(self):
+        args = arguments(nodes=("pod-a=node-a",))
+        kube = MagicMock(return_value=pod("pod-a"))
+        local = MagicMock(return_value=info("pod-a", args.role))
+        result = rollout.plan_process(args, kube, local)
+        kube.assert_called_once()
+        local.assert_called_once()
         self.assertEqual(result["nodes"][0]["kube"]["resource_version"], "1")
-        self.assertEqual(result["nodes"][0]["kube"]["rechecked_resource_version"], "2")
+        self.assertNotIn("rechecked_resource_version", result["nodes"][0]["kube"])
+        self.assertEqual(result["nodes"][0]["submission"]["selection"]["expected"],
+                         info("pod-a", args.role)["node_info"]["components"][0]["runtime"])
 
     def test_cli_uses_absolute_kubectl_and_literal_exec_argv(self):
         args = arguments(nodes=("pod-a=node-a",))
@@ -596,7 +405,7 @@ class ProcessUpgradeHttpTests(unittest.TestCase):
             owner = self.owner(epoch)
             for status in ("absent", "active", "released"):
                 with self.subTest(epoch=epoch, status=status):
-                    result = dict(status=status, owner=owner)
+                    result = dict(status=status, owner=owner, server_metadata="ignored")
                     if status == "active":
                         result.update(origin_session="s0", current_session="一" * 42 + "ab", yielded=True)
                     elif status == "released":
@@ -609,9 +418,9 @@ class ProcessUpgradeHttpTests(unittest.TestCase):
         owner = self.owner()
         active = dict(status="active", owner=owner, origin_session="s0", current_session="s1", yielded=True)
         invalid = [None, [], "<html>old coordinator</html>", {}, dict(status="absent", owner={}),
-                   dict(status="missing", owner=owner), dict(status="absent", owner=owner, state=None),
+                   dict(status="missing", owner=owner),
                    dict(active, owner=dict(owner, epoch=7.0)), dict(active, yielded=1)]
-        for session in ("", "x" * 129, "一" * 43, "\udc80", 5, None):
+        for session in ("", 5, None):
             for field in ("origin_session", "current_session"):
                 invalid.append(dict(active, **{field: session}))
             invalid.append(dict(status="released", owner=owner, node_session=session))
@@ -723,42 +532,44 @@ class AdxletPublisherFixture:
             step = argv[4]
             state = rollout.read_json_file(self.journal)["nodes"]["node-a"]
             self.events.append(step)
-            self.case.assertIn(state["stage"], ("rollback_intent", "original_start_intent")
-                               if step == "rollback" else (step + "_intent",))
+            self.case.assertEqual(state["stage"], "rollback_intent" if step == "rollback" else step + "_intent")
             identity = ["", ""] if step == "exit" else ["attempt", "candidate"]
             self.case.assertEqual(argv, ["step", "--task-id", self.node["submission"]["task_id"],
                                         "--step", step, "--attempt", identity[0], "--node-session", identity[1]])
             if step == "exit":
                 self.task["adxlet_execution"] = dict(stage="exited", old_pid=42, attempt="attempt",
-                                                     node_session="candidate", deadline_unix_ms=4102444800000)
+                                                     node_session="candidate", deadline_unix_ms=4102444800000,
+                                                     leg=dict(kind="target"), error=None)
                 self.view["node_info"]["components"][0]["runtime"] = None
                 self.marker["yielded"] = True
             elif step == "rollback":
                 execution = self.task["adxlet_execution"]
-                if execution.get("rollback_from") is None:
+                if execution["leg"] == dict(kind="target"):
                     if self.stop_deadline is None:
                         self.stop_deadline = 4102444500000
                     execution["deadline_unix_ms"] = self.stop_deadline
                     if step not in self.unknown_steps:
                         self.stopped_attempts.append("attempt")
-                        execution.update(stage="rollback_ready", attempt="original-attempt",
-                            node_session="original-session", candidate_pid=None,
-                            rollback_from=dict(attempt="attempt", node_session="candidate"))
+                        execution.update(stage="exited", attempt="original-attempt",
+                            node_session="original-session", error=None,
+                            leg={"kind": "rollback", "from": dict(attempt="attempt", node_session="candidate")})
+                        execution.pop("candidate_pid", None)
                         self.view["node_info"]["components"][0]["runtime"] = None
                     self.task["phase"] = "unknown"
                 else:
-                    self.case.assertEqual(execution["rollback_from"], dict(attempt="attempt", node_session="candidate"))
+                    self.case.assertEqual(execution["leg"]["from"], dict(attempt="attempt", node_session="candidate"))
                 if step not in self.unknown_steps:
                     self.start_attempt(original=True)
             elif step == "start":
-                self.case.assertIsNone(self.task["adxlet_execution"].get("rollback_from"))
+                self.case.assertEqual(self.task["adxlet_execution"]["leg"], dict(kind="target"))
                 self.start_attempt(original=False)
             else:
                 self.case.fail("unexpected destructive Step: " + step)
             if step in self.unknown_steps:
                 self.task["phase"] = "unknown"
-                self.task["adxlet_execution"]["stage"] = self.unknown_steps.pop(step)
+                self.task["adxlet_execution"].update(self.unknown_steps.pop(step))
                 if step == "exit":
+                    self.task["adxlet_execution"].update(attempt="", node_session="node-session")
                     self.view = info("pod-a", "adxlet")
                     self.marker["yielded"] = False
             self.acknowledge(step)
@@ -779,9 +590,9 @@ class AdxletPublisherFixture:
             return  # expiry only observes, and cannot manufacture a recovered B
         failed = self.original_fails if original else self.target_fails
         self.task["phase"] = "unknown" if failed else ("failed" if original else "completed")
-        execution.update(stage=("original_start_unknown" if original else "start_unknown")
-            if failed else ("original_selected" if original else "completed"),
-            candidate_pid=None if failed else (44 if original else 43))
+        execution.update(stage="starting" if failed else "selected",
+                         error="candidate readiness unknown" if failed else None,
+                         candidate_pid=None if failed else (44 if original else 43))
         if not failed:
             runtime = info("pod-a", "adxlet")["node_info"]["components"][0]["runtime"]
             runtime.update(pid=44 if original else 43, node_session=execution["node_session"],
@@ -795,14 +606,12 @@ class AdxletPublisherFixture:
                 self.started_attempts.append(execution["attempt"])
         if action in self.unknown_steps:
             self.task["phase"] = "unknown"
-            execution["stage"] = self.unknown_steps.pop(action)
-            if not execution["stage"].endswith("commit_unknown"):
+            execution.update(self.unknown_steps.pop(action))
+            if execution["stage"] != "committing":
                 self.view["node_info"]["components"][0]["runtime"] = None
                 execution["candidate_pid"] = None
         if original:
             self.acknowledge(action)
-
-
 
 
 class ProcessApplyTests(unittest.TestCase):
@@ -1046,7 +855,7 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(fixture.cli.call_args.args[1][0], "query")
             fixture.post.assert_not_called()
 
-    def test_rollback_v2_completed_b_is_adopted_before_terminal_without_external_start(self):
+    def test_rollback_selected_b_is_proven_without_external_start(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         with tempfile.TemporaryDirectory() as directory:
             fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
@@ -1057,15 +866,15 @@ class ProcessApplyTests(unittest.TestCase):
             def rollback_completes_original(node, argv):
                 result = command(node, argv)
                 if argv[0] == "step" and argv[4] == "rollback":
-                    self.assertEqual(fixture.task["adxlet_execution"]["stage"], "original_selected")
+                    self.assertEqual(fixture.task["adxlet_execution"]["stage"], "selected")
                 return result
 
             fixture.cli.side_effect = rollback_completes_original
             self.assertEqual(self.run_adxlet(fixture)["status"], "failed")
             state = rollout.read_json_file(fixture.journal)["nodes"]["node-a"]
             self.assertEqual((state["attempt"], state["node_session"], state["release_session"]),
-                             ("original-attempt", "original-session", "original-session"))
-            self.assertEqual(state["rollback_from"], dict(attempt="attempt", node_session="candidate"))
+                             ("attempt", "candidate", "original-session"))
+            self.assertNotIn("rollback_from", state)
             self.assertEqual(fixture.stopped_attempts, ["attempt"])
             self.assertEqual(fixture.started_attempts, ["original-attempt"])
             self.assertEqual(fixture.events.count("original_start"), 1)
@@ -1110,9 +919,10 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             self.assertEqual(self.run_adxlet(fixture)["status"], "failed")
             execution = fixture.task["adxlet_execution"]
-            self.assertEqual(execution["rollback_from"], dict(attempt="attempt", node_session="candidate"))
+            self.assertEqual(execution["leg"],
+                             {"kind": "rollback", "from": dict(attempt="attempt", node_session="candidate")})
             self.assertEqual((execution["attempt"], execution["node_session"], execution["stage"]),
-                             ("original-attempt", "original-session", "original_selected"))
+                             ("original-attempt", "original-session", "selected"))
             runtime = fixture.view["node_info"]["components"][0]["runtime"]
             self.assertEqual((runtime["pid"], runtime["executable_sha256"], runtime["configuration_sha256"],
                               runtime["relay_session"]), (44, "a" * 64, "e" * 64, "relay-session"))
@@ -1143,7 +953,7 @@ class ProcessApplyTests(unittest.TestCase):
                 self.assertEqual(fixture.started_attempts.count("original-attempt"), 1)
                 self.assertEqual(fixture.events.count(action), 1)
 
-    def test_adxlet_nonzero_start_with_queried_start_unknown_can_recover_original(self):
+    def test_adxlet_nonzero_start_with_queried_starting_error_can_recover_original(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         with tempfile.TemporaryDirectory() as directory:
             fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
@@ -1153,7 +963,7 @@ class ProcessApplyTests(unittest.TestCase):
             def local_start_error(node, argv):
                 result = command(node, argv)
                 if (argv[0] == "step" and argv[4] == "start"
-                        and fixture.task["adxlet_execution"].get("rollback_from") is None):
+                        and fixture.task["adxlet_execution"]["leg"] == dict(kind="target")):
                     raise rollout.Refusal("local Start returned nonzero")
                 return result
 
@@ -1161,34 +971,89 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             self.assertEqual(self.run_adxlet(fixture)["status"], "failed")
             self.assertEqual(fixture.stopped_attempts, ["attempt"])
-            self.assertEqual(fixture.task["adxlet_execution"]["stage"], "original_selected")
+            self.assertEqual(fixture.task["adxlet_execution"]["stage"], "selected")
 
     def test_adxlet_local_unknown_stages_resume_same_step_identity(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
-        cases = (("exit", "exit_unknown"), ("start", "start_intent"), ("start", "start_unknown"),
-                 ("start", "target_commit_unknown"), ("rollback", "rollback_intent"),
-                 ("rollback", "rollback_unknown"), ("original_start", "original_start_intent"),
-                 ("original_start", "original_start_unknown"), ("original_start", "original_commit_unknown"))
-        for action, local_stage in cases:
-            with self.subTest(action=action, stage=local_stage), tempfile.TemporaryDirectory() as directory:
+        cases = (("exit", "exiting", None), ("start", "starting", None),
+                 ("start", "starting", "spawn outcome unknown"), ("start", "committing", "commit reply unknown"),
+                 ("rollback", "stopping_for_rollback", "candidate reap unknown"),
+                 ("original_start", "starting", None), ("original_start", "starting", "readiness unknown"),
+                 ("original_start", "committing", "commit reply unknown"))
+        for action, local_stage, error in cases:
+            with (self.subTest(action=action, stage=local_stage, error=error),
+                  tempfile.TemporaryDirectory() as directory):
                 fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
                 fixture.target_fails = action in ("rollback", "original_start")
-                fixture.unknown_steps[action] = local_stage
+                fixture.unknown_steps[action] = dict(stage=local_stage, error=error)
                 self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+                if local_stage == "exiting":
+                    # Before reap, no successor identity exists. The fixture checks
+                    # that every Exit replay still sends the original empty input.
+                    self.assertEqual(fixture.task["adxlet_execution"]["attempt"], "")
+                    self.assertEqual(fixture.task["adxlet_execution"]["node_session"], "node-session")
                 if fixture.target_fails:
                     self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
                 deadline = fixture.task["adxlet_execution"]["deadline_unix_ms"]
                 self.assertEqual(self.run_adxlet(fixture)["status"], "failed" if fixture.target_fails else "completed")
                 self.assertEqual(fixture.task["adxlet_execution"]["deadline_unix_ms"], deadline)
                 self.assertEqual(fixture.events.count(action), 2)
+                self.assertEqual(fixture.events.count("maintenance"), 1)
                 self.assertEqual(fixture.stopped_attempts, ["attempt"] if fixture.target_fails else [])
+
+    def test_adxlet_starting_without_error_cannot_turn_cli_failure_into_rollback_proof(self):
+        snapshot = plan(arguments(nodes=("pod-a=node-a",)))
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
+            fixture.unknown_steps["start"] = dict(stage="starting", error=None)
+            self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+            command = fixture.cli.side_effect
+
+            def unavailable_start(node, argv):
+                if argv[0] == "step" and argv[4] == "start":
+                    raise rollout.Refusal("Start transport unavailable")
+                return command(node, argv)
+
+            fixture.cli.side_effect = unavailable_start
+            self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+            self.assertNotIn("rollback", fixture.events)
+            self.assertIsNotNone(fixture.marker)
+            self.assertIsNone(fixture.receipt)
+
+    def test_adxlet_invalid_execution_cannot_authorize_steps_or_release(self):
+        snapshot = plan(arguments(nodes=("pod-a=node-a",)))
+        cases = [(False, invalid) for invalid in (
+            dict(stage="unrecognized"), dict(leg={"kind": "rollback"}), dict(leg=None),
+            dict(stage="committing", candidate_pid=None), dict(candidate_pid=None),
+            dict(candidate_pid=True), dict(stage="exited"))]
+        cases += [(True, dict(stage="unrecognized")), (True, dict(stage="committing", candidate_pid=None))]
+        for rollback, invalid in cases:
+            with self.subTest(rollback=rollback, invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
+                fixture.target_fails = fixture.original_fails = rollback
+                if not rollback:
+                    fixture.lost_acks.add("start")
+                self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+                if rollback:
+                    self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+                fixture.task["adxlet_execution"].update(invalid)
+                if "stage" in invalid:
+                    fixture.task["phase"] = "unknown"
+                fixture.cli.reset_mock()
+                fixture.post.reset_mock()
+                self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
+                self.assertTrue(all(call.args[1][0] == "query" for call in fixture.cli.call_args_list))
+                self.assertTrue(all(call.args[1].get("action") not in ("prepare", "release")
+                                    for call in fixture.post.call_args_list))
+                self.assertIsNotNone(fixture.marker)
+                self.assertIsNone(fixture.receipt)
 
     def test_adxlet_expired_target_rollback_starts_original_from_origin_or_a(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         for current in ("node-session", "candidate"):
             with self.subTest(current=current), tempfile.TemporaryDirectory() as directory:
                 fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
-                fixture.unknown_steps["start"] = "start_unknown"
+                fixture.unknown_steps["start"] = dict(stage="starting", error="spawn outcome unknown")
                 self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
                 fixture.task["adxlet_execution"]["deadline_unix_ms"] = 1
                 fixture.marker["current_session"] = current
@@ -1200,11 +1065,11 @@ class ProcessApplyTests(unittest.TestCase):
                 self.assertEqual(fixture.marker, None)
                 self.assertEqual(fixture.receipt["node_session"], "original-session")
 
-    def test_adxlet_target_commit_unknown_only_replays_receipt_even_after_expiry(self):
+    def test_adxlet_target_committing_only_replays_receipt_even_after_expiry(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         with tempfile.TemporaryDirectory() as directory:
             fixture = AdxletPublisherFixture(self, snapshot, Path(directory) / "journal")
-            fixture.unknown_steps["start"] = "target_commit_unknown"
+            fixture.unknown_steps["start"] = dict(stage="committing", error="commit reply unknown")
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             fixture.task["adxlet_execution"]["deadline_unix_ms"] = 1
             command = fixture.cli.side_effect
@@ -1221,7 +1086,7 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertNotIn("rollback", fixture.events)
             self.assertEqual(fixture.started_attempts, ["attempt"])
             fixture.task["phase"] = "completed"
-            fixture.task["adxlet_execution"]["stage"] = "completed"
+            fixture.task["adxlet_execution"].update(stage="selected", error=None)
             self.assertEqual(self.run_adxlet(fixture)["status"], "completed")
             self.assertNotIn("rollback", fixture.events)
 
@@ -1237,7 +1102,7 @@ class ProcessApplyTests(unittest.TestCase):
                 if argv[0] == "step" and argv[4] == "rollback":
                     fixture.effect("rollback.receipt", "rollback_intent")
                     fixture.task["phase"] = "completed"
-                    fixture.task["adxlet_execution"].update(stage="completed", candidate_pid=43,
+                    fixture.task["adxlet_execution"].update(stage="selected", candidate_pid=43, error=None,
                                                            deadline_unix_ms=4102444500000)
                     runtime = info("pod-a", "adxlet")["node_info"]["components"][0]["runtime"]
                     runtime.update(pid=43, node_session="candidate", executable_sha256="d" * 64)
@@ -1250,7 +1115,7 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(self.run_adxlet(fixture)["status"], "completed")
             self.assertEqual(fixture.stopped_attempts, [])
             self.assertNotIn("original_start", fixture.events)
-            self.assertIsNone(fixture.task["adxlet_execution"].get("rollback_from"))
+            self.assertEqual(fixture.task["adxlet_execution"]["leg"], dict(kind="target"))
 
     def test_adxlet_original_failure_and_expiry_keep_maintenance_without_recursive_rollback(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
@@ -1289,8 +1154,8 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(steps, [["step", "--task-id", fixture.node["submission"]["task_id"],
                                      "--step", "rollback", "--attempt", "attempt", "--node-session", "candidate"]])
             execution = fixture.task["adxlet_execution"]
-            self.assertEqual(execution["stage"], "original_selected")
-            for field in ("attempt", "node_session", "rollback_from", "deadline_unix_ms"):
+            self.assertEqual(execution["stage"], "selected")
+            for field in ("attempt", "node_session", "leg", "deadline_unix_ms"):
                 self.assertEqual(execution[field], saved[field])
             self.assertIsNotNone(fixture.marker)
             self.assertIsNone(fixture.receipt)
@@ -1308,7 +1173,7 @@ class ProcessApplyTests(unittest.TestCase):
                 elif change == "yielded":
                     fixture.marker["yielded"] = True
                 elif change == "execution":
-                    fixture.task["adxlet_execution"] = dict(stage="exit_unknown")
+                    fixture.task["adxlet_execution"] = dict(stage="exiting", leg=dict(kind="target"))
                 self.assertEqual(self.run_adxlet(fixture)["status"], "failed" if change is None else "pending")
                 self.assertNotIn("exit", fixture.events)
                 self.assertEqual(fixture.receipt is not None, change is None)
@@ -1321,7 +1186,7 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             fixture.lost_acks.add("rollback")
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
-            fixture.task["adxlet_execution"]["rollback_from"]["node_session"] = "foreign"
+            fixture.task["adxlet_execution"]["leg"]["from"]["node_session"] = "foreign"
             fixture.events.clear()
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             self.assertNotIn("original_start", fixture.events)
@@ -1341,7 +1206,7 @@ class ProcessApplyTests(unittest.TestCase):
             fixture.post.side_effect = unavailable_release
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             self.assertEqual(rollout.read_json_file(fixture.journal)["nodes"]["node-a"]["stage"], "release_intent")
-            fixture.task["adxlet_execution"]["rollback_from"]["node_session"] = "foreign"
+            fixture.task["adxlet_execution"]["leg"]["from"]["node_session"] = "foreign"
             fixture.post.reset_mock()
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             fixture.post.assert_called_once_with("/v1/adxlet-process-upgrades/query", dict(owner=fixture.owner))
@@ -1355,12 +1220,13 @@ class ProcessApplyTests(unittest.TestCase):
             fixture.lost_acks.add("rollback")
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             fixture.task["phase"] = "unknown"
-            fixture.task["adxlet_execution"]["stage"] = "original_start_unknown"
+            fixture.task["adxlet_execution"].update(stage="starting", error="readiness unknown")
             fixture.marker["current_session"] = "foreign-session"
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             state = rollout.read_json_file(fixture.journal)["nodes"]["node-a"]
-            self.assertEqual((state["attempt"], state["node_session"]), ("original-attempt", "original-session"))
-            self.assertEqual(state["rollback_from"], dict(attempt="attempt", node_session="candidate"))
+            self.assertEqual((state["attempt"], state["node_session"]), ("attempt", "candidate"))
+            self.assertEqual(state["stage"], "rollback_intent")
+            self.assertNotIn("rollback_from", state)
             self.assertEqual(fixture.events.count("rollback"), 2)
             self.assertEqual(fixture.events.count("original_start"), 2)
             self.assertIsNone(fixture.receipt)
@@ -1425,7 +1291,6 @@ class ProcessApplyTests(unittest.TestCase):
             fixture.marker["yielded"] = True
             self.assertEqual(self.run_adxlet(fixture)["status"], "completed")
             self.assertEqual(fixture.events.count("exit"), 1)
-
 
 
     def test_adxlet_start_refuses_unyielded_or_unrelated_current_session(self):
@@ -1605,16 +1470,17 @@ class ProcessApplyTests(unittest.TestCase):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / "journal.json"
-            rollback_from = dict(attempt="target-attempt", node_session="target-session")
+            source = dict(attempt="target-attempt", node_session="target-session")
             state = dict(stage="release_intent", outcome="failed", release_session="recovered",
-                         attempt="original-attempt", node_session="recovered", rollback_from=rollback_from,
+                         **source,
                          first_submit_unix_ms=1)
             rollout.write_journal(journal, dict(schema_version=2, plan_hash=rollout.template_hash(snapshot),
                                                 nodes={"node-a": state}))
             node = snapshot["nodes"][0]
             owner = rollout.maintenance_owner(snapshot, node)
-            execution = dict(stage="original_selected", attempt=state["attempt"],
-                             node_session=state["node_session"], rollback_from=rollback_from)
+            execution = dict(stage="selected", candidate_pid=44, attempt="original-attempt",
+                             node_session="recovered", deadline_unix_ms=4102444500000,
+                             leg={"kind": "rollback", "from": source})
             task = dict(submission=node["submission"], phase="failed", adxlet_execution=execution)
             cli = MagicMock(return_value=dict(ok=True, task=task))
             post = MagicMock(return_value=dict(status="released", owner=owner, node_session="recovered"))
@@ -1662,15 +1528,18 @@ class ProcessApplyTests(unittest.TestCase):
         owner = rollout.maintenance_owner(snapshot, node)
         body = {"owner": owner, "node_session": "recovered"}
         task = {"submission": node["submission"], "phase": "failed", "execution": None,
-                "adxlet_execution": {"stage": "original_selected", "candidate_pid": 43,
-                                     "attempt": "attempt", "node_session": "recovered"}}
+                "adxlet_execution": {"stage": "selected", "candidate_pid": 43,
+                                     "leg": {"kind": "rollback",
+                                             "from": {"attempt": "target", "node_session": "target"}},
+                                     "attempt": "attempt", "node_session": "recovered",
+                                     "deadline_unix_ms": 4102444500000}}
         fresh = info("pod-a", "adxlet")
         fresh["node_info"]["components"][0]["runtime"].update(pid=43, node_session="recovered")
         for receipt in (None, rollout.Refusal("no receipt")):
             for change in ("none", "pid", "session", "relay"):
                 with self.subTest(receipt=receipt, change=change):
                     state = dict(stage="release_intent", outcome="failed", release_session=body["node_session"],
-                                 first_submit_unix_ms=1)
+                                 first_submit_unix_ms=1, attempt="target", node_session="target")
                     observed = copy.deepcopy(fresh)
                     runtime = observed["node_info"]["components"][0]["runtime"]
                     if change == "none":
@@ -1745,6 +1614,7 @@ class ProcessApplyTests(unittest.TestCase):
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             fixture.task["phase"] = "running"
             fixture.task["adxlet_execution"]["stage"] = "exited"
+            fixture.task["adxlet_execution"].pop("candidate_pid")
             fixture.cli.reset_mock()
             self.assertEqual(self.run_adxlet(fixture)["status"], "pending")
             self.assertTrue(all(call.args[1][0] == "query" for call in fixture.cli.call_args_list))
@@ -1754,12 +1624,13 @@ class ProcessApplyTests(unittest.TestCase):
     def test_adxlet_terminal_requires_unchanged_independent_relay(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
         node = snapshot["nodes"][0]
-        for phase, stage, digest in (("completed", "completed", snapshot["sha256"]),
-                                     ("failed", "original_selected", "a" * 64)):
+        rollback_leg = {"kind": "rollback", "from": dict(attempt="target", node_session="target")}
+        for phase, leg, digest in (("completed", dict(kind="target"), snapshot["sha256"]),
+                                   ("failed", rollback_leg, "a" * 64)):
             runtime = dict(node["submission"]["selection"]["expected"], pid=43,
                            node_session="candidate", relay_session="changed", executable_sha256=digest)
             task = {"phase": phase, "prepared": {"binary_sha256": snapshot["sha256"], "configuration_sha256": "e" * 64},
-                    "adxlet_execution": {"stage": stage, "candidate_pid": 43,
+                    "adxlet_execution": {"stage": "selected", "leg": leg, "candidate_pid": 43,
                     "attempt": "attempt", "node_session": "candidate"}}
             self.assertIsNone(rollout.finish_process(snapshot, node, task, runtime))
 

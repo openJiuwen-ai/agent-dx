@@ -233,9 +233,17 @@ async fn replacement(admin_paused: bool, abort_cleanup: bool) {
         .unwrap();
     let base = "/v1/node-upgrades/tasks";
     let begin = json!({"task_id":"pod","epoch":1,"namespace":"test","daemonset_uid":"workload",
-        "target_image":format!("image@sha256:{}", "d".repeat(64)),"nodes":[{"node_id":"node","pod_uid":"old-pod","node_session_id":"old"}]});
-    let result = management(http, base, begin).await;
+        "target_image":"registry:5000/image:release-20261124-1","nodes":[{"node_id":"node","pod_uid":"old-pod","node_session_id":"old"}]});
+    let result = management(http, base, begin.clone()).await;
     assert_eq!(result.0, 200, "{result:?}");
+    assert_eq!(result.1["target_image"], begin["target_image"]);
+    let replay = management(http, base, begin.clone()).await;
+    assert_eq!(replay.0, 200, "{replay:?}");
+    assert_eq!(replay.1, result.1);
+    let mut changed = begin;
+    changed["target_image"] = json!("registry:5000/image:release-20261124-2");
+    let conflict = management(http, base, changed).await;
+    assert_eq!(conflict.0, 409, "{conflict:?}");
     let mut request = json!({"task_id":"pod","epoch":1,"operation_id":"prepare", "node_id":"node",
         "pod_uid":"old-pod","node_session_id":"old"});
     let path = format!("{base}/pod");

@@ -17,6 +17,26 @@
 | `build/release/package.py` | 输入制品完整性检查、Redis 版本检查、清单与 SHA256、已展开目录复核 |
 | `build/ci/process_smoke.py` | 从统一包启动真实 Redis／Coordinator，注入进程退出、检查新 epoch、确认干净停止 |
 
+## 节点升级回归边界
+
+节点升级的本地检查需要分别覆盖以下行为，不能用编译成功代替运行检查：
+
+| 范围 | 回归要求 |
+| --- | --- |
+| Ingress | Direct HTTP、原生 CONNECT/WebSocket 的 Relay CONNECT 503 不制造 Environment 唤醒，发送业务前按预算等待；真实暂停实例仍可唤醒，业务 HTTP 503 原样返回。E2B HTTP/WebSocket 服务转发保持原恢复路径，不进入原生 CONNECT 的新重试循环。 |
+| 连接期限 | 同一绑定的 503 重试不刷新短期限；正常首次 CONNECT 响应不受该重试期限截断，生命周期恢复沿用原请求期限。 |
+| Coordinator | 无关 Env 更新不使 Yield 重试，既有和新增本节点 Env 变化仍受保护；解除回执跨任务、重启可查可重放，epoch 改变不能部分解除维护。 |
+| 回执存储 | 新回执不写入热控制 Hash；旧热记录按精确 owner 原子转存，冷热冲突拒绝且保留数据。独立回执 Hash 不设 TTL，未访问的旧记录不批量迁移。 |
+| adxlet | sealing 上报在 Coordinator 接受连接却不回复时受现有 RPC 超时约束，后续周期可继续；始终关闭准入，不进入普通实例恢复。 |
+| Relay 排水 | BeginDrain 成功回复后业务 TCP 与 health 地址可立即重新绑定；同 task/session 重放返回同一释放回执与固定期限，调用取消后已接收排水继续；已有连接保持到自然结束或真实关闭。 |
+| Relay 交接 | Reserve/Cancel/Switch/Finish 核对完整身份与父 supervisor 的真实 Child 证据；首个 snapshot 结果未知时重放冻结内容，精确 ready 后仅同步 canonical 最新增量；旧端退休仍等待真实 ACK 或真实 reap，失败候选更换须证明其 Child 已真实 reap。 |
+
+相关测试位于 `gateway/src/ingress/server/processing_tests.rs`、`gateway/tests/node_service.rs`、
+`platform/adxlet/tests/routes.rs`、`platform/deployment/src/rollout/relay.rs`、
+`platform/coordinator/src/storage/process_upgrade.rs` 和 `platform/adxlet/src/bin/adxlet.rs`。
+Redis 与 mTLS 用例使用本地隔离 fixture，默认忽略项必须显式执行并记录实跑数量。
+这些检查不代表已经部署、完成集群升级或验证全部压力与故障组合。
+
 ## 运行入口
 
 ```sh

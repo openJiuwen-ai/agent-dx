@@ -369,12 +369,6 @@ message NodeUpgradeInspectRequest {
 }
 message WakeNodeReconciliationRequest { string node_session_id = 1; }
 message WakeNodeReconciliationResponse {}
-message ProcessPreflightRequest {
-  string rollout_id = 1;
-  string local_task_id = 2;
-  uint64 epoch = 3;
-  string old_relay_session = 4;
-}
 message NodeUpgradeInspection {
   string task_id = 1;
   uint64 epoch = 2;

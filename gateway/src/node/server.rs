@@ -257,12 +257,7 @@ impl Relay {
     }
 
     /// Publish one authoritative environment route before FunctionProxy exposes it.
-    pub async fn activate_route(
-        &self,
-        instance_id: String,
-        workload_id: String,
-        environment_ip: IpAddr,
-    ) {
+    pub fn activate_route(&self, instance_id: String, workload_id: String, environment_ip: IpAddr) {
         if let Some(tracker) = &self.activity {
             tracker.register(&instance_id);
         }
@@ -291,7 +286,7 @@ impl Relay {
 
     /// Retire one route before sandboxd reclaims its IP. New streams are
     /// rejected immediately and existing relays observe the route revision.
-    pub async fn retire_route(&self, instance_id: String, workload_id: String) {
+    pub fn retire_route(&self, instance_id: String, workload_id: String) {
         if let Some(tracker) = &self.activity {
             tracker.retire(&instance_id);
         }

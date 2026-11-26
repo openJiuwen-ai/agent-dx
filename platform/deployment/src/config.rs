@@ -904,12 +904,11 @@ impl Deployment {
 #[serde(deny_unknown_fields)]
 pub struct ConfigInput {
     pub mount_path: PathBuf,
-    pub sha256: String,
 }
 
 impl ConfigInput {
     pub(crate) fn validate(&self) -> Result<()> {
-        if !self.mount_path.is_absolute() || !crate::rollout::hex(&self.sha256, 64) {
+        if !self.mount_path.is_absolute() {
             return Err("invalid component configuration descriptor".into());
         }
         Ok(())
@@ -1008,7 +1007,7 @@ pub(crate) fn prepare_component(
         .sources
         .entry(current.role)
         .or_default()
-        .raw_config_sha256 = Some(input.sha256.clone());
+        .raw_config_sha256 = None;
     Ok(process.clone())
 }
 
@@ -1237,7 +1236,6 @@ mod component_config_tests {
 
     #[test]
     fn component_configuration_preserves_actual_or_renders_fixed_baseline() {
-        use sha2::{Digest, Sha256};
         let root = tempfile::tempdir().unwrap();
         let mut deployment: Deployment = serde_saphyr::from_str(Profile::Node.template()).unwrap();
         deployment.state_dir = root.path().join("state");
@@ -1281,10 +1279,7 @@ mod component_config_tests {
         let path = root.path().join("override.json");
         let bytes = br#"{"env":{"NEW_TUNING":"new"}}"#;
         fs::write(&path, bytes).unwrap();
-        let mut input = ConfigInput {
-            mount_path: path,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
-        };
+        let input = ConfigInput { mount_path: path };
         let prepared = prepare_component(
             &deployment,
             &current,
@@ -1295,10 +1290,7 @@ mod component_config_tests {
         )
         .unwrap();
         assert!(!prepared.env.contains_key("PREVIOUS_TUNING"));
-        assert_eq!(
-            prepared.sources[&Role::Adxlet].raw_config_sha256,
-            Some(input.sha256.clone())
-        );
+        assert_eq!(prepared.sources[&Role::Adxlet].raw_config_sha256, None);
         assert_eq!(
             prepared.sources[&Role::Adxlet].version,
             current.sources[&Role::Adxlet].version
@@ -1314,7 +1306,6 @@ mod component_config_tests {
         );
         let bytes = br#"{"env":{"ADX_DATA_PLANE_RELAY_ROUTE_SOCKET":"/forged/route.sock"}}"#;
         fs::write(&input.mount_path, bytes).unwrap();
-        input.sha256 = format!("{:x}", Sha256::digest(bytes));
         assert!(prepare_component(
             &deployment,
             &current,

@@ -7,6 +7,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -19,7 +20,10 @@ fn host_target() -> Result<String> {
     }
 }
 
-fn check(deadline: Instant) -> Result<()> {
+fn check(deadline: Instant, stopped: &AtomicBool) -> Result<()> {
+    if stopped.load(Ordering::Acquire) {
+        return Err("supervisor stopping".into());
+    }
     if Instant::now() >= deadline {
         return Err("preparation deadline exceeded".into());
     }
@@ -30,7 +34,7 @@ pub(super) fn verify_file(
     file: &mut File,
     expected: &str,
     deadline: Instant,
-    stopped: &std::sync::atomic::AtomicBool,
+    stopped: &AtomicBool,
 ) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     if !file.metadata()?.is_file() {
@@ -40,10 +44,7 @@ pub(super) fn verify_file(
     let mut hash = Sha256::new();
     let mut bytes = [0; 65536];
     loop {
-        check(deadline)?;
-        if stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("supervisor stopping".into());
-        }
+        check(deadline, stopped)?;
         let count = file.read(&mut bytes)?;
         if count == 0 {
             break;
@@ -121,19 +122,13 @@ pub(super) fn prepare(
     output: &Path,
     deadline: Instant,
 ) -> Result<PreparedBinary> {
-    prepare_cancellable(
-        root,
-        request,
-        output,
-        deadline,
-        &std::sync::atomic::AtomicBool::new(false),
-    )
+    prepare_cancellable(root, request, output, deadline, &AtomicBool::new(false))
 }
 
 pub(super) fn copy_owned(
     source: &mut File,
     output: &Path,
-    stopped: &std::sync::atomic::AtomicBool,
+    stopped: &AtomicBool,
     deadline: Instant,
 ) -> Result<()> {
     use std::io::{Seek, SeekFrom};
@@ -144,50 +139,50 @@ pub(super) fn copy_owned(
     let temporary = output.with_extension("partial");
     let mut target = OpenOptions::new()
         .create_new(true)
+        .read(true)
         .write(true)
-        .mode(0o700)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temporary)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 128 * 1024];
-    loop {
-        check(deadline)?;
-        if stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("supervisor stopping".into());
+    let result = (|| -> Result<()> {
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 128 * 1024];
+        loop {
+            check(deadline, stopped)?;
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            target.write_all(&buffer[..count])?;
         }
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
+        let expected = hash.finalize();
+        target.seek(SeekFrom::Start(0))?;
+        let mut hash = Sha256::new();
+        loop {
+            check(deadline, stopped)?;
+            let count = target.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
         }
-        hash.update(&buffer[..count]);
-        target.write_all(&buffer[..count])?;
-    }
-    target.sync_all()?;
-    drop(target);
-    let expected = hash.finalize();
-    let mut copy = File::open(&temporary)?;
-    let mut hash = Sha256::new();
-    loop {
-        check(deadline)?;
-        if stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("supervisor stopping".into());
+        if hash.finalize() != expected {
+            return Err("owned executable copy mismatch".into());
         }
-        let count = copy.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
+        check(deadline, stopped)?;
+        target.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        target.sync_all()?;
+        drop(target);
+        check(deadline, stopped)?;
+        std::fs::rename(&temporary, output)?;
+        File::open(output.parent().ok_or("missing parent")?)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    if hash.finalize() != expected {
-        return Err("owned executable copy mismatch".into());
-    }
-    check(deadline)?;
-    if stopped.load(std::sync::atomic::Ordering::Acquire) {
-        return Err("supervisor stopping".into());
-    }
-    std::fs::rename(&temporary, output)?;
-    File::open(output.parent().ok_or("missing parent")?)?.sync_all()?;
-    Ok(())
+    result
 }
 
 pub(super) fn prepare_cancellable(
@@ -195,7 +190,7 @@ pub(super) fn prepare_cancellable(
     request: &Submission,
     output: &Path,
     deadline: Instant,
-    stopped: &std::sync::atomic::AtomicBool,
+    stopped: &AtomicBool,
 ) -> Result<PreparedBinary> {
     request.validate()?;
     let root = OpenOptions::new()
@@ -227,40 +222,14 @@ pub(crate) struct ExpectedBinary<'a> {
     pub(crate) sha256: Option<&'a str>,
 }
 
-pub(crate) fn prepare_package(
-    package: &File,
-    expected: ExpectedBinary<'_>,
-    output: &Path,
-    deadline: Instant,
-    stopped: &std::sync::atomic::AtomicBool,
-) -> Result<PreparedBinary> {
-    let ExpectedBinary {
-        role,
-        commit: expected_commit,
-        sha256: expected_sha256,
-    } = expected;
-    let check = |deadline| -> Result<()> {
-        if stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("supervisor stopping".into());
-        }
-        check(deadline)
-    };
-    check(deadline)?;
-    let mut manifest_bytes = Vec::new();
-    let mut manifest_file = child(package, "manifest.json", false)?.take(4 * 1024 * 1024 + 1);
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        check(deadline)?;
-        let count = manifest_file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        manifest_bytes.extend_from_slice(&buffer[..count]);
-    }
-    if manifest_bytes.len() > 4 * 1024 * 1024 {
+const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
+const MAX_BINARY: u64 = 512 * 1024 * 1024;
+
+fn parse_manifest(bytes: &[u8], expected: &ExpectedBinary<'_>) -> Result<PreparedBinary> {
+    if u64::try_from(bytes.len())? > MAX_MANIFEST {
         return Err("manifest too large".into());
     }
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
+    let manifest: Manifest = serde_json::from_slice(bytes)?;
     if manifest.files.iter().any(|(name, digest)| {
         let path = Path::new(name);
         path.is_absolute()
@@ -276,139 +245,114 @@ pub(crate) fn prepare_package(
     }) {
         return Err("invalid manifest file entry".into());
     }
-    let relative = format!("bin/{}", role.binary());
     let digest = manifest
         .files
-        .get(&relative)
+        .get(&format!("bin/{}", expected.role.binary()))
         .ok_or("missing fixed binary")?;
     if manifest.schema_version != 1
         || !super::hex(&manifest.commit, 40)
-        || manifest.commit != expected_commit
+        || manifest.commit != expected.commit
         || manifest.target != host_target()?
-        || expected_sha256.is_some_and(|expected| expected != digest)
+        || expected.sha256.is_some_and(|expected| expected != digest)
     {
         return Err("manifest identity or binary digest mismatch".into());
     }
-    use std::os::fd::AsRawFd;
-    let mut seen = std::collections::BTreeSet::new();
-    let mut pending = vec![String::new()];
+    Ok(PreparedBinary {
+        commit: manifest.commit,
+        sha256: digest.clone(),
+    })
+}
+
+// Checks cancellation between bounded decoder reads, including skipped payloads.
+struct BudgetedRead<'a, R> {
+    inner: R,
+    deadline: Instant,
+    stopped: &'a AtomicBool,
+}
+
+impl<R: Read> Read for BudgetedRead<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        check(self.deadline, self.stopped).map_err(std::io::Error::other)?;
+        let length = bytes.len().min(64 * 1024);
+        self.inner.read(&mut bytes[..length])
+    }
+}
+
+fn copy_binary(
+    source: &mut impl Read,
+    target: &mut File,
+    deadline: Instant,
+    stopped: &AtomicBool,
+) -> Result<String> {
+    let mut hash = Sha256::new();
     let mut buffer = [0u8; 128 * 1024];
-    // Queue names, not open directory handles or recursive stack frames. Reopen
-    // every component from the pinned package with NOFOLLOW on each traversal.
-    while let Some(prefix) = pending.pop() {
-        check(deadline)?;
-        let mut directory = package.try_clone()?;
-        if !prefix.is_empty() {
-            for component in prefix.split('/') {
-                check(deadline)?;
-                directory = child(&directory, component, true)?;
-            }
+    let mut size = 0u64;
+    loop {
+        check(deadline, stopped)?;
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
         }
-        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
-            check(deadline)?;
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "non-UTF8 artifact path")?;
-            if name.is_empty() || name.contains(['/', '\\']) || matches!(name.as_str(), "." | "..")
-            {
-                return Err("invalid artifact path component".into());
-            }
-            let relative = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                pending.try_reserve(1)?;
-                pending.push(relative);
-            } else {
-                let mut file = child(&directory, &name, false)?;
-                if relative == "manifest.json" {
-                    continue;
-                }
-                let expected = manifest
-                    .files
-                    .get(&relative)
-                    .ok_or("unlisted artifact file")?;
-                let mut hash = Sha256::new();
-                loop {
-                    check(deadline)?;
-                    let count = file.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..count]);
-                }
-                if format!("{:x}", hash.finalize()) != *expected {
-                    return Err("manifest file digest mismatch".into());
-                }
-                seen.insert(relative);
-            }
-        }
+        size = size
+            .checked_add(u64::try_from(count)?)
+            .filter(|size| *size <= MAX_BINARY)
+            .ok_or("executable exceeds limit")?;
+        hash.update(&buffer[..count]);
+        target.write_all(&buffer[..count])?;
     }
-    if seen.len() != manifest.files.len() {
-        return Err("manifest file set mismatch".into());
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(crate) fn prepare_package(
+    package: &File,
+    expected: ExpectedBinary<'_>,
+    output: &Path,
+    deadline: Instant,
+    stopped: &AtomicBool,
+) -> Result<PreparedBinary> {
+    check(deadline, stopped)?;
+    let mut manifest_bytes = Vec::new();
+    BudgetedRead {
+        inner: child(package, "manifest.json", false)?.take(MAX_MANIFEST + 1),
+        deadline,
+        stopped,
     }
+    .read_to_end(&mut manifest_bytes)?;
+    let prepared = parse_manifest(&manifest_bytes, &expected)?;
     let bin = child(package, "bin", true)?;
-    let mut source = child(&bin, role.binary(), false)?;
+    let mut source = child(&bin, expected.role.binary(), false)?;
+    if source.metadata()?.len() > MAX_BINARY {
+        return Err("executable exceeds limit".into());
+    }
     let temporary = output.with_extension("partial");
+    let mut target = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    let mut published = false;
     let result = (|| -> Result<()> {
-        let mut target = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        let mut hash = Sha256::new();
-        let mut buffer = [0u8; 128 * 1024];
-        loop {
-            check(deadline)?;
-            let count = source.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-            target.write_all(&buffer[..count])?;
-        }
-        if format!("{:x}", hash.finalize()) != *digest {
+        if copy_binary(&mut source, &mut target, deadline, stopped)? != prepared.sha256 {
             return Err("artifact digest mismatch".into());
         }
+        target.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         target.sync_all()?;
         drop(target);
-        let mut copy = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        let mut hash = Sha256::new();
-        loop {
-            check(deadline)?;
-            let count = copy.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-        }
-        if format!("{:x}", hash.finalize()) != *digest {
-            return Err("prepared copy digest mismatch".into());
-        }
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
-        check(deadline)?;
+        check(deadline, stopped)?;
         std::fs::rename(&temporary, output)?;
+        published = true;
         File::open(output.parent().ok_or("missing artifact parent")?)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
-        let _ = std::fs::remove_file(output);
+        if published {
+            let _ = std::fs::remove_file(output);
+        }
     }
     result?;
-    Ok(PreparedBinary {
-        commit: manifest.commit,
-        sha256: digest.clone(),
-    })
+    Ok(prepared)
 }
 
 #[cfg(test)]
@@ -426,7 +370,7 @@ mod tests {
         std::fs::remove_file(&binary).unwrap();
         std::fs::write(&binary, b"replacement at same commit path").unwrap();
         let output = root.path().join("rollback");
-        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let stopped = AtomicBool::new(false);
         copy_owned(
             &mut pinned,
             &output,
@@ -435,7 +379,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"running old inode");
-        stopped.store(true, std::sync::atomic::Ordering::Release);
+        stopped.store(true, Ordering::Release);
         let cancelled = root.path().join("cancelled");
         assert!(copy_owned(
             &mut pinned,
@@ -445,6 +389,35 @@ mod tests {
         )
         .is_err());
         assert!(!cancelled.exists());
+        assert!(!cancelled.with_extension("partial").exists());
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let temporary = cancelled.with_extension("partial");
+        std::fs::write(&temporary, b"another owner's partial").unwrap();
+        assert!(copy_owned(
+            &mut pinned,
+            &cancelled,
+            &stopped,
+            Instant::now() + Duration::from_secs(900)
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&temporary).unwrap(),
+            b"another owner's partial"
+        );
+        let failed = root.path().join("failed");
+        let mut unreadable = OpenOptions::new().write(true).open(&binary).unwrap();
+        assert!(copy_owned(
+            &mut unreadable,
+            &failed,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(900)
+        )
+        .is_err());
+        assert!(!failed.exists());
+        assert!(!failed.with_extension("partial").exists());
     }
 
     #[test]
@@ -485,6 +458,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        let cancelled = root.path().join("cancelled");
+        assert_eq!(
+            prepare_cancellable(
+                root.path(),
+                &request,
+                &cancelled,
+                Instant::now() + Duration::from_secs(900),
+                &AtomicBool::new(true)
+            )
+            .err()
+            .unwrap()
+            .to_string(),
+            "supervisor stopping"
+        );
+        assert!(!cancelled.exists());
+        assert!(!cancelled.with_extension("partial").exists());
         let mut derived = request.clone();
         derived.remote_archive = Some(super::super::RemoteArchive {
             url: "https://example.invalid/package.tar.gz".into(),
@@ -514,7 +503,7 @@ mod tests {
             },
             &wrong_identity,
             Instant::now() + Duration::from_secs(900),
-            &std::sync::atomic::AtomicBool::new(false)
+            &AtomicBool::new(false)
         )
         .is_err());
         assert!(!wrong_identity.exists());
@@ -546,6 +535,32 @@ mod tests {
             Instant::now() + Duration::from_secs(900)
         )
         .is_err());
+    }
+
+    #[test]
+    fn budgeted_reads_check_cancellation_between_bounded_chunks() {
+        struct StopAfterRead<'a>(&'a AtomicBool);
+        impl Read for StopAfterRead<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(bytes.len() <= 64 * 1024);
+                bytes.fill(0);
+                self.0.store(true, Ordering::Release);
+                Ok(bytes.len())
+            }
+        }
+        let stopped = AtomicBool::new(false);
+        let mut reader = BudgetedRead {
+            inner: StopAfterRead(&stopped),
+            deadline: Instant::now() + Duration::from_secs(900),
+            stopped: &stopped,
+        };
+        let mut bytes = [0; 128 * 1024];
+        assert_eq!(reader.read(&mut bytes).unwrap(), 64 * 1024);
+        assert!(reader
+            .read(&mut bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("supervisor stopping"));
     }
 
     #[test]
@@ -604,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn full_manifest_set_and_every_digest_are_required_before_publication() {
+    fn preparation_checks_only_the_selected_binary() {
         let root = tempfile::tempdir().unwrap();
         let package = root.path().join("a".repeat(40));
         std::fs::create_dir_all(package.join("bin")).unwrap();
@@ -630,92 +645,16 @@ mod tests {
             std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1, "commit": request.commit, "target": host_target().unwrap(), "files": files,
             })).unwrap()).unwrap();
-            assert!(prepare(
+            let output = root.path().join("output");
+            prepare(
                 root.path(),
                 &request,
-                &root.path().join("output"),
-                Instant::now() + Duration::from_secs(900)
+                &output,
+                Instant::now() + Duration::from_secs(900),
             )
-            .is_err());
-            assert!(!root.path().join("output").exists());
-        }
-    }
-
-    #[test]
-    fn deep_and_wide_packages_keep_full_manifest_validation() {
-        for deep in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let commit = "a".repeat(40);
-            let package = root.path().join(&commit);
-            std::fs::create_dir_all(package.join("bin")).unwrap();
-            std::fs::write(package.join("bin/adx-relay"), b"binary").unwrap();
-            let digest = format!("{:x}", Sha256::digest(b"binary"));
-            let mut files =
-                std::collections::BTreeMap::from([("bin/adx-relay".to_owned(), digest.clone())]);
-            let mut relative = String::new();
-            for index in 0..1024 {
-                relative = if deep {
-                    format!("{relative}d/")
-                } else {
-                    format!("d{index}/")
-                };
-                std::fs::create_dir_all(package.join(&relative)).unwrap();
-                let name = format!("{relative}payload");
-                std::fs::write(package.join(&name), b"payload").unwrap();
-                files.insert(name, format!("{:x}", Sha256::digest(b"payload")));
-            }
-            let request = Submission {
-                component_config: None,
-                task_id: "tree".into(),
-                role: crate::config::Role::Relay,
-                selection: super::super::Selection::LocalManual,
-                service_id: "relay".into(),
-                commit,
-                sha256: Some(digest),
-                remote_archive: None,
-                process: None,
-            };
-            let manifest_path = package.join("manifest.json");
-            let write_manifest = |files: &std::collections::BTreeMap<String, String>| {
-                std::fs::write(
-                    &manifest_path,
-                    serde_json::to_vec(&serde_json::json!({
-                        "schema_version": 1, "commit": request.commit,
-                        "target": host_target().unwrap(), "files": files,
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
-            };
-            write_manifest(&files);
-            let deadline = Instant::now() + Duration::from_secs(900);
-            prepare(root.path(), &request, &root.path().join("good"), deadline).unwrap();
-            for mode in ["digest", "extra", "missing", "stopped"] {
-                let mut changed = files.clone();
-                match mode {
-                    "digest" => {
-                        changed.insert(format!("{relative}payload"), "0".repeat(64));
-                    }
-                    "extra" => {
-                        changed.remove(&format!("{relative}payload"));
-                    }
-                    "missing" => {
-                        changed.insert("missing".into(), "0".repeat(64));
-                    }
-                    _ => (),
-                }
-                write_manifest(&changed);
-                let output = root.path().join(mode);
-                assert!(prepare_cancellable(
-                    root.path(),
-                    &request,
-                    &output,
-                    deadline,
-                    &std::sync::atomic::AtomicBool::new(mode == "stopped")
-                )
-                .is_err());
-                assert!(!output.exists());
-            }
+            .unwrap();
+            assert_eq!(std::fs::read(&output).unwrap(), b"binary");
+            std::fs::remove_file(output).unwrap();
         }
     }
 }

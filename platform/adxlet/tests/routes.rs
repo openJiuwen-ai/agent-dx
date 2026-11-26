@@ -220,52 +220,11 @@ async fn start<T: RelayService>(service: T) -> (Server, UdsRoutes) {
 }
 struct Handler(Arc<BindingService>);
 
-#[tokio::test]
-async fn ordinary_binding_listener_does_not_expose_candidate_switches() {
-    let bindings = service();
-    let (server, _adapter) = start(Handler(bindings.clone())).await;
-    let path = server.directory.path().join("route.sock");
-    let channel = tonic::transport::Endpoint::from_static("http://relay")
-        .connect_with_connector(tower::service_fn(move |_| {
-            let path = path.clone();
-            async move {
-                tokio::net::UnixStream::connect(path)
-                    .await
-                    .map(hyper_util::rt::TokioIo::new)
-            }
-        }))
-        .await
-        .unwrap();
-    let mut client = pb::relay_upgrade_service_client::RelayUpgradeServiceClient::new(channel);
-    let state = bindings.inspect().await;
-    assert_eq!(
-        client
-            .install_candidate_bindings(pb::BindingSnapshot {
-                proxy_session_id: state.proxy_session_id.clone(),
-                sync_epoch: state.sync_epoch,
-                bindings: vec![],
-            })
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
-    );
-    assert_eq!(
-        client
-            .open_candidate_bindings(state.clone())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
-    );
-    assert_eq!(bindings.inspect().await, state);
-}
-
 #[derive(Clone)]
 struct CandidateFaults {
     service: Arc<BindingService>,
-    installs: Arc<std::sync::atomic::AtomicUsize>,
-    opens: Arc<std::sync::atomic::AtomicUsize>,
+    takeovers: Arc<std::sync::atomic::AtomicUsize>,
+    replaces: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -305,19 +264,22 @@ impl RelayService for CandidateFaults {
         &self,
         request: Request<pb::BindingSnapshot>,
     ) -> Result<Response<pb::BindingState>, Status> {
-        if self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+        let attempt = self
+            .replaces
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == 0 {
             return Err(Status::unavailable("first full snapshot failed"));
         }
-        self.service.replace_bindings(request).await
+        let accepted = self.service.replace_bindings(request).await?;
+        if attempt == 1 {
+            return Err(Status::unavailable("lost Replace reply"));
+        }
+        Ok(accepted)
     }
     async fn update_binding(
         &self,
         r: Request<UpdateBindingRequest>,
     ) -> Result<Response<UpdateBindingResponse>, Status> {
-        assert!(
-            !self.service.inspect().await.ready,
-            "candidate opened before incremental ACK"
-        );
         self.service.update_binding(r).await
     }
 }
@@ -330,7 +292,7 @@ impl pb::relay_upgrade_service_server::RelayUpgradeService for CandidateFaults {
     ) -> Result<Response<pb::BindingState>, Status> {
         let accepted = self.service.takeover(r.into_inner()).await?;
         if self
-            .installs
+            .takeovers
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             == 0
         {
@@ -338,67 +300,20 @@ impl pb::relay_upgrade_service_server::RelayUpgradeService for CandidateFaults {
         }
         Ok(Response::new(accepted))
     }
-    async fn begin(
+    async fn begin_drain(
         &self,
         _: Request<pb::RelayUpgradeRequest>,
     ) -> Result<Response<pb::RelayUpgradeState>, Status> {
-        panic!("candidate must not receive old-generation drain Begin")
-    }
-    async fn query(
-        &self,
-        _: Request<pb::RelayUpgradeRequest>,
-    ) -> Result<Response<pb::RelayUpgradeState>, Status> {
-        panic!("candidate must not supply old-generation release evidence")
-    }
-    async fn install_candidate_bindings(
-        &self,
-        r: Request<pb::BindingSnapshot>,
-    ) -> Result<Response<pb::BindingState>, Status> {
-        let result = Response::new(self.service.install_candidate(r.into_inner()).await?);
-        assert!(!result.get_ref().ready);
-        if self
-            .installs
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            return Err(Status::unavailable("lost installation reply"));
-        }
-        Ok(result)
-    }
-    async fn open_candidate_bindings(
-        &self,
-        r: Request<pb::BindingState>,
-    ) -> Result<Response<pb::BindingState>, Status> {
-        let state = self.service.inspect().await;
-        let mut stale = active(42, 2);
-        stale.proxy_session_id = state.proxy_session_id;
-        stale.sync_epoch = state.sync_epoch;
-        // Retirement must already have been acknowledged before the first Open.
-        assert_eq!(
-            self.service.apply(stale).await.unwrap_err().code(),
-            tonic::Code::FailedPrecondition
-        );
-        let result = Response::new(self.service.open_candidate(r.into_inner()).await?);
-        if self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            return Err(Status::unavailable("lost open reply"));
-        }
-        Ok(result)
+        panic!("candidate must not receive old-generation BeginDrain")
     }
 }
-
-struct Released(pb::RelayUpgradeState, Arc<BindingService>);
 
 #[tokio::test]
 async fn preserving_client_retries_lost_reply_without_destructive_begin() {
-    preserving_client_retries(false).await;
+    preserving_client_retries().await;
 }
 
-#[tokio::test]
-async fn preserving_client_can_take_over_opened_relay_candidate() {
-    preserving_client_retries(true).await;
-}
-
-async fn preserving_client_retries(upgraded_relay: bool) {
+async fn preserving_client_retries() {
     let bindings = service();
     let mut old = bindings.inspect().await;
     old.controller_session_id = "old-route-owner".into();
@@ -413,22 +328,14 @@ async fn preserving_client_retries(upgraded_relay: bool) {
         sync_epoch: old.sync_epoch,
         bindings: vec![binding.clone()],
     };
-    if upgraded_relay {
-        let installed = bindings.install_candidate(snapshot).await.unwrap();
-        assert!(!installed.ready);
-        let opened = bindings.open_candidate(installed.clone()).await.unwrap();
-        assert!(opened.ready);
-        assert_eq!(bindings.open_candidate(installed).await.unwrap(), opened);
-    } else {
-        bindings.replace(snapshot).await.unwrap();
-    }
+    bindings.replace(snapshot).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("preserving.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let faults = CandidateFaults {
         service: bindings.clone(),
-        installs: Arc::default(),
-        opens: Arc::default(),
+        takeovers: Arc::default(),
+        replaces: Arc::default(),
     };
     let handler = Handler(bindings.clone());
     let task = tokio::spawn(async move {
@@ -472,8 +379,8 @@ async fn preserving_client_retries(upgraded_relay: bool) {
     let listener = UnixListener::bind(&path).unwrap();
     let handler = CandidateFaults {
         service: replacement.clone(),
-        installs: Arc::default(),
-        opens: Arc::default(),
+        takeovers: Arc::default(),
+        replaces: Arc::default(),
     };
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -488,76 +395,25 @@ async fn preserving_client_retries(upgraded_relay: bool) {
     };
     assert!(routes.ensure_synced().await.is_err());
     assert!(!replacement.inspect().await.ready);
+    assert!(routes.ensure_synced().await.is_err()); // Applied reply lost.
     routes.ensure_synced().await.unwrap();
     assert!(replacement.inspect().await.ready);
     routes.begin_reconcile().await.unwrap();
     routes.finish_reconcile().await.unwrap();
 }
 
-#[tonic::async_trait]
-impl pb::relay_upgrade_service_server::RelayUpgradeService for Released {
-    async fn takeover_bindings(
-        &self,
-        _: Request<pb::BindingTakeoverRequest>,
-    ) -> Result<Response<pb::BindingState>, Status> {
-        Err(Status::unimplemented("read-only release fixture"))
-    }
-    async fn install_candidate_bindings(
-        &self,
-        r: Request<pb::BindingSnapshot>,
-    ) -> Result<Response<pb::BindingState>, Status> {
-        Ok(Response::new(
-            self.1.install_candidate(r.into_inner()).await?,
-        ))
-    }
-    async fn open_candidate_bindings(
-        &self,
-        r: Request<pb::BindingState>,
-    ) -> Result<Response<pb::BindingState>, Status> {
-        Ok(Response::new(self.1.open_candidate(r.into_inner()).await?))
-    }
-    async fn begin(
-        &self,
-        _: Request<pb::RelayUpgradeRequest>,
-    ) -> Result<Response<pb::RelayUpgradeState>, Status> {
-        Err(Status::unimplemented("read-only release fixture"))
-    }
-    async fn query(
-        &self,
-        r: Request<pb::RelayUpgradeRequest>,
-    ) -> Result<Response<pb::RelayUpgradeState>, Status> {
-        assert_eq!(r.get_ref().task_id, self.0.task_id);
-        assert_eq!(r.get_ref().proxy_session_id, self.0.proxy_session_id);
-        Ok(Response::new(self.0.clone()))
-    }
-}
-
 #[tokio::test]
-async fn handoff_lost_install_then_retirement_stays_closed_until_synced_and_recovers_lost_open() {
+async fn handoff_replays_frozen_replace_then_converges_ready_candidate_with_latest_delta() {
     let directory = tempfile::tempdir().unwrap();
     let old_path = directory.path().join("old.sock");
     let candidate_path = directory.path().join("candidate.sock");
     let old = service();
     let candidate = service();
-    let old_session = old.inspect().await.proxy_session_id;
     let old_listener = UnixListener::bind(&old_path).unwrap();
     let old_handler = old.clone();
     let old_task = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(RelayServiceServer::new(Handler(old_handler.clone())))
-            .add_service(
-                pb::relay_upgrade_service_server::RelayUpgradeServiceServer::new(Released(
-                    pb::RelayUpgradeState {
-                        task_id: "handoff".into(),
-                        proxy_session_id: old_session,
-                        phase: "draining".into(),
-                        listeners_released: true,
-                        drain_deadline_unix_ms: 1,
-                    },
-                    old_handler,
-                ))
-                .max_decoding_message_size(64 * 1024 * 1024),
-            )
             .serve_with_incoming(UnixListenerStream::new(old_listener))
             .await
             .unwrap();
@@ -566,13 +422,13 @@ async fn handoff_lost_install_then_retirement_stays_closed_until_synced_and_reco
     adapter.begin_reconcile().await.unwrap();
     adapter.activate(&record()).await.unwrap();
     adapter.finish_reconcile().await.unwrap();
-    let installs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let takeovers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replaces = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = UnixListener::bind(&candidate_path).unwrap();
     let faults = CandidateFaults {
         service: candidate.clone(),
-        installs: installs.clone(),
-        opens: opens.clone(),
+        takeovers: takeovers.clone(),
+        replaces: replaces.clone(),
     };
     let candidate_task = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -599,20 +455,19 @@ async fn handoff_lost_install_then_retirement_stays_closed_until_synced_and_reco
     let mut reservation = request.clone();
     reservation.candidate_proxy_session_id.clear();
     adapter.reserve_handoff(reservation.clone()).await.unwrap();
-    adapter
-        .prove_handoff(adx_protocol::relay::RelayHandoffProof {
-            identity: Some(reservation),
+    let request = adx_protocol::relay::RelaySwitchRequest {
+        proof: Some(adx_protocol::relay::RelayHandoffProof {
+            identity: Some(request),
             old_pid: 42,
-            begin_accepted: true,
             listeners_released: true,
             old_exited: false,
-        })
-        .await
-        .unwrap();
+        }),
+        replacement: None,
+    };
     assert!(adapter.switch_handoff(request.clone()).await.is_err());
     assert!(!candidate.inspect().await.ready);
     assert!(adapter.retire(&record()).await.is_err()); // Canonical + old ACK retained.
-    assert!(adapter.switch_handoff(request.clone()).await.is_err()); // Open applied, reply lost.
+    assert!(adapter.switch_handoff(request.clone()).await.is_err()); // Replace applied, reply lost.
     assert!(candidate.inspect().await.ready);
     let opened = candidate.inspect().await;
     assert_eq!(
@@ -620,8 +475,15 @@ async fn handoff_lost_install_then_retirement_stays_closed_until_synced_and_reco
         "active_fenced"
     );
     assert_eq!(candidate.inspect().await, opened);
-    assert_eq!(installs.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(replaces.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let current = candidate.inspect().await;
+    let mut stale = active(42, 2);
+    stale.proxy_session_id = current.proxy_session_id;
+    stale.sync_epoch = current.sync_epoch;
+    assert_eq!(
+        candidate.apply(stale).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
     old_task.abort();
     candidate_task.abort();
 }

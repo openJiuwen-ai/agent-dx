@@ -288,37 +288,9 @@ impl pb::adxlet_process_service_server::AdxletProcessService for ProcessAdmin {
             .map_err(adx_protocol::status)?
             .is_none()
         {
-            if request.get_ref().old_node_session != self.manager.services.upgrade.session() {
-                return Err(tonic::Status::failed_precondition(
-                    "old Node session changed",
-                ));
-            }
-            self.routes
-                .process_preflight(&request.get_ref().old_relay_session)
-                .await
-                .map_err(adx_protocol::status)?;
-            let inspection = self
-                .manager
-                .inspect_upgrade_environment(None)
-                .await
-                .map_err(adx_protocol::status)?;
-            self.manager
-                .process_preflight(
-                    adx_protocol::control::ProcessPreflightRequest {
-                        rollout_id: request.get_ref().rollout_id.clone(),
-                        local_task_id: request.get_ref().local_task_id.clone(),
-                        epoch: request.get_ref().epoch,
-                        old_relay_session: request.get_ref().old_relay_session.clone(),
-                    },
-                    &inspection,
-                )
-                .await
-                .map_err(adx_protocol::status)?;
-            return Ok(tonic::Response::new(pb::AdxletProcessState {
-                identity: Some(request.into_inner()),
-                phase: "preflight".into(),
-                node_session: self.manager.services.upgrade.session().into(),
-            }));
+            return Err(tonic::Status::failed_precondition(
+                "process task has not begun",
+            ));
         }
         let state = self
             .manager
@@ -350,17 +322,6 @@ fn authorize_parent<T>(
 }
 #[tonic::async_trait]
 impl pb::relay_handoff_service_server::RelayHandoffService for RelayHandoff {
-    async fn replace_failed_candidate(
-        &self,
-        request: tonic::Request<pb::RelayReplacementRequest>,
-    ) -> std::result::Result<tonic::Response<pb::RelayHandoffState>, tonic::Status> {
-        authorize_parent(self.parent_pid, &request).map_err(tonic::Status::permission_denied)?;
-        self.routes
-            .replace_failed_candidate(request.into_inner())
-            .await
-            .map(tonic::Response::new)
-            .map_err(adx_protocol::status)
-    }
     async fn cancel(
         &self,
         request: tonic::Request<pb::RelayHandoffRequest>,
@@ -383,17 +344,6 @@ impl pb::relay_handoff_service_server::RelayHandoffService for RelayHandoff {
             .map(tonic::Response::new)
             .map_err(adx_protocol::status)
     }
-    async fn prove(
-        &self,
-        request: tonic::Request<pb::RelayHandoffProof>,
-    ) -> std::result::Result<tonic::Response<pb::RelayHandoffState>, tonic::Status> {
-        authorize_parent(self.parent_pid, &request).map_err(tonic::Status::permission_denied)?;
-        self.routes
-            .prove_handoff(request.into_inner())
-            .await
-            .map(tonic::Response::new)
-            .map_err(adx_protocol::status)
-    }
     async fn finish(
         &self,
         request: tonic::Request<pb::RelayHandoffProof>,
@@ -407,7 +357,7 @@ impl pb::relay_handoff_service_server::RelayHandoffService for RelayHandoff {
     }
     async fn switch(
         &self,
-        request: tonic::Request<pb::RelayHandoffRequest>,
+        request: tonic::Request<pb::RelaySwitchRequest>,
     ) -> std::result::Result<tonic::Response<pb::RelayHandoffState>, tonic::Status> {
         authorize_parent(self.parent_pid, &request).map_err(tonic::Status::permission_denied)?;
         self.routes

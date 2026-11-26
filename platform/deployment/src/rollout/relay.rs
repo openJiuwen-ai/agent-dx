@@ -1,3 +1,6 @@
+use super::actor::{
+    command, inspect_candidate, Command, CommitStage, Launch, Operation, Owner, Reply,
+};
 use crate::Result;
 use adx_protocol::relay as pb;
 use serde::{Deserialize, Serialize};
@@ -9,12 +12,35 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tonic::transport::Channel;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayStage {
+    Upgrading,
+    RollingBack,
+    Completed,
+    RolledBack,
+    FailedRetained,
+    CancelledBeforeBegin,
+}
+
+impl RelayStage {
+    pub(super) fn terminal_phase(self) -> Option<super::Phase> {
+        match self {
+            Self::Completed => Some(super::Phase::Completed),
+            Self::RolledBack | Self::FailedRetained | Self::CancelledBeforeBegin => {
+                Some(super::Phase::Failed)
+            }
+            Self::Upgrading | Self::RollingBack => None,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Execution {
-    pub phase: String,
+    pub phase: RelayStage,
     pub deadline_unix_ms: u64,
     pub old_pid: u32,
     pub old_socket: String,
@@ -25,7 +51,7 @@ pub struct Execution {
     pub candidate_session: String,
     pub admin_pid: u32,
     pub admin_socket: String,
-    pub begin_accepted: bool,
+
     pub released: bool,
     pub old_exited: bool,
     pub loss_observed: bool,
@@ -38,116 +64,6 @@ pub struct Execution {
     pub failed_observed_epoch: Option<u64>,
 }
 
-pub(crate) enum Operation {
-    RuntimeInspect,
-    Adxlet(super::adxlet::Operation),
-    Fence {
-        pid: u32,
-    },
-    Start {
-        config: crate::config::Process,
-        pid: u32,
-        binary: PathBuf,
-        directory: PathBuf,
-    },
-    Observe {
-        pid: u32,
-    },
-    Select {
-        pid: u32,
-    },
-    Confirm {
-        pid: u32,
-    },
-    Release,
-    Candidate,
-    StopFailed {
-        pid: u32,
-    },
-    RestartFailed {
-        pid: u32,
-        binary: PathBuf,
-        directory: PathBuf,
-    },
-}
-pub(crate) enum Reply {
-    NeverCreated,
-    Committed,
-    Runtime {
-        config: Box<crate::config::Process>,
-        pid: u32,
-        executable: std::fs::File,
-        admin_pid: u32,
-        admin_socket: PathBuf,
-        relay: Option<PathBuf>,
-    },
-    State {
-        exited: bool,
-        success: bool,
-        candidate_pid: Option<u32>,
-    },
-    Candidate {
-        pid: u32,
-        exited: bool,
-    },
-}
-pub(crate) struct Command {
-    pub expected_pid: Option<u32>,
-    pub service_id: String,
-    pub task_id: String,
-    pub operation: Operation,
-    pub reply: oneshot::Sender<Result<Reply>>,
-    pub expires: Instant,
-}
-pub(super) async fn command(
-    sender: &mpsc::Sender<Command>,
-    task: &super::Task,
-    operation: Operation,
-    deadline: Instant,
-) -> Result<Reply> {
-    command_with_pid(sender, task, operation, deadline, None).await
-}
-
-pub(super) async fn inspect_candidate(
-    sender: &mpsc::Sender<Command>,
-    task: &super::Task,
-    pid: u32,
-    deadline: Instant,
-) -> Result<Reply> {
-    command_with_pid(sender, task, Operation::RuntimeInspect, deadline, Some(pid)).await
-}
-
-async fn command_with_pid(
-    sender: &mpsc::Sender<Command>,
-    task: &super::Task,
-    operation: Operation,
-    deadline: Instant,
-    candidate_pid: Option<u32>,
-) -> Result<Reply> {
-    check_budget(deadline)?;
-    let (reply, result) = oneshot::channel();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        sender.send(Command {
-            expected_pid: if matches!(&operation, Operation::RuntimeInspect) {
-                candidate_pid.or(match &task.submission.selection {
-                    super::Selection::Publisher { expected } => Some(expected.pid),
-                    _ => None,
-                })
-            } else {
-                None
-            },
-            service_id: task.submission.service_id.clone(),
-            task_id: task.submission.task_id.clone(),
-            operation,
-            reply,
-            expires: deadline,
-        }),
-    )
-    .await?
-    .map_err(|_| "supervisor unavailable")?;
-    tokio::time::timeout(Duration::from_secs(2), result).await??
-}
 fn check_budget(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         return Err("stage deadline exceeded; outcome retained as unknown".into());
@@ -197,10 +113,6 @@ fn released(identity: &pb::RelayHandoffRequest, state: &pb::RelayUpgradeState) -
         && state.proxy_session_id == identity.old_proxy_session_id
         && state.listeners_released
         && state.drain_deadline_unix_ms > 0
-        && matches!(
-            state.phase.as_str(),
-            "draining" | "completed" | "forced" | "interrupted" | "failed"
-        )
 }
 
 fn unsupported_protocol(status: &tonic::Status) -> bool {
@@ -231,6 +143,65 @@ fn binding_failure(
         return Some("candidate_owner_epoch_conflict");
     }
     None
+}
+
+#[derive(Default)]
+struct CandidateBindings {
+    failure: Option<(u32, String)>,
+    observed: Option<(String, u64)>,
+}
+
+impl CandidateBindings {
+    async fn read(
+        &mut self,
+        identity: &pb::RelayHandoffRequest,
+        pid: u32,
+        deadline: Instant,
+        rolling_back: bool,
+        pre_switch: bool,
+    ) -> Result<Option<pb::BindingState>> {
+        // A None result retries the whole loop, including executable verification.
+        let retry_at = (Instant::now() + Duration::from_millis(100)).min(deadline);
+        let Ok(channel) = channel(Path::new(&identity.candidate_socket), pid).await else {
+            tokio::time::sleep_until(retry_at.into()).await;
+            return Ok(None);
+        };
+        let mut candidate = pb::relay_service_client::RelayServiceClient::new(channel);
+        let state = match candidate
+            .get_binding_state(stage_request(pb::GetBindingStateRequest {}, deadline)?)
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                if pre_switch && !rolling_back && unsupported_protocol(&status) {
+                    self.failure = Some((pid, "binding_protocol_unsupported".into()));
+                }
+                tokio::time::sleep_until(retry_at.into()).await;
+                return Ok(None);
+            }
+        };
+        let reason = binding_failure(identity, &state).or_else(|| {
+            (pre_switch && identity.candidate_proxy_session_id.is_empty() && state.sync_epoch != 0)
+                .then_some(if rolling_back {
+                    "rollback candidate not fresh"
+                } else {
+                    "candidate_not_fresh"
+                })
+        });
+        if let Some(reason) = reason {
+            if rolling_back {
+                return Err(reason.into());
+            }
+            self.failure = Some((pid, reason.into()));
+            self.observed = Some((
+                state.proxy_session_id.chars().take(128).collect(),
+                state.sync_epoch,
+            ));
+            tokio::time::sleep_until(retry_at.into()).await;
+            return Ok(None);
+        }
+        Ok(Some(state))
+    }
 }
 
 pub(super) async fn execute(
@@ -287,7 +258,7 @@ pub(super) async fn execute(
         {
             task.phase = super::Phase::Failed;
             if let Some(execution) = task.execution.as_mut() {
-                execution.phase = "cancelled_before_begin".into();
+                execution.phase = RelayStage::CancelledBeforeBegin;
             }
             super::store(directory, task)?;
         }
@@ -469,7 +440,7 @@ async fn execute_inner(
     };
     // Readiness reservation must precede any irreversible old-generation command.
     task.execution = Some(Execution {
-        phase: "reserving".into(),
+        phase: RelayStage::Upgrading,
         deadline_unix_ms: task.deadline_unix_ms,
         old_pid: pid,
         old_socket: identity.old_socket.clone(),
@@ -480,7 +451,7 @@ async fn execute_inner(
         candidate_session: String::new(),
         admin_pid,
         admin_socket: admin_socket.to_string_lossy().into_owned(),
-        begin_accepted: false,
+
         released: false,
         old_exited: false,
         loss_observed: false,
@@ -510,7 +481,7 @@ async fn execute_inner(
                     tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
                 ) =>
             {
-                return Err(status.into())
+                return Err(status.into());
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
@@ -525,59 +496,93 @@ async fn execute_inner(
     .ok_or("clock overflow")?;
     task.phase = super::Phase::Running;
     let execution = task.execution.as_mut().ok_or("missing execution")?;
-    execution.phase = "reserved".into();
     execution.deadline_unix_ms = deadline_unix_ms;
     super::store(directory, task)?;
     if stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
-        return Err("execution budget exhausted before Begin".into());
+        return Err("execution budget exhausted before BeginDrain".into());
     }
-    command(sender, task, Operation::Fence { pid }, deadline).await?;
-    task.execution.as_mut().ok_or("missing execution")?.phase = "begin_unknown".into();
-    super::store(directory, task)?;
+    command(
+        sender,
+        task,
+        Operation::Fence {
+            pid,
+            owner: Owner::Relay,
+        },
+        deadline,
+    )
+    .await?;
     let mut upgrade = pb::relay_upgrade_service_client::RelayUpgradeServiceClient::new(old_channel);
     let upgrade_request = pb::RelayUpgradeRequest {
         task_id: identity.task_id.clone(),
         proxy_session_id: identity.old_proxy_session_id.clone(),
     };
-    let mut started = false;
+    let target_attempt = candidate_socket.to_string_lossy().into_owned();
+    let original_attempt = rollback_socket.to_string_lossy().into_owned();
     let mut rolling_back = false;
     let mut replacement_request = None;
-    let mut confirmed_failure: Option<(u32, String)> = None;
-    let mut failed_observation: Option<(String, u64)> = None;
+    let mut candidate_bindings = CandidateBindings::default();
     loop {
         if stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err("execution stopped or deadline exceeded; generations retained".into());
         }
-        let Ok(observation) = command(sender, task, Operation::Observe { pid }, deadline).await
+        let attempt = if rolling_back && replacement_request.is_none() {
+            &original_attempt
+        } else {
+            &target_attempt
+        };
+        let candidate_receipt = command(
+            sender,
+            task,
+            Operation::Receipt {
+                owner: Owner::Relay,
+                old_pid: pid,
+                attempt: attempt.clone(),
+                pid: None,
+            },
+            deadline,
+        )
+        .await;
+        if matches!(candidate_receipt, Ok(Reply::Committed)) {
+            return record_selection(task, directory, rolling_back);
+        }
+        let (candidate_pid, candidate_exited) = match candidate_receipt {
+            Ok(Reply::Candidate { pid, exited }) => (Some(pid), exited),
+            Ok(Reply::NeverCreated) => {
+                return Err("candidate Child never created; generations retained".into());
+            }
+            _ => (None, false),
+        };
+        let Ok(observation) = command(
+            sender,
+            task,
+            Operation::Observe {
+                pid,
+                owner: Owner::Relay,
+            },
+            deadline,
+        )
+        .await
         else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        let (exited, success, candidate_pid) = match observation {
+        let (exited, success) = match observation {
             Reply::State {
-                exited,
-                success,
-                candidate_pid,
-            } => (exited, success, candidate_pid),
+                exited, success, ..
+            } => (exited, success),
             _ => return Err("invalid Child observation".into()),
         };
         let before = serde_json::to_vec(&task.execution)?;
         let execution = task.execution.as_mut().ok_or("missing execution")?;
-        if exited && (execution.begin_accepted || execution.released) {
+        if exited {
             execution.old_exited = true;
             execution.loss_observed |= !success;
         }
         if !exited {
-            let result = if execution.begin_accepted {
-                upgrade
-                    .query(stage_request(upgrade_request.clone(), deadline)?)
-                    .await
-            } else {
-                *begin_sent = true;
-                upgrade
-                    .begin(stage_request(upgrade_request.clone(), deadline)?)
-                    .await
-            };
+            *begin_sent = true;
+            let result = upgrade
+                .begin_drain(stage_request(upgrade_request.clone(), deadline)?)
+                .await;
             if let Ok(response) = result {
                 let state = response.into_inner();
                 if state.task_id != identity.task_id
@@ -585,28 +590,18 @@ async fn execute_inner(
                 {
                     return Err("old generation identity mismatch".into());
                 }
-                if matches!(state.phase.as_str(), "forced" | "interrupted" | "failed") {
-                    execution.loss_observed = true;
-                }
-                if !matches!(
-                    state.phase.as_str(),
-                    "accepted" | "draining" | "completed" | "forced" | "interrupted" | "failed"
-                ) {
-                    return Err("unknown old generation phase".into());
-                }
-                execution.begin_accepted = true;
                 execution.released |= released(&identity, &state);
             }
         }
         if serde_json::to_vec(&task.execution)? != before {
             super::store(directory, task)?;
         }
-        if started && !rolling_back {
-            if let Ok(Reply::Candidate { pid, exited }) =
-                command(sender, task, Operation::Candidate, deadline).await
-            {
+        if !rolling_back {
+            if let Some(pid) = candidate_pid {
+                let exited = candidate_exited;
                 if exited
-                    || confirmed_failure
+                    || candidate_bindings
+                        .failure
                         .as_ref()
                         .is_some_and(|(failed, _)| *failed == pid)
                 {
@@ -625,23 +620,19 @@ async fn execute_inner(
                     .checked_add(600_000)
                     .ok_or("clock overflow")?;
                     let execution = task.execution.as_mut().ok_or("missing execution")?;
-                    execution.phase = if exited {
-                        "rollback_fencing"
-                    } else {
-                        "rollback_stopping"
-                    }
-                    .into();
+                    execution.phase = RelayStage::RollingBack;
                     execution.rollback_deadline_unix_ms = Some(rollback_unix);
                     execution.failed_candidate_pid = Some(pid);
                     execution.failed_candidate_session =
                         identity.candidate_proxy_session_id.clone();
                     execution.failed_candidate_socket = identity.candidate_socket.clone();
                     execution.loss_observed = true;
-                    execution.failure_reason = confirmed_failure
+                    execution.failure_reason = candidate_bindings
+                        .failure
                         .as_ref()
                         .map(|(_, reason)| reason.clone())
                         .unwrap_or_else(|| "candidate_reaped".into());
-                    if let Some((session, epoch)) = failed_observation.as_ref() {
+                    if let Some((session, epoch)) = candidate_bindings.observed.as_ref() {
                         execution.failed_observed_session = session.clone();
                         execution.failed_observed_epoch = Some(*epoch);
                     }
@@ -654,8 +645,7 @@ async fn execute_inner(
                         .ok_or("missing generation parent")?;
                     super::private_directory(replacement_directory)?;
                     check_budget(deadline)?;
-                    replacement_request = Some(pb::RelayReplacementRequest {
-                        identity: Some(identity.clone()),
+                    replacement_request = Some(pb::RelayReplacement {
                         failed_pid: pid,
                         failed_exited: true,
                         replacement_socket: replacement_socket.to_string_lossy().into_owned(),
@@ -665,33 +655,67 @@ async fn execute_inner(
             }
         }
         if let Some(replacement) = replacement_request.as_ref() {
-            // Once durably fenced, the failed generation's exit proof is fixed.
-            // Restart may already have applied despite a lost actor reply.
-            if task
-                .execution
-                .as_ref()
-                .is_some_and(|execution| execution.phase == "rollback_stopping")
-            {
-                match command(sender, task, Operation::Candidate, deadline).await {
-                    Ok(Reply::Candidate { pid, exited }) if pid == replacement.failed_pid => {
-                        if !exited {
-                            let _ = command(sender, task, Operation::StopFailed { pid }, deadline)
-                                .await;
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
-                        }
-                    }
+            let original_receipt = command(
+                sender,
+                task,
+                Operation::Receipt {
+                    owner: Owner::Relay,
+                    old_pid: pid,
+                    attempt: original_attempt.clone(),
+                    pid: None,
+                },
+                deadline,
+            )
+            .await;
+            if matches!(original_receipt, Ok(Reply::Committed)) {
+                return record_selection(task, directory, true);
+            }
+            if matches!(original_receipt, Ok(Reply::NeverCreated)) {
+                return Err("rollback Child never created; generations retained".into());
+            }
+            // A lost Start(B) reply is resolved before attempting any further
+            // Stop(A); the current slot may already belong to B.
+            let original_created = matches!(original_receipt, Ok(Reply::Candidate { .. }));
+            // Close A even if it already exited. A late Start must never
+            // race B, and signalling is never itself an exit proof.
+            if !original_created {
+                match command(
+                    sender,
+                    task,
+                    Operation::StopFailed {
+                        owner: Owner::Relay,
+                        old_pid: pid,
+                        attempt: target_attempt.clone(),
+                        pid: Some(replacement.failed_pid),
+                    },
+                    deadline,
+                )
+                .await
+                {
+                    Ok(Reply::Candidate {
+                        pid: stopped,
+                        exited: true,
+                    }) if stopped == replacement.failed_pid => {}
+                    Ok(Reply::Committed) => return record_selection(task, directory, false),
                     _ => {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 }
-                task.execution.as_mut().ok_or("missing execution")?.phase =
-                    "rollback_fencing".into();
-                super::store(directory, task)?;
             }
             let Ok(response) = admin
-                .replace_failed_candidate(stage_request(replacement.clone(), deadline)?)
+                .switch(stage_request(
+                    pb::RelaySwitchRequest {
+                        proof: Some(pb::RelayHandoffProof {
+                            identity: Some(identity.clone()),
+                            old_pid: pid,
+                            listeners_released: task.execution.as_ref().is_some_and(|e| e.released),
+                            old_exited: task.execution.as_ref().is_some_and(|e| e.old_exited),
+                        }),
+                        replacement: Some(replacement.clone()),
+                    },
+                    deadline,
+                )?)
                 .await
             else {
                 continue;
@@ -705,72 +729,87 @@ async fn execute_inner(
             {
                 return Err("replacement identity mismatch".into());
             }
-            if command(
+            // Observe B before replaying Start after a lost reply.
+            let original = command(
                 sender,
                 task,
-                Operation::RestartFailed {
-                    pid: replacement.failed_pid,
-                    binary: directory.join("rollback"),
-                    directory: Path::new(&replacement.replacement_socket)
-                        .parent()
-                        .ok_or("missing rollback parent")?
-                        .to_path_buf(),
+                Operation::Receipt {
+                    owner: Owner::Relay,
+                    old_pid: pid,
+                    attempt: original_attempt.clone(),
+                    pid: None,
                 },
                 deadline,
             )
-            .await
-            .is_err()
-            {
-                continue;
+            .await;
+            let original = match original {
+                Ok(reply) => Ok(reply),
+                Err(_) => {
+                    command(
+                        sender,
+                        task,
+                        Operation::Start {
+                            config: original_process.clone(),
+                            pid,
+                            binary: directory.join("rollback"),
+                            launch: Launch::Relay {
+                                directory: Path::new(&replacement.replacement_socket)
+                                    .parent()
+                                    .ok_or("missing rollback parent")?
+                                    .to_path_buf(),
+                            },
+                            attempt: original_attempt.clone(),
+                            owner: Owner::Relay,
+                        },
+                        deadline,
+                    )
+                    .await
+                }
+            };
+            match original {
+                Ok(Reply::Candidate { .. }) => {}
+                Ok(Reply::NeverCreated) => {
+                    return Err("rollback Child never created; generations retained".into());
+                }
+                _ => continue,
             }
             identity = replacement_identity;
             let execution = task.execution.as_mut().ok_or("missing execution")?;
-            execution.phase = "rollback_starting".into();
             execution.candidate_socket = identity.candidate_socket.clone();
             execution.candidate_session.clear();
             super::store(directory, task)?;
             replacement_request = None;
             continue;
         }
-        if rolling_back {
-            if let Ok(Reply::Candidate { exited: true, .. }) =
-                command(sender, task, Operation::Candidate, deadline).await
-            {
-                return Err(
-                    "rollback generation exited; further replacement requires operator recovery"
-                        .into(),
-                );
-            }
+        if rolling_back && candidate_pid.is_some() && candidate_exited {
+            return Err(
+                "rollback generation exited; further replacement requires operator recovery".into(),
+            );
         }
         let execution = task.execution.as_ref().ok_or("missing execution")?;
         if execution.released || execution.old_exited {
             let proof = pb::RelayHandoffProof {
                 identity: Some(identity.clone()),
                 old_pid: pid,
-                begin_accepted: execution.begin_accepted,
                 listeners_released: execution.released,
                 old_exited: execution.old_exited,
             };
-            if admin
-                .prove(stage_request(proof.clone(), deadline)?)
-                .await
-                .is_err()
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            if !started {
+            if candidate_pid.is_none() {
                 if command(
                     sender,
                     task,
                     Operation::Start {
-                        config: target_process.clone(),
+                        config: Box::new(target_process.clone()),
                         pid,
                         binary: directory.join("executable"),
-                        directory: candidate_socket
-                            .parent()
-                            .ok_or("missing generation directory")?
-                            .to_path_buf(),
+                        launch: Launch::Relay {
+                            directory: candidate_socket
+                                .parent()
+                                .ok_or("missing generation directory")?
+                                .to_path_buf(),
+                        },
+                        attempt: target_attempt.clone(),
+                        owner: Owner::Relay,
                     },
                     deadline,
                 )
@@ -779,7 +818,7 @@ async fn execute_inner(
                 {
                     continue;
                 }
-                started = true;
+                continue;
             }
             if let Some(pid) = candidate_pid {
                 let selected = if rolling_back {
@@ -811,164 +850,101 @@ async fn execute_inner(
                         stopped,
                     )?;
                 }
-                // The candidate's private endpoint must belong to our actual Child.
-                if let Ok(candidate_channel) =
-                    channel(Path::new(&identity.candidate_socket), pid).await
+                // Every read authenticates the private endpoint to this actual Child.
+                let Some(state) = candidate_bindings
+                    .read(&identity, pid, deadline, rolling_back, true)
+                    .await?
+                else {
+                    continue;
+                };
+                if identity.candidate_proxy_session_id.is_empty() {
+                    identity.candidate_proxy_session_id = state.proxy_session_id.clone();
+                    task.execution
+                        .as_mut()
+                        .ok_or("missing execution")?
+                        .candidate_session = state.proxy_session_id;
+                    super::store(directory, task)?;
+                }
+                if let Ok(response) = admin
+                    .switch(stage_request(
+                        pb::RelaySwitchRequest {
+                            proof: Some(proof.clone()),
+                            replacement: None,
+                        },
+                        deadline,
+                    )?)
+                    .await
                 {
-                    let mut candidate =
-                        pb::relay_service_client::RelayServiceClient::new(candidate_channel);
-                    let response = match candidate
-                        .get_binding_state(stage_request(pb::GetBindingStateRequest {}, deadline)?)
-                        .await
+                    let switched = response.into_inner();
+                    if !matches!(switched.phase.as_str(), "active_fenced" | "completed")
+                        || !proof.old_exited
                     {
-                        Ok(response) => response,
-                        Err(status) => {
-                            if !rolling_back && unsupported_protocol(&status) {
-                                confirmed_failure =
-                                    Some((pid, "binding_protocol_unsupported".into()));
-                            }
-                            continue;
-                        }
-                    };
-                    let state = response.into_inner();
-                    if let Some(reason) = binding_failure(&identity, &state) {
-                        if rolling_back {
-                            return Err(reason.into());
-                        }
-                        confirmed_failure = Some((pid, reason.into()));
-                        failed_observation = Some((
-                            state.proxy_session_id.chars().take(128).collect(),
-                            state.sync_epoch,
-                        ));
                         continue;
                     }
-                    if identity.candidate_proxy_session_id.is_empty() {
-                        if state.sync_epoch != 0 {
-                            if rolling_back {
-                                return Err("rollback candidate not fresh".into());
-                            }
-                            confirmed_failure = Some((pid, "candidate_not_fresh".into()));
-                            failed_observation = Some((
-                                state.proxy_session_id.chars().take(128).collect(),
-                                state.sync_epoch,
-                            ));
-                            continue;
-                        }
-                        identity.candidate_proxy_session_id = state.proxy_session_id.clone();
-                        task.execution
-                            .as_mut()
-                            .ok_or("missing execution")?
-                            .candidate_session = state.proxy_session_id;
-                        super::store(directory, task)?;
+                    // Never use a previous Switch boolean as current liveness.
+                    let Some(current) = candidate_bindings
+                        .read(&identity, pid, deadline, rolling_back, false)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    if !current.ready || current.sync_epoch != switched.candidate_sync_epoch {
+                        return Err("candidate changed before Finish".into());
                     }
-                    if let Ok(response) = admin
-                        .switch(stage_request(identity.clone(), deadline)?)
-                        .await
+                    if command(
+                        sender,
+                        task,
+                        Operation::Commit {
+                            pid,
+                            old_pid: proof.old_pid,
+                            attempt: attempt.clone(),
+                            owner: Owner::Relay,
+                            stage: CommitStage::Confirm,
+                        },
+                        deadline,
+                    )
+                    .await
+                    .is_err()
                     {
-                        let switched = response.into_inner();
-                        if !matches!(switched.phase.as_str(), "active_fenced" | "completed")
-                            || !proof.old_exited
-                        {
-                            continue;
-                        }
-                        // Never use a previous Switch boolean as current liveness.
-                        let Ok(current_channel) =
-                            channel(Path::new(&identity.candidate_socket), pid).await
-                        else {
-                            continue;
-                        };
-                        let mut candidate =
-                            pb::relay_service_client::RelayServiceClient::new(current_channel);
-                        let Ok(current_response) = candidate
-                            .get_binding_state(stage_request(
-                                pb::GetBindingStateRequest {},
-                                deadline,
-                            )?)
-                            .await
-                        else {
-                            continue;
-                        };
-                        let current = current_response.into_inner();
-                        if let Some(reason) = binding_failure(&identity, &current) {
-                            if rolling_back {
-                                return Err(reason.into());
-                            }
-                            confirmed_failure = Some((pid, reason.into()));
-                            failed_observation = Some((
-                                current.proxy_session_id.chars().take(128).collect(),
-                                current.sync_epoch,
-                            ));
-                            continue;
-                        }
-                        if !current.ready || current.sync_epoch != switched.candidate_sync_epoch {
-                            return Err("candidate changed before Finish".into());
-                        }
-                        if command(sender, task, Operation::Confirm { pid }, deadline)
-                            .await
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let mut final_proof = proof.clone();
-                        final_proof.identity = Some(identity.clone());
-                        let Ok(receipt) = admin.finish(stage_request(final_proof, deadline)?).await
-                        else {
-                            continue;
-                        };
-                        if receipt.into_inner().phase != "completed" {
-                            continue;
-                        }
-                        // Reconnect checks SO_PEERCRED again after Finish as well.
-                        let Ok(final_channel) =
-                            channel(Path::new(&identity.candidate_socket), pid).await
-                        else {
-                            continue;
-                        };
-                        let mut candidate =
-                            pb::relay_service_client::RelayServiceClient::new(final_channel);
-                        let Ok(final_response) = candidate
-                            .get_binding_state(stage_request(
-                                pb::GetBindingStateRequest {},
-                                deadline,
-                            )?)
-                            .await
-                        else {
-                            continue;
-                        };
-                        let final_state = final_response.into_inner();
-                        if let Some(reason) = binding_failure(&identity, &final_state) {
-                            if rolling_back {
-                                return Err(reason.into());
-                            }
-                            confirmed_failure = Some((pid, reason.into()));
-                            failed_observation = Some((
-                                final_state.proxy_session_id.chars().take(128).collect(),
-                                final_state.sync_epoch,
-                            ));
-                            continue;
-                        }
-                        if final_state != current {
-                            continue;
-                        }
-                        if command(sender, task, Operation::Select { pid }, deadline)
-                            .await
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let execution = task.execution.as_mut().ok_or("missing execution")?;
-                        execution.phase = if rolling_back {
-                            "rolled_back"
-                        } else if execution.loss_observed {
-                            "failed_retained"
-                        } else {
-                            "completed"
-                        }
-                        .into();
-                        task.phase = super::relay_phase(&execution.phase);
-                        super::store(directory, task)?;
-                        return Ok(());
+                        continue;
                     }
+                    let mut final_proof = proof.clone();
+                    final_proof.identity = Some(identity.clone());
+                    let Ok(receipt) = admin.finish(stage_request(final_proof, deadline)?).await
+                    else {
+                        continue;
+                    };
+                    if receipt.into_inner().phase != "completed" {
+                        continue;
+                    }
+                    // Reconnect checks SO_PEERCRED again after Finish as well.
+                    let Some(final_state) = candidate_bindings
+                        .read(&identity, pid, deadline, rolling_back, false)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    if final_state != current {
+                        continue;
+                    }
+                    if command(
+                        sender,
+                        task,
+                        Operation::Commit {
+                            pid,
+                            old_pid: proof.old_pid,
+                            attempt: attempt.clone(),
+                            owner: Owner::Relay,
+                            stage: CommitStage::Select,
+                        },
+                        deadline,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    return record_selection(task, directory, rolling_back);
                 }
             }
         }
@@ -976,9 +952,56 @@ async fn execute_inner(
     }
 }
 
+fn record_selection(task: &mut super::Task, directory: &Path, original: bool) -> Result<()> {
+    let execution = task.execution.as_mut().ok_or("missing execution")?;
+    execution.phase = if original {
+        RelayStage::RolledBack
+    } else if execution.loss_observed {
+        RelayStage::FailedRetained
+    } else {
+        RelayStage::Completed
+    };
+    task.phase = execution
+        .phase
+        .terminal_phase()
+        .ok_or("Relay selection is not terminal")?;
+    super::store(directory, task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_candidate_endpoint_backs_off_within_existing_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = pb::RelayHandoffRequest {
+            candidate_socket: root.path().join("unbound.sock").to_string_lossy().into(),
+            ..Default::default()
+        };
+        let mut bindings = CandidateBindings::default();
+        for budget in [Duration::from_secs(1), Duration::from_millis(20)] {
+            let started = Instant::now();
+            let deadline = started + budget;
+            assert!(bindings
+                .read(&identity, std::process::id(), deadline, false, true)
+                .await
+                .unwrap()
+                .is_none());
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= budget.min(Duration::from_millis(100)),
+                "{elapsed:?}"
+            );
+            if budget < Duration::from_millis(100) {
+                assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+            }
+            assert!(
+                bindings.failure.is_none(),
+                "transport failure is not rollback proof"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn generation_paths_accept_full_publisher_identity_and_bind_both_legs() {
@@ -1088,7 +1111,12 @@ mod tests {
         assert!(command(
             &sender,
             &task,
-            Operation::Select { pid: 42 },
+            Operation::Receipt {
+                owner: Owner::Relay,
+                old_pid: 41,
+                attempt: "attempt".into(),
+                pid: Some(42)
+            },
             Instant::now()
         )
         .await
@@ -1106,7 +1134,6 @@ mod tests {
         let mut state = adx_protocol::relay::RelayUpgradeState {
             task_id: "task".into(),
             proxy_session_id: "old".into(),
-            phase: "draining".into(),
             listeners_released: true,
             drain_deadline_unix_ms: 1,
         };
@@ -1114,8 +1141,8 @@ mod tests {
         state.task_id = "other".into();
         assert!(!released(&identity, &state));
         state.task_id = "task".into();
-        state.phase = "forced".into();
-        assert!(released(&identity, &state));
+        state.drain_deadline_unix_ms = 0;
+        assert!(!released(&identity, &state));
     }
 
     #[test]

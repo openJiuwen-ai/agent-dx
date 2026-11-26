@@ -1732,6 +1732,14 @@ impl CoordinatorRpc {
             result?;
         }
         if state.live.get(id).is_none_or(|live| live.expired) {
+            adx_observability::warn!(
+                event = "environment_commit_conflict",
+                guard = "node_liveness",
+                environment_id = %record.spec.id,
+                node_id = %id,
+                revision = record.revision,
+                "Environment result owner is not live"
+            );
             return Err(Error::Conflict);
         }
         if state
@@ -1740,6 +1748,14 @@ impl CoordinatorRpc {
             .and_then(|n| n.session.as_ref())
             .is_none_or(|s| s.id != session_id)
         {
+            adx_observability::warn!(
+                event = "environment_commit_conflict",
+                guard = "node_session",
+                environment_id = %record.spec.id,
+                node_id = %id,
+                revision = record.revision,
+                "Environment result owner session changed"
+            );
             return Err(Error::Conflict);
         }
         let first_create = record.state == EnvironmentState::Running

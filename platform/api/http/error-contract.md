@@ -65,7 +65,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
-网络策略更新遇到节点 RPC 的 `Unavailable` 或 `DeadlineExceeded` 时，API Server 在原 RPC 期限内最多退避重试 15 秒。归属未变时沿用原操作 ID 和预期版本。最终仍无法确认结果时，保留错误的 `same_operation / unknown` 语义。
+暂停、快照、重载、删除和网络策略更新遇到节点 RPC 的 `Unavailable` 或 `DeadlineExceeded` 时，API Server 在不超过 RPC 超时、最多 15 秒的固定重试窗口内退避等待。窗口从首次节点调用前计时，重试不续期；暂停和快照的已受理执行仍沿用原执行超时。归属未变时保留原操作身份和预期版本，归属变化仍按原规则拒绝重放。最终无法确认结果时，保留错误的 `same_operation / unknown` 语义。
 
 内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时归一为 504、`DEADLINE_EXCEEDED`；只有等待超时而没有确认终态时，仍使用 `outcome=unknown`、`retry=same_operation`。写请求的结果可能未知，创建重试沿用原 Request ID 和 Environment ID；尚未成功确认的执行可以重新分配 generation，并由对账回收残留。已确认成功和后续生命周期继续校验归属代次；不能因连接失败覆盖已有成功。
 
@@ -223,6 +223,8 @@ does not publish a `prewarm_recipe` before confirming the catalog entry.
 ### 恢复并发与删除
 
 同一次恢复的并发等待者共享已受理任务的结果；等待超时仍为 `same_operation / unknown`，不能据此启动另一份执行。显式删除意图发布失败时尚未受理并重新开放恢复准入；发布成功后，新到或尚未执行的恢复返回 `CONFLICT / never / not_started`。已经进入执行的恢复被删除中止时使用 `Unavailable`，保留 `same_operation / unknown`，不能将其误报为从未启动。清理或结果发布未确认时继续保留实际进度，调用方按同一 Environment ID 查询或重试删除；删除调用超时不撤销当前 Controller 已受理的删除屏障。该屏障不新增进程重启后的持久化保证。
+
+Coordinator 后台恢复只推进已记录且仍有效的同一恢复意图。扫描取得候选后，若该意图已完成、被删除或被另一意图替换，后台跳过旧候选；不能为此新建恢复请求，也不能重新唤醒已再次暂停的 Environment。后台与显式恢复共用实例锁，锁等待、重读和推进使用同一个固定预算。
 
 ### Volume 管理错误
 

@@ -8,9 +8,9 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep_until, timeout_at, Instant};
 use tonic::{Code, Status};
 
-const NETWORK_RETRY_WINDOW: Duration = Duration::from_secs(15);
-const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
-const NETWORK_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const OPERATION_RETRY_WINDOW: Duration = Duration::from_secs(15);
+const OPERATION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const OPERATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -372,19 +372,10 @@ impl Operations {
                 "operation target or arguments changed",
             ));
         }
-        let mut network_deadline = if kind == Kind::Network {
-            Some(
-                Instant::now()
-                    .checked_add(clients.config.timeout().min(NETWORK_RETRY_WINDOW))
-                    .ok_or_else(|| {
-                        Status::unavailable("network policy RPC timeout is too large")
-                    })?,
-            )
-        } else {
-            None
-        };
-        let mut retry_delay = NETWORK_RETRY_INITIAL_DELAY;
-        let mut retried = false;
+        let retry_deadline = Instant::now()
+            .checked_add(clients.config.timeout().min(OPERATION_RETRY_WINDOW))
+            .ok_or_else(|| Status::unavailable("operation RPC timeout is too large"))?;
+        let mut retry_delay = OPERATION_RETRY_INITIAL_DELAY;
         loop {
             let mut node = pb::node_service_client::NodeServiceClient::new(
                 clients.channel(&owner.node_address).await?,
@@ -456,9 +447,7 @@ impl Operations {
                     Err(error) => Err(error),
                 },
                 Kind::Network => {
-                    let timeout = network_deadline.map_or(clients.config.timeout(), |deadline| {
-                        deadline.saturating_duration_since(Instant::now())
-                    });
+                    let timeout = retry_deadline.saturating_duration_since(Instant::now());
                     if timeout.is_zero() {
                         return Err(Status::deadline_exceeded(
                             "network policy RPC deadline exceeded",
@@ -598,9 +587,7 @@ impl Operations {
                             .is_some_and(|value| value == "true")
                     {
                         operation.network_outcome_unknown = previous_network_uncertainty;
-                        let deadline = network_deadline.ok_or_else(|| {
-                            Status::internal("network policy RPC deadline missing")
-                        })?;
+                        let deadline = retry_deadline;
                         if previous_network_uncertainty {
                             let current =
                                 timeout_at(deadline, clients.owner(id, caller, true)).await;
@@ -663,27 +650,19 @@ impl Operations {
                         }
                         return Err(error);
                     }
-                    owner = if let Some(deadline) = &mut network_deadline {
-                        let now = Instant::now();
-                        let next = now + retry_delay;
-                        if next >= *deadline {
-                            return Err(error);
-                        }
-                        retry_delay = (retry_delay * 2).min(NETWORK_RETRY_MAX_DELAY);
-                        match timeout_at(*deadline, async {
-                            sleep_until(next).await;
-                            clients.owner(id, caller, true).await
-                        })
-                        .await
-                        {
-                            Ok(owner) => owner?,
-                            Err(_) => return Err(error),
-                        }
-                    } else {
-                        if retried {
-                            return Err(error);
-                        }
-                        clients.owner(id, caller, true).await?
+                    let next = Instant::now() + retry_delay;
+                    if next >= retry_deadline {
+                        return Err(error);
+                    }
+                    retry_delay = (retry_delay * 2).min(OPERATION_RETRY_MAX_DELAY);
+                    owner = match timeout_at(retry_deadline, async {
+                        sleep_until(next).await;
+                        clients.owner(id, caller, true).await
+                    })
+                    .await
+                    {
+                        Ok(owner) => owner?,
+                        Err(_) => return Err(error),
                     };
                     if owner
                         .record
@@ -705,7 +684,6 @@ impl Operations {
                             "ownership changed; original operation cannot be replayed",
                         ));
                     }
-                    retried = true;
                 }
             }
         }
@@ -737,7 +715,7 @@ impl Operations {
                     }
                     _ => return Ok(None),
                 }
-                tokio::time::sleep(NETWORK_RETRY_INITIAL_DELAY).await;
+                tokio::time::sleep(OPERATION_RETRY_INITIAL_DELAY).await;
             }
         };
         timeout_at(deadline, waiting)

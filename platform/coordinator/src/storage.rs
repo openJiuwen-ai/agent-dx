@@ -1474,6 +1474,12 @@ impl Session {
         let header: Header = decode(value.as_deref().ok_or(Error::Conflict)?)?;
         header.validate()?;
         if header.epoch != self.epoch {
+            adx_observability::warn!(
+                event = "coordinator_header_conflict",
+                expected_epoch = self.epoch,
+                actual_epoch = header.epoch,
+                "Coordinator storage epoch changed"
+            );
             return Err(Error::Conflict);
         }
         Ok(header)
@@ -2511,6 +2517,14 @@ impl Session {
             }
             let mut session_check = if !session.is_empty() {
                 if token_value.as_deref() != Some(session) {
+                    adx_observability::warn!(
+                        event = "environment_commit_conflict",
+                        guard = "node_session_token",
+                        environment_id = %result.spec.id,
+                        node_id = %result.assignment.node_id,
+                        revision = result.revision,
+                        "Environment result session token rejected"
+                    );
                     return Err(Error::Conflict);
                 }
                 vec![(token_field.clone(), Some(session.to_owned()))]
@@ -2536,7 +2550,39 @@ impl Session {
                 return Err(Error::NotFound);
             };
             let mut stored_environment: StoredEnvironment = decode(environment_value)?;
-            if !(next_result(&stored_environment, &result)?
+            let advances_result = next_result(&stored_environment, &result).inspect_err(|error| {
+                let previous = stored_environment.result.as_ref();
+                let point = previous.and_then(|r| r.checkpoint.as_ref().or(r.snapshot_source.as_ref()));
+                let mut expected_spec = stored_environment.spec.clone();
+                expected_spec.execution.network.clone_from(&result.spec.execution.network);
+                adx_observability::warn!(
+                    event = "environment_commit_conflict",
+                    guard = "next_result",
+                    environment_id = %result.spec.id,
+                    node_id = %result.assignment.node_id,
+                    revision = result.revision,
+                    state = ?result.state,
+                    previous_revision = ?previous.map(|r| r.revision),
+                    previous_state = ?previous.map(|r| r.state),
+                    invalidated = stored_environment.invalidated,
+                    spec_matches = (expected_spec == result.spec),
+                    assignment_matches = (stored_environment.assignment == result.assignment),
+                    checkpoint_matches = previous.is_some_and(|r| r.checkpoint == result.checkpoint),
+                    snapshot_matches = previous.is_some_and(|r| r.snapshot_source == result.snapshot_source),
+                    runtime_changed = previous.is_some_and(|r| r.runtime.id != result.runtime.id),
+                    restart_attempts = result.restart_attempts,
+                    previous_restart_attempts = ?previous.map(|r| r.restart_attempts),
+                    prepared = point.is_some_and(|cp| previous.is_some_and(|r| r.execution_artifacts.contains(&cp.artifact))),
+                    resume_intent = ?stored_environment.resume.as_ref().map(|r| r.operation_id.as_str()),
+                    recovery_pending = stored_environment.recovery.as_ref().is_some_and(|r| r.pending),
+                    operation_id = ?result.last_operation.as_ref().map(|op| op.id.as_str()),
+                    operation_kind = ?result.last_operation.as_ref().map(|op| op.kind),
+                    expected_revision = ?result.last_operation.as_ref().map(|op| op.expected_revision),
+                    reason = %error,
+                    "Environment result rejected before storage publication"
+                );
+            })?;
+            if !(advances_result
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
                 && stopped.is_empty()
             {

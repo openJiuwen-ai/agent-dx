@@ -4,9 +4,6 @@ use std::{error::Error, path::PathBuf};
 
 pub mod resource;
 
-/// Confirmed configuration syntax or pure semantic failure, not runtime availability.
-pub const CONFIGURATION_EXIT_CODE: u8 = 78;
-
 /// Match launch-time parent identity against caller-supplied kernel observations.
 /// PID 1 is a valid parent; zero, negative and mismatched identities are rejected.
 /// Callers must obtain the current parent and peer PID from kernel credentials.
@@ -17,18 +14,6 @@ pub fn launch_parent_matches(
 ) -> bool {
     captured_parent > 0 && current_parent == captured_parent && peer_pid == Some(captured_parent)
 }
-
-/// A static, safe reason that never embeds configuration or environment contents.
-#[derive(Debug)]
-pub struct ConfigurationError(pub &'static str);
-
-impl std::fmt::Display for ConfigurationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
-    }
-}
-
-impl Error for ConfigurationError {}
 
 /// Common command-line arguments accepted by ADX service processes.
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -48,8 +33,7 @@ pub fn read_config<T: DeserializeOwned>() -> Result<T, Box<dyn Error>> {
 /// Deserialize one service configuration without exposing its contents in errors.
 pub fn read_config_file<T: DeserializeOwned>(path: &std::path::Path) -> Result<T, Box<dyn Error>> {
     let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| ConfigurationError("invalid service configuration").into())
+    serde_json::from_slice(&bytes).map_err(|_| "invalid service configuration".into())
 }
 
 /// Wait until the process receives its supported shutdown signal.
@@ -139,15 +123,14 @@ mod tests {
     }
 
     #[test]
-    fn parsing_is_configuration_but_missing_file_remains_io() {
+    fn missing_configuration_file_preserves_io_error() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
         let missing = read_config_file::<Config>(&path).unwrap_err();
         assert!(missing.is::<std::io::Error>());
-        assert!(!missing.is::<ConfigurationError>());
-        std::fs::write(&path, b"{").unwrap();
-        assert!(read_config_file::<Config>(&path)
-            .unwrap_err()
-            .is::<ConfigurationError>());
+        assert_eq!(
+            missing.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }
