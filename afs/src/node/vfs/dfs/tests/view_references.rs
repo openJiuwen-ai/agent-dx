@@ -99,10 +99,16 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_sharing(false)
+}
+
+fn fixture_with_sharing(share: bool) -> Fixture {
     let (temp, meta, fs) = test_fs();
     let gc = Arc::new(RecordingGc::default());
     let references = crate::node::gc::GcReferences::new(gc.clone());
-    let fs = fs.with_gc_references(Some(references.clone()));
+    let fs = fs
+        .with_gc_references(Some(references.clone()))
+        .with_read_sharing(share);
     let inode_id = meta.inode.lock().unwrap().inode_id.clone();
     let v1 = publish_external_version_with_bytes(&meta, &fs, "r94-v1", b"version-one");
     let inode = fs.backend_inode(&inode_id).unwrap();
@@ -698,7 +704,8 @@ fn t8_check(
 
 #[test]
 fn h2_t8_cached_view_indexes_a_shared_version() {
-    let fx = fixture();
+    // The VFS indexes only with sharing on (!318 round 3 item 2).
+    let fx = fixture_with_sharing(true);
     fx.fs.load_readonly_version(Some(&fx.v1)).unwrap();
     let (holders, layout) = t8_shared(&fx);
     assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::NotReady);
@@ -709,7 +716,8 @@ fn h2_t8_cached_view_indexes_a_shared_version() {
 
 #[test]
 fn h2_t8_loaded_view_indexes_a_shared_version() {
-    let fx = fixture();
+    // The VFS indexes only with sharing on (!318 round 3 item 2).
+    let fx = fixture_with_sharing(true);
     fx.fs.versions.set_capacity(0);
     let (holders, layout) = t8_shared(&fx);
     // Nothing cached: loaded from Meta.
@@ -719,7 +727,8 @@ fn h2_t8_loaded_view_indexes_a_shared_version() {
 
 #[test]
 fn h2_t8_async_read_view_indexes_a_shared_version() {
-    let fx = fixture();
+    // The VFS indexes only with sharing on (!318 round 3 item 2).
+    let fx = fixture_with_sharing(true);
     let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
     let (holders, layout) = t8_shared(&fx);
     assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::NotReady);
@@ -727,4 +736,23 @@ fn h2_t8_async_read_view_indexes_a_shared_version() {
     assert_eq!(read_all(&fx.fs, handle), b"version-one");
     assert_eq!(t8_check(&fx, &holders, &layout), HolderRange::Covered);
     fx.fs.release(&context(), handle).unwrap();
+}
+
+/// !318 round 3 item 2: with sharing off (the default) a DFS read and a
+/// version-cache hit never walk a layout for the holder index.
+#[test]
+fn h2_round3_sharing_off_reads_never_walk_layouts_for_holders() {
+    let fx = fixture();
+    let holders = fx.references.holders();
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    fx.fs.load_readonly_version(Some(&fx.v1)).unwrap();
+    fx.fs.load_readonly_version(Some(&fx.v1)).unwrap();
+    fx.fs.release(&context(), handle).unwrap();
+    assert_eq!(holders.work_done(), (0, 0));
+    assert_eq!(
+        holders.attach_calls(),
+        0,
+        "the VFS asked the holder registry"
+    );
 }

@@ -249,6 +249,11 @@ impl DistributedFs {
     /// Index the checked layout of a version this Node shares (H2 step 2,
     /// plan/15 §1.2.1 item 4). A no-op for versions not shared.
     fn attach_shared_layout(&self, version: &ReadOnlyVersion) {
+        // Sharing off (the default): nothing to index, nothing to look up
+        // (!318 round 3 item 2).
+        if !self.gc.share_read_cache {
+            return;
+        }
         if let (Some(references), Some(file)) = (&self.gc.references, &version.version) {
             references.holders().attach(&file.id, &version.layout);
         }
