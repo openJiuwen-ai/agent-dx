@@ -110,7 +110,29 @@ fn node_shutdown_drains_dfs_while_seed_registry_is_stalled() {
     run_scenario("dfs", true);
 }
 
+/// Startup attempts: the free ports are released before the children bind
+/// them, so another test running in parallel can take one in between.
+const STARTUP_ATTEMPTS: usize = 3;
+
 fn run_scenario(fs: &str, stalled_seed: bool) {
+    for attempt in 1..=STARTUP_ATTEMPTS {
+        match try_scenario(fs, stalled_seed) {
+            Ok(()) => return,
+            Err(logs) if attempt < STARTUP_ATTEMPTS => {
+                println!(
+                    "shutdown order: a child lost its port at startup, retrying with new ports \
+                     (attempt {attempt})\n{logs}"
+                );
+            }
+            Err(logs) => panic!("children kept losing their ports at startup\n{logs}"),
+        }
+    }
+}
+
+/// One run with fresh ports and directories. `Err(logs)` only when a child
+/// exited during startup because its address was taken (`AddrInUse`); every
+/// other failure panics as before.
+fn try_scenario(fs: &str, stalled_seed: bool) -> Result<(), String> {
     let ownerfs = fs == "all";
     let fuse = fuse_usable();
     if !fuse {
@@ -198,7 +220,11 @@ fn run_scenario(fs: &str, stalled_seed: bool) {
     while !read_trace(&trace).iter().any(|stage| stage == "serving") {
         for (name, child) in [("meta", &mut meta.0), ("node", &mut node.0)] {
             if let Some(status) = child.try_wait().unwrap() {
-                panic!("{name} exited during startup: {status}\n{}", logs(root));
+                let logs = logs(root);
+                if logs.contains("AddrInUse") {
+                    return Err(format!("{name} exited during startup: {status}\n{logs}"));
+                }
+                panic!("{name} exited during startup: {status}\n{logs}");
             }
         }
         assert!(
@@ -238,6 +264,7 @@ fn run_scenario(fs: &str, stalled_seed: bool) {
     };
     assert!(status.success(), "Node shutdown failed\n{}", logs(root));
     assert_eq!(read_trace(&trace), expected_stages(ownerfs, fuse));
+    Ok(())
 }
 
 const MANAGEMENT_TOKEN: &str = "test-only-nydus-management-token";

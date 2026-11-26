@@ -2071,3 +2071,386 @@ async fn a_session_changing_during_every_claim_cannot_keep_the_patrol_from_far_p
     }
     assert!(found, "a change must not send the patrol back to the start");
 }
+
+/// H2 step 2: version holders and holder grants (plan/15 §1.2, §2.2.1–§2.2.2).
+mod holder_grants {
+    use super::*;
+    use crate::dfs::{
+        DfsHolderGrant, DfsVersionHoldersRequest, HOLDER_GRANT_TOKEN_LEN, ValidateDfsHolderGrant,
+    };
+
+    async fn session(f: &Fixture, node: &str) -> NodeSession {
+        match f
+            .store
+            .read(MetaRead::CurrentNodeSession {
+                node_id: node.into(),
+            })
+            .await
+            .unwrap()
+            .entity
+        {
+            Some(MetaEntity::NodeSession(session)) => session,
+            _ => panic!("session {node} is missing"),
+        }
+    }
+
+    /// `node` opens the fixture's version, shared or not.
+    async fn open(f: &Fixture, node: &str, reader: u64, shared: bool) {
+        let session = session(f, node).await;
+        f.service.readers.insert(
+            node,
+            &session.session_id,
+            reader,
+            &InodeId::new("file"),
+            Some(&FileVersionId::new("version")),
+            shared,
+        );
+    }
+
+    fn holders_request(caller: &str) -> DfsVersionHoldersRequest {
+        DfsVersionHoldersRequest {
+            caller_id: caller.into(),
+            namespace_id: NamespaceId::new("default"),
+            file_version_id: FileVersionId::new("version"),
+            layout_root_id: LayoutRootId::new("layout"),
+        }
+    }
+
+    /// "reader" reads the version and gets "receiver" (a sharing reader) as holder.
+    async fn holder_grant(f: &Fixture) -> DfsHolderGrant {
+        open(f, "receiver", 7, true).await;
+        open(f, "reader", 1, false).await;
+        let holders = f
+            .service
+            .version_holders(holders_request("reader"))
+            .await
+            .unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].node_id, "receiver");
+        holders[0].grant.clone()
+    }
+
+    async fn validate(f: &Fixture, grant: &DfsHolderGrant) -> Result<u64> {
+        let receiver = session(f, "receiver").await;
+        f.service
+            .validate_holder_grant(ValidateDfsHolderGrant {
+                receiver_node_id: "receiver".into(),
+                receiver_node_epoch: receiver.lease_epoch,
+                peer_node_id: "reader".into(),
+                grant: grant.clone(),
+            })
+            .await
+            .map(|authorized| authorized.expires_at_unix_ms)
+    }
+
+    #[tokio::test]
+    async fn h2_holder_grant_is_signed_for_the_caller_and_validated_by_the_holder() {
+        let f = fixture().await;
+        let grant = holder_grant(&f).await;
+        assert!(grant.token.starts_with("dfs-read-holder-v1:"));
+        assert_eq!(grant.token.len(), HOLDER_GRANT_TOKEN_LEN);
+        assert_eq!(grant.caller_node_id, "reader");
+        assert_eq!(grant.holder_node_id, "receiver");
+        let expires = validate(&f, &grant).await.unwrap();
+        // The holder may keep it at most 2 s (plan/15 §2.2.4).
+        assert!(expires <= now_unix_ms() + 2_000);
+    }
+
+    /// T17 (N1): only a reader of the version learns its holders; a holder
+    /// never lists itself, and an unshared reader is not a holder.
+    #[tokio::test]
+    async fn h2_t17_holders_are_listed_only_to_readers_of_the_version() {
+        let f = fixture().await;
+        open(&f, "receiver", 7, true).await;
+        assert!(
+            f.service
+                .version_holders(holders_request("reader"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a Node that does not read the version learns nothing"
+        );
+        assert!(
+            f.service
+                .version_holders(holders_request("receiver"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a holder is never offered to itself"
+        );
+        open(&f, "reader", 1, false).await;
+        let holders = f
+            .service
+            .version_holders(holders_request("reader"))
+            .await
+            .unwrap();
+        assert_eq!(holders.len(), 1);
+        f.service
+            .readers
+            .release("receiver", &session(&f, "receiver").await.session_id, &[7]);
+        open(&f, "receiver", 8, false).await;
+        assert!(
+            f.service
+                .version_holders(holders_request("reader"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unshared reader is not a holder"
+        );
+    }
+
+    /// T18: replays and forgeries are all refused.
+    #[tokio::test]
+    async fn h2_t18_holder_grant_replays_and_forgeries_are_denied() {
+        let f = fixture().await;
+        let grant = holder_grant(&f).await;
+        let denied = |result: Result<u64>| {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                afs_error::ErrorKind::PermissionDenied
+            );
+        };
+        // Any field changed without a new MAC, the deadline above all.
+        let mut later = grant.clone();
+        later.expires_at_unix_ms += 60_000;
+        denied(validate(&f, &later).await);
+        let mut other_version = grant.clone();
+        other_version.layout_root_id = LayoutRootId::new("other");
+        denied(validate(&f, &other_version).await);
+        let mut other_caller = grant.clone();
+        other_caller.caller_node_epoch += 1;
+        denied(validate(&f, &other_caller).await);
+        // Sent to another holder, or to the holder in another epoch.
+        let mut other_holder = grant.clone();
+        other_holder.holder_node_id = "reader".into();
+        denied(validate(&f, &other_holder).await);
+        let receiver = session(&f, "receiver").await;
+        denied(
+            f.service
+                .validate_holder_grant(ValidateDfsHolderGrant {
+                    receiver_node_id: "receiver".into(),
+                    receiver_node_epoch: receiver.lease_epoch + 1,
+                    peer_node_id: "reader".into(),
+                    grant: grant.clone(),
+                })
+                .await
+                .map(|value| value.expires_at_unix_ms),
+        );
+        // Presented by a peer other than the caller.
+        denied(
+            f.service
+                .validate_holder_grant(ValidateDfsHolderGrant {
+                    receiver_node_id: "receiver".into(),
+                    receiver_node_epoch: receiver.lease_epoch,
+                    peer_node_id: "receiver".into(),
+                    grant: grant.clone(),
+                })
+                .await
+                .map(|value| value.expires_at_unix_ms),
+        );
+        // A per-copy token, or a MAC of the per-copy domain, in a holder grant.
+        let mut per_copy = grant.clone();
+        per_copy.token = format!(
+            "dfs-read-v1:{}",
+            &grant.token["dfs-read-holder-v1:".len()..]
+        );
+        denied(validate(&f, &per_copy).await);
+        let mut wrong_domain = grant.clone();
+        let key = f.service.read_grant_key.as_ref().unwrap();
+        let mut unsigned = grant.clone();
+        unsigned.token.clear();
+        let canonical = serde_json::to_vec(&("afs-dfs-read-v1", unsigned)).unwrap();
+        wrong_domain.token = format!(
+            "dfs-read-holder-v1:{}",
+            blake3::keyed_hash(&key, &canonical).to_hex()
+        );
+        denied(validate(&f, &wrong_domain).await);
+        // The genuine grant still validates.
+        validate(&f, &grant).await.unwrap();
+    }
+
+    /// T18 (genuine MAC): the caller's session changed (a new epoch), or the
+    /// holder restarted, after the grant was signed: refused by the session
+    /// checks even though the MAC and the presented receiver epoch match.
+    #[tokio::test]
+    async fn h2_t18_genuine_grant_of_a_replaced_session_is_denied() {
+        let f = fixture().await;
+        let grant = holder_grant(&f).await;
+        let old_receiver = session(&f, "receiver").await;
+        validate(&f, &grant).await.unwrap();
+        register(&f.store, "reader", "reader-restarted", Vec::new()).await;
+        assert_eq!(
+            validate(&f, &grant).await.unwrap_err().kind(),
+            afs_error::ErrorKind::PermissionDenied,
+            "the caller's session was replaced"
+        );
+
+        let f = fixture().await;
+        let grant = holder_grant(&f).await;
+        validate(&f, &grant).await.unwrap();
+        register(&f.store, "receiver", "receiver-restarted", Vec::new()).await;
+        assert_ne!(
+            session(&f, "receiver").await.lease_epoch,
+            old_receiver.lease_epoch
+        );
+        let result = f
+            .service
+            .validate_holder_grant(ValidateDfsHolderGrant {
+                receiver_node_id: "receiver".into(),
+                // The epoch the grant names, presented as is.
+                receiver_node_epoch: grant.holder_node_epoch,
+                peer_node_id: "reader".into(),
+                grant: grant.clone(),
+            })
+            .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            afs_error::ErrorKind::PermissionDenied,
+            "the holder restarted"
+        );
+    }
+
+    /// N1 (code review): on an external backend Meta neither lists holders
+    /// nor accepts a holder grant, even a genuine one.
+    #[tokio::test]
+    async fn h2_n1_external_backend_refuses_holder_grants() {
+        let mut f = fixture().await;
+        let grant = holder_grant(&f).await;
+        validate(&f, &grant).await.unwrap();
+        f.service.durability_policy = crate::dfs::DfsDurabilityPolicy::ExternalBackend {
+            store_id: "seaweed-test".into(),
+            generation: "generation-1".into(),
+        };
+        assert_eq!(
+            validate(&f, &grant).await.unwrap_err().kind(),
+            afs_error::ErrorKind::PermissionDenied
+        );
+        assert!(
+            f.service
+                .version_holders(holders_request("reader"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// S2 (code review): refreshing the holder list within one window gives
+    /// the same grant, token included, so holders keep hitting their
+    /// authorization cache; the deadline stays at least 30 s ahead.
+    #[tokio::test]
+    async fn h2_s2_holder_grant_is_stable_within_a_window() {
+        let f = fixture().await;
+        let first = holder_grant(&f).await;
+        let mut second = None;
+        for _ in 0..3 {
+            // Later than the first grant: a deadline counted from "now" differs.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let holders = f
+                .service
+                .version_holders(holders_request("reader"))
+                .await
+                .unwrap();
+            let grant = holders[0].grant.clone();
+            if grant.expires_at_unix_ms == first.expires_at_unix_ms {
+                second = Some(grant);
+                break;
+            }
+        }
+        assert_eq!(second.expect("a refresh within the window"), first);
+        for now in [0, 1, 9_999, 10_000, 1_700_000_012_345] {
+            let deadline = crate::meta::dfs::read_auth::holder_grant_deadline(now);
+            assert!(
+                deadline >= now + 30_000 && deadline <= now + 40_000,
+                "{now}"
+            );
+            assert_eq!(deadline % 10_000, 0);
+        }
+    }
+
+    /// T13 (S4): once the holder stops sharing the version (close, or a
+    /// report without the flag after a Meta restart), its grants are refused.
+    #[tokio::test]
+    async fn h2_t13_holder_that_stopped_sharing_is_refused() {
+        let f = fixture().await;
+        let grant = holder_grant(&f).await;
+        validate(&f, &grant).await.unwrap();
+        let receiver = session(&f, "receiver").await;
+        f.service
+            .readers
+            .release("receiver", &receiver.session_id, &[7]);
+        assert_eq!(
+            validate(&f, &grant).await.unwrap_err().kind(),
+            afs_error::ErrorKind::PermissionDenied
+        );
+        // T21 ②: a report without the flag rebuilds an unshared entry.
+        f.service.readers.report(
+            "receiver",
+            &receiver.session_id,
+            7,
+            &[ReaderEntry {
+                reader: 7,
+                inode_id: InodeId::new("file"),
+                version_id: Some(FileVersionId::new("version")),
+                share_read_cache: false,
+            }],
+            true,
+        );
+        assert!(validate(&f, &grant).await.is_err());
+        // T21 ①: a report with the flag restores the holder.
+        f.service.readers.report(
+            "receiver",
+            &receiver.session_id,
+            7,
+            &[ReaderEntry {
+                reader: 7,
+                inode_id: InodeId::new("file"),
+                version_id: Some(FileVersionId::new("version")),
+                share_read_cache: true,
+            }],
+            true,
+        );
+        validate(&f, &grant).await.unwrap();
+    }
+
+    /// A per-copy grant is never accepted as a holder grant, nor the reverse
+    /// (T12, Meta side).
+    #[tokio::test]
+    async fn h2_t12_per_copy_and_holder_grants_do_not_cross() {
+        let f = fixture().await;
+        let grant = holder_grant(&f).await;
+        let receiver = session(&f, "receiver").await;
+        let as_copy = DfsReadGrant {
+            namespace_id: grant.namespace_id.clone(),
+            file_version_id: grant.file_version_id.clone(),
+            layout_root_id: grant.layout_root_id.clone(),
+            caller_node_id: grant.caller_node_id.clone(),
+            caller_node_epoch: grant.caller_node_epoch,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            fence: 0,
+            token: grant.token.clone(),
+        };
+        let result = f
+            .service
+            .validate_read_grants(ValidateDfsReadGrants {
+                receiver_node_id: "receiver".into(),
+                receiver_node_epoch: receiver.lease_epoch,
+                peer_node_id: "reader".into(),
+                validations: vec![DfsReadValidation {
+                    grant: as_copy,
+                    chunk_id: f.request.chunk_ids[0].clone(),
+                    copy_id: f.copy.id.clone(),
+                    chunk_offset: 0,
+                    length: 4,
+                }],
+            })
+            .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            afs_error::ErrorKind::PermissionDenied
+        );
+        let source = f.sources().await.remove(0);
+        let mut as_holder = grant.clone();
+        as_holder.token = source.read_grant.token.clone();
+        assert!(validate(&f, &as_holder).await.is_err());
+    }
+}

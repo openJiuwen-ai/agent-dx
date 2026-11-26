@@ -774,6 +774,7 @@ fn dfs_rdma_full_pool_waits_for_evicted_endpoint() {
                         DfsChunkTransportResources {
                             rdma_sessions: RdmaSessionRegistry::new(Some(device.clone())),
                             payload_metrics: None,
+                            holders: None,
                         },
                     ))
                     .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),

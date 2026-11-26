@@ -238,6 +238,27 @@ impl DistributedFs {
         self
     }
 
+    /// H2 step 2: register read opens as shared readers, so other readers of
+    /// the same version may read this Node's read-cache copies. Needs GC
+    /// references (soft readers); without them nothing is shared.
+    pub(crate) fn with_read_sharing(mut self, share: bool) -> Self {
+        self.gc.share_read_cache = share;
+        self
+    }
+
+    /// Index the checked layout of a version this Node shares (H2 step 2,
+    /// plan/15 §1.2.1 item 4). A no-op for versions not shared.
+    fn attach_shared_layout(&self, version: &ReadOnlyVersion) {
+        // Sharing off (the default): nothing to index, nothing to look up
+        // (!318 round 3 item 2).
+        if !self.gc.share_read_cache {
+            return;
+        }
+        if let (Some(references), Some(file)) = (&self.gc.references, &version.version) {
+            references.holders().attach(&file.id, &version.layout);
+        }
+    }
+
     /// Enable the open-time name check for a mount whose kernel entry TTL is
     /// `entry_ttl` (zero keeps the inode-only check), with its counters.
     pub(crate) fn with_open_name_check(
@@ -310,11 +331,13 @@ impl DistributedFs {
             let Some(reader) = references.begin_reader()? else {
                 return Ok((self.open_preflight(inode_id, pid)?, None, false));
             };
+            let share = self.gc.share_read_cache;
             let opened = self.meta.open_file_read(
                 reader,
                 inode_id,
                 name.as_ref()
                     .map(|(parent, name)| (parent, name.as_slice())),
+                share,
             );
             let opened = match opened {
                 Ok(opened) => opened,
@@ -330,7 +353,7 @@ impl DistributedFs {
                     return Err(error);
                 }
             };
-            let pin = references.finish_reader(
+            let pin = references.finish_shared_reader(
                 reader,
                 opened
                     .inode
@@ -343,6 +366,7 @@ impl DistributedFs {
                             inode.head_version.as_ref(),
                         )
                     }),
+                share,
             )?;
             let Some(inode) = opened.inode else {
                 if let Some((parent, name)) = &name {

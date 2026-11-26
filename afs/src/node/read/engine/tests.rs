@@ -699,6 +699,7 @@ pub(super) fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCan
             fence: 1,
             token: "test-token".into(),
         },
+        holder_grant: None,
     }
 }
 

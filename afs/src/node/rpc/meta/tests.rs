@@ -393,6 +393,34 @@ async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
             })
             .is_err()
         );
+        assert!(
+            meta.version_holders(crate::dfs::DfsVersionHoldersRequest {
+                caller_id: "node-a".into(),
+                namespace_id: crate::dfs::NamespaceId::new("default"),
+                file_version_id: crate::dfs::FileVersionId::new("missing"),
+                layout_root_id: crate::dfs::LayoutRootId::new("missing"),
+            })
+            .is_err()
+        );
+        assert!(
+            meta.validate_holder_grant(crate::dfs::ValidateDfsHolderGrant {
+                receiver_node_id: "node-a".into(),
+                receiver_node_epoch: 1,
+                peer_node_id: "node-b".into(),
+                grant: crate::dfs::DfsHolderGrant {
+                    namespace_id: crate::dfs::NamespaceId::new("default"),
+                    file_version_id: crate::dfs::FileVersionId::new("missing"),
+                    layout_root_id: crate::dfs::LayoutRootId::new("missing"),
+                    caller_node_id: "node-b".into(),
+                    caller_node_epoch: 1,
+                    holder_node_id: "node-a".into(),
+                    holder_node_epoch: 1,
+                    expires_at_unix_ms: 1,
+                    token: String::new(),
+                },
+            })
+            .is_err()
+        );
     })
     .await
     .unwrap();
@@ -402,7 +430,7 @@ async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
         .iter()
         .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
         .unwrap();
-    assert_eq!(calls.get_metric().len(), 5);
+    assert_eq!(calls.get_metric().len(), 7);
     for metric in calls.get_metric() {
         let method = metric
             .get_label()

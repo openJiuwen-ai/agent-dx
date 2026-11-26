@@ -52,6 +52,10 @@ mod external;
 mod fanout;
 #[cfg(test)]
 mod h2_tests;
+mod holders;
+#[cfg(test)]
+pub(crate) use holders::holder_ranks_above;
+pub(crate) use holders::{HolderLists, holder_wait_ms};
 mod local;
 mod peer_cache_source;
 mod prefetch;
@@ -252,6 +256,15 @@ pub trait ReadSourceProvider: Send + Sync {
         _deadline: Instant,
     ) -> super::admission::ReadFuture<'_, ()> {
         Box::pin(async { Err(unavailable("read cache retirement is unavailable")) })
+    }
+
+    /// H2 step 2: the other readers sharing a version, with holder grants.
+    /// Providers without the RPC offer none.
+    fn version_holders_async(
+        &self,
+        _request: crate::dfs::DfsVersionHoldersRequest,
+    ) -> super::admission::ReadFuture<'_, Vec<crate::dfs::VersionHolder>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     /// Local/test providers may return immediately. Network adapters override
@@ -638,6 +651,8 @@ fn same_peer_context(left: &SourceCandidate, right: &SourceCandidate) -> bool {
         && a.layout_root_id == b.layout_root_id
         && a.caller_node_id == b.caller_node_id
         && a.caller_node_epoch == b.caller_node_epoch
+        // One kind of grant per request (plan/15 R4).
+        && left.holder_grant.is_some() == right.holder_grant.is_some()
 }
 
 fn range_covered(ranges: &[(u64, u64)], requested_start: u64, requested_len: u64) -> bool {
@@ -683,6 +698,9 @@ pub struct DfsReadEngine {
     source_cache: Arc<Mutex<SourceCache>>,
     fetcher: Option<Arc<super::object_fetch::ObjectFetcher>>,
     external_authority_cache: Mutex<ExternalAuthorityCache>,
+    /// H2 step 2: the version holders this reader may read from, by version
+    /// (`None`: sharing is off and no holder is ever offered).
+    pub(super) holder_lists: Option<Arc<holders::HolderLists>>,
 }
 
 #[cfg(test)]
@@ -692,6 +710,8 @@ struct ReadEngineTestHooks {
     pub(super) peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
     pub(super) prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
     pub(super) after_prefetch_resident_check: Mutex<Option<AfterPrefetchResidentCheck>>,
+    /// Holder RPCs started: (when, the holder deadline they ran under).
+    pub(super) holder_attempts: Arc<Mutex<Vec<(Instant, Instant)>>>,
 }
 
 #[cfg(test)]
@@ -808,6 +828,7 @@ impl DfsReadEngine {
             test_hooks: ReadEngineTestHooks::default(),
             source_cache: Arc::new(Mutex::new(source_cache)),
             fetcher: None,
+            holder_lists: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
         }
     }
@@ -882,10 +903,14 @@ impl DfsReadEngine {
             read_authority: self.read_authority.clone(),
             readers: Mutex::new(BoundedLru::new(0)),
             #[cfg(test)]
-            test_hooks: ReadEngineTestHooks::default(),
+            test_hooks: ReadEngineTestHooks {
+                holder_attempts: self.test_hooks.holder_attempts.clone(),
+                ..Default::default()
+            },
             source_cache: self.source_cache.clone(),
             fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
+            holder_lists: self.holder_lists.clone(),
         }
     }
 
@@ -1014,6 +1039,12 @@ impl DfsReadEngine {
         }
         Ok(())
     }
+    /// Tests: holder RPCs started, with the holder deadline of each.
+    #[cfg(test)]
+    pub(crate) fn holder_attempt_log(&self) -> Vec<(Instant, Instant)> {
+        self.test_hooks.holder_attempts.lock().unwrap().clone()
+    }
+
     pub fn has_external_backend(&self) -> bool {
         self.external_backend.is_some()
     }

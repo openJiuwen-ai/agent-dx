@@ -174,6 +174,7 @@ async fn dfs_replica_opposite_chains_complete_on_real_grpc() {
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
             suspect_reviews: Default::default(),
+            holders: None,
         };
         peers.push((gate, first_hops, permits, forward_permits, auth_permits));
         servers.push(tokio::spawn(async move {

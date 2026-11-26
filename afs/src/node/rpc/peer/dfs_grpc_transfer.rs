@@ -92,7 +92,19 @@ impl GrpcChunkTransfer {
                     length: item.op.length,
                     destination_offset: item.op.output_offset as u64,
                     source_copy_id: item.source.copy_id.0.clone(),
-                    grant: Some(wire_dfs_read_grant(&item.source.read_grant)),
+                    // H2 step 2: a version holder gets its holder grant, never
+                    // a per-copy one (one kind per request, plan/15 R4).
+                    grant: item
+                        .source
+                        .holder_grant
+                        .is_none()
+                        .then(|| wire_dfs_read_grant(&item.source.read_grant)),
+                    holder_grant: item.source.holder_grant.clone().map(Into::into),
+                    wait_ms: crate::node::read::engine::holder_wait_ms(
+                        item,
+                        self.peers.holder_wait_ms,
+                    ),
+                    fetch_if_absent: false,
                 })
                 .collect(),
         };
@@ -405,6 +417,11 @@ impl GrpcChunkTransfer {
             // drains this sink and acquires the original exclusive full-body fill.
             return Ok(None);
         }
+        // H2 step 2: holders serve the range form only; this whole-object
+        // path never sends a holder's grant as a per-copy one.
+        if source.holder_grant.is_some() {
+            return Ok(None);
+        }
         let node_id = node_id.clone();
         let node_epoch = *node_epoch;
         let endpoint = endpoint.to_owned();
@@ -428,6 +445,9 @@ impl GrpcChunkTransfer {
                 destination_offset: 0,
                 source_copy_id: source.copy_id.0.clone(),
                 grant: Some(wire_dfs_read_grant(&source.read_grant)),
+                holder_grant: None,
+                wait_ms: 0,
+                fetch_if_absent: false,
             }],
         };
         let op = &request.operations[0];

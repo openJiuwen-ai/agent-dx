@@ -257,6 +257,62 @@ impl GrpcDfsMeta {
         )
     }
 
+    /// H2 step 2: a holder asks Meta whether a holder grant is current.
+    pub fn validate_holder_grant(
+        &self,
+        request: crate::dfs::ValidateDfsHolderGrant,
+    ) -> afs_error::Result<crate::dfs::DfsAuthorizedHolderRead> {
+        self.record_read_rpc("validate_holder_grant");
+        let reply =
+            self.run(self.client().validate_holder_grant(
+                afs_tracing::request_with_current_context(
+                    afs_protocol::meta::ValidateDfsHolderGrantRequest {
+                        receiver_node_id: request.receiver_node_id,
+                        receiver_node_epoch: request.receiver_node_epoch,
+                        peer_node_id: request.peer_node_id,
+                        grant: Some(request.grant.into()),
+                    },
+                ),
+            ))?
+            .into_inner();
+        Ok(crate::dfs::DfsAuthorizedHolderRead {
+            grant: required(reply.grant, "ValidateDfsHolderGrantReply.grant")?.into(),
+            expires_at_unix_ms: reply.expires_at_unix_ms,
+        })
+    }
+
+    /// H2 step 2: the other readers sharing a version, with holder grants.
+    pub fn version_holders(
+        &self,
+        request: crate::dfs::DfsVersionHoldersRequest,
+    ) -> afs_error::Result<Vec<crate::dfs::VersionHolder>> {
+        self.record_read_rpc("get_version_holders");
+        let reply =
+            self.run(self.client().get_version_holders(
+                afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetDfsVersionHoldersRequest {
+                        caller_id: request.caller_id,
+                        namespace_id: request.namespace_id.0,
+                        file_version_id: request.file_version_id.0,
+                        layout_root_id: request.layout_root_id.0,
+                    },
+                ),
+            ))?
+            .into_inner();
+        reply
+            .holders
+            .into_iter()
+            .map(|holder| {
+                Ok(crate::dfs::VersionHolder {
+                    node_id: holder.node_id,
+                    node_epoch: holder.node_epoch,
+                    data_endpoint: holder.data_endpoint,
+                    grant: required(holder.grant, "DfsVersionHolder.grant")?.into(),
+                })
+            })
+            .collect()
+    }
+
     pub fn validate_external_read_grants(
         &self,
         request: crate::dfs::ValidateExternalReadGrants,

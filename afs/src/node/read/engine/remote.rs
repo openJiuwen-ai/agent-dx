@@ -44,7 +44,134 @@ const MAX_REFRESH_WAIT: Duration = Duration::from_millis(250);
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(5);
 const BUSY_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
+/// One remote read's scope (see [`keeping_fetched`]).
+struct Fetched {
+    /// In-flight marks of the Chunks this read fetched from a copy, kept
+    /// until the read has staged them (review/18 a1).
+    marks: std::cell::RefCell<Vec<crate::node::read::holders::InFlightGuard>>,
+    /// Whether this read may ask a holder to wait (!318 P2-4).
+    holder_wait: bool,
+    /// When this read stops trying holders (!318 round 2 item 2): one
+    /// deadline for all its groups and parallel children.
+    holder_deadline: Option<Instant>,
+}
+
+/// Holders together get at most this share (1/n) of a read's time left when
+/// it starts; the rest stays with the copies it already has.
+const HOLDER_READ_SHARE: u32 = 2;
+
+tokio::task_local! {
+    static FETCHED: Fetched;
+    /// The holder deadline of the logical read this task serves (!318 round
+    /// 3 item 1): fixed once, before the read is split into parts.
+    static LOGICAL_HOLDER_DEADLINE: Instant;
+}
+
+/// Runs one logical read (all its parts, groups, parallel children and
+/// retries) under one holder deadline: its start plus 1/[`HOLDER_READ_SHARE`]
+/// of the time left until `deadline`. Nested calls keep the outer deadline.
+pub(super) async fn for_logical_read<T>(
+    deadline: Instant,
+    read: impl std::future::Future<Output = T>,
+) -> T {
+    if LOGICAL_HOLDER_DEADLINE.try_with(|_| ()).is_ok() {
+        return read.await;
+    }
+    let now = Instant::now();
+    LOGICAL_HOLDER_DEADLINE
+        .scope(
+            now + deadline.saturating_duration_since(now) / HOLDER_READ_SHARE,
+            read,
+        )
+        .await
+}
+
+/// Runs `read` with a scope that keeps the in-flight marks of the Chunks it
+/// fetches until it ends.
+///
+/// `holder_wait`: whether the read may ask holders to wait for a Chunk in
+/// flight there. Only a read of one Chunk may (!318 P2-4): a read of several
+/// keeps each Chunk it fetched in flight until all of them are staged, so
+/// two such reads asking each other for their second Chunks would each wait
+/// for a Chunk the other installs only after its own wait. A read that may
+/// wait marks nothing but that one Chunk, for which waits only go to
+/// higher-ranked holders (re-review P2), so no wait cycle can form.
+///
+/// `deadline`: the read's own. Its holder attempts, in every group and
+/// parallel child, end by one shared holder deadline: the read's start plus
+/// 1/[`HOLDER_READ_SHARE`] of its time left. Holders not yet tried by then
+/// are skipped, so several silent holders cannot take the time of the copies
+/// one Chunk after another (!318 round 2 item 2).
+pub(super) async fn keeping_fetched<T>(
+    holder_wait: bool,
+    deadline: Option<Instant>,
+    read: impl std::future::Future<Output = T>,
+) -> T {
+    let now = Instant::now();
+    // The logical read's, when one is set: parts of one read share it.
+    let holder_deadline = LOGICAL_HOLDER_DEADLINE
+        .try_with(|limit| *limit)
+        .ok()
+        .or_else(|| {
+            deadline
+                .map(|deadline| now + deadline.saturating_duration_since(now) / HOLDER_READ_SHARE)
+        });
+    FETCHED
+        .scope(
+            Fetched {
+                marks: std::cell::RefCell::new(Vec::new()),
+                holder_wait,
+                holder_deadline,
+            },
+            read,
+        )
+        .await
+}
+
+/// The current read's shared holder deadline, if it has one.
+fn holder_deadline() -> Option<Instant> {
+    FETCHED
+        .try_with(|fetched| fetched.holder_deadline)
+        .ok()
+        .flatten()
+        .or_else(|| LOGICAL_HOLDER_DEADLINE.try_with(|limit| *limit).ok())
+}
+
+/// The deadline of one attempt: the read's, and for a holder also the
+/// read's shared holder deadline.
+fn attempt_deadline(deadline: Instant, holder: bool) -> Instant {
+    match holder_deadline() {
+        Some(limit) if holder => deadline.min(limit),
+        _ => deadline,
+    }
+}
+
+/// Keeps `marks` until the enclosing [`keeping_fetched`] scope ends, or
+/// drops them now outside one.
+fn keep_fetched(marks: Vec<crate::node::read::holders::InFlightGuard>) {
+    let _ = FETCHED.try_with(move |fetched| fetched.marks.borrow_mut().extend(marks));
+}
+
+/// Whether the current read may ask a holder to wait; none outside a
+/// [`keeping_fetched`] scope.
+pub(crate) fn holder_wait_allowed() -> bool {
+    FETCHED
+        .try_with(|fetched| fetched.holder_wait)
+        .unwrap_or(false)
+}
+
 impl DfsReadEngine {
+    /// Measurement only (review/18 §8.3): times one remote read stage until
+    /// the returned timer drops, whatever the stage's end (!318 P3-2).
+    pub(super) fn time_route(
+        &self,
+        stage: &'static str,
+    ) -> Option<crate::node::metrics::work::ShareTimer> {
+        self.local
+            .read_work_metrics()
+            .map(|metrics| metrics.share.route(stage))
+    }
+
     pub(super) async fn read_remote_ranges_async(
         &self,
         batch: &ReadBatch,
@@ -144,6 +271,25 @@ impl DfsReadEngine {
         progress: &mut PeerRangeProgress,
     ) -> Result<()> {
         let batch = round.batch;
+        let holder_group = group.iter().all(|&index| {
+            progress.candidates[index][progress.next[index]]
+                .holder_grant
+                .is_some()
+        });
+        if holder_group && Instant::now() >= attempt_deadline(round.deadline, true) {
+            // The read's holder time is over: go on to the copies.
+            self.local
+                .record_read_cache_event("holder_skipped_deadline");
+            progress.last_error = Some(Error::coded(
+                afs_error::NODE_TRANSFER_NOT_READY,
+                "the read's holder deadline passed",
+            ));
+            for &index in group {
+                progress.next[index] += 1;
+                progress.pending.push(index);
+            }
+            return Ok(());
+        }
         let mut length = 0;
         let operations = group
             .iter()
@@ -197,7 +343,80 @@ impl DfsReadEngine {
             .map(|&i| progress.candidates[i].len() - progress.next[i])
             .min()
             .unwrap_or(1);
-        let result = self.try_peer_before(round.deadline, choices, fetch).await;
+        // review/18 a1: in flight only while fetched from a copy that is not
+        // a holder (a holder may itself be waiting for this reader).
+        // Nothing is tracked without sharing (!318 P2-5).
+        let flights = self
+            .distributed_cache
+            .as_ref()
+            .and_then(|cache| cache.in_flight.get());
+        let marks: Vec<_> = match flights {
+            Some(flights)
+                if attempt
+                    .operations
+                    .iter()
+                    .all(|item| item.source.holder_grant.is_none()) =>
+            {
+                attempt
+                    .operations
+                    .iter()
+                    .map(|item| flights.begin(&item.op.chunk_id))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let role = {
+            let source = &attempt.operations[0].source;
+            if source.holder_grant.is_some() {
+                "peer_holder"
+            } else if source.role == CopyRole::VerifiedCache {
+                "verified_cache"
+            } else {
+                "durable"
+            }
+        };
+        // Recorded as `cancelled` if this read is dropped during the attempt.
+        let timer = self
+            .local
+            .read_work_metrics()
+            .map(|metrics| metrics.share.peer_attempt(role));
+        let holder = attempt
+            .operations
+            .iter()
+            .all(|item| item.source.holder_grant.is_some());
+        #[cfg(test)]
+        if holder {
+            self.test_hooks
+                .holder_attempts
+                .lock()
+                .unwrap()
+                .push((Instant::now(), attempt_deadline(round.deadline, true)));
+        }
+        let result = self
+            .try_peer_before(
+                attempt_deadline(round.deadline, holder),
+                choices,
+                holder,
+                fetch,
+            )
+            .await;
+        if let Some(timer) = timer {
+            let outcome = match &result {
+                Ok(()) => "ok",
+                Err(error) if crate::node::fault::classify::peer_not_ready(error) => "not_ready",
+                Err(error) if crate::node::fault::classify::retryable_backpressure(error) => "busy",
+                Err(error) if crate::node::fault::classify::read_authority_rejected(error) => {
+                    "denied"
+                }
+                Err(_) => "error",
+            };
+            timer.end(outcome);
+        }
+        if result.is_ok() {
+            keep_fetched(marks);
+        } else {
+            drop(marks);
+        }
         match result {
             Ok(()) => {
                 if attempt
@@ -227,6 +446,37 @@ impl DfsReadEngine {
                 Ok(())
             }
             Err(error) => {
+                // H2 step 2: a version holder that has no current copy, or no
+                // longer accepts this read, is skipped; it is not a failed
+                // copy and does not end the read.
+                if attempt
+                    .operations
+                    .iter()
+                    .all(|item| item.source.holder_grant.is_some())
+                {
+                    let not_ready = crate::node::fault::classify::peer_not_ready(&error);
+                    let denied = crate::node::fault::classify::read_authority_rejected(&error);
+                    // A holder out of validation or read slots is busy, not a
+                    // bad copy: skip it without demotion and keep this read's
+                    // sources (code review S2, N5).
+                    let busy = crate::node::fault::classify::retryable_backpressure(&error);
+                    if not_ready || denied || busy {
+                        if not_ready {
+                            self.local
+                                .record_read_cache_event("holder_answered_not_ready");
+                        } else if busy {
+                            self.local.record_read_cache_event("holder_answered_busy");
+                        } else if let Some(lists) = &self.holder_lists {
+                            lists.forget(round.version, &batch.layout_root_id);
+                        }
+                        progress.last_error = Some(error);
+                        for &index in group {
+                            progress.next[index] += 1;
+                            progress.pending.push(index);
+                        }
+                        return Ok(());
+                    }
+                }
                 self.invalidate_native_batch_on_error(batch, &error);
                 if crate::node::fault::classify::read_authority_rejected(&error) {
                     // A cache holder refuses a grant once its copy is retired
@@ -292,13 +542,18 @@ impl DfsReadEngine {
         }
     }
 
+    /// One attempt within its share of the read's time left: `1/choices`
+    /// with parallel reads, and always for a holder (!318 P1), which is
+    /// optional and never the last copy, so a slow or silent holder leaves
+    /// the remaining copies their time. Otherwise the whole time left.
     async fn try_peer_before(
         &self,
         deadline: Instant,
         choices: usize,
+        holder: bool,
         fetch: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
-        if self.distribution.parallelism <= 1 {
+        if self.distribution.parallelism <= 1 && !holder {
             return fetch.await;
         }
         let budget = deadline.saturating_duration_since(Instant::now())
@@ -584,6 +839,7 @@ impl DfsReadEngine {
     /// fan-out shows who supplied whom without inferring it from senders.
     pub(super) fn record_source_bytes(&self, source: &SourceCandidate, bytes: u64) {
         let role = match source.role {
+            _ if source.holder_grant.is_some() => "peer_holder",
             CopyRole::VerifiedCache => "verified_cache",
             _ => "durable",
         };
@@ -642,7 +898,16 @@ impl DfsReadEngine {
                 let fetch = self
                     .transfer
                     .read_ranges_async(&single_batch, &mut single_scratch);
-                match self.try_peer_before(round.deadline, choices, fetch).await {
+                let holder = item.source.holder_grant.is_some();
+                match self
+                    .try_peer_before(
+                        attempt_deadline(round.deadline, holder),
+                        choices,
+                        holder,
+                        fetch,
+                    )
+                    .await
+                {
                     Ok(()) => {
                         if !self.source_matches(batch, &item.source) {
                             return Err(external_denied(

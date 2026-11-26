@@ -71,6 +71,8 @@ pub struct SoftReader {
     pub reader: u64,
     pub inode: InodeId,
     pub version: Option<FileVersionId>,
+    /// H2 step 2: registered as a shared reader of `version`.
+    pub shared: bool,
 }
 
 /// One collection reply.
@@ -148,6 +150,10 @@ pub struct GcReferences {
     open_pins: Mutex<std::collections::HashMap<OpenPinKey, std::sync::Weak<GcPin>>>,
     /// In-memory reader registrations of this session (C-1).
     soft: Mutex<SoftReaders>,
+    /// The versions this Node shares (H2 step 2): exactly the versions of
+    /// the shared entries of `soft.live`, updated under the `soft` lock.
+    #[cfg(feature = "dfs")]
+    holders: Arc<crate::node::read::holders::HolderRegistry>,
 }
 
 /// Retain attempts of one soft registration (term drops, a report first)
@@ -163,7 +169,8 @@ const SOFT_RETAIN_ATTEMPTS: usize = 4;
 struct SoftReaders {
     next: u64,
     in_flight: std::collections::BTreeSet<u64>,
-    live: std::collections::BTreeMap<u64, (InodeId, Option<FileVersionId>)>,
+    /// Reader number to (inode, version, shared).
+    live: std::collections::BTreeMap<u64, (InodeId, Option<FileVersionId>, bool)>,
     /// Highest Meta writer term seen. A reply of a lower term comes from a
     /// replaced Meta and is dropped (L6).
     seen_term: u64,
@@ -336,6 +343,11 @@ impl Drop for GcPin {
     fn drop(&mut self) {
         if let Some(reader) = self.reader {
             if let Ok(mut soft) = self.owner.soft.lock() {
+                // The registry leaves under the same lock as `live`.
+                #[cfg(feature = "dfs")]
+                if let Some((_, Some(version), true)) = soft.live.get(&reader) {
+                    self.owner.holders.release(version, reader);
+                }
                 soft.live.remove(&reader);
                 soft.released.push(reader);
                 if soft.released.len() == RELEASE_WAKE_PENDING {
@@ -378,7 +390,14 @@ impl GcReferences {
             wake: tokio::sync::Notify::new(),
             open_pins: Mutex::default(),
             soft: Mutex::default(),
+            #[cfg(feature = "dfs")]
+            holders: crate::node::read::holders::HolderRegistry::new(),
         })
+    }
+    /// The versions this Node shares with other readers (H2 step 2).
+    #[cfg(feature = "dfs")]
+    pub(crate) fn holders(&self) -> Arc<crate::node::read::holders::HolderRegistry> {
+        self.holders.clone()
     }
     /// Resolves when enough dropped pins wait that the release loop should not
     /// sleep until its next pass.
@@ -444,7 +463,8 @@ impl GcReferences {
         let mut soft = self.soft()?;
         // Live before it leaves flight: a report never misses it (L3).
         if matches!(outcome, Ok(true)) {
-            soft.live.insert(reader, (inode.clone(), version.cloned()));
+            soft.live
+                .insert(reader, (inode.clone(), version.cloned(), false));
         }
         soft.in_flight.remove(&reader);
         drop(soft);
@@ -482,11 +502,28 @@ impl GcReferences {
         reader: u64,
         registered: Option<(u64, &InodeId, Option<&FileVersionId>)>,
     ) -> Result<Option<Arc<GcPin>>> {
+        self.finish_shared_reader(reader, registered, false)
+    }
+    /// [`Self::finish_reader`] for an open that asked Meta to register a
+    /// shared reader (H2 step 2). `shared` must be what the open sent: the
+    /// reader joins the holder registry exactly when Meta keeps it shared.
+    pub(crate) fn finish_shared_reader(
+        self: &Arc<Self>,
+        reader: u64,
+        registered: Option<(u64, &InodeId, Option<&FileVersionId>)>,
+        shared: bool,
+    ) -> Result<Option<Arc<GcPin>>> {
         let mut soft = self.soft()?;
         let accepted = registered.filter(|(term, _, _)| *term >= soft.seen_term);
         if let Some((term, inode, version)) = accepted {
             soft.seen_term = term;
-            soft.live.insert(reader, (inode.clone(), version.cloned()));
+            let shared = shared && version.is_some();
+            #[cfg(feature = "dfs")]
+            if let (true, Some(version)) = (shared, version) {
+                self.holders.retain(version, reader);
+            }
+            soft.live
+                .insert(reader, (inode.clone(), version.cloned(), shared));
         }
         soft.in_flight.remove(&reader);
         drop(soft);
@@ -554,10 +591,11 @@ impl GcReferences {
                 let readers = soft
                     .live
                     .iter()
-                    .map(|(reader, (inode, version))| SoftReader {
+                    .map(|(reader, (inode, version, shared))| SoftReader {
                         reader: *reader,
                         inode: inode.clone(),
                         version: version.clone(),
+                        shared: *shared,
                     })
                     .collect::<Vec<_>>();
                 (soft.seen_term, low_watermark, readers)
@@ -1073,6 +1111,76 @@ mod tests {
         assert_eq!(terms, [0, 3]);
     }
 
+    /// H2 step 2 T21 ④: the holder registry, the live readers and the report
+    /// describe the same shared readers, through open, a second reader of the
+    /// same version, close in either order, a stale-term reply and an
+    /// unshared open.
+    #[test]
+    #[cfg(feature = "dfs")]
+    fn h2_t21_holder_registry_follows_shared_soft_readers() {
+        let meta = soft_meta(2);
+        let references = GcReferences::new(meta.clone());
+        references.report_readers().unwrap();
+        let inode = InodeId::new("i");
+        let version = FileVersionId::new("v");
+        let holders = references.holders();
+        let open = |shared: bool, term: u64| {
+            let reader = references.begin_reader().unwrap().unwrap();
+            let pin = references
+                .finish_shared_reader(reader, Some((term, &inode, Some(&version))), shared)
+                .unwrap();
+            (reader, pin)
+        };
+        let (first, first_pin) = open(true, 2);
+        let (second, second_pin) = open(true, 2);
+        let (plain, plain_pin) = open(false, 2);
+        // A reply of an older Meta term is not accepted: it never joins.
+        let (stale, stale_pin) = open(true, 1);
+        assert!(stale_pin.is_none());
+        assert_eq!(holders.readers(&version), vec![first, second]);
+        references.report_readers().unwrap();
+        let (_, _, reported) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        let shared = |readers: &[SoftReader]| {
+            readers
+                .iter()
+                .filter(|reader| reader.shared)
+                .map(|reader| reader.reader)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shared(&reported), vec![first, second]);
+        assert!(reported.iter().all(|reader| reader.reader != stale));
+        assert!(
+            reported
+                .iter()
+                .any(|reader| reader.reader == plain && !reader.shared)
+        );
+        drop(second_pin);
+        assert_eq!(holders.readers(&version), vec![first]);
+        assert!(holders.is_shared(&version));
+        drop(plain_pin);
+        assert!(holders.is_shared(&version));
+        drop(first_pin);
+        assert!(!holders.is_shared(&version));
+        references.report_readers().unwrap();
+        let (_, _, reported) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        assert!(shared(&reported).is_empty());
+    }
+
+    /// A shared open without a version (an empty file) shares nothing.
+    #[test]
+    #[cfg(feature = "dfs")]
+    fn h2_shared_open_without_a_version_is_not_shared() {
+        let meta = soft_meta(1);
+        let references = GcReferences::new(meta.clone());
+        let reader = references.begin_reader().unwrap().unwrap();
+        let _pin = references
+            .finish_shared_reader(reader, Some((1, &InodeId::new("i"), None)), true)
+            .unwrap();
+        references.report_readers().unwrap();
+        let (_, _, reported) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        assert!(reported.iter().all(|reader| !reader.shared));
+    }
+
     /// Meta refusing the version as not the linked head (an old version, an
     /// unlinked inode) makes the pin durable, as before C-1.
     #[test]
@@ -1148,7 +1256,8 @@ mod tests {
             vec![SoftReader {
                 reader: completed,
                 inode,
-                version: Some(version)
+                version: Some(version),
+                shared: false,
             }]
         );
         drop(pin);

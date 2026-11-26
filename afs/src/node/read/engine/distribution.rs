@@ -75,6 +75,9 @@ impl DfsReadEngine {
         set.sources.sort_by_cached_key(|source| {
             let remote = self.is_remote_candidate(source);
             let fallback = cached && source.role != CopyRole::VerifiedCache;
+            // H2 step 2: version holders after the published copies, before
+            // the durable ones.
+            let holder = source.holder_grant.is_some();
             let node = match &source.location {
                 CopyLocation::Node { node_id, .. } => node_id.as_str(),
                 CopyLocation::External { .. } => "",
@@ -83,6 +86,7 @@ impl DfsReadEngine {
                 !remote,
                 is_demoted(source),
                 fallback,
+                holder,
                 source.load_hint,
                 std::cmp::Reverse(rendezvous_weight(version, &set.chunk_id, node)),
             )
@@ -93,8 +97,10 @@ impl DfsReadEngine {
     /// when any is offered, otherwise every remote holder (D3-1).
     fn striping_nodes<'s>(&self, batch: &ReadBatch, set: &'s ChunkSources) -> BTreeSet<&'s String> {
         let demoted = self.demoted_now();
+        // A version holder may answer NOT_READY: never a stripe.
         let usable = |s: &&SourceCandidate| {
             self.is_remote_candidate(s)
+                && s.holder_grant.is_none()
                 && self.source_matches(batch, s)
                 && !demoted.contains(&s.copy_id)
         };

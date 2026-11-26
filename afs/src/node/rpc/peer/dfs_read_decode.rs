@@ -53,6 +53,9 @@ pub(super) fn peer_disk_test_frames(
             destination_offset: 0,
             source_copy_id: "sink-test-copy".into(),
             grant: None,
+            holder_grant: None,
+            wait_ms: 0,
+            fetch_if_absent: false,
         }],
     };
     let mut frames = vec![DfsReadRangesFrame {

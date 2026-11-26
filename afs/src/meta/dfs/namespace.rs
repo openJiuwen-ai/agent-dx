@@ -167,6 +167,7 @@ impl DfsService {
                 reader,
                 &inode.inode_id,
                 None,
+                false,
             );
             (reader, seq)
         });

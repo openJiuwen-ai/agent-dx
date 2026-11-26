@@ -12,6 +12,10 @@ pub struct PeerConnectionPool {
     pub(super) read_crc_mode: crate::config::DfsReadCrcMode,
     #[cfg(feature = "dfs")]
     pub(super) read_work_metrics: Option<crate::node::metrics::work::ReadWorkMetrics>,
+    /// H2 step 2: the wait a reader asks a higher-ranked holder for
+    /// (`dfs_holder_wait_ms`; the Node sets it, a bare pool asks for none).
+    #[cfg(feature = "dfs")]
+    pub(super) holder_wait_ms: u32,
     pub(super) config: afs_transport::GrpcConfig,
     security: afs_transport::SecurityManager,
     capacity: usize,
@@ -64,6 +68,8 @@ impl PeerConnectionPool {
             stream_work: Arc::new(PeerStreamWorkPool::default()),
             #[cfg(feature = "dfs")]
             read_work_metrics: None,
+            #[cfg(feature = "dfs")]
+            holder_wait_ms: 0,
         })
     }
 
@@ -88,6 +94,14 @@ impl PeerConnectionPool {
     #[cfg(feature = "dfs")]
     pub(crate) fn with_read_crc_mode(mut self, mode: crate::config::DfsReadCrcMode) -> Self {
         self.read_crc_mode = mode;
+        self
+    }
+
+    /// H2 step 2: how long a reader asks a holder ranked above it to wait
+    /// for a Chunk it is fetching (0 = never ask to wait).
+    #[cfg(feature = "dfs")]
+    pub(crate) fn with_holder_wait_ms(mut self, wait_ms: u32) -> Self {
+        self.holder_wait_ms = wait_ms;
         self
     }
 

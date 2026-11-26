@@ -2849,6 +2849,7 @@ fn open_read(reader: u64, inode_id: &str, name: Option<&str>) -> crate::meta::df
         session_id: "s".into(),
         reader,
         inode_id: InodeId::new(inode_id),
+        share_read_cache: false,
         name: name.map(|name| {
             (
                 NamespaceId::new("ns"),
@@ -3131,6 +3132,7 @@ async fn a_restart_preserves_a_live_reader_above_the_report_watermark() {
                     reader: entry.reader,
                     inode_id: entry.inode.clone(),
                     version_id: entry.version.clone(),
+                    share_read_cache: entry.shared,
                 })
                 .collect();
             let meta = self.meta.lock().unwrap().clone();

@@ -89,7 +89,9 @@ fn service_paths_keep_the_package() {
 /// Generation 11 carries workspace deletion tombstones (`ListOwnerRoots`,
 /// `MarkRootTombstonesIsolated`, `ClearRootTombstones`) and covers
 /// `OwnerControl.WorkspaceOutletLayouts`, which joined the layout without a bump.
+/// Generation 12 adds DFS version holders (H2 step 2): shared reader
+/// registrations, holder grants and the holder form of `ReadRanges`.
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 11);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 12);
 }
