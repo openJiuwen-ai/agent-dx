@@ -83,9 +83,19 @@ where
                     Some(Ok(data)) => {
                         let n = data.len() as u64;
                         recv.flow_control().release_capacity(data.len()).map_err(|e| io::Error::other(e.to_string()))?;
-                        if let Some(progress) = &progress { progress.request_wait.pending(progress.now_ms()); }
-                        tcp.write_all(&data).await?;
-                        if let Some(progress) = &progress { progress.request_wait.ready(progress.now_ms()); progress.progress(true, data.len()); }
+                        if let Some(progress) = &progress {
+                            let mut remaining=&data[..];
+                            while !remaining.is_empty() {
+                                let n=poll_fn(|cx| {
+                                    let result=std::pin::Pin::new(&mut tcp).poll_write(cx,remaining);
+                                    progress.request_wait.observe(result.is_pending(),||progress.now_ms());
+                                    result
+                                }).await?;
+                                if n==0 { return Err(io::Error::new(io::ErrorKind::WriteZero,"runtime TCP write returned zero")); }
+                                remaining=&remaining[n..];
+                            }
+                            progress.progress(true,data.len());
+                        } else { tcp.write_all(&data).await?; }
                         stats.bytes_up.fetch_add(n, Ordering::Relaxed);
                     }
                     Some(Err(e)) => return Err(io::Error::other(e.to_string())),
@@ -110,8 +120,7 @@ where
                     let capacity = poll_fn(|cx| {
                         let result = send.poll_capacity(cx);
                         if let Some(progress) = &progress {
-                            if matches!(result,Poll::Pending|Poll::Ready(Some(Ok(0)))) { progress.h2_wait.pending(progress.now_ms()); }
-                            else { progress.h2_wait.ready(progress.now_ms()); }
+                            progress.h2_wait.observe(matches!(result,Poll::Pending|Poll::Ready(Some(Ok(0)))),||progress.now_ms());
                         }
                         result
                     }).await

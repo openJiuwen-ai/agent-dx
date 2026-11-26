@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
+#[path = "transfer/diagnostic.rs"]
+mod diagnostic;
+use diagnostic::Diagnostic;
+const CHECK_BATCH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferPolicy {
@@ -26,13 +30,21 @@ impl Default for TransferPolicy {
 pub(crate) struct Wait {
     since: AtomicU64,
     total: AtomicU64,
-    longest: AtomicU64,
-    count: AtomicU64,
 }
 impl Wait {
-    pub fn pending(&self, now: u64) {
-        if self
-            .since
+    /// Polls of each I/O direction have one writer. Snapshots may run concurrently.
+    pub fn observe(&self, pending: bool, now: impl FnOnce() -> u64) -> bool {
+        match (pending, self.since.load(Ordering::Relaxed) != 0) {
+            (true, false) => self.pending(now()),
+            (false, true) => {
+                self.ready(now());
+                false
+            }
+            _ => false,
+        }
+    }
+    pub fn pending(&self, now: u64) -> bool {
+        self.since
             .compare_exchange(
                 0,
                 now.saturating_add(1),
@@ -40,19 +52,15 @@ impl Wait {
                 Ordering::Relaxed,
             )
             .is_ok()
-        {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
     }
     pub fn ready(&self, now: u64) {
         let since = self.since.swap(0, Ordering::Relaxed);
         if since != 0 {
-            let elapsed = now.saturating_sub(since - 1);
-            self.total.fetch_add(elapsed, Ordering::Relaxed);
-            self.longest.fetch_max(elapsed, Ordering::Relaxed);
+            self.total
+                .fetch_add(now.saturating_sub(since - 1), Ordering::Relaxed);
         }
     }
-    pub fn snapshot(&self, now: u64) -> (u64, u64, u64) {
+    pub fn snapshot(&self, now: u64) -> (u64, u64) {
         let since = self.since.load(Ordering::Relaxed);
         let pending = if since == 0 {
             0
@@ -61,15 +69,38 @@ impl Wait {
         };
         (
             self.total.load(Ordering::Relaxed).saturating_add(pending),
-            self.longest.load(Ordering::Relaxed).max(pending),
             pending,
         )
+    }
+}
+#[derive(Default)]
+pub(crate) struct H2Wait {
+    wait: Wait,
+    count: AtomicU64,
+}
+impl H2Wait {
+    pub fn observe(&self, pending: bool, now: impl FnOnce() -> u64) {
+        if self.wait.observe(pending, now) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(test)]
+    fn pending(&self, now: u64) {
+        self.observe(true, || now);
+    }
+    #[cfg(test)]
+    fn ready(&self, now: u64) {
+        self.observe(false, || now);
+    }
+    pub fn snapshot(&self, now: u64) -> (u64, u64, u64) {
+        let (total, pending) = self.wait.snapshot(now);
+        (total, self.count.load(Ordering::Relaxed), pending)
     }
 }
 
 /// Counters belong to one CONNECT transport, including when HTTP reuses it.
 pub(crate) struct H2Observation {
-    pub wait: Wait,
+    pub wait: H2Wait,
     pub enqueued: AtomicU64,
     pub stream_id: AtomicU32,
     pub tunnel_id: String,
@@ -79,7 +110,7 @@ pub(crate) struct H2Observation {
 impl H2Observation {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            wait: Wait::default(),
+            wait: H2Wait::default(),
             enqueued: AtomicU64::new(0),
             stream_id: AtomicU32::new(0),
             tunnel_id: uuid::Uuid::new_v4().to_string(),
@@ -91,22 +122,18 @@ impl H2Observation {
         milliseconds(self.started.elapsed())
     }
     pub fn poll_capacity(&self, pending: bool) {
-        if pending {
-            self.wait.pending(self.now_ms());
-        } else if self.wait.since.load(Ordering::Relaxed) != 0 {
-            self.wait.ready(self.now_ms());
-        }
+        self.wait.observe(pending, || self.now_ms());
     }
     pub fn sent(&self, bytes: usize) {
         self.enqueued.fetch_add(bytes as u64, Ordering::Relaxed);
         self.last_progress.store(self.now_ms(), Ordering::Relaxed);
     }
     fn snapshot(&self) -> H2Snapshot {
-        let (wait_ms, _, pending_ms) = self.wait.snapshot(self.now_ms());
+        let (wait_ms, wait_count, pending_ms) = self.wait.snapshot(self.now_ms());
         H2Snapshot {
             wait_ms,
             pending_ms,
-            wait_count: self.wait.count.load(Ordering::Relaxed),
+            wait_count,
             enqueued_bytes: self.enqueued.load(Ordering::Relaxed),
         }
     }
@@ -174,6 +201,7 @@ impl ConnectionProgress {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransferIdentity {
     pub component: &'static str,
     pub direction: &'static str,
@@ -190,7 +218,7 @@ pub(crate) struct TransferProgress {
     pub response_bytes: AtomicU64,
     pub request_wait: Wait,
     pub response_wait: Wait,
-    pub h2_wait: Wait,
+    pub h2_wait: H2Wait,
     pub frontend: Option<Arc<ConnectionProgress>>,
     pub headers_ms: AtomicU64,
     pub h2_enqueued_bytes: AtomicU64,
@@ -246,11 +274,11 @@ impl TransferProgress {
                 pending_ms: current.pending_ms.min(self.now_ms()),
             };
         }
-        let (wait_ms, _, pending_ms) = self.h2_wait.snapshot(self.now_ms());
+        let (wait_ms, wait_count, pending_ms) = self.h2_wait.snapshot(self.now_ms());
         H2Snapshot {
             wait_ms,
             pending_ms,
-            wait_count: self.h2_wait.count.load(Ordering::Relaxed),
+            wait_count,
             enqueued_bytes: self.h2_enqueued_bytes.load(Ordering::Relaxed),
         }
     }
@@ -338,13 +366,19 @@ impl TransferProgress {
         if bytes == 0 {
             return;
         }
+        self.progress_at(request, bytes, self.now_ms());
+    }
+    pub fn progress_at(&self, request: bool, bytes: usize, now: u64) {
+        if bytes == 0 {
+            return;
+        }
         let counter = if request {
             &self.request_bytes
         } else {
             &self.response_bytes
         };
         counter.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.last_progress.store(self.now_ms(), Ordering::Relaxed);
+        self.last_progress.store(now, Ordering::Relaxed);
     }
     fn slow_reason(&self, policy: &TransferPolicy) -> Option<&'static str> {
         if self.finished.load(Ordering::Acquire) {
@@ -363,7 +397,7 @@ impl TransferProgress {
             if self.h2_wait.snapshot(now).2 >= milliseconds(policy.slow_after) {
                 return Some("h2_capacity_wait");
             }
-            if self.request_wait.snapshot(now).2 >= milliseconds(policy.slow_after) {
+            if self.request_wait.snapshot(now).1 >= milliseconds(policy.slow_after) {
                 return Some("runtime_write_wait");
             }
             // A low-rate CONNECT is diagnostic only when flow-control waits
@@ -440,6 +474,7 @@ struct Monitor {
     slow: AtomicU64,
     suppressed: AtomicU64,
     budget: Mutex<(Instant, usize)>,
+    diagnostics: OnceLock<Option<std::sync::mpsc::SyncSender<Diagnostic>>>,
 }
 impl Default for TransferMonitor {
     fn default() -> Self {
@@ -459,6 +494,7 @@ impl TransferMonitor {
             slow: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
             budget: Mutex::new((Instant::now(), 0)),
+            diagnostics: OnceLock::new(),
         }))
     }
     pub fn start(
@@ -475,7 +511,7 @@ impl TransferMonitor {
             response_bytes: AtomicU64::new(0),
             request_wait: Wait::default(),
             response_wait: Wait::default(),
-            h2_wait: Wait::default(),
+            h2_wait: H2Wait::default(),
             headers_ms: AtomicU64::new(0),
             h2_enqueued_bytes: AtomicU64::new(0),
             last_progress: AtomicU64::new(0),
@@ -522,6 +558,10 @@ impl TransferMonitor {
                         .expect("transfer scheduling never panics while locked")
                         .next();
                     drop(current);
+                    if next.is_some_and(|at| at <= Instant::now()) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     match next {
                         Some(at) => {
                             tokio::select! { _ = tokio::time::sleep_until(at) => {}, _ = wake.notified() => {} }
@@ -550,7 +590,7 @@ impl Drop for Monitor {
 }
 impl Monitor {
     fn check(&self) {
-        loop {
+        for _ in 0..CHECK_BATCH {
             let due = self
                 .schedule
                 .lock()
@@ -562,7 +602,7 @@ impl Monitor {
             let Some(state) = progress.upgrade() else {
                 continue;
             };
-            let _events = state
+            let events = state
                 .events
                 .lock()
                 .expect("diagnostic lifecycle never panics while locked");
@@ -570,26 +610,36 @@ impl Monitor {
                 continue;
             }
             self.checks.fetch_add(1, Ordering::Relaxed);
-            self.consider(&state);
-            {
-                let next = Instant::now() + self.policy.slow_after;
-                self.schedule
-                    .lock()
-                    .expect("transfer scheduling never panics while locked")
-                    .insert(id, next, Arc::downgrade(&state));
+            let diagnostic = self.consider(&state);
+            self.schedule
+                .lock()
+                .expect("transfer scheduling never panics while locked")
+                .insert(
+                    id,
+                    Instant::now() + self.policy.slow_after,
+                    Arc::downgrade(&state),
+                );
+            drop(events);
+            if let Some(diagnostic) = diagnostic {
+                self.enqueue(diagnostic);
             }
         }
     }
-    fn consider(&self, state: &TransferProgress) {
-        if let Some(reason) = state.slow_reason(&self.policy) {
-            if !state.slow.swap(true, Ordering::AcqRel) {
-                let _ = state.reason.set(reason);
-                self.slow.fetch_add(1, Ordering::Relaxed);
-                self.emit(state, "slow_transfer_started", reason);
-            }
+    fn consider(&self, state: &TransferProgress) -> Option<Diagnostic> {
+        let reason = state.slow_reason(&self.policy)?;
+        if state.slow.swap(true, Ordering::AcqRel) {
+            return None;
         }
+        let _ = state.reason.set(reason);
+        self.slow.fetch_add(1, Ordering::Relaxed);
+        self.prepare(state, "slow_transfer_started", reason)
     }
-    fn emit(&self, state: &TransferProgress, event: &'static str, outcome: &'static str) {
+    fn prepare(
+        &self,
+        state: &TransferProgress,
+        event: &'static str,
+        outcome: &'static str,
+    ) -> Option<Diagnostic> {
         let mut budget = self
             .budget
             .lock()
@@ -599,50 +649,20 @@ impl Monitor {
         }
         if budget.1 >= self.policy.logs_per_minute {
             self.suppressed.fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         }
         budget.1 += 1;
         drop(budget);
-        let now = state.now_ms();
-        let (request_wait_ms, _, _) = state.request_wait.snapshot(now);
-        let (response_wait_ms, _, _) = state.response_wait.snapshot(now);
-        let h2 = state.h2_snapshot();
-        let (h2_tunnel_id, h2_stream_id) = state.h2_identity();
-        let window = if event == "slow_transfer_finished" {
-            state.sample_window(self.policy.slow_after, true)
-        } else {
-            state.window()
-        };
-        let (
-            frontend_connection_id,
-            frontend_connection_written_bytes,
-            frontend_write_wait_ms,
-            frontend_write_pending_ms,
-        ) = state.frontend.as_ref().map_or((0, 0, 0, 0), |connection| {
-            let (wait, _, pending) = connection.write_wait.snapshot(connection.now_ms());
-            (
-                connection.id,
-                connection.written.load(Ordering::Relaxed),
-                wait,
-                pending,
-            )
-        });
-        tracing::warn!(target: "adx_transfer", event, outcome,
-            component = state.identity.component, direction = state.identity.direction,
-            request_id = %state.identity.request_id, trace_id = %state.identity.trace_id, span_id = %state.identity.span_id,
-            elapsed_ms = now, headers_ms = state.headers_ms.load(Ordering::Relaxed),
-            request_bytes = state.request_bytes.load(Ordering::Relaxed), response_bytes = state.response_bytes.load(Ordering::Relaxed),
-            last_progress_age_ms = state.progress_age_ms(), slow_reason=state.reason(),
-            request_wait_ms, response_wait_ms,
-            h2_capacity_wait_ms = h2.wait_ms, h2_capacity_wait_count=h2.wait_count,
-            h2_capacity_wait_ratio=ratio(h2.wait_ms,now),
-            h2_capacity_pending_ms=h2.pending_ms, h2_enqueued_bytes=h2.enqueued_bytes,
-            h2_tunnel_id, h2_stream_id, window_ms=window.duration_ms, window_end_ms=window.end_ms,
-            window_request_bytes=window.request_bytes, window_response_bytes=window.response_bytes,
-            h2_window_wait_ms=window.h2_wait_ms,h2_window_wait_count=window.h2_wait_count,
-            h2_window_wait_ratio=window.h2_wait_ratio(),h2_window_enqueued_bytes=window.h2_enqueued_bytes,
-            frontend_connection_id, frontend_connection_written_bytes, frontend_write_wait_ms, frontend_write_pending_ms,
-            "Slow transfer diagnostic");
+        Some(Diagnostic::capture(state, event, outcome))
+    }
+    fn enqueue(&self, diagnostic: Diagnostic) {
+        let sender = self.diagnostics.get_or_init(diagnostic::start_worker);
+        if sender
+            .as_ref()
+            .is_none_or(|sender| sender.try_send(diagnostic).is_err())
+        {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -658,25 +678,35 @@ impl TransferRegistration {
             return;
         }
         self.finished = true;
-        // A delayed executor may not have polled an already-due timer before completion.
-        let _events = self
-            .progress
-            .events
-            .lock()
-            .expect("diagnostic lifecycle never panics while locked");
-        self.monitor.0.consider(&self.progress);
-        self.progress.finished.store(true, Ordering::Release);
-        self.monitor
-            .0
-            .schedule
-            .lock()
-            .expect("transfer scheduling never panics while locked")
-            .cancel(self.id);
-        self.monitor.0.active.fetch_sub(1, Ordering::Relaxed);
-        if self.progress.slow.load(Ordering::Acquire) {
+        // Finish also checks a due transfer if its timer has not run yet.
+        let (started, finished) = {
+            let _events = self
+                .progress
+                .events
+                .lock()
+                .expect("diagnostic lifecycle never panics while locked");
+            let started = self.monitor.0.consider(&self.progress);
+            self.progress.finished.store(true, Ordering::Release);
             self.monitor
                 .0
-                .emit(&self.progress, "slow_transfer_finished", outcome);
+                .schedule
+                .lock()
+                .expect("transfer scheduling never panics while locked")
+                .cancel(self.id);
+            self.monitor.0.active.fetch_sub(1, Ordering::Relaxed);
+            let finished = if self.progress.slow.load(Ordering::Acquire) {
+                self.progress
+                    .sample_window(self.monitor.0.policy.slow_after, true);
+                self.monitor
+                    .0
+                    .prepare(&self.progress, "slow_transfer_finished", outcome)
+            } else {
+                None
+            };
+            (started, finished)
+        };
+        for diagnostic in [started, finished].into_iter().flatten() {
+            self.monitor.0.enqueue(diagnostic);
         }
     }
 }
@@ -699,6 +729,129 @@ pub(crate) fn ratio(wait_ms: u64, elapsed_ms: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overhead_wait_clock_runs_only_on_state_changes() {
+        let wait = Wait::default();
+        let reads = std::cell::Cell::new(0);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            100
+        };
+        for _ in 0..1000 {
+            wait.observe(false, clock);
+        }
+        assert_eq!(reads.get(), 0, "ready writes must not read the clock");
+        for _ in 0..1000 {
+            wait.observe(true, clock);
+        }
+        assert_eq!(reads.get(), 1, "repeated pending polls share one start");
+        for _ in 0..1000 {
+            wait.observe(false, clock);
+        }
+        assert_eq!(reads.get(), 2);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn overhead_watchdog_bounds_one_due_batch() {
+        let monitor = TransferMonitor::default();
+        monitor.0.started.store(true, Ordering::Relaxed);
+        let active: Vec<_> = (0..1024)
+            .map(|_| monitor.start(identity("relay"), None))
+            .collect();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        monitor.0.check();
+        let checked = monitor.0.checks.load(Ordering::Relaxed);
+        assert!(
+            checked > 0 && checked <= 128,
+            "one batch processed {checked} transfers"
+        );
+        assert_eq!(monitor.0.active.load(Ordering::Relaxed), 1024);
+        while monitor.0.checks.load(Ordering::Relaxed) < 1024 {
+            monitor.0.check();
+        }
+        drop(active);
+        assert_eq!(monitor.0.active.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn overhead_blocked_diagnostics_do_not_block_transfer_completion() {
+        use std::sync::{mpsc, Condvar};
+        struct Blocked {
+            entered: mpsc::SyncSender<()>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl tracing::Subscriber for Blocked {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target() != "adx_transfer" {
+                    return;
+                }
+                let _ = self.entered.try_send(());
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+        }
+        let (entered, receiver) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let dispatch = tracing::Dispatch::new(Blocked {
+            entered,
+            release: release.clone(),
+        });
+        let monitor = TransferMonitor::new(TransferPolicy {
+            logs_per_minute: 512,
+            ..Default::default()
+        });
+        monitor.0.started.store(true, Ordering::Relaxed);
+        let mut transfer = monitor.start(identity("ingress"), None);
+        let mut others: Vec<_> = (0..100)
+            .map(|_| monitor.start(identity("ingress"), None))
+            .collect();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let runtime = tokio::runtime::Handle::current();
+        let checker = monitor.clone();
+        let runtime_check = runtime.clone();
+        let worker = std::thread::spawn(move || {
+            let _runtime = runtime_check.enter();
+            tracing::dispatcher::with_default(&dispatch, || checker.0.check());
+        });
+        let blocked = receiver.recv_timeout(Duration::from_secs(2));
+        let (done, completed) = mpsc::channel();
+        let finish = std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            transfer.finish("complete");
+            done.send(()).unwrap();
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        for other in &mut others {
+            other.finish("complete");
+        }
+        let suppressed = monitor.0.suppressed.load(Ordering::Relaxed);
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        worker.join().unwrap();
+        finish.join().unwrap();
+        assert!(blocked.is_ok(), "diagnostic subscriber was not exercised");
+        assert!(
+            result.is_ok(),
+            "blocked diagnostic output delayed completion"
+        );
+        assert_eq!(monitor.0.active.load(Ordering::Relaxed), 0);
+        assert!(monitor.0.budget.lock().unwrap().1 < 512);
+        assert!(
+            suppressed > 0,
+            "a full bounded queue must suppress without blocking"
+        );
+    }
     fn identity(component: &'static str) -> TransferIdentity {
         TransferIdentity {
             component,
@@ -763,12 +916,9 @@ mod tests {
         tokio::time::advance(Duration::from_secs(12)).await;
         monitor.0.check();
         assert!(transfer.progress.slow.load(Ordering::Relaxed));
-        assert_eq!(
-            transfer.progress.h2_wait.snapshot(12000),
-            (12000, 12000, 12000)
-        );
+        assert_eq!(transfer.progress.h2_wait.snapshot(12000), (12000, 1, 12000));
         transfer.progress.h2_wait.ready(12000);
-        assert_eq!(transfer.progress.h2_wait.snapshot(15000), (12000, 12000, 0));
+        assert_eq!(transfer.progress.h2_wait.snapshot(15000), (12000, 1, 0));
         transfer.finish("complete");
     }
     #[tokio::test(start_paused = true)]
@@ -803,7 +953,7 @@ mod tests {
     }
     #[test]
     fn wait_counts_blocking_episodes_instead_of_repeated_polls() {
-        let wait = Wait::default();
+        let wait = H2Wait::default();
         wait.pending(0);
         wait.pending(10);
         wait.pending(20);
@@ -811,7 +961,7 @@ mod tests {
         wait.pending(200);
         wait.ready(450);
         assert_eq!(wait.count.load(Ordering::Relaxed), 2);
-        assert_eq!(wait.snapshot(500), (350, 250, 0));
+        assert_eq!(wait.snapshot(500), (350, 2, 0));
     }
     #[tokio::test(start_paused = true)]
     async fn healthy_h2_rate_and_idle_reused_tunnels_stay_quiet() {
@@ -952,9 +1102,9 @@ mod tests {
                 .progress
                 .h2_wait
                 .snapshot(transfer.progress.now_ms())
-                .1
+                .2
                 < 500,
-            "no individual wait should reach the long-stall threshold"
+            "credit updates must keep the current wait below the stall threshold"
         );
         transfer.finish("cancelled");
         drop(send);

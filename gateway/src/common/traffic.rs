@@ -104,11 +104,9 @@ impl<T> MeteredIo<T> {
     }
     fn written(&mut self, result: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
         if let Some(connection) = &self.connection {
-            if result.is_pending() {
-                connection.write_wait.pending(connection.now_ms());
-            } else {
-                connection.write_wait.ready(connection.now_ms());
-            }
+            connection
+                .write_wait
+                .observe(result.is_pending(), || connection.now_ms());
         }
         if let Poll::Ready(Ok(n)) = result {
             self.written = self.written.saturating_add(n as u64);

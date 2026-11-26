@@ -24,12 +24,12 @@ impl TransferGuard {
             .as_ref()
             .expect("an active transfer owns its trace")
     }
-    pub fn progress(&self) -> Arc<TransferProgress> {
+    pub fn progress(&self) -> &TransferProgress {
         self.registration
             .as_ref()
             .expect("file response guards own a transfer registration")
             .progress
-            .clone()
+            .as_ref()
     }
     pub fn finish(&mut self, outcome: &'static str) {
         let Some(trace) = self.trace.take() else {
@@ -46,7 +46,7 @@ impl TransferGuard {
             "transfer.headers_ms",
             integer(state.headers_ms.load(Ordering::Relaxed)),
         );
-        if state.slow.load(Ordering::Relaxed) {
+        if state.slow.load(Ordering::Relaxed) && trace.is_recording() {
             let h2 = state.h2_snapshot();
             let window = state.window();
             trace.boolean_attribute("transfer.slow", true);
@@ -132,15 +132,20 @@ impl<B: Body<Data = Bytes> + Unpin> Body for RequestBody<B> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, B::Error>>> {
         let result = Pin::new(&mut self.inner).poll_frame(cx);
-        let now = self.state.now_ms();
-        if result.is_pending() {
-            self.state.request_wait.pending(now);
-        } else {
-            self.state.request_wait.ready(now);
-            if let Poll::Ready(Some(Ok(ref frame))) = result {
-                if let Some(bytes) = frame.data_ref() {
-                    self.state.progress(true, bytes.len());
-                }
+        let now = match &result {
+            Poll::Ready(Some(Ok(frame)))
+                if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) =>
+            {
+                Some(self.state.now_ms())
+            }
+            _ => None,
+        };
+        self.state.request_wait.observe(result.is_pending(), || {
+            now.unwrap_or_else(|| self.state.now_ms())
+        });
+        if let (Some(now), Poll::Ready(Some(Ok(frame)))) = (now, &result) {
+            if let Some(bytes) = frame.data_ref() {
+                self.state.progress_at(true, bytes.len(), now);
             }
         }
         result
@@ -172,27 +177,38 @@ impl Body for ResponseBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        let result = Pin::new(&mut self.inner).poll_frame(cx);
-        let state = self.guard.progress();
-        let now = state.now_ms();
+        let this = self.as_mut().get_mut();
+        if this.guard.registration.is_none() {
+            return Poll::Ready(None);
+        }
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
+        let state = this.guard.progress();
+        let now = match &result {
+            Poll::Ready(Some(Ok(frame)))
+                if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) =>
+            {
+                Some(state.now_ms())
+            }
+            _ => None,
+        };
+        state.response_wait.observe(result.is_pending(), || {
+            now.unwrap_or_else(|| state.now_ms())
+        });
         match &result {
-            Poll::Pending => state.response_wait.pending(now),
+            Poll::Pending => {}
             Poll::Ready(Some(Ok(frame))) => {
-                state.response_wait.ready(now);
-                if let Some(bytes) = frame.data_ref() {
-                    state.progress(false, bytes.len());
+                if let (Some(now), Some(bytes)) = (now, frame.data_ref()) {
+                    state.progress_at(false, bytes.len(), now);
                 }
-                if self.inner.is_end_stream() {
-                    self.guard.finish("complete");
+                if this.inner.is_end_stream() {
+                    this.guard.finish("complete");
                 }
             }
             Poll::Ready(None) => {
-                state.response_wait.ready(now);
-                self.guard.finish("complete");
+                this.guard.finish("complete");
             }
             Poll::Ready(Some(Err(_))) => {
-                state.response_wait.ready(now);
-                self.guard.finish("response_body_error");
+                this.guard.finish("response_body_error");
             }
         }
         result

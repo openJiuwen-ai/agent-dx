@@ -1149,7 +1149,14 @@ and H2 enqueue throughput is below the threshold. Idle CONNECT transports remain
 Slow summaries and slow native file spans include cumulative/window H2 wait time,
 blocking-episode count and wait ratio. Ingress upload counters start at each HTTP lease
 and stop when it is returned; shared tunnel identifiers associate them with Relay data.
-Normal requests do not export these H2 details. Active slow transfers keep sampling
+Normal requests do not export these H2 details. Ready I/O without a preceding wait
+skips wait timing and atomic state changes; body progress shares one clock reading.
+The scheduler processes at most 128 due entries before yielding to other tasks.
+Slow summaries capture counters under the lifecycle lock, then enter a bounded
+64-record queue with a lazy dedicated log thread per monitor. Full queues and
+unavailable log workers increment the existing suppression counter; request
+completion never waits for the log sink. Queued summaries may be lost at process exit.
+Active slow transfers keep sampling
 windows without generating additional periodic diagnostic records.
 See [file transfer diagnostics](../docs/testing/distributed-traces.md#文件传输-trace-与慢传输诊断)
 for counter boundaries, cancellation, CONNECT reuse and output limits.
