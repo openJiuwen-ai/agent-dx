@@ -347,4 +347,16 @@ async fn start_failure_publishes_volume_stop_proof_at_a_new_revision() {
     let published = busy.sync().await.unwrap();
     assert_eq!(published.durability, Durability::Published);
     assert_eq!(node.used().cpu_millis, 0);
+    let revision = published.record.revision;
+    for _ in 0..3 {
+        busy.tick()
+            .await
+            .expect("repeated cleanup ticks must stay published");
+    }
+    assert_eq!(
+        busy.sync().await.unwrap().record.revision,
+        revision,
+        "a published stop proof must not advance revision on every tick"
+    );
+    assert_eq!(journal.pending().await.unwrap(), 0);
 }

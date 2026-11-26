@@ -527,6 +527,7 @@ fn spawn_controller(
         auto_pause_guard: None,
         create_deadline: None,
         stopped_runtime_ids,
+        published_stopped_runtime_ids: BTreeSet::new(),
     };
     controller.publish_view();
     tokio::spawn(async move {
@@ -1120,7 +1121,6 @@ struct ExecutionReference {
     pin: Option<Box<dyn Send + Sync>>,
 }
 
-#[derive(Clone)]
 struct PublicationSnapshot {
     resources_held: bool,
     execution_artifacts: Vec<adx_core::CheckpointArtifact>,
@@ -1135,6 +1135,7 @@ struct Controller {
     // One validated reload may retry after its intent-only state revisions.
     intent_retry: Option<adx_core::CompletedOperation>,
     stopped_runtime_ids: Vec<String>,
+    published_stopped_runtime_ids: BTreeSet<String>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
     snapshot_publication: Option<snapshots::SnapshotPublication>,
     create_deadline: Option<tokio::time::Instant>,
@@ -1579,7 +1580,8 @@ impl Controller {
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
         self.durability = Some(durability);
         if durability == Durability::Published {
-            self.stopped_runtime_ids.clear();
+            self.published_stopped_runtime_ids
+                .extend(std::mem::take(&mut self.stopped_runtime_ids));
         }
         self.publish_view();
         self.clean_obsolete_checkpoints().await?;
@@ -1956,7 +1958,7 @@ impl Controller {
                 let before = self.publication_snapshot();
                 let cleanup = self.cleanup().await;
                 let changed = self.note_cleanup_publication(&before)?;
-                if restore_cancelled || changed {
+                if changed || (cleanup.is_ok() && restore_cancelled) {
                     // Failure publication precedes physical cleanup. Publish the
                     // completed cleanup separately before opening Volume admission.
                     commit = self.sync().await;
@@ -2104,6 +2106,9 @@ impl Controller {
     }
 
     fn record_stopped_runtime(&mut self) {
+        let runtime_id = self.record.runtime.id.clone();
+        self.published_stopped_runtime_ids
+            .retain(|published| published == &runtime_id);
         if self
             .record
             .spec
@@ -2111,10 +2116,10 @@ impl Controller {
             .mounts
             .iter()
             .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))
-            && !self.stopped_runtime_ids.contains(&self.record.runtime.id)
+            && !self.published_stopped_runtime_ids.contains(&runtime_id)
+            && !self.stopped_runtime_ids.contains(&runtime_id)
         {
-            self.stopped_runtime_ids
-                .push(self.record.runtime.id.clone());
+            self.stopped_runtime_ids.push(runtime_id);
             self.durability = None;
         }
     }
