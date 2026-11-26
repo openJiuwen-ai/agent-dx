@@ -28,7 +28,7 @@ CodeCheck 的平台规则另行检查。处理 Python 代码时尤其注意：
 - 导入与 Python 内置名称同名的 SDK 异常时使用别名，例如 `EnvironmentError as SDKEnvironmentError`，
   避免触发 `redefined-builtin`；不要为通过检查而改动公共异常类型。
 - URL 使用 `urllib.parse` 构建和编码，CIDR 使用 `ipaddress` 构造；动态字典查找显式处理键缺失。
-- 运行日志使用 `logging`；循环内定义的回调通过参数显式绑定循环变量，避免延迟绑定。
+- 运行日志使用 `logging`；循环内定义的回调通过 `functools.partial` 或不可变默认参数绑定循环变量，避免延迟绑定；本地预检拒绝可变对象默认值。
 - 文件描述符通过上下文管理器配对申请和释放，正常及异常路径都必须关闭；`os.open` 显式传入权限参数。
   只读打开时权限参数不改变现有文件的权限；私有文件仍须独立验证属主、权限、类型和读取上限。
 - CLI 若输出机器读取的 JSON，使用 `logging` 时应显式保留原来的输出流和无前缀格式。

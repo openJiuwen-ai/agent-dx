@@ -296,10 +296,10 @@ class ProcessPlanTests(unittest.TestCase):
             with self.subTest(key=key):
                 with self.assertRaises(rollout.Refusal):
 
-                    def change(obj, k=key, v=value):
-                        obj["status"]["containerStatuses"][0][k] = v
+                    def change(obj, field, replacement):
+                        obj["status"]["containerStatuses"][0][field] = replacement
 
-                    plan(arguments(), change_pod=change)
+                    plan(arguments(), change_pod=partial(change, field=key, replacement=value))
 
     def test_runtime_and_component_changes_refused(self):
         for key, value in [("boot_nonce", "new"), ("pod_uid", "forged")]:
@@ -1022,10 +1022,11 @@ class ProcessApplyTests(unittest.TestCase):
 
     def test_adxlet_invalid_execution_cannot_authorize_steps_or_release(self):
         snapshot = plan(arguments(nodes=("pod-a=node-a",)))
-        cases = [(False, invalid) for invalid in (
+        invalid_executions = (
             dict(stage="unrecognized"), dict(leg={"kind": "rollback"}), dict(leg=None),
             dict(stage="committing", candidate_pid=None), dict(candidate_pid=None),
-            dict(candidate_pid=True), dict(stage="exited"))]
+            dict(candidate_pid=True), dict(stage="exited"))
+        cases = [(False, invalid) for invalid in invalid_executions]
         cases += [(True, dict(stage="unrecognized")), (True, dict(stage="committing", candidate_pid=None))]
         for rollback, invalid in cases:
             with self.subTest(rollback=rollback, invalid=invalid), tempfile.TemporaryDirectory() as directory:
