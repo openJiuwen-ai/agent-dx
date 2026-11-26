@@ -25,9 +25,11 @@ pub struct Upload {
 }
 
 impl Upload {
-    pub async fn respond(self, body: Incoming, content_type: &str) -> Response<ProxyBody> {
+    /// 返回响应与“至少一个文件成功写入”的业务结果——上传端点在部分/全部失败时
+    /// 仍返回 200，活跃统计不能只看 HTTP 状态。
+    pub async fn respond(self, body: Incoming, content_type: &str) -> (Response<ProxyBody>, bool) {
         let Some(boundary) = boundary(content_type) else {
-            return error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART");
+            return (error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"), false);
         };
         let bytes = match tokio::time::timeout_at(
             self.context.deadline(),
@@ -37,35 +39,42 @@ impl Upload {
         {
             Ok(Ok(body)) => body.to_bytes(),
             Ok(Err(body_error)) if body_error.is::<http_body_util::LengthLimitError>() => {
-                return error(StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE");
+                return (
+                    error(StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
+                    false,
+                );
             }
-            _ => return error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"),
+            _ => return (error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"), false),
         };
         let form = match parse_form(bytes, &boundary) {
             Ok(form) => form,
-            Err(FormError::MissingFile) => return error(StatusCode::BAD_REQUEST, "MISSING_FILE"),
-            Err(FormError::TooManyFiles) => {
-                return error(StatusCode::BAD_REQUEST, "TOO_MANY_FILES")
+            Err(FormError::MissingFile) => {
+                return (error(StatusCode::BAD_REQUEST, "MISSING_FILE"), false)
             }
-            Err(FormError::Invalid) => return error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"),
+            Err(FormError::TooManyFiles) => {
+                return (error(StatusCode::BAD_REQUEST, "TOO_MANY_FILES"), false)
+            }
+            Err(FormError::Invalid) => {
+                return (error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"), false)
+            }
         };
         if form
             .user_id
             .as_deref()
             .is_some_and(|id| !id.is_empty() && id != self.user_id)
         {
-            return error(StatusCode::FORBIDDEN, "USER_MISMATCH");
+            return (error(StatusCode::FORBIDDEN, "USER_MISMATCH"), false);
         }
         if form
             .agent_type
             .as_deref()
             .is_some_and(|kind| !kind.is_empty() && kind != self.agent_type)
         {
-            return error(StatusCode::BAD_REQUEST, "AGENT_TYPE_MISMATCH");
+            return (error(StatusCode::BAD_REQUEST, "AGENT_TYPE_MISMATCH"), false);
         }
         let directory = match relative_directory(form.directory.as_deref().unwrap_or("")) {
             Some(value) => value,
-            None => return error(StatusCode::BAD_REQUEST, "INVALID_PATH"),
+            None => return (error(StatusCode::BAD_REQUEST, "INVALID_PATH"), false),
         };
         let reader = match Files::new(
             &self.ingress,
@@ -74,7 +83,7 @@ impl Upload {
             &self.environment_id,
         ) {
             Ok(value) => value,
-            Err(_) => return error(StatusCode::FORBIDDEN, "FORBIDDEN"),
+            Err(_) => return (error(StatusCode::FORBIDDEN, "FORBIDDEN"), false),
         };
         let mut files = Vec::with_capacity(form.files.len());
         let mut errors = Vec::new();
@@ -103,11 +112,21 @@ impl Upload {
                 _ => errors.push(serde_json::json!({"filename":filename,"error":"UPLOAD_FAILED"})),
             }
         }
-        json_response(
-            StatusCode::OK,
-            serde_json::json!({"ok":true,"files":files,"errors":errors}),
+        let success = upload_succeeded(&files, &errors);
+        (
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok":true,"files":files,"errors":errors}),
+            ),
+            success,
         )
     }
+}
+
+/// 上传端点部分成功仍返回 200；活跃统计只要求至少一个文件写入成功，
+/// 不能因为同批次其他文件失败而漏记。
+fn upload_succeeded(files: &[serde_json::Value], _errors: &[serde_json::Value]) -> bool {
+    !files.is_empty()
 }
 
 struct UploadedFile {
@@ -372,4 +391,20 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Proxy
 }
 fn error(status: StatusCode, code: &str) -> Response<ProxyBody> {
     json_response(status, serde_json::json!({"error":code,"code":code}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_succeeded;
+
+    #[test]
+    fn partial_upload_still_counts_as_active() {
+        let files = vec![serde_json::json!({"filename": "ok.bin"})];
+        let errors = vec![serde_json::json!({
+            "filename": "bad.bin",
+            "error": "INVALID_PATH"
+        })];
+        assert!(upload_succeeded(&files, &errors));
+        assert!(!upload_succeeded(&[], &errors));
+    }
 }

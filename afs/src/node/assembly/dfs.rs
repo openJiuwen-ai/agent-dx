@@ -647,7 +647,7 @@ fn dfs_rdma_startup_device(
     device: Option<&str>,
 ) -> afs_error::Result<Option<String>> {
     match mode {
-        rpc::peer::DataMode::Grpc => Ok(None),
+        rpc::peer::DataMode::Grpc | rpc::peer::DataMode::Hixl => Ok(None),
         rpc::peer::DataMode::Rdma => {
             device
                 .map(|value| value.to_owned())

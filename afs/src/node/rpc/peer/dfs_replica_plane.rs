@@ -932,19 +932,22 @@ pub fn make_replica_data_plane(
     timeout: Duration,
     rdma: Option<Arc<DfsRdmaPool>>,
 ) -> afs_error::Result<Arc<dyn crate::node::replication::ReplicaDataPlane>> {
-    match mode {
-        DataMode::Rdma => Ok(Arc::new(RdmaReplicaDataPlane::new(
-            rdma.ok_or_else(|| dfs_protocol_error("DFS RDMA resources are absent"))?,
-        )?)),
-        DataMode::Auto => {
-            if let Some(rdma) = rdma {
+    use crate::node::data_plane::{Backend, select};
+    match select(mode, false, rdma.is_some()) {
+        Backend::Rdma => {
+            let rdma = rdma.ok_or_else(|| dfs_protocol_error("DFS RDMA resources are absent"))?;
+            if mode == DataMode::Auto {
                 Ok(Arc::new(RdmaReplicaDataPlane::new_with_grpc_fallback(
                     rdma, peers, timeout,
                 )?))
             } else {
-                Ok(Arc::new(GrpcReplicaDataPlane::new(peers, timeout)?))
+                Ok(Arc::new(RdmaReplicaDataPlane::new(rdma)?))
             }
         }
-        DataMode::Grpc => Ok(Arc::new(GrpcReplicaDataPlane::new(peers, timeout)?)),
+        Backend::Grpc => Ok(Arc::new(GrpcReplicaDataPlane::new(peers, timeout)?)),
+        Backend::Hixl => Err(afs_error::Error::coded(
+            afs_error::NODE_TRANSFER_UNSUPPORTED,
+            "DFS has no HIXL adapter",
+        )),
     }
 }

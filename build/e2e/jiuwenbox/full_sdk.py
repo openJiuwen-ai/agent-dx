@@ -183,6 +183,7 @@ class FullSDK(Acceptance):
                 "rpc_timeout_seconds": 120,
                 "cache_entries": 1000,
                 "auth_cache_ttl_seconds": 1,
+                "allowed_host_paths": ["*"],
                 "ingress_mode": "standalone",
             },
         )

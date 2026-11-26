@@ -66,6 +66,11 @@ pub struct Config {
     /// Deployment-owned parent directories for explicit Local rootfs sources.
     #[serde(default)]
     pub allowed_local_rootfs_dirs: Vec<String>,
+    /// Allowed source paths and their descendants for caller-supplied host mounts.
+    /// A `*` entry permits every valid source path.
+    /// Empty or absent denies every caller-supplied Local mount source.
+    #[serde(default)]
+    pub allowed_host_paths: Vec<String>,
     pub listen: SocketAddr,
     /// Private Prometheus listener, independent of the public HTTP API.
     #[serde(default)]
@@ -121,6 +126,13 @@ impl Config {
                 "allowed_local_rootfs_dirs requires normalized absolute directories other than /"
                     .into(),
             );
+        }
+        if self.allowed_host_paths.iter().any(|path| {
+            path != "*"
+                && (!crate::contract::canonical_local_path(path)
+                    || path != "/" && path[1..].split('/').any(str::is_empty))
+        }) {
+            return Err("allowed_host_paths requires '*' or normalized absolute paths".into());
         }
         if self.coordinator_address.is_empty() == self.discovery.is_none()
             || (self.internal_security == adx_transport::rpc::SecurityMode::Mtls

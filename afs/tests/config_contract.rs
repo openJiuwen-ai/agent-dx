@@ -603,6 +603,240 @@ fn ownerfs_data_dir_defaults_to_the_private_root_and_follows_data_dir() {
 
 #[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
+fn hixl_defaults_off_with_roce_transport_without_changing_existing_data_mode() {
+    let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(cfg.data_mode, DataMode::Grpc);
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["transport"], "roce");
+    assert_eq!(printed["hixl"]["buffer_pool_count"], 4);
+    assert_eq!(printed["hixl"]["buffer_pool_size_mib"], 8);
+    assert_eq!(printed["hixl"]["session_idle_ms"], 20000);
+    assert!(printed["hixl"].get("device_listen_port").is_some());
+    assert!(printed["hixl"]["device_listen_port"].is_null());
+    let options = cfg.hixl.runtime_options_per_device().remove(0);
+    assert_eq!(options.transport, afs_transport::hixl::ReadTransport::Roce);
+    assert_eq!(options.device_listen_port, None);
+    assert_eq!(options.buffer_pool_count, 4);
+    assert_eq!(options.buffer_pool_size_mib, 8);
+}
+
+#[test]
+fn disabled_hixl_table_is_accepted_without_native_dependencies() {
+    let cfg = resolve_hixl_table(
+        "data_mode='grpc'",
+        "window_bytes=4194304\nreceive_slots=2\nexport_slots=2",
+    )
+    .unwrap();
+    assert_eq!(cfg.data_mode, DataMode::Grpc);
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["receive_slots"], 2);
+}
+
+fn resolve_hixl_table(prefix: &str, table: &str) -> afs_error::Result<Config> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, format!("{prefix}\n[hixl]\n{table}\n")).unwrap();
+    Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+}
+
+#[test]
+fn hixl_toml_accepts_device_listen_port_independent_of_engine_id() {
+    let cfg = resolve_hixl_table(
+        "",
+        "engine_id='192.0.2.10:7920'
+device_listen_port=27666",
+    )
+    .unwrap();
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["engine_id"], "192.0.2.10:7920");
+    assert_eq!(printed["hixl"]["device_listen_port"], 27666);
+    assert_eq!(
+        cfg.hixl.runtime_options_per_device()[0].device_listen_port,
+        Some(27666)
+    );
+
+    let cfg = resolve_hixl_table("", "device_listen_port=65535").unwrap();
+    assert_eq!(cfg.hixl.device_listen_port, Some(65535));
+    assert_eq!(
+        cfg.hixl.runtime_options_per_device()[0].device_listen_port,
+        Some(65535)
+    );
+}
+
+#[test]
+fn hixl_link_and_buffer_pool_are_independent() {
+    for (table, link, pool) in [
+        ("", "roce", false),
+        ("transport='roce'\nbuffer_pool=true", "roce", true),
+        (HCCS_BUFFER_POOL, "hccs", true),
+    ] {
+        let cfg = resolve_hixl_table("", table).unwrap();
+        let options = cfg.hixl.runtime_options_per_device().remove(0);
+        assert_eq!(options.transport.to_string(), link);
+        assert_eq!(options.buffer_pool, pool);
+    }
+    assert!(
+        resolve_hixl_table("", "transport='hccs'\nbuffer_pool=false")
+            .unwrap_err()
+            .message()
+            .contains("buffer_pool")
+    );
+}
+
+const HCCS_BUFFER_POOL: &str = "transport='hccs'\nbuffer_pool=true";
+
+#[test]
+fn hixl_accepts_hccs_buffer_pool_bounds_and_maps_them_to_runtime_options() {
+    for (count, size_mib) in [(1, 1), (64, 1), (1, 64), (32, 8), (4, 8), (7, 9)] {
+        let cfg = resolve_hixl_table(
+            "",
+            &format!(
+                "{HCCS_BUFFER_POOL}\nbuffer_pool_count={count}\nbuffer_pool_size_mib={size_mib}"
+            ),
+        )
+        .unwrap_or_else(|error| panic!("HCCS pool count={count}, size={size_mib} MiB: {error}"));
+        let printed = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(printed["hixl"]["transport"], "hccs");
+        assert_eq!(printed["hixl"]["buffer_pool_count"], count);
+        assert_eq!(printed["hixl"]["buffer_pool_size_mib"], size_mib);
+        let options = cfg.hixl.runtime_options_per_device().remove(0);
+        assert_eq!(options.transport, afs_transport::hixl::ReadTransport::Hccs);
+        assert_eq!(options.buffer_pool_count, count);
+        assert_eq!(options.buffer_pool_size_mib, size_mib);
+    }
+}
+
+#[test]
+fn hixl_rejects_typed_values_outside_their_bounds_at_the_config_boundary() {
+    let invalid_values = [
+        // Ports are typed u16 values; zero reaches device port validation.
+        "device_listen_port=0",
+        "device_listen_port=-1",
+        "device_listen_port=65536",
+        "transport='hccs_buffer_pool'",
+    ];
+    let invalid_pool_options = [
+        "buffer_pool_count=0",
+        "buffer_pool_count=65",
+        "buffer_pool_size_mib=0",
+        "buffer_pool_size_mib=65",
+        // The pool budget is capped at 512 MiB with checked arithmetic.
+        "buffer_pool_count=33\nbuffer_pool_size_mib=8",
+        "buffer_pool_count=32\nbuffer_pool_size_mib=9",
+        "buffer_pool_count=9223372036854775807\nbuffer_pool_size_mib=64",
+    ];
+    let tables = invalid_values.into_iter().map(str::to_owned).chain(
+        invalid_pool_options
+            .into_iter()
+            .map(|options| format!("{HCCS_BUFFER_POOL}\n{options}")),
+    );
+    for table in tables {
+        let error = resolve_hixl_table("", &table)
+            .err()
+            .unwrap_or_else(|| panic!("invalid HIXL config was accepted: {table}"));
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "a typed field must reach validation: {table}: {error}"
+        );
+    }
+}
+
+#[test]
+fn hixl_rejects_unbounded_pools_and_unknown_options() {
+    for table in [
+        "window_bytes=0",
+        "window_bytes=4194305",
+        "receive_slots=0",
+        "export_slots=129",
+        "device_id=-1",
+        "window_byets=1024",
+        // Renamed to ownerfs_read_group_*; no alias is kept.
+        "ownerfs_window_bytes=16777216",
+        "ownerfs_max_inflight=1",
+        "ownerfs_host_budget_bytes=268435456",
+    ] {
+        assert!(resolve_hixl_table("", table).is_err(), "{table}");
+    }
+}
+
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[test]
+fn auto_hixl_requires_node_identity_and_concrete_endpoint() {
+    let table = "engine_id='127.0.0.1:7920'";
+    assert!(
+        resolve_hixl_table("fs='ownerfs'\ndata_mode='auto'", table)
+            .unwrap_err()
+            .message()
+            .contains("mTLS")
+    );
+    for address in ["0.0.0.0:7920", "127.0.0.1:0", "224.0.0.1:7920", "node:7920"] {
+        assert!(
+            resolve_hixl_table(
+                "fs='ownerfs'\ndata_mode='auto'",
+                &format!("engine_id='{address}'")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[test]
+fn explicit_hixl_requires_ownerfs_without_dfs_and_the_native_feature() {
+    let identity = "tls_encryption_enabled=true\ntls_ca_certificate='/tmp/ca.pem'\ntls_identity_certificate='/tmp/node.pem'\ntls_identity_private_key='/tmp/node.key'\ntls_server_name='node'\n[trusted_node_certs]\npeer='/tmp/peer.pem'";
+    let engine = "engine_id='127.0.0.1:7920'\ntrusted_peers=['peer']";
+    let auto =
+        resolve_hixl_table(&format!("fs='all'\ndata_mode='auto'\n{identity}"), engine).unwrap();
+    assert_eq!(auto.data_mode, DataMode::Auto);
+    let mixed =
+        resolve_hixl_table(&format!("fs='all'\ndata_mode='hixl'\n{identity}"), engine).unwrap_err();
+    assert!(mixed.message().contains("unsupported for DFS"));
+    let explicit = resolve_hixl_table(
+        &format!("fs='ownerfs'\ndata_mode='hixl'\n{identity}"),
+        engine,
+    );
+    if cfg!(feature = "hixl") {
+        assert_eq!(explicit.unwrap().data_mode, DataMode::Hixl);
+    } else {
+        assert!(explicit.unwrap_err().message().contains("not compiled"));
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn enabled_hixl_requires_a_tls_bound_subset_of_trusted_nodes() {
+    let prefix = "fs='ownerfs'
+data_mode='auto'
+tls_encryption_enabled=true
+tls_ca_certificate='/tmp/ca.pem'
+tls_identity_certificate='/tmp/node.pem'
+tls_identity_private_key='/tmp/node.key'
+tls_server_name='node'
+[trusted_node_certs]
+peer='/tmp/peer.pem'";
+    for peers in ["[]", "['other']", "['']"] {
+        let table = format!(
+            "engine_id='127.0.0.1:7920'
+trusted_peers={peers}"
+        );
+        let error = resolve_hixl_table(prefix, &table).unwrap_err();
+        assert!(error.message().contains("hixl.trusted_peers"));
+    }
+    let cfg = resolve_hixl_table(
+        prefix,
+        "engine_id='127.0.0.1:7920'
+trusted_peers=['peer']",
+    )
+    .unwrap();
+    assert_eq!(cfg.hixl.trusted_peers, ["peer"]);
+    assert!(!cfg.hixl.ownerfs_buffered_writes);
+    assert!(!cfg.hixl.ownerfs_snapshot_reads);
+}
+
+#[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
     let examples =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/config/examples/afs");
@@ -634,6 +868,8 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
         "the shipped examples must not start with test-only or diagnostic options"
     );
     assert!(meta.non_product_options().is_empty());
+    let printed = serde_json::to_value(&node).unwrap();
+    assert_eq!(printed["hixl"]["transport"], "roce");
     for tls in [meta.tls_config(), node.tls_config()] {
         assert!(matches!(
             tls,
@@ -2304,14 +2540,14 @@ fn data_mode_keeps_its_toml_cli_and_printed_names() {
     assert!(
         error
             .to_string()
-            .contains("expected one of `grpc`, `rdma`, `auto`"),
+            .contains("expected one of `grpc`, `rdma`, `hixl`, `auto`"),
         "{error}"
     );
     let error = Cli::try_parse_from(["afs", "--data-mode", "tcp"]).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("[possible values: grpc, rdma, auto]"),
+            .contains("[possible values: grpc, rdma, hixl, auto]"),
         "{error}"
     );
 }

@@ -4,7 +4,6 @@ fn main() {
     // 没有 rdma feature 时仍声明 cfg 名称，避免 rustc unexpected-cfg 告警。
     println!("cargo:rerun-if-changed=native/rdma.c");
     println!("cargo:rerun-if-changed=native/rdma.h");
-
     if std::env::var_os("CARGO_FEATURE_RDMA").is_some() {
         cc::Build::new()
             .file("native/rdma.c")
@@ -12,8 +11,6 @@ fn main() {
             .compile("afs_transport_rdma");
         println!("cargo:rustc-link-lib=ibverbs");
         println!("cargo:rustc-cfg=has_native_rdma");
-        println!("cargo:rustc-check-cfg=cfg(has_native_rdma)");
-    } else {
-        println!("cargo:rustc-check-cfg=cfg(has_native_rdma)");
     }
+    println!("cargo:rustc-check-cfg=cfg(has_native_rdma)");
 }

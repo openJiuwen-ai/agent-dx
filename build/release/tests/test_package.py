@@ -249,6 +249,8 @@ class PackageTests(unittest.TestCase):
             redis_cli.chmod(0o700)
             wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
+            module_path = f"bin/{pkg.AFS_HIXL_MODULE}"
+            (binaries / pkg.AFS_HIXL_MODULE).write_bytes(b"hixl fixture")
 
             default_output = root / "default-package"
             default_manifest = pkg.assemble(
@@ -273,7 +275,22 @@ class PackageTests(unittest.TestCase):
             self.assertIn("etc/examples/afs/deployment-ownerfs-local.yaml", afs_manifest["files"])
             self.assertIn("third_party/afs-source/LICENSE", afs_manifest["files"])
             self.assertIn("third_party/afs-source/NOTICE", afs_manifest["files"])
+            self.assertNotIn(module_path, afs_manifest["files"])
             pkg.verify(afs_output)
+
+            hixl_output = root / "hixl-package"
+            hixl_manifest = pkg.assemble(
+                binaries, redis, redis_cli, wheel, hixl_output,
+                pkg.BuildIdentity("a" * 40, True, "aarch64-unknown-linux-gnu", "debug"),
+                with_afs=True, with_hixl=True,
+            )
+            self.assertIs(hixl_manifest["with_hixl"], True)
+            self.assertIn(module_path, hixl_manifest["files"])
+            pkg.verify(hixl_output)
+            del hixl_manifest["with_hixl"]
+            (hixl_output / "manifest.json").write_text(json.dumps(hixl_manifest))
+            with self.assertRaisesRegex(ValueError, "HIXL module is present without with_hixl"):
+                pkg.verify(hixl_output)
 
             yaml_path = "etc/examples/afs/deployment-ownerfs-local.yaml"
             manifest_path = afs_output / "manifest.json"

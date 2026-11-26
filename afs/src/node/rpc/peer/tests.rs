@@ -2238,11 +2238,14 @@ async fn owner_prefetch_cache_hits_do_not_count_as_client_rpc_or_payload() {
     );
     let grant = test_grant();
     let file = test_remote_file(b"prefetched-handle".to_vec());
-    client
-        .prefetched_reads
-        .lock()
-        .unwrap()
-        .insert(file.handle.clone(), b"cached".to_vec());
+    client.prefetched_reads.lock().unwrap().entries.insert(
+        file.handle.clone(),
+        super::PrefetchedOwnerRead {
+            #[cfg(feature = "dfs")]
+            identity: file.identity.0.clone(),
+            bytes: b"cached".to_vec(),
+        },
+    );
 
     let mut out = [0_u8; 6];
     assert_eq!(client.read(&grant, &file, 0, &mut out).unwrap(), 6);

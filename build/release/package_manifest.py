@@ -36,6 +36,7 @@ SANDBOXD_DEPLOYMENT_FILES = (
     "registry_auths.json",
 )
 AFS_BINARIES = ("afs-meta", "afs-node")
+AFS_HIXL_MODULE = "libafs_hixl.so"
 AFS_REQUIRED_FILES = {
     "etc/examples/afs/meta.toml",
     "etc/examples/afs/node.toml",
@@ -67,6 +68,8 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         raise ValueError("legacy with_dfs manifest; rebuild with --with-afs")
     if "with_afs" in manifest and not isinstance(manifest["with_afs"], bool):
         raise ValueError("with_afs must be a boolean")
+    if "with_hixl" in manifest and not isinstance(manifest["with_hixl"], bool):
+        raise ValueError("with_hixl must be a boolean")
 
     expected = set(files)
     required = {f"bin/{binary}" for binary in BINARIES} | {
@@ -106,6 +109,13 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         required.update(AFS_REQUIRED_FILES)
     elif afs_artifacts:
         raise ValueError("AFS artifacts are present in a default package")
+    hixl_module = f"bin/{AFS_HIXL_MODULE}"
+    if manifest.get("with_hixl") is True:
+        if manifest.get("with_afs") is not True or "linux" not in manifest.get("target", ""):
+            raise ValueError("the HIXL module requires an AFS package for Linux")
+        required.add(hixl_module)
+    elif hixl_module in expected:
+        raise ValueError("HIXL module is present without with_hixl")
     if not required.issubset(expected) or not any(
         name.startswith("sdk/adx_environment-") and name.endswith(".whl") for name in expected
     ):

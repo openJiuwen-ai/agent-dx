@@ -1,0 +1,4 @@
+{
+    global: afs_hixl_*;
+    local: *;
+};

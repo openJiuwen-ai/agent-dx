@@ -21,6 +21,13 @@ to `/opt/adx/config/afs/` or update the paths before running `adxctl`.
 
 See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-apiserver` serves the public control API and embeds Ingress by default. The release package also includes `adx-ingress` for explicit split-process deployment with `ingress_mode: standalone`.
 
+The standalone and ingress-api profiles explicitly set API Server
+`allowed_host_paths: ["*"]`, permitting every valid caller-supplied host mount
+source. Override `service_overrides.apiserver.config.allowed_host_paths` with a
+list of absolute source paths to restrict admission, or `[]` to deny all inline
+Local mounts. A raw API Server configuration that omits this field also denies
+inline Local mounts. In YAML, quote the `"*"` entry.
+
 String values in deployment YAML may use `${VAR}` or `${VAR:-default}`. Expansion happens after YAML parsing, so environment values remain scalar strings and cannot inject mappings or lists. Missing variables without defaults fail configuration loading. Numeric and boolean fields remain native YAML values rather than implicitly converting environment strings.
 
 Compact `service_overrides` keys are local role names. The default Node profile has one `adxlet` service that embeds Relay, so Proxy environment overrides also belong under `adxlet`. Each worker has its own deployment YAML; its cluster-wide identity is the `adxlet` configuration's `node_id`, not the supervisor service ID.

@@ -456,6 +456,58 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 
 文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
+Node 的 `data_mode` 选择正文通道，gRPC 始终承载控制 RPC。`auto` 按当前操作选已装配的候选，
+顺序为 HIXL、RDMA、gRPC。显式 HIXL 默认用于 OwnerFs 远端按需读，禁止 gRPC OPEN 携带正文。
+OwnerFs 继续通过 `RemoteFiles` 和 `OwnerPeerClient` 访问 Home。HIXL 客户端接入 OwnerFiles 的文件操作，
+授权、目录批量、数据新鲜度和写提交归 OwnerFs。控制 RPC 仍由 OwnerFiles 认证。
+`node/data_plane/hixl` 管理原生批量搬运、导出窗口和完整性校验，分别报告未提交、已完成或未知。
+未知结果隔离并保留槽位。一次 HIXL I/O 共用一个绝对期限。等待读或写超时后，后台任务继续持有
+尚未退役的槽。提交前超时会关掉 Commit 入口。Close 校验 peer、会话编号和 Home 代际，
+重启前的 Close 无法关闭同号新会话。
+
+HIXL 的链路与中转池分别由 `transport` 和 `buffer_pool` 选择。RoCE 直传注册 Host 窗口；RoCE 和 HCCS 的中转路径使用 HIXL Buffer Pool。HCCS 只支持中转路径，并校验两端 A3 设备的 super-pod。两端须匹配链路和中转池设置。设备工作线程对每批 READ 或 WRITE 调用一次 `TransferSync`。
+
+每条 HIXL lane 的 ACL owner 线程在启动时为接收槽和导出槽分配普通 Host 内存。节点选择优先使用 NPU 的 PCI NUMA 节点。只有无法确定 PCI 节点时，才在实际分配槽的 owner 线程上用 `sched_getaffinity` 读取该线程允许使用的 CPU；仅当掩码非空且其中每个 CPU 都能确认属于同一个 NUMA 节点时，才用该节点。
+
+选出节点且线程使用默认内存策略时，在 `aclrtMallocHost` 和首次触页期间临时设置 `MPOL_PREFERRED`，随后恢复原策略，再注册内存。未选出节点、线程已有非默认策略或无法设置优先策略时，沿用原策略。该机制不自动绑定 CPU、不新增 TOML 配置，也不保证物理页落在优先节点。启动日志 `AFS_HIXL_NUMA` 中，`source=pci|worker_cpu|unknown` 表示节点来源，`policy=preferred|inherited` 表示首个接收槽分配时的策略。
+
+Node 停机在退场广播前冻结 Home HIXL 新协商和新 Prepare，gRPC 继续处理已认证的 Release 和
+Prepare 携带的 `prior_release`。Home 等待已发布的导出槽归还，并确认在途 Prepare 完成或回滚。
+Home 排空超时后隔离 runtime 并保留未确认槽，返回 `NODE_TRANSFER_DRAIN_INCOMPLETE`。
+随后 Node 在服务与挂载收尾后等待 native HIXL runtime 清理。Runtime 仍校验本地接收槽和导出槽
+的占用与隔离状态，清理错误计入停机失败。HIXL 构建的进程级看门狗覆盖 SDK 清理和 C/C++ 退出处理器。
+
+HIXL 缓冲写默认关闭。两端启用 `ownerfs_buffered_writes` 并由 Home 确认能力后，才使用 HIXL 写入已打开文件。
+显式 HIXL 在可写或截断打开之前确认写能力，能力缺失时不向 Home 发送 `Open`。显式 HIXL 的 Create 与 `O_DIRECT` 返回不支持。
+默认每次读从 Home 获取当前数据，避免跨节点写入后重用旧字节或 EOF。只有数据不可变、打开期间授权稳定的
+部署才启用 `ownerfs_snapshot_reads`，允许只读句柄使用预读窗口和小文件目录批量。带 HIXL 的 Auto 路径也只在此选项开启时允许 gRPC OPEN 预取。
+Auto 写在发送 `PrepareWriteHixl` 或复用已授予的写槽之前，按本次缓冲写的正文长度选择通道。
+`[hixl].ownerfs_min_write_bytes` 默认 `524288` 字节、有效范围 `0..=1048576`；达到阈值才尝试 HIXL，
+低于阈值走原有 RDMA/gRPC 路径，即使已持有写槽。`0` 对所有非空缓冲写尝试 HIXL；显式 HIXL 不受此阈值限制。
+Writer 以 `PrepareWriteHixl` 申请 Home 的注册目标槽，绑定授权、句柄、偏移、长度、写选项及正文摘要。写摘要沿用会话协商的槽校验算法：优先 CRC32C（4 字节小端），否则使用 BLAKE3。Writer 和 Home 分别校验传输前后的有效字节；请求重放指纹只覆盖控制消息。
+Writer 向槽提交 native `WRITE`，确认设备完成后以同一票据调用 `CommitWriteHixl`。Home 复验写授权、内容并执行文件写入，按实际 `written` 返回结果。
+读端未收到窗口或目录批量 Prepare 的回包时，可用本地会话、`read_id` 和代次报告 `NotSubmitted`。Home 回收已发布的槽，并拒绝同 ID 的迟到 Prepare。
+Commit 重试复用原会话及 `write_id`。设备 WRITE 完成后，Writer 用剩余期限的一半重试 Commit，余下时间用于向 Home 查询同一票据的结果。Home 可回放已有回执（包括实际短写字节数），或封住尚未执行的 Commit 并回收槽。恢复请求本身不执行文件写入。无法取得确定回执时，应用仍得到写结果未知。关闭文件时，写槽清理跳过忙碌会话，等待总计最多 100 ms，并受请求超时配置约束。空闲回收继续处理剩余窗口。本节点按 Home 和文件身份停用可复用的读数据，包括批量切片与 Open 预取；同一读句柄在 Home 延迟写入完成后能看到新字节。设备结果未知时隔离槽位。持久化仍由文件 `Fsync` 契约处理。
+
+DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
+启用快照读后，预读组目标大小是 `ownerfs_read_group_bytes`（默认 32 MiB，即八个 4 MiB 窗口）。Home 在协商中公布
+各 lane 的总导出槽数，reader 按会话分摊，再与本地接收槽数和单次 64 个描述符的上限取最小值。
+实际槽大小取两端窗口大小的较小值。同一打开认领窗口后，可复用其切片，本节点写入、setattr 或 `O_TRUNC` 打开使窗口失效。FUSE READ 完全落在窗口内时
+直接共享窗口内存，不再分配和拷贝。小文件另按目录批量取回：Home 用一次 `PrepareBatchHixl` 把
+同一目录下锚点之后的一串整文件装入导出槽（文件不跨槽），reader 按 file identity 与版本认领切片，
+认领四分之一后预取下一批。父目录路径失效时按已打开的文件句柄继续读取。驻留批量合计不超过
+`max(4 × ownerfs_read_group_bytes, ownerfs_read_group_host_budget_bytes / 2)`：空间不足时只淘汰
+1 秒内无人读取的批量或未被认领的预取批量，不挤掉其他目录正在读的批量；被丢弃的预取批量让其目录
+回到锚点重来。已发出的共享切片仍占用进程字节预算，直到最后一个引用释放。每个 Home 默认
+2 条控制会话，每条同时只准入一次取回。reader 按 `session_idle_ms` 复用空闲会话。取回校验通过后不单独发
+`ReleaseHixlRead`：释放停放在会话上，由该会话下一次 `PrepareReadHixl`／`PrepareBatchHixl` 的
+`prior_release` 携带，Home 在准入前先释放（被拒绝的 Prepare 同样生效，重放命中释放墓碑）。
+Home 发布导出槽时再次确认 read ID 的释放历史，回滚迟到重放自己占用的槽。
+10 ms 内没有下一次 Prepare，或会话要关闭时，reader 再单独发送。单独发送的已完成票据会保留到 Home 确认，同一代的会话在释放确认前不会因续用而关闭。传输失败、校验失败等路径仍立即
+单独释放。批量不需要时可关闭 `ownerfs_batch_read`，此时与没有批量时路径相同。
+Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文件偏移经页缓存填充导出槽。
+reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。
+
 所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求双向证书身份认证和
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
 映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only

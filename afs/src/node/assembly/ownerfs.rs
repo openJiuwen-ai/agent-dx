@@ -11,11 +11,16 @@
 //! in one place.
 
 use super::common::Startup;
+#[cfg(feature = "ownerfs")]
+use crate::node::registration::{
+    META_FAIL_CLOSED_AFTER, META_RETRY_INTERVAL, meta_transport_error_is_retryable,
+};
 use crate::{
     config::Config,
     node::{Node, api, bridge, fuse, rpc, storage, vfs},
     runtime::{BoxError, Services, cancelled},
 };
+use afs_protocol::node_data::owner_files_server::OwnerFilesServer;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// B-side slow-path connector. The root grant and Home location stay in the
@@ -32,6 +37,9 @@ struct OwnerFilesFactory {
     rdma_device: Option<String>,
     timeout: std::time::Duration,
     rdma_admission: Arc<tokio::sync::Semaphore>,
+    /// HIXL read-ahead windows; `None` keeps every read on gRPC.
+    hixl_reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
+    hixl_trusted_peers: std::collections::HashSet<String>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -84,16 +92,23 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
             &self.runtime,
             self.peers.long_wait_channel(home_node_id, node_epoch, &uri),
         )?;
-        Ok(Arc::new(
-            rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
-                channel,
-                self.runtime.clone(),
-                Some(self.metrics.clone()),
-            )
-            .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
-            .with_rdma_admission(self.rdma_admission.clone())
-            .with_long_wait_channel(long_wait_channel),
-        ))
+        let client = rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
+            channel,
+            self.runtime.clone(),
+            Some(self.metrics.clone()),
+        )
+        .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
+        .with_rdma_admission(self.rdma_admission.clone())
+        .with_long_wait_channel(long_wait_channel);
+        let client = match self
+            .hixl_reader
+            .as_ref()
+            .filter(|_| self.hixl_trusted_peers.contains(home_node_id))
+        {
+            Some(reader) => client.with_hixl(reader.clone(), home_node_id.to_owned()),
+            None => client,
+        };
+        Ok(Arc::new(client))
     }
 }
 
@@ -117,6 +132,7 @@ pub(super) async fn assemble(
     startup: &Startup<'_>,
     peer_connections: &Arc<rpc::peer::PeerConnectionPool>,
     owner_rpc_metrics: &rpc::OwnerRpcMetrics,
+    hixl: &super::hixl::Hixl,
 ) -> Result<OwnerFsAssembly, BoxError> {
     let meta_endpoint = startup.meta_endpoint;
     let session_id = &startup.session_id;
@@ -145,11 +161,10 @@ pub(super) async fn assemble(
             .into());
         }
         #[cfg(feature = "rdma")]
-        if owner_data_mode == rpc::peer::DataMode::Rdma {
-            let device = cfg
-                .rdma_device
-                .clone()
-                .expect("OwnerFs RDMA checked rdma_device");
+        if (owner_data_mode == rpc::peer::DataMode::Rdma
+            || (owner_data_mode == rpc::peer::DataMode::Auto && !cfg.dfs))
+            && let Some(device) = cfg.rdma_device.clone()
+        {
             crate::node::bridge::spawn_blocking(move || {
                 afs_transport::rdma::RdmaEndpoint::open(&device)
             })
@@ -169,6 +184,8 @@ pub(super) async fn assemble(
             rdma_admission: Arc::new(tokio::sync::Semaphore::new(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
+            hixl_reader: hixl.reader(),
+            hixl_trusted_peers: cfg.hixl.trusted_peers.iter().cloned().collect(),
         });
         let recovery_root_meta = root_meta.clone();
         let roots = Arc::new(
@@ -321,10 +338,8 @@ pub(super) fn owner_files_server(
     state: &Node,
     owner_rpc_metrics: &rpc::OwnerRpcMetrics,
     owner_rdma_sessions: &rpc::control::RdmaSessionRegistry,
-) -> Result<
-    afs_protocol::node_data::owner_files_server::OwnerFilesServer<rpc::data::OwnerFilesService>,
-    BoxError,
-> {
+    hixl_source: Option<&Arc<rpc::data::owner_hixl::OwnerHixlService>>,
+) -> Result<OwnerFilesServer<rpc::data::OwnerFilesService>, BoxError> {
     let owner_files = if let Some(ownerfs) = state.ownerfs.as_ref() {
         let trusted = cfg
             .trusted_node_certs
@@ -335,12 +350,14 @@ pub(super) fn owner_files_server(
             .collect::<afs_error::Result<Vec<_>>>()?;
         let authenticator = Arc::new(rpc::data::MtlsPeerAuthenticator::new(trusted)?);
         let handler = rpc::data::make_owner_files_handler(ownerfs.peer_executor()?);
-        rpc::data::make_owner_files_server_with_handler_metrics_and_rdma(
-            handler,
-            authenticator,
-            owner_rpc_metrics.clone(),
-            owner_rdma_sessions.clone(),
-        )
+        let service = rpc::data::OwnerFilesService::new(handler, authenticator)
+            .with_metrics(owner_rpc_metrics.clone())
+            .with_rdma_sessions(owner_rdma_sessions.clone());
+        let service = match hixl_source {
+            Some(source) => service.with_hixl(source.clone()),
+            None => service,
+        };
+        OwnerFilesServer::new(service)
     } else {
         rpc::data::make_owner_files_server()
     };
@@ -419,9 +436,9 @@ impl OwnerPeerReaper {
 
 /// T13: start the workspace bind-root command loop when workspace bind is on.
 ///
-/// Fatal class: any untrusted control result or refusal fails closed and ends
-/// the Node (`ownerfs.workspace_bind_root_command_control_failed`). Stop:
-/// `services.stop`, checked before each poll and after the in-flight RPC.
+/// Retryable Meta transport failures are retried inside `META_FAIL_CLOSED_AFTER`;
+/// an untrusted control result, a refusal, or an expired window still ends the
+/// Node. Stop: `services.stop`, checked before each poll and after the RPC.
 pub(super) fn start_workspace_bind_root_commands(
     assembly: &mut OwnerFsAssembly,
     services: &mut Services,
@@ -432,7 +449,20 @@ pub(super) fn start_workspace_bind_root_commands(
     #[cfg(feature = "ownerfs")]
     if let Some((meta, roots)) = workspace_bind_root_control {
         let stop = services.stop.subscribe();
-        services.spawn(run_workspace_bind_root_commands(meta, roots, stop));
+        services.spawn(run_workspace_bind_root_commands(
+            meta,
+            move |command| {
+                roots.revoke_matching_home(&vfs::ownerfs::root::HomeRootRevocation {
+                    command_id: command.command_id.clone(),
+                    root_id: vfs::ownerfs::root::RootId(command.root_id.clone()),
+                    root_epoch: command.root_epoch,
+                    home_node_id: command.home_node_id.clone(),
+                    home_session_id: command.home_session_id.clone(),
+                    access_generation: command.access_generation,
+                })
+            },
+            stop,
+        ));
     }
 }
 
@@ -483,62 +513,134 @@ fn process_workspace_bind_root_commands(
     Ok(next_revision - 1)
 }
 
+/// Blocking Meta poll boundary for RootCommand batches; tests script transport
+/// failures and batches without a live Meta. `budget` is the remaining window.
+#[cfg(feature = "ownerfs")]
+trait RootCommandPoller: Send + Sync + 'static {
+    fn poll_commands(
+        &self,
+        after_revision: u64,
+        budget: Duration,
+    ) -> afs_error::Result<rpc::meta::RootCommandBatch>;
+}
+
+#[cfg(feature = "ownerfs")]
+impl RootCommandPoller for rpc::meta::GrpcRootMeta {
+    fn poll_commands(
+        &self,
+        after_revision: u64,
+        budget: Duration,
+    ) -> afs_error::Result<rpc::meta::RootCommandBatch> {
+        rpc::meta::GrpcRootMeta::poll_root_command_batch(self, after_revision, budget)
+    }
+}
+
+/// Logs the fatal control event and returns the error unchanged.
+#[cfg(feature = "ownerfs")]
+fn control_fatal(after_revision: u64, error: afs_error::Error) -> afs_error::Error {
+    afs_logging::error!("ownerfs.workspace_bind_root_command_control_failed";
+        "after_revision" => after_revision,
+        "error" => error.to_string());
+    error
+}
+
+#[cfg(feature = "ownerfs")]
+fn control_window_expired() -> afs_error::Error {
+    afs_error::Error::coded(
+        afs_error::CLIENT_DEADLINE_EXCEEDED,
+        "workspace bind RootCommand control did not recover within the fail-closed window",
+    )
+}
+
 #[cfg(feature = "ownerfs")]
 async fn run_workspace_bind_root_commands(
-    meta: Arc<rpc::meta::GrpcRootMeta>,
-    roots: Arc<vfs::ownerfs::root::RootManager>,
+    meta: Arc<dyn RootCommandPoller>,
+    mut reject: impl FnMut(&rpc::meta::RootCommand) -> afs_error::Result<bool> + Send + 'static,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), BoxError> {
     let shutdown = cancelled(stop.clone());
     tokio::pin!(shutdown);
     let mut after_revision = 0;
     let mut delay = Duration::ZERO;
+    let mut last_success = tokio::time::Instant::now();
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(delay) => {}
         }
+        // The window is absolute: no poll starts after it expires, and a
+        // response that outlives it cannot restart the clock.
+        let deadline = last_success + META_FAIL_CLOSED_AFTER;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(control_fatal(after_revision, control_window_expired()).into());
+        }
+        let deadline_std = deadline.into_std();
         let meta = meta.clone();
-        // Join this exact blocking RPC before another poll or shutdown. Do not
-        // race/cancel it on a tick and leave detached duplicate control calls.
-        let result = crate::node::bridge::spawn_blocking(move || {
-            meta.poll_root_command_batch(after_revision)
-        })
-        .await?;
+        // The wait and the poll share the same deadline. The blocking task
+        // re-checks it after getting a thread, so a queued call does not reach
+        // Meta after the window. Abandoning the call happens only on the fatal
+        // path, so no later poll can duplicate it.
+        let result = match tokio::time::timeout_at(
+            deadline,
+            crate::node::bridge::spawn_blocking(move || {
+                // Blocking threads have no runtime clock; production uses real
+                // time, where the tokio and std instants agree.
+                let started_at = std::time::Instant::now();
+                if started_at >= deadline_std {
+                    return Err(control_window_expired());
+                }
+                meta.poll_commands(
+                    after_revision,
+                    deadline_std.saturating_duration_since(started_at),
+                )
+            }),
+        )
+        .await
+        {
+            Ok(joined) => joined?,
+            Err(_) => {
+                if *stop.borrow() {
+                    return Ok(());
+                }
+                return Err(control_fatal(after_revision, control_window_expired()).into());
+            }
+        };
         if *stop.borrow() {
             return Ok(());
         }
-        let next = result.and_then(|batch| {
-            process_workspace_bind_root_commands(after_revision, batch, |command| {
-                roots.revoke_matching_home(&vfs::ownerfs::root::HomeRootRevocation {
-                    command_id: command.command_id.clone(),
-                    root_id: vfs::ownerfs::root::RootId(command.root_id.clone()),
-                    root_epoch: command.root_epoch,
-                    home_node_id: command.home_node_id.clone(),
-                    home_session_id: command.home_session_id.clone(),
-                    access_generation: command.access_generation,
-                })
-            })
-        });
-        match next {
-            Ok(next) => {
-                delay = if next > after_revision {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(250)
-                };
-                after_revision = next;
+        let received_at = tokio::time::Instant::now();
+        if received_at >= deadline {
+            return Err(control_fatal(after_revision, control_window_expired()).into());
+        }
+        // A Meta restart is a retryable transport failure, not an untrusted
+        // control result: retry inside the heartbeat's fail-closed window.
+        let batch = match result {
+            Ok(batch) => {
+                last_success = received_at;
+                batch
             }
             Err(error) => {
-                // Host ON deliberately fails closed on any untrusted control
-                // result. Ordinary OFF retains its existing heartbeat policy.
-                afs_logging::error!("ownerfs.workspace_bind_root_command_control_failed";
-                    "after_revision" => after_revision,
-                    "error" => error.to_string());
-                return Err(error.into());
+                if meta_transport_error_is_retryable(&error) {
+                    afs_logging::warn!("ownerfs.workspace_bind_root_command_control_retry";
+                        "after_revision" => after_revision,
+                        "since_last_success_ms" => u64::try_from(received_at.duration_since(last_success).as_millis()).unwrap_or(u64::MAX),
+                        "error" => error.to_string());
+                    delay = META_RETRY_INTERVAL.min(deadline.saturating_duration_since(received_at));
+                    continue;
+                }
+                return Err(control_fatal(after_revision, error).into());
             }
-        }
+        };
+        // Untrusted control results and refusals stay fatal on the first poll.
+        let next = process_workspace_bind_root_commands(after_revision, batch, &mut reject)
+            .map_err(|error| control_fatal(after_revision, error))?;
+        delay = if next > after_revision {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(250)
+        };
+        after_revision = next;
     }
 }
 
@@ -674,5 +776,387 @@ mod workspace_bind_root_command_tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+    }
+
+    fn unavailable() -> afs_error::Error {
+        afs_error::Error::coded(
+            afs_error::IO_UNAVAILABLE,
+            "Connection refused (os error 111)",
+        )
+    }
+
+    fn malformed_reply() -> afs_error::Error {
+        afs_error::Error::coded(
+            afs_error::CLIENT_PROTOCOL_VIOLATION,
+            "RootCommand has an unknown command type",
+        )
+    }
+
+    fn node_session_rejected() -> afs_error::Error {
+        afs_error::Error::coded(
+            afs_error::META_CATALOG_INVALID_REQUEST,
+            "node session is not current",
+        )
+    }
+
+    fn remote_status(kind: afs_error::ErrorKind, message: &str) -> afs_error::Error {
+        afs_error::Error::new(afs_error::CLIENT_REMOTE_STATUS, kind, message)
+    }
+
+    struct ScriptedPoller {
+        script: std::sync::Mutex<std::collections::VecDeque<afs_error::Result<RootCommandBatch>>>,
+        fail_on_idle: bool,
+        calls: std::sync::atomic::AtomicUsize,
+        cursors: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl ScriptedPoller {
+        fn new(script: Vec<afs_error::Result<RootCommandBatch>>) -> Self {
+            Self::with_idle(script, false)
+        }
+
+        fn failing_after(script: Vec<afs_error::Result<RootCommandBatch>>) -> Self {
+            Self::with_idle(script, true)
+        }
+
+        fn always_failing() -> Self {
+            Self::failing_after(Vec::new())
+        }
+
+        fn with_idle(script: Vec<afs_error::Result<RootCommandBatch>>, fail_on_idle: bool) -> Self {
+            Self {
+                script: std::sync::Mutex::new(script.into()),
+                fail_on_idle,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                cursors: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn cursors(&self) -> Vec<u64> {
+            self.cursors.lock().expect("cursor log").clone()
+        }
+    }
+
+    impl RootCommandPoller for ScriptedPoller {
+        fn poll_commands(
+            &self,
+            after_revision: u64,
+            _budget: Duration,
+        ) -> afs_error::Result<RootCommandBatch> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.cursors
+                .lock()
+                .expect("cursor log")
+                .push(after_revision);
+            let mut script = self.script.lock().expect("scripted poller lock");
+            match script.pop_front() {
+                Some(result) => result,
+                None if self.fail_on_idle => Err(unavailable()),
+                None => Ok(events(after_revision, after_revision + 1, vec![])),
+            }
+        }
+    }
+
+    struct SlowPoller {
+        calls: std::sync::atomic::AtomicUsize,
+        budget: std::sync::Mutex<Option<Duration>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SlowPoller {
+        fn new() -> (Self, std::sync::mpsc::Sender<()>) {
+            let (release, blocked) = std::sync::mpsc::channel();
+            (
+                Self {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    budget: std::sync::Mutex::new(None),
+                    release: std::sync::Mutex::new(blocked),
+                },
+                release,
+            )
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn budget(&self) -> Option<Duration> {
+            *self.budget.lock().expect("budget log")
+        }
+    }
+
+    impl RootCommandPoller for SlowPoller {
+        fn poll_commands(
+            &self,
+            after_revision: u64,
+            budget: Duration,
+        ) -> afs_error::Result<RootCommandBatch> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            *self.budget.lock().expect("budget log") = Some(budget);
+            // Hold the poll open until the test releases it.
+            let _ = self
+                .release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(10));
+            Ok(events(after_revision, after_revision + 1, vec![]))
+        }
+    }
+
+    /// A retryable transport error must not end the loop; the retry resumes at
+    /// the unchanged cursor and the command delivered after recovery is
+    /// processed exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_transport_retry_keeps_control_alive() {
+        let poller = Arc::new(ScriptedPoller::new(vec![
+            // Advance the cursor to 1 so a reset to 0 would be visible below.
+            Ok(events(0, 2, vec![])),
+            Err(unavailable()),
+            // start_revision < command.revision < next_revision
+            Ok(events(1, 3, vec![command("after-retry", 2)])),
+        ]));
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = applied.clone();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_workspace_bind_root_commands(
+            poller.clone(),
+            move |command: &RootCommand| {
+                seen.lock()
+                    .expect("applied lock")
+                    .push(command.command_id.clone());
+                Ok(false)
+            },
+            stop_rx,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while applied.lock().expect("applied lock").is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control loop stopped on a retryable transport error"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        stop.send(true).expect("stop receiver must be alive");
+        assert!(handle.await.expect("control loop task").is_ok());
+        let applied = applied.lock().expect("applied lock");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0], "after-retry");
+        let cursors = poller.cursors();
+        assert!(cursors.len() >= 3, "expected at least three polls");
+        assert_eq!(&cursors[..3], [0, 1, 1], "the retry must reuse the cursor");
+    }
+
+    /// Retrying is bounded: the loop ends at the 25-second contract, not later.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_transport_failure_past_window_is_fatal() {
+        let poller = Arc::new(ScriptedPoller::always_failing());
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            run_workspace_bind_root_commands(poller.clone(), |_: &RootCommand| Ok(false), stop_rx),
+        )
+        .await
+        .expect("retryable transport failures must fail closed after the window");
+        assert!(result.is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(25),
+            "the loop must not fail closed before the 25s window"
+        );
+        assert!(
+            elapsed < Duration::from_secs(26),
+            "the loop must end at the window instead of running past it"
+        );
+        assert!(
+            poller.calls() > 1,
+            "transport failures must be retried before fail-closed"
+        );
+    }
+
+    /// A success restarts the fail-closed clock; failures after it get a fresh
+    /// 25 seconds instead of inheriting the first failure's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_window_restarts_after_success() {
+        let mut script = (0..10).map(|_| Err(unavailable())).collect::<Vec<_>>();
+        script.push(Ok(events(0, 1, vec![])));
+        let poller = Arc::new(ScriptedPoller::failing_after(script));
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            run_workspace_bind_root_commands(poller.clone(), |_: &RootCommand| Ok(false), stop_rx),
+        )
+        .await
+        .expect("failures after the success must end the loop at the restarted window");
+        assert!(result.is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(35),
+            "the success at about 10s must restart the 25s window"
+        );
+        assert!(
+            elapsed < Duration::from_secs(36),
+            "the loop must end 25s after the success, not at the first deadline"
+        );
+    }
+
+    /// An in-flight poll that outlives the window must not delay the exit: the
+    /// loop ends at the deadline while the poll is still blocked, and never
+    /// issues a second poll.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_slow_poll_ends_at_deadline() {
+        let (poller, release) = SlowPoller::new();
+        let poller = Arc::new(poller);
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(run_workspace_bind_root_commands(
+            poller.clone(),
+            |_: &RootCommand| Ok(false),
+            stop_rx,
+        ));
+        // Let the loop issue the poll without letting paused time advance.
+        while poller.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The poll is blocked; move the clock past the window.
+        tokio::time::advance(Duration::from_secs(25)).await;
+
+        // The loop must end while the poll is still blocked. A loop that awaits
+        // the join here would not finish before the poller is released.
+        let not_waiting = std::time::Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < not_waiting,
+                "the loop waited for the blocked poll instead of ending at the window"
+            );
+            tokio::task::yield_now().await;
+        }
+        let result = handle.await.expect("control loop task");
+        assert!(result.is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(25),
+            "the loop must not end before the window"
+        );
+        assert!(
+            elapsed < Duration::from_secs(26),
+            "the loop must end at the window even while the poll is in flight"
+        );
+        assert_eq!(poller.calls(), 1, "no second poll may be issued");
+        let budget = poller.budget().expect("budget log");
+        assert!(
+            budget > Duration::from_secs(24) && budget <= Duration::from_secs(25),
+            "the poll must receive the remaining window as its budget"
+        );
+
+        // Release the blocked poll so the blocking task can finish.
+        release.send(()).expect("poller must still be blocked");
+    }
+
+    /// A malformed Meta reply decodes to an internal protocol error, not to a
+    /// transport failure: it must stay fatal without retry.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_malformed_reply_is_fatal_without_retry() {
+        let poller = Arc::new(ScriptedPoller::new(vec![Err(malformed_reply())]));
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_workspace_bind_root_commands(poller.clone(), |_: &RootCommand| Ok(false), stop_rx),
+        )
+        .await
+        .expect("a malformed Meta reply must terminate the loop");
+        assert!(result.is_err());
+        assert_eq!(poller.calls(), 1);
+    }
+
+    /// A non-retryable RPC rejection is not a transport failure: the first poll
+    /// must end the loop.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_rpc_rejection_is_fatal_without_retry() {
+        let poller = Arc::new(ScriptedPoller::new(vec![Err(node_session_rejected())]));
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_workspace_bind_root_commands(poller.clone(), |_: &RootCommand| Ok(false), stop_rx),
+        )
+        .await
+        .expect("a non-retryable RPC rejection must terminate the loop");
+        assert!(result.is_err());
+        assert_eq!(poller.calls(), 1);
+    }
+
+    /// A call broken after it was sent has no AFS detail and arrives as a
+    /// framework status; it is still a transport failure and must be retried.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_inflight_disconnect_retries() {
+        let poller = Arc::new(ScriptedPoller::new(vec![
+            Err(remote_status(
+                afs_error::ErrorKind::Internal,
+                "h2 protocol error: stream reset",
+            )),
+            Ok(events(0, 1, vec![])),
+        ]));
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_workspace_bind_root_commands(
+            poller.clone(),
+            |_: &RootCommand| Ok(false),
+            stop_rx,
+        ));
+
+        while poller.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Sleeping advances the paused clock, so the retry delay can elapse.
+        let not_retried = std::time::Instant::now() + Duration::from_secs(2);
+        while poller.calls() < 2 {
+            assert!(
+                std::time::Instant::now() < not_retried,
+                "an in-flight disconnect must be retried"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop.send(true).expect("stop receiver must be alive");
+        assert!(handle.await.expect("control loop task").is_ok());
+    }
+
+    /// A framework status that rejects the request itself is not a transport
+    /// failure and must stay fatal.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_remote_rejection_is_fatal() {
+        let poller = Arc::new(ScriptedPoller::new(vec![Err(remote_status(
+            afs_error::ErrorKind::InvalidArgument,
+            "invalid request",
+        ))]));
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_workspace_bind_root_commands(poller.clone(), |_: &RootCommand| Ok(false), stop_rx),
+        )
+        .await
+        .expect("a remote rejection must terminate the loop");
+        assert!(result.is_err());
+        assert_eq!(poller.calls(), 1);
+    }
+
+    /// An untrusted control result stays fatal on the first poll, without retry.
+    #[tokio::test(start_paused = true)]
+    async fn workspace_bind_root_command_untrusted_batch_is_fatal_without_retry() {
+        let poller = Arc::new(ScriptedPoller::new(vec![Ok(events(9, 31, vec![]))]));
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_workspace_bind_root_commands(poller.clone(), |_: &RootCommand| Ok(false), stop_rx),
+        )
+        .await
+        .expect("an untrusted control result must terminate the loop");
+        assert!(result.is_err());
+        assert_eq!(poller.calls(), 1);
     }
 }

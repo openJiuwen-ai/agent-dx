@@ -3,7 +3,7 @@ use crate::{Activator, Error, Result};
 use adx_agent_core::{
     environment::{EnvironmentError, ExecutionSpec},
     mounts::Parameters,
-    prewarm::{PrewarmRecipe, SeedExecution, SeedResult, GOLDEN_PHASE, TEMPLATE_HANDOFF_VERSION},
+    prewarm::{PrewarmRecipe, SeedExecution, SeedResult, TEMPLATE_HANDOFF_VERSION},
     volumes::{AccessMode, VolumeSource, VolumeSpec},
     TemplateVersion,
 };
@@ -15,36 +15,6 @@ const WORKSPACE_PARAMETER: &str = "${workspace}";
 const PREPARATION_LIFETIME_MS: u64 = 15 * 60 * 1000;
 const PREPARATION_ATTEMPT_CAP: Duration = Duration::from_secs(15);
 const SEED_PREFIX: &str = "adx-agent-seed-";
-
-fn safe_seed_env(name: &str, value: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && !upper.starts_with("ADX_")
-        && !upper.starts_with("EXECD_")
-        && upper != "SECRET"
-        && !upper.ends_with("_SECRET")
-        && ![
-            "PASSWORD",
-            "TOKEN",
-            "PRIVATE_KEY",
-            "API_KEY",
-            "API_BASE",
-            "ACCESS_KEY",
-            "SIGNING_KEY",
-            "CREDENTIAL",
-        ]
-        .iter()
-        .any(|marker| upper.contains(marker))
-        && !value.chars().any(char::is_control)
-        && !reqwest::Url::parse(value).ok().is_some_and(|url| {
-            url.has_host()
-                && (!url.username().is_empty() || url.password().is_some() || url.query().is_some())
-        })
-        && (!value.contains("${") || value == WORKSPACE_PARAMETER)
-}
 
 fn seed_volume(template: &TemplateVersion, identity: &str) -> Result<VolumeSpec> {
     let ([mount], [volume]) = (template.mounts.as_slice(), template.volumes.as_slice()) else {
@@ -103,20 +73,12 @@ impl Activator {
                 "Golden requires runsc and an explicit readiness probe".into(),
             ));
         }
-        for (key, value) in &template.env {
-            if key == "DIGITALMATE_GOLDEN_PHASE" || !safe_seed_env(key, value) {
-                return Err(Error::Invalid(format!(
-                    "Golden cannot capture template environment field {key}"
-                )));
-            }
-        }
         let id = uuid::Uuid::new_v4().to_string();
         let identity = format!("{SEED_PREFIX}{id}");
         let volume = seed_volume(template, &identity)?;
         let params = Parameters::from([("workspace".into(), identity)]);
         let mut execution = ExecutionSpec::from(template);
         execution.env = template.render_env(&params).map_err(Error::Invalid)?;
-        execution.env.insert(GOLDEN_PHASE.into(), "seed".into());
         execution.lifecycle = Default::default();
         execution.mounts = template.render_mounts(&params).map_err(Error::Invalid)?;
         execution.mounts[0].volume_id = Some(volume.id.clone());
@@ -130,7 +92,7 @@ impl Activator {
             image_digest: image_digest.into(),
             restore_profile_digest: restore_digest(template)?,
             handoff_contract_version: TEMPLATE_HANDOFF_VERSION.into(),
-            restore_env: [(GOLDEN_PHASE.into(), "restore".into())].into(),
+            restore_env: Default::default(),
         };
         recipe.validate(&template.image).map_err(Error::Invalid)?;
         let mut seed = SeedExecution {
@@ -288,27 +250,26 @@ impl Activator {
         job: &PreparationJob,
         recipe: PrewarmRecipe,
     ) -> Result<std::result::Result<PrewarmRecipe, String>> {
-        if recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION {
-            use adx_agent_core::environment::{SnapshotChange, SnapshotOwner};
-            let owner = SnapshotOwner::Template {
-                name: job.template.clone(),
-                version: job.version.clone(),
-            };
-            match self
-                .environment
-                .update_snapshot_reference(
-                    &job.tenant,
-                    &recipe.snapshot_id,
-                    &SnapshotChange::Acquire { owner },
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => {
-                    return Ok(Err("Golden snapshot is retiring".into()))
-                }
-                Err(error) => return Err(error.into()),
+        use adx_agent_core::environment::{SnapshotChange, SnapshotOwner};
+        let owner = SnapshotOwner::Template {
+            name: job.template.clone(),
+            version: job.version.clone(),
+        };
+        // Durable jobs from an earlier handoff still need Catalog protection.
+        match self
+            .environment
+            .update_snapshot_reference(
+                &job.tenant,
+                &recipe.snapshot_id,
+                &SnapshotChange::Acquire { owner },
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => {
+                return Ok(Err("Golden snapshot is retiring".into()))
             }
+            Err(error) => return Err(error.into()),
         }
         Ok(Ok(recipe))
     }

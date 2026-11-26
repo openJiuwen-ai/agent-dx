@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import logging
 import os
 import pathlib
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 
 from fc_runtime_profile import resolve as resolve_runtime_profile
 from storage_fixture import external as external_storage, public as public_storage
 from storage_workload import io_engine as storage_io_engine
 from storage_workload import checkpoint_mode as storage_checkpoint_mode
+
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
 
 def _executable(command_name, environment=None, cwd=None):
@@ -347,6 +351,7 @@ if node == "node1":
             "rpc_timeout_seconds": 120,
             "cache_entries": 1000,
             "auth_cache_ttl_seconds": 10,
+            "allowed_host_paths": ["*"],
         },
     )
     ee = {
@@ -394,7 +399,7 @@ d["runtime_profile"] = resolve_runtime_profile(
 (P / "deployment.yaml").write_text(json.dumps(d))
 (P / "deployment.yaml").chmod(0o600)
 
-print("configured", node, capacity)
+logging.info("configured %s %s", node, capacity)
 
 (P / "capacity.json").write_text(
     json.dumps(
@@ -561,13 +566,13 @@ if os.environ.get("ADX_FC_PROXY_MODE", "embedded") == "embedded":
     node["config"]["proxy_mode"] = "embedded"
     deployment["services"] = [s for s in deployment["services"] if s["role"] != "relay"]
     config_path.write_text(json.dumps(deployment, indent=2))
-    print("embedded Relay enabled in Adxlet", flush=True)
+    logging.info("embedded Relay enabled in Adxlet")
 else:
     deployment = json.loads(config_path.read_text())
     node = next(s for s in deployment["services"] if s["role"] == "adxlet")
     node["config"]["proxy_mode"] = "standalone"
     config_path.write_text(json.dumps(deployment, indent=2))
-    print("standalone Relay explicitly enabled", flush=True)
+    logging.info("standalone Relay explicitly enabled")
 run = RUN
 
 d = json.loads((run / "deployment.yaml").read_text())

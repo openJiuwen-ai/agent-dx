@@ -244,19 +244,19 @@ async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_sc
         template_ref: TemplateRef::Version("2".into()),
         ..first.clone()
     };
-    assert_eq!(
-        state
-            .create_binding_for_version(next.clone(), &params, true, "2", None)
-            .await
-            .unwrap(),
-        assigned
-    );
-    service.delete_binding(&first).await.unwrap();
-    assert_eq!(state.subject_binding(&next).await.unwrap(), None);
-    let rebound = state
+    let (same, created) = state
         .create_binding_for_version(next.clone(), &params, true, "2", None)
         .await
         .unwrap();
+    assert!(!created, "CAS loser must not report a cold binding");
+    assert_eq!(same, assigned);
+    service.delete_binding(&first).await.unwrap();
+    assert_eq!(state.subject_binding(&next).await.unwrap(), None);
+    let (rebound, created) = state
+        .create_binding_for_version(next.clone(), &params, true, "2", None)
+        .await
+        .unwrap();
+    assert!(created, "new binding must report a cold binding");
     assert_eq!(rebound.scope, next);
     assert_ne!(
         rebound.current.environment_id,

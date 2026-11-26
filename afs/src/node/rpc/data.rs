@@ -85,6 +85,10 @@ mod dfs_range_stream;
 mod dfs_read_authz;
 #[cfg(feature = "dfs")]
 mod dfs_replica_authz;
+#[cfg(feature = "ownerfs")]
+mod hixl;
+#[cfg(feature = "ownerfs")]
+pub mod owner_hixl;
 #[cfg(feature = "dfs")]
 use dfs_chunks::*;
 #[cfg(feature = "dfs")]
@@ -1706,6 +1710,7 @@ pub struct OwnerFilesService {
     authenticator: Option<Arc<dyn PeerAuthenticator>>,
     metrics: Option<super::OwnerRpcMetrics>,
     rdma_sessions: Option<RdmaSessionRegistry>,
+    hixl: Option<Arc<owner_hixl::OwnerHixlService>>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -1720,7 +1725,16 @@ impl OwnerFilesService {
             authenticator: Some(authenticator),
             metrics: None,
             rdma_sessions: None,
+            hixl: None,
         }
+    }
+
+    /// Enables OwnerFs HIXL read-ahead windows. Without it the HIXL RPCs
+    /// report the capability as unsupported after authenticating the peer.
+    #[must_use]
+    pub fn with_hixl(mut self, hixl: Arc<owner_hixl::OwnerHixlService>) -> Self {
+        self.hixl = Some(hixl);
+        self
     }
 
     #[must_use]
@@ -2180,9 +2194,77 @@ pub fn make_owner_files_server_with_handler_metrics_and_rdma(
     )
 }
 
+// Authenticate every HIXL method before exposing this Home's capabilities.
+#[cfg(feature = "ownerfs")]
+macro_rules! owner_hixl_rpc {
+    ($service:ident, $request:ident, $operation:literal, $method:ident) => {{
+        let peer = $service.owner_peer($operation, &$request)?;
+        let home = $service.hixl.as_ref().ok_or_else(|| {
+            owner_hixl::unsupported_status("OwnerFs HIXL capability is unavailable")
+        })?;
+        home.check_peer(&peer)?;
+        home.$method(peer, $request.into_inner()).await
+    }};
+}
+
 #[tonic::async_trait]
 #[cfg(feature = "ownerfs")]
 impl OwnerFiles for OwnerFilesService {
+    async fn negotiate_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerNegotiateHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerNegotiateHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.NegotiateHixl", negotiate)
+    }
+
+    async fn prepare_read_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerPrepareReadHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerPrepareReadHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.PrepareReadHixl", prepare)
+    }
+
+    async fn prepare_batch_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerPrepareBatchHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerPrepareBatchHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.PrepareBatchHixl", prepare_batch)
+    }
+
+    async fn prepare_write_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerPrepareWriteHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerPrepareWriteHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.PrepareWriteHixl", prepare_write)
+    }
+
+    async fn commit_write_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerFinishWriteHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerCommitWriteHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.CommitWriteHixl", commit_write)
+    }
+
+    async fn abort_write_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerAbortWriteHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerAbortWriteHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.AbortWriteHixl", abort_write)
+    }
+
+    async fn release_hixl_read(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerReleaseHixlReadRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerReleaseHixlReadReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.ReleaseHixlRead", release)
+    }
+
+    async fn close_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerCloseHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerCloseHixlReply>, Status> {
+        owner_hixl_rpc!(self, request, "OwnerFiles.CloseHixl", close)
+    }
     async fn lookup(
         &self,
         request: Request<OwnerLookupRequest>,

@@ -10,6 +10,7 @@ use serde_json::json;
 #[tokio::test]
 async fn embedded_and_http_creation_use_the_same_platform_contract() {
     let config: Config = serde_json::from_value(json!({
+        "allowed_host_paths": ["/mnt/sfs"],
         "listen":"127.0.0.1:0", "coordinator_address":"http://127.0.0.1:1", "internal_security":"network", "ingress_mode":"standalone", "rpc_timeout_seconds":1,"cache_entries":16,"auth_cache_ttl_seconds":1,
         "runtime_profile": {
             "rootfs":{"runtime_class":"runc","type":"image","image":format!("runtime@sha256:{}","0".repeat(64)),"readonly":false},

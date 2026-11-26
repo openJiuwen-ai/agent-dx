@@ -4,6 +4,8 @@
 //! （探测流程在 `node::diagnostics::probe`）。它调用正式 caller/adapter，不是另写一套
 //! 模拟传输。正常 FUSE 回调不会自动触发这些 RPC。
 //! REST 面向 runtime 的 snapshot/publish API 尚未实现；不要用本诊断接口推断镜像发布成功。
+mod hixl;
+
 use crate::error::RestError;
 use crate::node::{
     AfsMountIdentity, Node, current_visible_afs_mount_id_in_mountinfo,
@@ -62,6 +64,8 @@ async fn metrics(
         axum::Extension<crate::node::rpc::control::RdmaSessionRegistry>,
     >,
 ) -> Result<String, RestError> {
+    #[cfg(feature = "ownerfs")]
+    hixl::snapshot_metrics(&node);
     let encoded = afs_metrics::encode_text(&node.observability.registry)
         .map_err(|e| RestError(Error::coded(METRICS_FAILED, e.to_string())))?;
     #[cfg(feature = "rdma")]
@@ -170,11 +174,13 @@ fn node_health_report(node: &Node) -> HealthReport {
     let mounts_ready = ownerfs_mount.ready && dfs_mount.ready;
     let mounts_configured = ownerfs_mount.configured || dfs_mount.configured;
     let rdma = rdma_check(node);
+    let hixl = hixl::health(node);
     let ready = meta_functional_ready
         && registration_ready
         && data_device.ready
         && mounts_ready
-        && rdma.ready;
+        && rdma.ready
+        && hixl.ready;
     let scope = if mounts_configured && mounts_ready {
         "configured_fs"
     } else {
@@ -219,7 +225,8 @@ fn node_health_report(node: &Node) -> HealthReport {
                     "ownerfs": ownerfs_mount.body,
                     "dfs": dfs_mount.body
                 },
-                "rdma": rdma.body
+                "rdma": rdma.body,
+                "hixl": hixl.body
             }
         }),
     }

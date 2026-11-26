@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_manifest import (  # noqa: E402
     AFS_BINARIES,
+    AFS_HIXL_MODULE,
     BINARIES,
     GVISOR_BINARIES,
     SANDBOXD_BINARIES,
@@ -36,12 +37,17 @@ class BuildIdentity:
     profile: str
 
 
-def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=False, backend_dir=None, runsc=None):
+def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *,
+             with_afs=False, with_hixl=False, backend_dir=None, runsc=None):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
     if with_afs:
         inputs.update({f"bin/{name}": binary_dir / name for name in AFS_BINARIES})
+    if with_hixl:
+        if not with_afs or "linux" not in identity.target:
+            raise ValueError("the HIXL module requires an AFS package for Linux")
+        inputs[f"bin/{AFS_HIXL_MODULE}"] = binary_dir / AFS_HIXL_MODULE
     inputs["runtime/adx-execd"] = binary_dir / "adx-execd"
     envd_dir = binary_dir / "envd"
     envd_component = (binary_dir / "envd-manifest.json", binary_dir / "envd-LICENSE")
@@ -158,6 +164,8 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=
             manifest["with_sandboxd"] = True
         if with_afs:
             manifest["with_afs"] = True
+        if with_hixl:
+            manifest["with_hixl"] = True
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         verify(stage)
         stage.rename(output)
@@ -177,6 +185,7 @@ def main():
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
     p.add_argument("--with-afs", action="store_true", help="include OwnerFs and DistributedFs binaries")
+    p.add_argument("--with-hixl", action="store_true", help="include the optional AFS HIXL module")
     p.add_argument("--backend-dir", type=Path)
     p.add_argument("--runsc", type=Path)
     v = sub.add_parser("verify")
@@ -204,6 +213,7 @@ def main():
             args.output,
             BuildIdentity(commit, dirty, args.target, args.profile),
             with_afs=args.with_afs,
+            with_hixl=args.with_hixl,
             backend_dir=args.backend_dir,
             runsc=args.runsc,
         )

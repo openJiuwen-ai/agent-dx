@@ -1,0 +1,11 @@
+{
+  "postgres": {
+    "database_url_env": "ADX_OBSERVATION_DATABASE_URL",
+    "database_allow_plaintext": false
+  },
+  "hmac_key_env": "ADX_OBSERVATION_HMAC_KEY",
+  "flush_interval_seconds": 15,
+  "retention_days": 30,
+  "max_sessions_per_user_minute": 20,
+  "capacity": 200000
+}

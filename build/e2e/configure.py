@@ -2,6 +2,7 @@
 import argparse
 import ipaddress
 import json
+import logging
 import os
 import pathlib
 import re
@@ -9,9 +10,12 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 
 from cgroup_limits import v2_directory
 from network_config import sandboxd_gateway_range
+
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
 
 def _executable(name, environment=None, cwd=None):
@@ -362,6 +366,7 @@ if node == 'node1' or activator_mode:
             'rpc_timeout_seconds': 120,
             'cache_entries': 1000,
             'auth_cache_ttl_seconds': 10,
+            'allowed_host_paths': ['*'],
         },
     )
     ee = {
@@ -485,4 +490,4 @@ elif runtime_artifact.is_file():
         indent=2,
     )
 )
-print('configured', node, capacity)
+logging.info('configured %s %s', node, capacity)
