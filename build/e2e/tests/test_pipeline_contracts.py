@@ -180,7 +180,13 @@ class PipelineContracts(unittest.TestCase):
 
     def test_platform_release_passes_make_afs_mode_to_release_builder(self):
         makefile = (ROOT / "Makefile").read_text()
-        self.assertIn("ADX_WITH_AFS=$(ADX_WITH_AFS) bash build/release/build.sh", makefile)
+        release_recipes = [
+            line for line in makefile.splitlines() if line.strip().endswith("bash build/release/build.sh")
+        ]
+        self.assertEqual(len(release_recipes), 1)
+        arguments = release_recipes[0].split()
+        self.assertIn("ADX_WITH_AFS=$(ADX_WITH_AFS)", arguments)
+        self.assertIn("AFS_WITH_HIXL=$(AFS_WITH_HIXL)", arguments)
 
     def test_release_build_validates_afs_mode_before_rust_probe(self):
         script = (ROOT / "build/release/build.sh").read_text()

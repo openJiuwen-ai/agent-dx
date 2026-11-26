@@ -320,26 +320,34 @@ mod tests {
         );
         assert_eq!(over_the_wire.code(), afs_error::META_NODE_PROTOCOL_VERSION);
         assert!(!super::heartbeat_error_is_retryable(&over_the_wire));
-        assert!(super::heartbeat_error_is_retryable(&afs_error::Error::coded(
-            afs_error::META_OWNER_ROOT_BUSY,
-            "other FailedPrecondition-class errors keep their retry",
-        )));
+        assert!(super::heartbeat_error_is_retryable(
+            &afs_error::Error::coded(
+                afs_error::META_OWNER_ROOT_BUSY,
+                "other FailedPrecondition-class errors keep their retry",
+            )
+        ));
     }
 
     #[test]
     fn heartbeat_retries_transport_failure_but_stops_expired_session() {
-        assert!(super::heartbeat_error_is_retryable(&afs_error::Error::coded(
-            afs_error::CLIENT_CONNECTION_UNAVAILABLE,
-            "temporary transport outage",
-        )));
-        assert!(!super::heartbeat_error_is_retryable(&afs_error::Error::coded(
-            afs_error::CLIENT_ARGUMENT_INVALID,
-            "expired node session cannot be renewed; start a new session_id",
-        )));
-        assert!(!super::heartbeat_error_is_retryable(&afs_error::Error::coded(
-            afs_error::IO_PERMISSION_DENIED,
-            "registration authority rejected",
-        )));
+        assert!(super::heartbeat_error_is_retryable(
+            &afs_error::Error::coded(
+                afs_error::CLIENT_CONNECTION_UNAVAILABLE,
+                "temporary transport outage",
+            )
+        ));
+        assert!(!super::heartbeat_error_is_retryable(
+            &afs_error::Error::coded(
+                afs_error::CLIENT_ARGUMENT_INVALID,
+                "expired node session cannot be renewed; start a new session_id",
+            )
+        ));
+        assert!(!super::heartbeat_error_is_retryable(
+            &afs_error::Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "registration authority rejected",
+            )
+        ));
     }
 
     #[tokio::test]
