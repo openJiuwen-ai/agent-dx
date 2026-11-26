@@ -73,7 +73,42 @@ impl HolderLayout {
             intervals,
         })
     }
+
+    /// Bytes one index entry costs besides its Chunk id and intervals: the
+    /// entry itself and the map's control byte, doubled for spare buckets.
+    const ENTRY_BYTES: usize = 2 * (std::mem::size_of::<(ChunkId, Vec<(u64, u64)>)>() + 1);
+
+    /// An upper bound of [`Self::retained_bytes`] for `layout`, known before
+    /// building: at most one entry and one interval per extent.
+    fn estimate(layout: &LayoutRoot) -> u64 {
+        let interval = std::mem::size_of::<(u64, u64)>();
+        let entries: usize = layout
+            .inline_extents
+            .iter()
+            .map(|extent| Self::ENTRY_BYTES + extent.chunk_id.0.len() + interval)
+            .sum();
+        (std::mem::size_of::<Self>() + layout.id.0.len() + entries) as u64
+    }
+
+    /// The heap and inline bytes this index keeps (capacities, not lengths).
+    fn retained_bytes(&self) -> u64 {
+        let interval = std::mem::size_of::<(u64, u64)>();
+        let entries: usize = self
+            .intervals
+            .iter()
+            .map(|(id, ranges)| id.0.capacity() + ranges.capacity() * interval)
+            .sum();
+        (std::mem::size_of::<Self>()
+            + self.layout_root_id.0.capacity()
+            + self.intervals.capacity() * Self::ENTRY_BYTES / 2
+            + entries) as u64
+    }
 }
+
+/// Bytes all holder layout indexes of a Node may keep (!318 round 2 item
+/// 3). An index that does not fit is not built: its version answers not
+/// ready, so readers use the copies, until bytes return.
+pub(crate) const HOLDER_INDEX_BUDGET: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 std::thread_local! {
@@ -88,6 +123,20 @@ struct Shared {
     layout: Option<Arc<HolderLayout>>,
     /// The layout was seen but could not be indexed completely.
     incomplete: bool,
+    /// The build in progress, if any (one per version at a time).
+    building: Option<u64>,
+    /// Budget bytes this version holds: its build's estimate while it runs,
+    /// then its index's retained bytes. Returned when the version leaves.
+    charged: u64,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    versions: HashMap<FileVersionId, Shared>,
+    /// Sum of every version's `charged`.
+    used: u64,
+    /// Identifies builds.
+    builds: u64,
 }
 
 /// Outcome of a holder range check (plan/15 §2.2.3).
@@ -104,11 +153,28 @@ pub(crate) enum HolderRange {
 }
 
 /// See the module documentation.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HolderRegistry {
-    inner: Mutex<HashMap<FileVersionId, Shared>>,
+    inner: Mutex<State>,
+    /// See [`HOLDER_INDEX_BUDGET`].
+    budget: u64,
     /// Notified whenever a version stops being shared (!318 P3-3).
     unshared: tokio::sync::Notify,
+    /// Tests: layout indexes built.
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for HolderRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            budget: HOLDER_INDEX_BUDGET,
+            unshared: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 impl HolderRegistry {
@@ -116,14 +182,30 @@ impl HolderRegistry {
         Arc::new(Self::default())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<FileVersionId, Shared>> {
-        // Every method leaves the map consistent before it can panic.
+    /// A registry whose indexes may keep `bytes` (tests).
+    #[cfg(test)]
+    pub(crate) fn with_index_budget(bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            budget: bytes,
+            ..Self::default()
+        })
+    }
+
+    /// Budget bytes in use: indexes kept and builds in progress (tests).
+    #[cfg(test)]
+    pub(crate) fn index_bytes(&self) -> u64 {
+        self.lock().used
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        // Every method leaves the state consistent before it can panic.
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     /// A shared reader of `version` joined (called under the soft lock).
     pub(crate) fn retain(&self, version: &FileVersionId, reader: u64) {
         self.lock()
+            .versions
             .entry(version.clone())
             .or_default()
             .readers
@@ -131,13 +213,16 @@ impl HolderRegistry {
     }
 
     /// A shared reader of `version` left (called under the soft lock); the
-    /// version leaves with its last reader.
+    /// version leaves with its last reader, and its budget bytes with it
+    /// (also those of a build still running: that build publishes nothing).
     pub(crate) fn release(&self, version: &FileVersionId, reader: u64) {
         let mut inner = self.lock();
-        if let Some(shared) = inner.get_mut(version) {
+        if let Some(shared) = inner.versions.get_mut(version) {
             shared.readers.remove(&reader);
             if shared.readers.is_empty() {
-                inner.remove(version);
+                if let Some(shared) = inner.versions.remove(version) {
+                    inner.used -= shared.charged;
+                }
                 drop(inner);
                 // A holder request waiting for this version ends now.
                 self.unshared.notify_waiters();
@@ -157,34 +242,69 @@ impl HolderRegistry {
     /// bound to `version`.
     ///
     /// The index is built outside the registry lock (!318 P2-1), so other
-    /// versions are checked, joined and released meanwhile; it is published
-    /// only if the version is still shared and still unindexed. A version
-    /// whose last reader left during the build publishes nothing.
+    /// versions are checked, joined and released meanwhile, and at most once
+    /// at a time per version (a concurrent first attach leaves it to the
+    /// build in progress). The build first reserves an upper bound of its
+    /// bytes from the Node-wide budget ([`HOLDER_INDEX_BUDGET`]); a version
+    /// that does not fit stays unindexed (not ready: readers use the copies)
+    /// and is tried again at its next attach. The index is published only if
+    /// the version is still shared and this is still its build; a version
+    /// whose last reader left during the build publishes nothing and has
+    /// already given its bytes back.
     pub(crate) fn attach(&self, version: &FileVersionId, layout: &LayoutRoot) {
-        let wanted = self
-            .lock()
-            .get(version)
-            .is_some_and(|shared| shared.layout.is_none() && !shared.incomplete);
-        if !wanted {
-            return;
-        }
+        let estimate = HolderLayout::estimate(layout);
+        let build = {
+            let mut inner = self.lock();
+            let State {
+                versions,
+                used,
+                builds,
+            } = &mut *inner;
+            let Some(shared) = versions.get_mut(version) else {
+                return;
+            };
+            if shared.layout.is_some() || shared.incomplete || shared.building.is_some() {
+                return;
+            }
+            if used.saturating_add(estimate) > self.budget {
+                return;
+            }
+            *builds += 1;
+            *used += estimate;
+            shared.charged = estimate;
+            shared.building = Some(*builds);
+            *builds
+        };
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let built = HolderLayout::build(layout);
         let mut inner = self.lock();
-        let Some(shared) = inner.get_mut(version) else {
+        let State { versions, used, .. } = &mut *inner;
+        let Some(shared) = versions.get_mut(version) else {
             return;
         };
-        if shared.layout.is_some() || shared.incomplete {
+        if shared.building != Some(build) {
             return;
         }
+        shared.building = None;
+        *used -= shared.charged;
+        shared.charged = 0;
         match built {
-            Some(index) => shared.layout = Some(Arc::new(index)),
+            Some(index) => {
+                // Never more than reserved: the estimate is an upper bound.
+                let kept = index.retained_bytes().min(estimate);
+                *used += kept;
+                shared.charged = kept;
+                shared.layout = Some(Arc::new(index));
+            }
             None => shared.incomplete = true,
         }
     }
 
     /// Whether `version` is shared here (whatever its layout state).
     pub(crate) fn is_shared(&self, version: &FileVersionId) -> bool {
-        self.lock().contains_key(version)
+        self.lock().versions.contains_key(version)
     }
 
     /// The holder range check of one operation (plan/15 §2.2.3 items 1–6).
@@ -199,7 +319,7 @@ impl HolderRegistry {
     ) -> HolderRange {
         let layout = {
             let inner = self.lock();
-            match inner.get(version) {
+            match inner.versions.get(version) {
                 Some(Shared {
                     layout: Some(layout),
                     ..
@@ -221,6 +341,7 @@ impl HolderRegistry {
     #[cfg(test)]
     pub(crate) fn readers(&self, version: &FileVersionId) -> Vec<u64> {
         self.lock()
+            .versions
             .get(version)
             .map(|shared| shared.readers.iter().copied().collect())
             .unwrap_or_default()
@@ -523,6 +644,7 @@ mod tests {
                 }))
             });
         }
+        let before = registry.index_bytes();
         registry.attach(&version, &layout("l", 16, &[(&a, 0, 0, 16)]));
         assert_eq!(
             seen.lock().unwrap().take(),
@@ -530,12 +652,114 @@ mod tests {
             "built under the registry lock"
         );
         assert!(!registry.is_shared(&version));
+        assert_eq!(
+            registry.index_bytes(),
+            before,
+            "a dropped build keeps bytes"
+        );
         registry.retain(&version, 2);
         assert_eq!(
             registry.check(&version, &LayoutRootId::new("l"), &a.id, 0, 16),
             HolderRange::NotReady,
             "a layout built for the old readers was published"
         );
+    }
+
+    /// A layout of `n` distinct content-addressed Chunks, 16 bytes each.
+    fn wide_layout(id: &str, n: u32) -> (LayoutRoot, Vec<ChunkObject>) {
+        let chunks: Vec<ChunkObject> = (0..n)
+            .map(|i| {
+                let mut bytes = id.as_bytes().to_vec();
+                bytes.extend_from_slice(&i.to_le_bytes());
+                bytes.resize(16, 0);
+                StagedChunk::new(OperationId::new("wide"), bytes).chunk
+            })
+            .collect();
+        let extents: Vec<(&ChunkObject, u64, u64, u64)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| (chunk, 16 * i as u64, 0, 16))
+            .collect();
+        (layout(id, 16 * u64::from(n), &extents), chunks)
+    }
+
+    /// !318 round 2 item 3: two first attaches of one version at once build
+    /// its index once; the other finds it being built and leaves it.
+    #[test]
+    fn holder_layout_concurrent_first_attaches_build_once() {
+        let registry = Arc::new(HolderRegistry::default());
+        let (root, chunks) = wide_layout("l", 64);
+        let version = FileVersionId::new("v");
+        registry.retain(&version, 1);
+        {
+            let registry = registry.clone();
+            let version = version.clone();
+            let root = root.clone();
+            BUILD_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // Another reader opens the version meanwhile.
+                    std::thread::spawn(move || registry.attach(&version, &root))
+                        .join()
+                        .unwrap();
+                }))
+            });
+        }
+        registry.attach(&version, &root);
+        assert_eq!(
+            registry.builds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "built twice"
+        );
+        assert_eq!(
+            registry.check(&version, &root.id, &chunks[63].id, 0, 16),
+            HolderRange::Covered
+        );
+    }
+
+    /// !318 round 2 item 3: the indexes' kept bytes have a Node-wide budget.
+    /// A version that does not fit stays unindexed (its holder answers not
+    /// ready, readers use the copies); when the last reader of another one
+    /// leaves, its bytes return and the version is indexed at its next open.
+    #[test]
+    fn holder_layout_indexes_are_bounded_and_their_bytes_return() {
+        let (big1, chunks1) = wide_layout("l1", 2000);
+        let (big2, chunks2) = wide_layout("l2", 2000);
+        let probe = HolderRegistry::with_index_budget(u64::MAX);
+        let one = shared(&probe, "probe", 1, &big1);
+        let size = probe.index_bytes();
+        assert!(
+            size > 2000 * 16,
+            "an index of 2000 Chunks keeps {size} bytes"
+        );
+        probe.release(&one, 1);
+        assert_eq!(
+            probe.index_bytes(),
+            0,
+            "bytes kept after the last reader left"
+        );
+
+        let registry = HolderRegistry::with_index_budget(size + size / 2);
+        let v1 = shared(&registry, "v1", 1, &big1);
+        let v2 = shared(&registry, "v2", 2, &big2);
+        assert_eq!(
+            registry.check(&v1, &big1.id, &chunks1[0].id, 0, 16),
+            HolderRange::Covered
+        );
+        assert_eq!(
+            registry.check(&v2, &big2.id, &chunks2[0].id, 0, 16),
+            HolderRange::NotReady,
+            "over the budget: not ready, so readers use the copies"
+        );
+        assert!(registry.index_bytes() <= size + size / 2);
+        registry.release(&v1, 1);
+        assert_eq!(registry.index_bytes(), 0);
+        registry.attach(&v2, &big2);
+        assert_eq!(
+            registry.check(&v2, &big2.id, &chunks2[0].id, 0, 16),
+            HolderRange::Covered,
+            "the returned bytes are used again"
+        );
+        assert_eq!(registry.index_bytes(), size);
     }
 }
 
