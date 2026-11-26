@@ -155,3 +155,16 @@ Relay TCP 字节包含 HTTP 编码，Ingress body 字节不包含编码，两个
 `slow_transfers_total`、`transfer_diagnostics_suppressed_total` 和
 `transfer_slow_checks_total`（均带同一组件前缀）。这些指标无请求或连接 ID 标签。
 原有 HTTP 请求指标的响应头边界保持不变，完整文件传输的活动数量使用新指标。
+
+### HTTP/1 正文 EOF 与协议结束
+
+正文数据已收齐但请求仍不结束时，还需要检查 chunked 响应的 `0\r\n\r\n` 结束块。
+Hyper 1.11.0 的 HTTP/1 写入重检路径可能将结束块留在用户态缓冲区而没有刷新，
+使客户端等待协议结束；服务端正文 EOF 和在途数归零不足以排除此问题。
+Gateway 的 Hyper 最低版本为 1.11.1，锁文件包含
+[上游刷新修复](https://github.com/hyperium/hyper/pull/4143)。
+`gateway/tests/http1_streaming_eof.rs` 控制正文 EOF 出现在写入重检时，验证客户端
+在发送下一笔 keep-alive 请求前已经收到完整结束块，避免依赖后续请求触发刷新。
+
+这一故障形态与“正文只收到部分且持续低吞吐”需要分别取证；后者仍需结合客户端
+已收字节、Ingress 正文进度、前端写等待和 Relay H2 等待逐段分析。

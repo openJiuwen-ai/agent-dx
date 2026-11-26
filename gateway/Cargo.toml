@@ -61,7 +61,8 @@ futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
 httparse = "1"
-hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+# Flush HTTP/1 streaming terminators buffered by the write recheck (hyper#4143).
+hyper = { version = "1.11.1", features = ["client", "server", "http1", "http2"] }
 ipnet = "2"
 libc = "0.2"
 prost = { version = "0.13", optional = true }

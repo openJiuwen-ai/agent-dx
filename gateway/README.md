@@ -1136,3 +1136,11 @@ on completion, with a shared per-instance output budget. Configure
 `ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE` (60).
 See [file transfer diagnostics](../docs/testing/distributed-traces.md#文件传输-trace-与慢传输诊断)
 for counter boundaries, cancellation, CONNECT reuse and output limits.
+
+Streaming HTTP/1 responses require Hyper 1.11.1 or newer. Earlier affected versions
+can leave the chunked response terminator buffered after the body reaches EOF,
+so a client receives the payload but continues waiting for message completion.
+The minimum dependency and lockfile include the upstream
+[write-recheck flush fix](https://github.com/hyperium/hyper/pull/4143).
+The HTTP/1 streaming regression checks that the terminator reaches a raw client
+before it sends the next request on the same connection.
