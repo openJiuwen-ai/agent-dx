@@ -41,6 +41,14 @@ def _retryable_wait_read(error: Union[httpx.TransportError, EnvironmentError]) -
     )
 
 
+def _wait_read_reached_deadline(
+    error: Union[httpx.TransportError, EnvironmentError], deadline: Optional[float]
+) -> bool:
+    if deadline is None or time.monotonic() < deadline:
+        return False
+    return _retryable_wait_read(error)
+
+
 class CommandSubmissionError(RuntimeError):
     """Submission outcome is unknown, but the stable ID remains recoverable."""
 
@@ -427,7 +435,12 @@ class CommandHandle:
                     raise
 
     def wait(self, timeout: Optional[float] = None) -> CommandResult:
-        """Wait with periodic activity reads; a wait deadline never kills the command."""
+        """Wait with periodic activity reads without killing the command.
+
+        Deadline expiry during a retryable periodic read returns the last
+        observed running state with ``WAIT_TIMEOUT``. Initial read failures
+        and nonretryable errors still raise.
+        """
         increment("command_wait_total")
         started = time.monotonic()
         connection = getattr(self._client, "_connection", None)
@@ -472,7 +485,12 @@ class CommandHandle:
                             return _wait_timeout_result(snapshot)
                         # Watch connections are passive. A bounded registry read
                         # keeps an explicit caller wait active without replaying work.
-                        snapshot = self._wait_snapshot(deadline)
+                        try:
+                            snapshot = self._wait_snapshot(deadline)
+                        except (httpx.TransportError, EnvironmentError) as error:
+                            if not _wait_read_reached_deadline(error, deadline):
+                                raise
+                            return _wait_timeout_result(snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
@@ -482,6 +500,8 @@ class CommandHandle:
 
         Watch notifications wake the wait early. Periodic registry reads keep
         caller activity visible while the remote command is still running.
+        A retryable periodic read reaching the wait deadline returns the last
+        observed running state with ``WAIT_TIMEOUT``, as in :meth:`wait`.
         """
         started = time.monotonic()
         deadline = None if timeout is None else started + max(0, timeout)
@@ -509,7 +529,12 @@ class CommandHandle:
                             return _wait_timeout_result(snapshot)
                     if deadline is not None and time.monotonic() >= deadline:
                         return _wait_timeout_result(snapshot)
-                    snapshot = await self._wait_snapshot_async(deadline)
+                    try:
+                        snapshot = await self._wait_snapshot_async(deadline)
+                    except (httpx.TransportError, EnvironmentError) as error:
+                        if not _wait_read_reached_deadline(error, deadline):
+                            raise
+                        return _wait_timeout_result(snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)

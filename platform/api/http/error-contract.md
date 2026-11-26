@@ -170,6 +170,12 @@ Healthcheck 达到连续失败阈值后，由 adxlet 清理并按既有策略处
 
 Python SDK 对结构化错误抛出 `EnvironmentHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id`、`environment_id` 和可选的 `probe_failure`、`scheduling_failure`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。创建重试耗尽若最后收到完整服务失败，仍抛出 `EnvironmentHTTPError` 并保留状态码、载荷与诊断；连接/流中断才使用传输失败文案。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
 
+命令的 watch-backed `wait()` / `wait_async()` 已读到非终态快照后，若后续可重试状态读取耗尽调用方等待期限，返回
+`CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT", exit_code=None)`，保留最后一次观测到的输出。
+这表示本地等待结束；调用方可用同一 `command_id` 继续等待最终结果，SDK 不重放命令或发送 kill。
+首次状态读取失败仍抛出原异常；首次异步读取的本地计时器到期仍报告 `COMMAND_STATE_UNAVAILABLE / same_operation / unknown`。
+明确终态、不可重试错误，以及在调用方等待期限之前耗尽 30 秒读取重试预算的错误保留原有异常与诊断。
+
 创建请求未显式提供名称时，SDK 使用 `create-*` Request ID 中的 UUID 生成稳定名称。跨 API Server 重试因此仍得到相同 Environment ID；查询暂时返回 404 不能触发换名称或创建第二个实例。
 
 实现位置：
