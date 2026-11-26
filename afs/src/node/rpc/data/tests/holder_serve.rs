@@ -624,8 +624,7 @@ async fn h2_p1_crc_chunk_is_read_from_a_holder_end_to_end() {
     let holder_local =
         Arc::new(LocalChunkStore::open(temp.path().join("holder"), "holder").unwrap());
     let bytes: Vec<u8> = (0..(3 * 65536 + 17)).map(|i| (i % 251) as u8).collect();
-    let staged =
-        StagedChunk::new_crc32c(crate::dfs::OperationId::new("crc"), bytes.clone()).unwrap();
+    let staged = crc_chunk_designating_holder("crc", bytes.clone(), &["holder"]);
     assert!(staged.chunk.is_segment_crc32c());
     holder_local.put(staged.clone()).unwrap();
     let layout = LayoutRoot {
@@ -1140,7 +1139,7 @@ impl DfsHolderGrantValidator for AnyHolderGrant {
 /// one holder.
 struct PairMeta {
     reply: crate::dfs::DfsChunkSourcesReply,
-    holder: crate::dfs::VersionHolder,
+    holder: Option<crate::dfs::VersionHolder>,
 }
 impl crate::node::read::engine::ReadSourceProvider for PairMeta {
     fn sources_for(
@@ -1165,7 +1164,7 @@ impl crate::node::read::engine::ReadSourceProvider for PairMeta {
         &self,
         _: crate::dfs::DfsVersionHoldersRequest,
     ) -> crate::node::read::admission::ReadFuture<'_, Vec<crate::dfs::VersionHolder>> {
-        Box::pin(async move { Ok(vec![self.holder.clone()]) })
+        Box::pin(async move { Ok(self.holder.iter().cloned().collect()) })
     }
 }
 
@@ -1202,6 +1201,17 @@ async fn h2_p2_a_reader_never_waits_for_a_lower_ranked_holder() {
     assert_eq!(pair.timeouts, 0, "{:?}", pair.elapsed);
     assert_eq!(pair.waited_at_lower, 0, "{:?}", pair.elapsed);
     assert_eq!(pair.writer_reads, 2);
+}
+
+/// Plan 27 T2. Only the higher-ranked reader sees the lower-ranked one
+/// in its list. Seeing a lower-ranked peer does not cause a holder RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_2c1_asymmetric_holder_lists_do_not_wait_on_each_other() {
+    let pair = pair_read(|pool| pool.with_holder_wait_ms(200), Start::Asymmetric).await;
+    assert_eq!(pair.waited_at_higher + pair.waited_at_lower, 0);
+    assert_eq!(pair.timeouts, 0);
+    assert_eq!(pair.writer_reads, 2);
+    assert_eq!(pair.not_ready_at_lower, 0);
 }
 
 /// review/18 a5: with no holder wait (`dfs_holder_wait_ms = 0`, also a bare
@@ -1250,6 +1260,8 @@ enum Start {
     /// it from the writer when the other one starts.
     HigherFirst,
     LowerFirst,
+    /// The lower-ranked reader sees an empty holder list and starts first.
+    Asymmetric,
     /// Two Chunks ranked oppositely; each reader reads both, its own top
     /// Chunk first (!318 P2-4).
     Crossed,
@@ -1260,6 +1272,7 @@ struct PairOutcome {
     /// Waits each reader's holder service let the other one do.
     waited_at_higher: u64,
     waited_at_lower: u64,
+    not_ready_at_lower: u64,
     timeouts: u64,
     writer_reads: usize,
 }
@@ -1366,6 +1379,13 @@ async fn pair_read(
         server: tokio::task::JoinHandle<()>,
     }
     let names = ["r1", "r2"];
+    // r1 ranks above r2 for chunks[0] in the crossed case. For one Chunk,
+    // derive the ordering before configuring the possibly asymmetric lists.
+    let higher = usize::from(!crate::node::read::engine::holder_ranks_above(
+        &chunks[0].0.chunk.id,
+        names[0],
+        names[1],
+    ));
     let locals: Vec<_> = names
         .iter()
         .map(|name| {
@@ -1451,12 +1471,14 @@ async fn pair_read(
                     })
                     .collect(),
             },
-            holder: crate::dfs::VersionHolder {
-                node_id: other.into(),
-                node_epoch: 9,
-                data_endpoint: endpoints[1 - index].clone(),
-                grant: holder_grant,
-            },
+            holder: (!matches!(start, Start::Asymmetric) || index == higher).then(|| {
+                crate::dfs::VersionHolder {
+                    node_id: other.into(),
+                    node_epoch: 9,
+                    data_endpoint: endpoints[1 - index].clone(),
+                    grant: holder_grant,
+                }
+            }),
         });
         let pool = Arc::new(configure(
             crate::node::rpc::peer::PeerConnectionPool::new(
@@ -1540,15 +1562,9 @@ async fn pair_read(
             expected,
         )
     };
-    // r1 ranks above r2 for chunks[0] (`pair_chunks`); for one Chunk, find out.
-    let higher = usize::from(!crate::node::read::engine::holder_ranks_above(
-        &chunks[0].0.chunk.id,
-        names[0],
-        names[1],
-    ));
     let order = match start {
         Start::Together | Start::HigherFirst | Start::Crossed => [higher, 1 - higher],
-        Start::LowerFirst => [1 - higher, higher],
+        Start::LowerFirst | Start::Asymmetric => [1 - higher, higher],
     };
     let read_of = |index: usize| {
         let engine = nodes[index].engine.clone();
@@ -1594,7 +1610,7 @@ async fn pair_read(
             reads.push(read_of(order[0]));
             reads.push(read_of(order[1]));
         }
-        Start::HigherFirst | Start::LowerFirst => {
+        Start::HigherFirst | Start::LowerFirst | Start::Asymmetric => {
             reads.push(read_of(order[0]));
             // The first reader is at the writer: its Chunk is in flight.
             until_or_ended("the first fetch", deadline, &reads, || {
@@ -1632,7 +1648,9 @@ async fn pair_read(
         .map(|node| cache_event_count(&node.registry, "holder_wait_timeout"))
         .sum();
     let waited_at_higher = cache_event_count(&nodes[higher].registry, "holder_waited");
-    let waited_at_lower = cache_event_count(&nodes[1 - higher].registry, "holder_waited");
+    let lower_metrics = &nodes[1 - higher].registry;
+    let waited_at_lower = cache_event_count(lower_metrics, "holder_waited");
+    let not_ready_at_lower = cache_event_count(lower_metrics, "holder_not_ready");
     for node in nodes {
         node.server.abort();
     }
@@ -1643,6 +1661,7 @@ async fn pair_read(
         elapsed,
         waited_at_higher,
         waited_at_lower,
+        not_ready_at_lower,
         timeouts,
         writer_reads: writer_reads.reads(),
     }
@@ -1695,7 +1714,26 @@ fn review_chunk(seed: u8) -> StagedChunk {
     let bytes: Vec<u8> = (0..(2 * 65536 + 5))
         .map(|i: u32| (i as u8).wrapping_mul(31).wrapping_add(seed))
         .collect();
-    StagedChunk::new_crc32c(crate::dfs::OperationId::new("review"), bytes).unwrap()
+    crc_chunk_designating_holder(
+        &format!("review-{seed}"),
+        bytes,
+        &["holder", "holder-0", "holder-1"],
+    )
+}
+
+fn crc_chunk_designating_holder(operation: &str, bytes: Vec<u8>, holders: &[&str]) -> StagedChunk {
+    use crate::dfs::{ChunkId, ChunkObject, OperationId};
+    let operation = OperationId::new(operation);
+    let generation = ChunkObject::generation_id(&operation);
+    let id = (0..128)
+        .map(|index| ChunkId::new(format!("crc32c-v2-{generation}-{index:032x}")))
+        .find(|id| {
+            holders
+                .iter()
+                .all(|holder| crate::node::read::engine::holder_ranks_above(id, holder, "reader"))
+        })
+        .expect("fixture needs a designated remote holder");
+    StagedChunk::from_shared_crc32c_id(operation, bytes.into(), id).unwrap()
 }
 
 fn review_layout(chunks: &[StagedChunk]) -> LayoutRoot {

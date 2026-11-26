@@ -1,9 +1,9 @@
 //! H2 step 2: reading from version holders (plan/15 v3 §1.2, §1.3).
 //!
 //! A reader with sharing on asks Meta which other readers share the version
-//! it reads, at most once per [`HolderLists::ttl`] per version, and adds them
-//! as candidates of every Chunk: after the published read-cache copies and
-//! before the durable copies (the writer stays the fallback). A holder that
+//! it reads, at most once per [`HolderLists::ttl`] per version. Each Chunk
+//! gets one designated reader. Other readers try that holder after published
+//! read-cache copies and before the durable copies. A holder that
 //! answers `NOT_READY` is skipped without being demoted; one that refuses
 //! the grant drops the cached list so the next read asks Meta again.
 use super::*;
@@ -49,9 +49,16 @@ const WAIT_ORDER_DOMAIN: &str = "holder-wait-order";
 /// on who may wait for whom, or each could wait for the other's mark
 /// (!318 round 2 item 5).
 pub(crate) fn holder_ranks_above(chunk: &ChunkId, holder: &str, caller: &str) -> bool {
-    let weight =
-        |node: &str| super::distribution::rendezvous_weight(WAIT_ORDER_DOMAIN, chunk, node);
-    weight(holder) > weight(caller)
+    holder_order(chunk, holder) > holder_order(chunk, caller)
+}
+
+/// Both election and waiting must use the same strict order; node ID breaks
+/// weight ties independently of the order of the Meta reply.
+fn holder_order<'a>(chunk: &ChunkId, node: &'a str) -> (u64, &'a str) {
+    (
+        super::distribution::rendezvous_weight(WAIT_ORDER_DOMAIN, chunk, node),
+        node,
+    )
 }
 const MAX_HOLDER_LISTS: usize = 256;
 
@@ -226,9 +233,6 @@ impl DfsReadEngine {
                 holders
             }
         };
-        if holders.is_empty() {
-            return result;
-        }
         // A demoted holder is left out until its demotion ends (re-review
         // P3): a holder is optional, and ranked after the durable copies it
         // could turn a busy writer into a failed read.
@@ -247,21 +251,23 @@ impl DfsReadEngine {
             {
                 continue;
             }
-            // review/18 a3: only the holder ranked highest for this Chunk
-            // (rendezvous over the version, the Chunk and the Node); its
-            // NOT_READY sends the read straight to the copies.
+            let own_rank = holder_order(&set.chunk_id, &self.local_node_id);
             let best = holders
                 .iter()
-                .map(|holder| holder_candidate(holder, &set.chunk_id))
-                .filter(|candidate| !demoted.contains(&candidate.copy_id))
-                .max_by_key(|candidate| {
-                    let node = match &candidate.location {
-                        CopyLocation::Node { node_id, .. } => node_id.as_str(),
-                        CopyLocation::External { .. } => "",
-                    };
-                    super::distribution::rendezvous_weight(&version.0, &set.chunk_id, node)
-                });
-            let Some(best) = best else { continue };
+                .filter_map(|holder| {
+                    let rank = holder_order(&set.chunk_id, &holder.node_id);
+                    if rank <= own_rank {
+                        return None;
+                    }
+                    let candidate = holder_candidate(holder, &set.chunk_id);
+                    (!demoted.contains(&candidate.copy_id)).then_some((rank, candidate))
+                })
+                .max_by(|(left, _), (right, _)| left.cmp(right));
+            let Some((_, best)) = best else {
+                self.local.record_read_cache_event("designated_self");
+                continue;
+            };
+            self.local.record_read_cache_event("designated_remote");
             let offered = set
                 .sources
                 .iter()

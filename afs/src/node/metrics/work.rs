@@ -318,6 +318,8 @@ pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
     // H2 step 2: what this Node met as a reader of a holder.
     "holder_answered_not_ready",
     "holder_answered_busy",
+    "designated_self",
+    "designated_remote",
 ];
 /// Where a native read's bytes came from: this Node, a durable replica, or
 /// another reader's verified cache copy.
