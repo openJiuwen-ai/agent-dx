@@ -192,6 +192,7 @@ _DIRECT_UNKNOWN_OUTCOME_ERRORS = (
 )
 _DIRECT_RETRY_BACKOFF_SECONDS = 0.1
 _DIRECT_POOL_TIMEOUT_SECONDS = 2.0
+_RELAY_CONNECT_TIMEOUT = "RELAY_CONNECT_TIMEOUT"
 # A single missing route is commonly a transient publication race. Keep trying
 # direct on later logical invokes and only sticky-disable after this many misses
 # have already been tolerated.
@@ -839,8 +840,8 @@ class EnvironmentClient:
 
         Returns the decoded JSON ``args``/result object. The HTTP timeout is
         derived from the logical *timeout* with a small network buffer, so a slow
-        primitive does not trip the client first. An internal absolute deadline
-        caps both budgets across attempts, including their backoff.
+        primitive does not trip the client first. Direct retries share the
+        original deadlines, including any shorter internal deadline.
         """
         logical_timeout = ADX_GET_DEFAULT_TIMEOUT if timeout is None else timeout
         if (
@@ -864,20 +865,15 @@ class EnvironmentClient:
         # Environment route is not evidence that control-plane invoke exists.
         # Keep explicit legacy opt-out, but never select it after a failure.
         if self._direct_enabled:
-            result, fell_back = self._invoke_direct(
+            result = self._invoke_direct(
                 environment_id,
                 action,
                 args or {},
                 request_id,
                 deadline,
                 processing_deadline,
-                logical_timeout if _deadline is None and logical_timeout >= 0 else None,
             )
-            if not fell_back:
-                return _InvokeResult(result, request_id)
-            if _deadline is None and logical_timeout >= 0:
-                processing_deadline = time.monotonic() + logical_timeout
-                deadline = processing_deadline + self._connection.communication_margin_seconds
+            return _InvokeResult(result, request_id)
 
         fallback_timeout = self._remaining_timeout(deadline)
         if fallback_timeout is not None and fallback_timeout <= 0:
@@ -910,10 +906,9 @@ class EnvironmentClient:
         args: Dict[str, Any],
         request_id: str,
         deadline: Optional[float],
-        processing_deadline: Optional[float] = None,
-        retry_processing_timeout: Optional[float] = None,
-    ) -> "tuple[Dict[str, Any], bool]":
-        """Try the /direct path. Successful calls return ``(result, False)``.
+        processing_deadline: Optional[float],
+    ) -> Dict[str, Any]:
+        """Invoke an action on the /direct path.
 
         All attempts for one logical action reuse ``request_id``. EXECD deduplicates
         direct requests by that id, so a retry can wait for or replay the first
@@ -934,8 +929,9 @@ class EnvironmentClient:
         attempts = 0
         first_error: Optional[BaseException] = None
         terminal_route_error: Optional[EnvironmentHTTPError] = None
-
         pending_resume: Optional[EnvironmentHTTPError] = None
+        relay_timeout: Optional[EnvironmentHTTPError] = None
+        unverified_route_miss = False
         attempt_limit = self._connection.request_max_attempts
         for attempt in range(1, attempt_limit + 1):
             remaining = self._remaining_timeout(deadline)
@@ -986,17 +982,13 @@ class EnvironmentClient:
                     first_error=first_error or exc,
                 ) from exc
             else:
-                if resp.status_code == 404:
-                    try:
-                        not_found = resp.json()
-                    except ValueError:
-                        not_found = None
-                    if isinstance(not_found, dict) and not_found.get("error_code"):
+                error = self._http_error(resp, request_id=request_id) if resp.status_code >= 400 else None
+                if resp.status_code == 404 and error is not None and error.code != _RELAY_CONNECT_TIMEOUT:
+                    if error.payload.get("error_code"):
                         # EXECD uses 404 for an operation-level missing command.
                         # It is an authoritative result from the resolved
                         # Environment route, not evidence that /direct is absent.
                         self._direct_route_misses = 0
-                        error = self._http_error(resp, request_id=request_id)
                         error.first_error = first_error
                         raise error
                     # A later missing route invalidates the earlier resuming
@@ -1010,34 +1002,12 @@ class EnvironmentClient:
                             request_id=request_id,
                         )
                         break
-                    last_error = self._http_error(resp, request_id=request_id)
+                    unverified_route_miss = True
+                    last_error = error
                     last_failure_safe = True
                 else:
                     self._direct_route_misses = 0
-                    error = self._http_error(resp, request_id=request_id) if resp.status_code >= 400 else None
-                    if error is not None:
-                        error.first_error = first_error
-                    if error is not None and error.retry == "never":
-                        if error.code == "ENV_UNAVAILABLE":
-                            # A gateway rejection can hide a committed backend
-                            # failure. Enrich once without retrying this operation.
-                            terminal_route_error = error
-                            last_error = error
-                            first_error = first_error or error
-                            break
-                        raise error
-                    if error is not None and self._is_resuming(resp, error, request_id):
-                        pending_resume = error
-                        last_error = error
-                        last_failure_safe = True
-                        retry_after = self._resume_retry_delay(resp)
-                    elif resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
-                        last_error = _RetryableHTTPStatus(self._http_error(resp, request_id=request_id))
-                        last_failure_safe = False
-                        outcome_unknown = True
-                    elif resp.status_code >= 400:
-                        raise error
-                    else:
+                    if error is None:
                         try:
                             parsed = resp.json()
                         except ValueError as exc:
@@ -1048,9 +1018,46 @@ class EnvironmentClient:
                             last_failure_safe = False
                             outcome_unknown = True
                         else:
-                            if not isinstance(parsed, dict):
-                                parsed = {"value": parsed}
-                            return parsed, False
+                            return parsed if isinstance(parsed, dict) else {"value": parsed}
+                    elif self._is_relay_connect_timeout(resp, error, request_id):
+                        error.operation_id = request_id
+                        error.environment_id = environment_id
+                        pending_resume = None
+                        relay_timeout = last_error = error
+                        last_failure_safe = True
+                    elif self._is_resuming(resp, error, request_id):
+                        error.first_error = first_error
+                        pending_resume = last_error = error
+                        last_failure_safe = True
+                        retry_after = self._resume_retry_delay(resp)
+                    else:
+                        error.first_error = first_error
+                        if resp.status_code == 504 or error.code == _RELAY_CONNECT_TIMEOUT:
+                            # A JSON field by itself cannot attest where a 504
+                            # came from. Preserve the raw payload for diagnosis.
+                            error.outcome = "unknown"
+                            if error.request_forwarded is False:
+                                error.request_forwarded = None
+                            if error.code == _RELAY_CONNECT_TIMEOUT:
+                                error.code = "OUTCOME_UNKNOWN"
+                                error.request_id = request_id
+                                error.operation_id = request_id
+                                error.environment_id = environment_id
+                        if error.retry == "never" and error.code == "ENV_UNAVAILABLE":
+                            # A gateway rejection can hide a committed backend
+                            # failure. Enrich once without retrying this operation.
+                            terminal_route_error = error
+                            last_error = error
+                            first_error = first_error or error
+                            break
+                        if error.retry == "never" or resp.status_code not in _RETRYABLE_GATEWAY_STATUS_CODES:
+                            if outcome_unknown and error.outcome == "not_started":
+                                error.outcome = "unknown"
+                                error.request_forwarded = None
+                            raise error
+                        last_error = _RetryableHTTPStatus(error)
+                        last_failure_safe = False
+                        outcome_unknown = True
 
             if first_error is None and last_error is not None:
                 first_error = last_error
@@ -1061,7 +1068,8 @@ class EnvironmentClient:
                 backoff += random.uniform(0, 0.1)
             if backoff <= 0:
                 break
-            if retry_processing_timeout is None and deadline is not None and backoff >= deadline - time.monotonic():
+            remaining = self._remaining_timeout(processing_deadline)
+            if remaining is not None and backoff >= remaining:
                 break
             logger.warning(
                 "direct invoke transport error; retrying request_id=%s action=%s attempt=%d/%d error=%s",
@@ -1072,23 +1080,23 @@ class EnvironmentClient:
                 last_error,
             )
             time.sleep(backoff)
-            if retry_processing_timeout is not None:
-                # Every permitted retry is a new HTTP attempt with the same
-                # configured timeout, margin and operation identity.
-                processing_deadline = time.monotonic() + retry_processing_timeout
-                deadline = processing_deadline + self._connection.communication_margin_seconds
 
-        if pending_resume is not None and not outcome_unknown and terminal_route_error is None:
-            # No attempt reached the application. Keep this authoritative outcome;
-            # never turn demand waiting into a control-plane invocation fallback.
-            pending_resume.first_error = first_error if first_error is not pending_resume else None
-            raise pending_resume
+        # A plain 404 could be from a guest. It cannot contribute evidence to
+        # an operation-wide Relay rejection, even if a later attempt is attested.
+        if relay_timeout is not None and unverified_route_miss:
+            outcome_unknown = True
+        confirmed_rejection = pending_resume or relay_timeout
+        if confirmed_rejection is not None and not outcome_unknown and terminal_route_error is None:
+            confirmed_rejection.first_error = first_error if first_error is not confirmed_rejection else None
+            raise confirmed_rejection
         detail = last_error or "invoke deadline exhausted"
         # The failed data connection alone cannot classify OOM. Consult the
         # authenticated catalog only on this recovery path, within the same
         # deadline. A still-running or unavailable record preserves uncertainty.
         remaining = self._remaining_timeout(deadline)
-        if remaining is None or remaining > 0:
+        # A later proven rejection cannot resolve what earlier attempts did.
+        diagnose_catalog = relay_timeout is None or terminal_route_error is not None
+        if diagnose_catalog and (remaining is None or remaining > 0):
             try:
                 info = self.environment_info(
                     environment_id, timeout=min(2.0, remaining) if remaining is not None else 2.0
@@ -1117,6 +1125,7 @@ class EnvironmentClient:
             # response payload while reporting the logical operation's outcome.
             if outcome_unknown:
                 terminal_route_error.outcome = "unknown"
+                terminal_route_error.request_forwarded = None
             raise terminal_route_error
         if last_failure_safe and not outcome_unknown and last_error is not None:
             raise EnvironmentError(
@@ -1135,6 +1144,21 @@ class EnvironmentClient:
             environment_id=environment_id,
             first_error=first_error,
         ) from last_error
+
+    @staticmethod
+    def _is_relay_connect_timeout(
+        response: httpx.Response, error: EnvironmentHTTPError, request_id: str,
+    ) -> bool:
+        # Native Ingress reserves X-ADX-Error-Code and strips it from guest
+        # replies. Require the same ID in the response headers and the body.
+        if response.status_code != 504 or response.headers.get("X-ADX-Error-Code") != _RELAY_CONNECT_TIMEOUT:
+            return False
+        if error.code != _RELAY_CONNECT_TIMEOUT or error.retry != "same_operation" or error.outcome != "not_started":
+            return False
+        detail = error.payload.get("error")
+        if not isinstance(detail, dict) or error.request_forwarded is not False:
+            return False
+        return detail.get("requestId") == response.headers.get("X-Request-Id") == request_id
 
     @staticmethod
     def _is_resuming(response: httpx.Response, error: EnvironmentHTTPError, request_id: str) -> bool:

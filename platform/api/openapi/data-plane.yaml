@@ -91,6 +91,8 @@ paths:
       responses:
         "503":
           $ref: "#/components/responses/DemandUnavailable"
+        "504":
+          $ref: "#/components/responses/InvokeGatewayTimeout"
         "200":
           description: Action-specific JSON result.
           content:
@@ -412,6 +414,27 @@ components:
               - $ref: "#/components/schemas/RuntimeError"
         text/plain:
           schema: {type: string}
+    InvokeGatewayTimeout:
+      description: |
+        A gateway timeout during direct invoke. RELAY_CONNECT_TIMEOUT with the
+        Ingress-owned marker, matching header and JSON request IDs, and
+        requestForwarded=false confirms that this attempt ended before forwarding.
+        The SDK accounts for earlier attempts separately.
+      headers:
+        X-ADX-Error-Code:
+          schema: {type: string, const: RELAY_CONNECT_TIMEOUT}
+          description: The native Ingress strips this header from upstream replies.
+        X-Request-Id:
+          schema: {type: string}
+          description: Original Request ID echoed by Ingress on a Relay CONNECT timeout.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/GatewayError"
+              - $ref: "#/components/schemas/RuntimeError"
+        text/plain:
+          schema: {type: string}
   schemas:
     GatewayError:
       type: object
@@ -421,7 +444,9 @@ components:
           type: object
           required: [code, message, retry, outcome, requestForwarded]
           properties:
-            code: {type: string, enum: [ENV_RESUMING, ENV_UNAVAILABLE, PROCESSING_DEADLINE_EXCEEDED]}
+            code:
+              type: string
+              enum: [ENV_RESUMING, ENV_UNAVAILABLE, PROCESSING_DEADLINE_EXCEEDED, RELAY_CONNECT_TIMEOUT]
             message: {type: string}
             retry: {type: string, enum: [same_operation, never]}
             outcome: {type: string, enum: [not_started, unknown]}

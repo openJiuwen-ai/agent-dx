@@ -542,6 +542,8 @@ impl Relay {
                 );
                 adx_observability::trace::attribute("result", "fail".into());
                 adx_observability::trace::record_error("relay", "relay dial timed out");
+                // A final CONNECT 504 proves the relay ended before pumping any
+                // application bytes. Keep it in this pre-forward branch.
                 send_error(&mut respond, StatusCode::GATEWAY_TIMEOUT);
                 return;
             }

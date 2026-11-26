@@ -185,13 +185,31 @@ Python SDK 对结构化错误抛出 `EnvironmentHTTPError`，并公开 `status_c
 - Python SDK 解析：`platform/sdk/environment/python/adx_environment/_transport.py`
 - 系统可靠性验收：`docs/testing/system-reliability-gates.md`
 
+## 原生 direct invoke 的 CONNECT 超时
+
+Relay 在向 guest 建立 TCP 连接的预算用尽时，以 HTTP/2 CONNECT 504 结束该次尝试。
+Ingress 确认尚持有未转发的原生 `POST /direct/{environmentId}/invoke` 请求后，返回 HTTP 504，携带
+`X-ADX-Error-Code: RELAY_CONNECT_TIMEOUT` 和原 `X-Request-Id`。JSON 的 `error` 对象包含
+`code: RELAY_CONNECT_TIMEOUT`、`retry: same_operation`、`outcome: not_started`、
+`requestForwarded: false`、`requestId` 和 `environmentId`。这份响应只证明本次尝试的结果。
+
+原生 Ingress 会剥除 guest 响应中的保留标记。SDK 要求状态、标记、JSON 契约及响应头和
+JSON 中的请求 ID 均匹配。缺少证据的 504 和转发后的断连保留执行歧义。重试共用原操作 ID、
+原截止时间及 Execd 的幂等契约。全部尝试均证实未转发时，SDK 抛出 HTTP 504
+`EnvironmentHTTPError`，其中 `request_forwarded=False`。如果任一次尝试可能已经转发，
+即使后来收到明确拒绝，整体仍报告 `OUTCOME_UNKNOWN / same_operation / unknown`。
+
+`process.get` 的该错误只描述状态读取。首次读取失败会抛出异常，已取得运行快照的
+等待可在其期限内继续读取同一命令。旧 SDK 收到新 Ingress 的 504 或新 SDK 收到旧
+Ingress 的无标记 504 时，均沿用未知结果路径。
+
 ## OOM 原因与 SDK
 
 OOM 分为命令级与 Environment 级，不由 HTTP 502/503 或 exit_code=137 推断。
 
 - **用户进程**：Execd 只保留命令退出结果，不观测或判断 OOM。SDK `CommandResult.exit_signal` / `CommandInfo.exit_signal` 表示命令实际终止信号（如 SIGKILL=9），没有普通退出码时继续保留原来的 `exit_code=-1`。用户进程退出而 Execd/后端仍 Running 时，只是命令失败；普通 SIGKILL 不能证明 OOM。当前 sandboxd 接口没有单独的用户进程 OOM 事件，不提供 `PROCESS_OOM` 之类推断码。
 - **整个运行环境**：Adxlet 观察到后端 Exited 后、删除前调用 sandboxd `Wait`，仅将后端提供的 OOM message 转换为 `failure.reason=OomKilled`，同时保留后端 `exit_code`。原因与同一个 Environment 记录一起持久化、发布到订阅目录。`GET /api/instances?instance_id=...` 和 SDK `get_info().failure` 可读取；成功启动/恢复的新执行清除旧原因。
-- SDK direct invoke 重试耗尽后，在原 deadline 剩余时间内进行一次最长 2 秒的认证目录查询。仅当目录已经提交 `status=failed` 且 `failure.reason=OomKilled` 时返回 `EnvironmentError(code=ENVIRONMENT_OOM, retry=never, outcome=terminal)`，`failure` 属性保留详情。这是 SDK 对已确认 Environment 终态的分类，不是新的管理面 gRPC 状态，也不改变数据网关的通用 502/503 响应。
+- SDK direct invoke 的普通传输重试耗尽后，在原 deadline 剩余时间内进行一次最长 2 秒的认证目录查询。仅当目录已经提交 `status=failed` 且 `failure.reason=OomKilled` 时返回 `EnvironmentError(code=ENVIRONMENT_OOM, retry=never, outcome=terminal)`，`failure` 属性保留详情。这是 SDK 对已确认 Environment 终态的分类，不是新的管理面 gRPC 状态，也不改变数据网关的通用 502/503 响应。
 - 当目录已提交 `status=failed` 且存在其他结构化 `failure` 时，返回 `ENVIRONMENT_FAILED / never / terminal`，不把普通退出猜测成 OOM。异常保留 `request_id`、`operation_id`、`environment_id`、`failure` 与首次数据路径错误 `first_error`。
 - 网关直接拒绝 `ENV_UNAVAILABLE / never` 时，也会在剩余 deadline 内查询一次目录以补全已提交的后端失败原因，不重试被拒绝的操作。若目录没有确认后端失败，保持网关原错误及其 retry/outcome 语义。
 - 原因尚未提交或目录 API 暂不可用时，不自动重放到不支持 invoke 的控制面接口，也不永久禁用后续 direct 调用。仅有已确认未发送的连接错误、连接池超时或缺失路由时，返回 `ENVIRONMENT_UNAVAILABLE / same_operation / not_started`；存在执行歧义时继续保留 `OUTCOME_UNKNOWN / same_operation / unknown`。失败查询不会刷新 deadline。之后可用 `get_info()` 确认原因，普通成功调用不会增加目录查询。

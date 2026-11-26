@@ -164,6 +164,15 @@ from upstream replies. HTTP 504 after forwarding instead reports an unknown
 outcome and `retry: never`; an expired error response stream with already-sent
 headers is closed. Rejected checkpoint restoration reports HTTP 409 `ENV_UNAVAILABLE`.
 
+For native `POST /direct/{environmentId}/invoke`, a final 504 on the
+Ingress-to-Relay CONNECT stream means Relay ended the attempt before relaying
+any application bytes to the guest. Ingress returns HTTP 504 with
+`X-ADX-Error-Code: RELAY_CONNECT_TIMEOUT`, the original `X-Request-Id`, and a
+JSON error with `requestForwarded: false`. Ingress emits this evidence when its
+backend HTTP pool still owns the untouched request. The native proxy removes
+`X-ADX-Error-Code` from guest responses. L4 CONNECT, generic HTTP forwarding,
+and native file transfer continue to return their existing statuses.
+
 A request's timeout or disconnection does not cancel a durable wake intent.
 Independent Ingress replicas coalesce through Coordinator and can deliver retries
 using their own route cache and connection pool. Without the HTTP deadline header,

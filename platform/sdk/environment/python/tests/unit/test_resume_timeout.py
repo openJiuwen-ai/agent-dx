@@ -2,6 +2,7 @@ import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from unittest.mock import patch
 
 import httpx
@@ -32,16 +33,19 @@ class ResumeTimeoutTests(unittest.TestCase):
         self.assertGreater(seen[0].extensions["timeout"]["read"], 14)
         self.assertLessEqual(seen[0].extensions["timeout"]["read"], 15)
 
-    def test_resuming_retries_same_request_with_the_same_fresh_timeout(self):
+    def test_resuming_retries_same_request_with_the_remaining_timeout(self):
         seen, sleeps = [], []
         def handler(request):
             seen.append(request)
             if len(seen) == 1:
-                clock[0] += 10.0
-                return httpx.Response(503, headers={"Retry-After": "1", "X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
-                    "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
-                    "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
-                }})
+                clock[0] += 6.0
+                return httpx.Response(
+                    503, headers={"Retry-After": "1", "X-ADX-Error-Code": "ENV_RESUMING"},
+                    json={"error": {
+                        "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
+                        "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
+                    }},
+                )
             return httpx.Response(200, json={"ok": True})
         clock = [100.0]
         def sleep(seconds):
@@ -49,23 +53,26 @@ class ResumeTimeoutTests(unittest.TestCase):
             clock[0] += seconds
         with patch("adx_environment._transport.time.monotonic", side_effect=lambda: clock[0]), patch(
             "adx_environment._transport.time.sleep", side_effect=sleep
-        ):
+        ), patch("adx_environment._transport.random.uniform", return_value=0.0):
             self.assertEqual(self.client(handler).invoke("env", "side_effect", timeout=10), {"ok": True})
         self.assertGreaterEqual(sleeps[0], 1)
-        self.assertEqual(int(seen[1].headers["X-ADX-Processing-Timeout-Ms"]), 10000)
+        self.assertEqual(int(seen[1].headers["X-ADX-Processing-Timeout-Ms"]), 3000)
         self.assertEqual(seen[0].headers["X-ADX-Request-ID"], seen[1].headers["X-ADX-Request-ID"])
         self.assertEqual(json.loads(seen[0].content), json.loads(seen[1].content))
-        self.assertEqual(seen[1].extensions["timeout"]["read"], 15)
+        self.assertEqual(seen[1].extensions["timeout"]["read"], 8)
         self.assertTrue(all(r.url.path.startswith("/direct/") for r in seen))
 
     def test_resuming_exhaustion_preserves_known_not_forwarded_outcome(self):
         calls = []
         def handler(request):
             calls.append(request)
-            return httpx.Response(503, headers={"Retry-After": "1", "X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
-                "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
-                "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
-            }})
+            return httpx.Response(
+                503, headers={"Retry-After": "1", "X-ADX-Error-Code": "ENV_RESUMING"},
+                json={"error": {
+                    "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
+                    "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
+                }},
+            )
         with patch("adx_environment._transport.time.sleep"):
             with self.assertRaises(EnvironmentHTTPError) as raised:
                 self.client(handler).invoke("env", "side_effect", timeout=10)
@@ -90,20 +97,20 @@ class ResumeTimeoutTests(unittest.TestCase):
                                        "ADX_COMMUNICATION_MARGIN_SECONDS": "7.5"}):
             self.assertEqual(ConnectionConfig.from_env().communication_margin_seconds, 7.5)
 
-    def test_existing_idempotent_transport_retry_uses_same_fresh_timeout(self):
+    def test_existing_idempotent_transport_retry_uses_remaining_timeout(self):
         seen, clock = [], [100.0]
         def handler(request):
             seen.append(request)
             if len(seen) == 1:
-                clock[0] += 15
+                clock[0] += 3
                 raise httpx.ReadTimeout("response lost", request=request)
             return httpx.Response(200, json={"ok": True})
         with patch("adx_environment._transport.time.monotonic", side_effect=lambda: clock[0]), patch(
             "adx_environment._transport.time.sleep"
         ):
             self.client(handler).invoke("env", "side_effect", timeout=10)
-        self.assertEqual([r.headers["X-ADX-Processing-Timeout-Ms"] for r in seen], ["10000", "10000"])
-        self.assertEqual([r.extensions["timeout"]["read"] for r in seen], [15, 15])
+        self.assertEqual([r.headers["X-ADX-Processing-Timeout-Ms"] for r in seen], ["10000", "7000"])
+        self.assertEqual([r.extensions["timeout"]["read"] for r in seen], [15, 12])
         self.assertEqual(seen[0].headers["X-ADX-Request-ID"], seen[1].headers["X-ADX-Request-ID"])
 
     def test_resuming_cannot_erase_an_earlier_unknown_outcome(self):
@@ -136,10 +143,13 @@ class ResumeTimeoutTests(unittest.TestCase):
                 first = len(calls[request_id]) == 1
             if first:
                 barrier.wait(timeout=5)
-                return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING", "Retry-After": "0"}, json={"error": {
-                    "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
-                    "requestForwarded": False, "requestId": request_id,
-                }})
+                return httpx.Response(
+                    503, headers={"X-ADX-Error-Code": "ENV_RESUMING", "Retry-After": "0"},
+                    json={"error": {
+                        "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
+                        "requestForwarded": False, "requestId": request_id,
+                    }},
+                )
             with lock:
                 executions[request_id] = executions.get(request_id, 0) + 1
             return httpx.Response(200, json={"requestId": request_id})
@@ -156,15 +166,16 @@ class ResumeTimeoutTests(unittest.TestCase):
     def test_binary_upload_retries_only_a_replayable_body(self):
         for replayable in [True, False]:
             calls = []
-            def handler(request):
-                calls.append(request)
-                if len(calls) == 1:
+
+            def handler(request, recorded):
+                recorded.append(request)
+                if len(recorded) == 1:
                     return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
                         "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
                         "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
                     }})
                 return httpx.Response(200, json={"ok": True})
-            client = self.client(handler)
+            client = self.client(partial(handler, recorded=calls))
             with patch("adx_environment._transport.time.sleep"):
                 if replayable:
                     client.upload_bytes_direct("env", b"payload", "/file", 10)
@@ -180,22 +191,26 @@ class ResumeTimeoutTests(unittest.TestCase):
     def test_attempt_limit_is_configurable_and_exhaustion_is_retryable(self):
         for limit in [1, 4]:
             calls = []
-            def handler(request):
-                calls.append(request)
+
+            def handler(request, recorded):
+                recorded.append(request)
                 return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
                     "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
                     "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
                 }})
             with patch("adx_environment._transport.time.sleep"):
                 with self.assertRaises(EnvironmentHTTPError) as raised:
-                    self.client(handler, attempts=limit).invoke("env", "side_effect", timeout=10)
+                    client = self.client(partial(handler, recorded=calls), attempts=limit)
+                    client.invoke("env", "side_effect", timeout=10)
             self.assertEqual(len(calls), limit)
             self.assertEqual(raised.exception.code, "ENV_RESUMING")
             self.assertFalse(raised.exception.request_forwarded)
         for value in [0, -1, True, 1.5, "3"]:
             with self.assertRaises(ValueError):
                 ConnectionConfig(server_address="ingress", token="t", request_max_attempts=value)
-        with patch.dict("os.environ", {"ADX_SERVER_ADDRESS": "ingress", "ADX_TOKEN": "t", "ADX_REQUEST_MAX_ATTEMPTS": "4"}):
+        with patch.dict(
+            "os.environ", {"ADX_SERVER_ADDRESS": "ingress", "ADX_TOKEN": "t", "ADX_REQUEST_MAX_ATTEMPTS": "4"}
+        ):
             self.assertEqual(ConnectionConfig.from_env().request_max_attempts, 4)
 
     def test_forwarded_deadline_exceeded_never_enters_safe_resume_retry(self):

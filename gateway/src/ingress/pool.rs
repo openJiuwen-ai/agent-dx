@@ -26,6 +26,11 @@ const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
 
+/// A final response from Relay rejecting the CONNECT stream.
+#[derive(Debug, thiserror::Error)]
+#[error("node proxy rejected CONNECT: {0}")]
+pub(super) struct ConnectRejected(pub StatusCode);
+
 #[derive(Clone)]
 pub struct H2PoolConfig {
     pub connections_per_node: usize,
@@ -201,10 +206,11 @@ impl H2ConnectionPool {
                 }
             };
             let response = response.await.map_err(io_error)?;
-            if response.status() != StatusCode::OK {
+            let status = response.status();
+            if status != StatusCode::OK {
                 return Err(io::Error::new(
-                    status_to_error_kind(response.status()),
-                    format!("node proxy rejected CONNECT: {}", response.status()),
+                    status_to_error_kind(status),
+                    ConnectRejected(status),
                 ));
             }
             pool.active_streams.fetch_add(1, Ordering::Relaxed);

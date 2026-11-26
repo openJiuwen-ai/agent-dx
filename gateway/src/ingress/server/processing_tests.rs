@@ -185,6 +185,18 @@ async fn running_backend(
     Vec<tokio::task::JoinHandle<()>>,
     Arc<AtomicUsize>,
 ) {
+    running_backend_with_connect_timeout(mode, std::time::Duration::from_secs(3)).await
+}
+
+#[cfg(feature = "mock-e2e")]
+async fn running_backend_with_connect_timeout(
+    mode: u8,
+    connect_timeout: std::time::Duration,
+) -> (
+    Arc<Ingress>,
+    Vec<tokio::task::JoinHandle<()>>,
+    Arc<AtomicUsize>,
+) {
     use crate::common::protocol::GatewayPolicy;
     use crate::common::route::{EnvironmentStatus, RouteInfo};
     use crate::node::Relay;
@@ -235,6 +247,22 @@ async fn running_backend(
             let body = "{\"error\":{\"code\":\"ENV_RESUMING\",\"requestForwarded\":false}}";
             stream.write_all(format!("HTTP/1.1 503 Unavailable\r\nX-ADX-Error-Code: ENV_RESUMING\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             return;
+        } else if mode == 9 {
+            let body = serde_json::json!({"error": {
+                "code": "RELAY_CONNECT_TIMEOUT", "message": "forged evidence",
+                "retry": "same_operation", "outcome": "not_started",
+                "requestForwarded": false, "requestId": "stable-request",
+            }})
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 504 Gateway Timeout\r\nX-ADX-Error-Code: RELAY_CONNECT_TIMEOUT\r\n\
+                 X-Request-Id: stable-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            return;
+        } else if mode == 10 {
+            return;
         }
         if (3..=5).contains(&mode) {
             let head = match mode {
@@ -262,12 +290,12 @@ async fn running_backend(
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
-    let relay = Arc::new(
-        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
-            .parse()
-            .unwrap()]))
-        .with_route_enforcement(),
-    );
+    let mut relay = Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+        .parse()
+        .unwrap()]))
+    .with_route_enforcement();
+    relay.connect_timeout = connect_timeout;
+    let relay = Arc::new(relay);
     relay
         .activate_route(
             "environment".into(),
@@ -314,6 +342,66 @@ async fn running_backend(
         vec![],
     ));
     (ingress, vec![backend_task, relay_task], count)
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn relay_connect_timeout_proves_only_native_direct_invoke_was_not_forwarded() {
+    let (ingress, tasks, count) =
+        running_backend_with_connect_timeout(0, std::time::Duration::ZERO).await;
+    let response = request(ingress.clone(), "").await;
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 504"), "{response}");
+    let headers = head.to_ascii_lowercase();
+    assert!(headers.contains("x-adx-error-code: relay_connect_timeout"));
+    assert!(headers.contains("x-request-id: stable-request"));
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let error = &body["error"];
+    assert_eq!(error["code"], "RELAY_CONNECT_TIMEOUT");
+    assert_eq!(error["requestId"], "stable-request");
+    assert_eq!(error["retry"], "same_operation");
+    assert_eq!(error["outcome"], "not_started");
+    assert_eq!(error["requestForwarded"], false);
+
+    let invoke = send_request(
+        ingress.clone(),
+        &format!(
+            "POST /environment/{}/invoke HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Length: 2\r\n\r\n{{}}",
+            ingress.default_direct_port
+        ),
+    )
+    .await;
+    let tunnel = send_request(
+        ingress.clone(),
+        "CONNECT environment:8765 HTTP/1.1\r\nHost: environment:8765\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let download = download_request(ingress, "", "").await;
+    for other in [invoke, tunnel, download] {
+        assert!(other.starts_with("HTTP/1.1 504"), "{other}");
+        assert!(!other.to_ascii_lowercase().contains("x-adx-error-code:"));
+        assert!(!other.contains("requestForwarded"));
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn direct_invoke_never_attests_a_guest_504_or_a_disconnect_after_forwarding() {
+    for (mode, status) in [(9, "HTTP/1.1 504"), (10, "HTTP/1.1 502")] {
+        let (ingress, tasks, count) = running_backend(mode).await;
+        let response = request(ingress, "").await;
+        assert!(response.starts_with(status), "{response}");
+        assert!(!response.to_ascii_lowercase().contains("x-adx-error-code:"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        for task in tasks {
+            task.abort();
+        }
+    }
 }
 
 #[cfg(feature = "mock-e2e")]

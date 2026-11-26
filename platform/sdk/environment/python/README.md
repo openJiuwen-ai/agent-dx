@@ -373,14 +373,15 @@ forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
 `Retry-After: 1`, and a JSON `error` containing `code: ENV_RESUMING`,
 `retry: same_operation`, `outcome: not_started`, `requestForwarded: false`,
 `requestId`, and `environmentId`. The durable restore continues independently.
-SDK retries retain the request ID and body. An ordinary invoke gives each
-allowed retry the configured timeout plus communication margin. Reads during a
-bounded command wait use the remaining wait budget. Retry count is configurable via
+Direct invoke retries retain the request ID and body and share the original
+processing and HTTP deadlines. The communication margin applies to the HTTP
+deadline. Reads during a bounded command wait also respect the remaining wait
+budget. Retry count is configurable via
 `ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
 including the first data-path attempt). Connection failures and absent direct
 routes never trigger an implicit control-plane invoke: the current API Server
-does not implement that operation. After bounded direct retries, the SDK checks
-the authenticated Environment catalog and preserves a confirmed OOM or runtime
+does not implement that operation. After ordinary transport retries, the SDK
+checks the authenticated Environment catalog and preserves a confirmed OOM or runtime
 failure, including the original operation identity and first transport failure.
 A terminal gateway `ENV_UNAVAILABLE` rejection also checks the catalog once for
 this cause without retrying the rejected operation. If no backend failure is
@@ -397,6 +398,17 @@ between demand retries.
 Exhaustion raises `EnvironmentHTTPError` with the same `ENV_RESUMING` contract; callers
 can choose to try again. No sticky Ingress routing is required: replicas share the
 Coordinator intent and independently subscribe to the committed route.
+
+On the native direct invoke endpoint, Ingress returns HTTP 504
+`RELAY_CONNECT_TIMEOUT` when Relay terminates CONNECT before any application
+bytes are sent. The SDK requires the reserved `X-ADX-Error-Code` marker and
+matching `X-Request-Id` and JSON `requestId`. If every attempt was confirmed
+unsent, it raises an `EnvironmentHTTPError` with `retry="same_operation"`,
+`outcome="not_started"`, and `request_forwarded=False`. A plain 504, a missing
+marker, or a lost response remains ambiguous even if a later attempt receives
+a confirmed rejection. For a command status read, this error describes the
+read operation. Callers can continue observing the same command ID within their
+wait budget.
 
 HTTP 504 after forwarding carries `PROCESSING_DEADLINE_EXCEEDED`, `outcome: unknown`,
 `requestForwarded: true`, and `retry: never`; it is not a safe demand retry. If
