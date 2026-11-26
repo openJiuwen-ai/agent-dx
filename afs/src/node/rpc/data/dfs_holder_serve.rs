@@ -140,6 +140,8 @@ type TestHook = (TestPoint, Box<dyn FnOnce() + Send>);
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestPoint {
+    /// The change notification is armed and the waiter is about to poll it.
+    Waiting,
     /// Steps 1–5 passed; the request is about to queue for a read slot.
     SlotQueue,
     /// Inside the slot, every check passed; serving starts next.

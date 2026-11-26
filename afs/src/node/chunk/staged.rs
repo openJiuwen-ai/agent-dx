@@ -27,14 +27,19 @@ impl StagedChunk {
         expected: &ChunkObject,
         bytes: Vec<u8>,
     ) -> Result<Self> {
+        Self::from_shared_replica(operation_id, expected, bytes.into())
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn from_shared_replica(
+        operation_id: OperationId,
+        expected: &ChunkObject,
+        bytes: SharedChunkBytes,
+    ) -> Result<Self> {
         let staged = if expected.is_segment_crc32c() {
-            Self::from_shared_crc32c_id(
-                operation_id,
-                SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
-                expected.id.clone(),
-            )?
+            Self::from_shared_crc32c_id(operation_id, bytes, expected.id.clone())?
         } else {
-            Self::new(operation_id, bytes)
+            Self::from_shared(operation_id, bytes)
         };
         if &staged.chunk != expected {
             return Err(corrupt(
@@ -53,7 +58,7 @@ impl StagedChunk {
     pub(crate) fn from_replica_with_table(
         operation_id: OperationId,
         expected: &ChunkObject,
-        bytes: Vec<u8>,
+        bytes: SharedChunkBytes,
         table: Option<&Arc<super::super::chunk_crc32c::CrcTable>>,
     ) -> Result<(Self, bool)> {
         let Some(table) = table.filter(|table| {
@@ -62,14 +67,15 @@ impl StagedChunk {
                 && table.valid_shape(expected.length)
                 && table.descriptor_digest() == expected.content_digest
         }) else {
-            return Self::from_replica(operation_id, expected, bytes).map(|staged| (staged, false));
+            return Self::from_shared_replica(operation_id, expected, bytes)
+                .map(|staged| (staged, false));
         };
         let staged = Self {
             operation_id,
             #[cfg(feature = "dfs")]
             sealed_chunk: expected.clone(),
             chunk: expected.clone(),
-            bytes: SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+            bytes,
             outboard: None,
             segment_crc: Some(table.clone()),
         };

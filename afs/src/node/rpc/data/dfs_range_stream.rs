@@ -78,54 +78,64 @@ pub(super) fn stream_dfs_ranges_until(
         if sender.is_closed() {
             return Ok(());
         }
-        let diagnostic = local
-            .read_diagnostic(crate::node::metrics::read_timing::ReadDiagnosticStage::PeerServe);
-        let diagnostic_token = diagnostic.as_ref().map(|span| span.token());
-        if let Some(table) = local
-            .peer_crc32c_table(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
-            .map_err(error_to_status)?
-        {
-            stream_crc32c_op(&stream, op, table)?;
-        } else if request.include_blake3_outboard
-            && let Some(groups) = local
-                .open_peer_group_stream_until(
-                    &crate::dfs::ChunkId::new(op.chunk_id.clone()),
-                    op.chunk_offset,
-                    op.length as usize,
-                    admission_deadline,
-                )
-                .map_err(error_to_status)?
-        {
-            // Sidecars bind every streamed coverage group to the catalog's
-            // standard root. There is no whole-object body allocation or pre-scan.
-            // Legacy, partial and proof-capacity fallbacks retain the path below.
-            stream_grouped_op(&stream, op, groups, diagnostic_token.as_ref())?;
-        } else if let RangeSent::ConsumerClosed =
-            stream_verified_op(&stream, op, diagnostic_token.as_ref())?
-        {
+        if let RangeSent::ConsumerClosed = stream_dfs_range_op(&stream, op)? {
             return Ok(());
-        }
-        if let Some(diagnostic) = diagnostic {
-            diagnostic.finish(true);
         }
     }
     Ok(())
 }
 
+#[cfg(feature = "dfs")]
+pub(super) fn stream_dfs_range_op(
+    stream: &RangeStream<'_>,
+    op: &afs_protocol::node_data::DfsChunkReadOp,
+) -> Result<RangeSent, Status> {
+    let local = stream.local;
+    let diagnostic =
+        local.read_diagnostic(crate::node::metrics::read_timing::ReadDiagnosticStage::PeerServe);
+    let diagnostic_token = diagnostic.as_ref().map(|span| span.token());
+    if let Some(table) = local
+        .peer_crc32c_table(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
+        .map_err(error_to_status)?
+    {
+        stream_crc32c_op(stream, op, table)?;
+    } else if stream.request.include_blake3_outboard
+        && let Some(groups) = local
+            .open_peer_group_stream_until(
+                &crate::dfs::ChunkId::new(op.chunk_id.clone()),
+                op.chunk_offset,
+                op.length as usize,
+                stream.admission_deadline,
+            )
+            .map_err(error_to_status)?
+    {
+        // A sidecar binds each streamed coverage group to the standard root.
+        stream_grouped_op(stream, op, groups, diagnostic_token.as_ref())?;
+    } else if let RangeSent::ConsumerClosed =
+        stream_verified_op(stream, op, diagnostic_token.as_ref())?
+    {
+        return Ok(RangeSent::ConsumerClosed);
+    }
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.finish(true);
+    }
+    Ok(RangeSent::Complete)
+}
+
 /// One range request being streamed to its peer.
 #[cfg(feature = "dfs")]
 #[derive(Clone, Copy)]
-struct RangeStream<'s> {
-    local: &'s LocalChunkStore,
-    request: &'s DfsReadRangesRequest,
-    sender: &'s tokio::sync::mpsc::Sender<Result<DfsReadRangesFrame, Status>>,
-    metrics: Option<&'s DfsPayloadMetrics>,
-    admission_deadline: std::time::Instant,
-    read_mode: crate::config::DfsReadCrcMode,
+pub(super) struct RangeStream<'s> {
+    pub(super) local: &'s LocalChunkStore,
+    pub(super) request: &'s DfsReadRangesRequest,
+    pub(super) sender: &'s tokio::sync::mpsc::Sender<Result<DfsReadRangesFrame, Status>>,
+    pub(super) metrics: Option<&'s DfsPayloadMetrics>,
+    pub(super) admission_deadline: std::time::Instant,
+    pub(super) read_mode: crate::config::DfsReadCrcMode,
 }
 
 #[cfg(feature = "dfs")]
-enum RangeSent {
+pub(super) enum RangeSent {
     Complete,
     /// The consumer went away mid-range; the stream ends without error.
     ConsumerClosed,
@@ -171,41 +181,11 @@ fn stream_crc32c_op(
     if verified.len() as u64 != op.length {
         return Err(Status::data_loss("CRC range ended early"));
     }
-    // Exact grants never disclose prefix/suffix bytes of a covering
-    // storage segment. read_peer_range verified those segments first.
-    // The persisted segment table already binds these complete segments
-    // to Meta. Signal that mode explicitly; old receivers fail closed.
-    // Fragments retain their original exact-range transport checksum.
-    let segment_bytes = crate::node::chunk_crc32c::SEGMENT as u64;
-    let segment_only = op.chunk_offset.is_multiple_of(segment_bytes)
-        && (op.length.is_multiple_of(segment_bytes)
-            || op.chunk_offset.checked_add(op.length) == Some(table.length));
-    let checksum = if segment_only || read_mode == crate::config::DfsReadCrcMode::Off {
-        None
-    } else {
-        let crc_scope = local.coarse_diagnostic("crc_range_send", verified.len() as u64);
-        local.record_crc_read("range_send", verified.len() as u64);
-        let checksum = crate::node::chunk_crc32c::checksum(verified.as_slice());
-        drop(crc_scope);
-        Some(checksum)
-    };
-    local.record_read_check(crate::node::metrics::work::ReadCheck::DescriptorEncode);
-    let descriptor =
-        serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
+    let (header, completion) = crc_range_metadata(stream, op, &table, verified.as_slice())?;
     local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
     validate_served_read(request)?;
     local.ensure_peer_serve_open().map_err(error_to_status)?;
-    send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
-        read_id: request.read_id.clone(),
-        attempt_id: request.attempt_id.clone(),
-        operation_index: op.operation_index,
-        chunk_id: op.chunk_id.clone(),
-        chunk_offset: op.chunk_offset,
-        length: op.length,
-        source_copy_id: op.source_copy_id.clone(),
-        blake3_outboard: Default::default(),
-        crc32c_table: descriptor,
-    }))?;
+    send(dfs_read_ranges_frame::Body::Header(header))?;
     let body = verified.into_shared_bytes();
     for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
         local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
@@ -219,29 +199,111 @@ fn stream_crc32c_op(
         }
         send(dfs_read_ranges_frame::Body::Data(data))?;
     }
-    send(dfs_read_ranges_frame::Body::Completion(
-        DfsReadRangesCompletion {
-            crc32c_table: Default::default(),
-            read_id: request.read_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            operation_index: op.operation_index,
-            source_copy_id: op.source_copy_id.clone(),
-            transferred_bytes: op.length,
-            range_checksum: checksum
-                .map(|value| value.to_le_bytes().to_vec())
-                .unwrap_or_default(),
-            range_checksum_algorithm: if read_mode == crate::config::DfsReadCrcMode::Off {
-                afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked as i32
-            } else if segment_only && read_mode == crate::config::DfsReadCrcMode::Receiver {
-                afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly as i32
-            } else if segment_only {
-                afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
-            } else {
-                afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32
-            },
-        },
-    ))?;
+    send(dfs_read_ranges_frame::Body::Completion(completion))?;
     Ok(())
+}
+
+#[cfg(feature = "dfs")]
+fn crc_range_metadata(
+    stream: &RangeStream<'_>,
+    op: &afs_protocol::node_data::DfsChunkReadOp,
+    table: &crate::node::chunk_crc32c::CrcTable,
+    exact_range: &[u8],
+) -> Result<(DfsReadRangesHeader, DfsReadRangesCompletion), Status> {
+    use crate::config::DfsReadCrcMode;
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    let RangeStream {
+        local,
+        request,
+        read_mode,
+        ..
+    } = *stream;
+    let segment_bytes = crate::node::chunk_crc32c::SEGMENT as u64;
+    let aligned = op.chunk_offset.is_multiple_of(segment_bytes)
+        && (op.length.is_multiple_of(segment_bytes)
+            || op.chunk_offset.checked_add(op.length) == Some(table.length));
+    // Exact grants never disclose prefix/suffix bytes. A boundary fragment
+    // retains its exact-range transport checksum.
+    let (algorithm, range_checksum) = match (read_mode, aligned) {
+        (DfsReadCrcMode::Off, _) => (DfsDigestAlgorithm::ReadUnchecked, Vec::new()),
+        (DfsReadCrcMode::Receiver, true) => (DfsDigestAlgorithm::Crc32cReceiverOnly, Vec::new()),
+        (DfsReadCrcMode::Both, true) => (DfsDigestAlgorithm::Crc32cSegmentsV1, Vec::new()),
+        (_, false) => {
+            let crc_scope = local.coarse_diagnostic("crc_range_send", exact_range.len() as u64);
+            local.record_crc_read("range_send", exact_range.len() as u64);
+            let checksum = crate::node::chunk_crc32c::checksum(exact_range);
+            drop(crc_scope);
+            (DfsDigestAlgorithm::Crc32c, checksum.to_le_bytes().to_vec())
+        }
+    };
+    local.record_read_check(crate::node::metrics::work::ReadCheck::DescriptorEncode);
+    let descriptor =
+        serde_json::to_vec(table).map_err(|error| Status::internal(error.to_string()))?;
+    let header = DfsReadRangesHeader {
+        read_id: request.read_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        operation_index: op.operation_index,
+        chunk_id: op.chunk_id.clone(),
+        chunk_offset: op.chunk_offset,
+        length: op.length,
+        source_copy_id: op.source_copy_id.clone(),
+        blake3_outboard: Default::default(),
+        crc32c_table: descriptor,
+    };
+    let completion = DfsReadRangesCompletion {
+        read_id: request.read_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        operation_index: op.operation_index,
+        source_copy_id: op.source_copy_id.clone(),
+        transferred_bytes: op.length,
+        range_checksum,
+        range_checksum_algorithm: algorithm as i32,
+        crc32c_table: Default::default(),
+    };
+    Ok((header, completion))
+}
+
+#[cfg(feature = "dfs")]
+pub(super) async fn stream_holder_memory_range(
+    stream: &RangeStream<'_>,
+    op: &afs_protocol::node_data::DfsChunkReadOp,
+    table: &crate::node::chunk_crc32c::CrcTable,
+    body: prost::bytes::Bytes,
+) -> Result<(), Status> {
+    use dfs_read_ranges_frame::Body;
+    let (header, completion) = crc_range_metadata(stream, op, table, &body)?;
+    let deadline = tokio::time::Instant::from_std(stream.admission_deadline);
+    let send = |body| async move {
+        stream
+            .local
+            .record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
+        validate_served_read(stream.request)?;
+        stream
+            .local
+            .ensure_peer_serve_open()
+            .map_err(error_to_status)?;
+        tokio::time::timeout_at(
+            deadline,
+            stream
+                .sender
+                .send(Ok(DfsReadRangesFrame { body: Some(body) })),
+        )
+        .await
+        .map_err(|_| Status::resource_exhausted("DFS peer read deadline exceeded"))?
+        .map_err(|_| Status::cancelled("DFS range consumer disconnected"))
+    };
+    send(Body::Header(header)).await?;
+    for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
+        let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
+        let length = data.len() as u64;
+        send(Body::Data(data)).await?;
+        stream.local.record_peer_read_event("data_frame");
+        stream.local.record_peer_read_event("shared_frame");
+        if let Some(metrics) = stream.metrics {
+            metrics.record("grpc", "send", "read", length);
+        }
+    }
+    send(Body::Completion(completion)).await
 }
 
 /// A sidecar-backed object streamed group by group without a body allocation.

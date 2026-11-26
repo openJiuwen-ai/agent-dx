@@ -360,7 +360,14 @@ impl DfsReadEngine {
                 attempt
                     .operations
                     .iter()
-                    .map(|item| flights.begin(&item.op.chunk_id))
+                    .map(|item| {
+                        flights.begin_range(
+                            &item.op.chunk_id,
+                            item.source.grant.context().caller_node_epoch,
+                            item.op.chunk_offset,
+                            item.op.length,
+                        )
+                    })
                     .collect()
             }
             _ => Vec::new(),

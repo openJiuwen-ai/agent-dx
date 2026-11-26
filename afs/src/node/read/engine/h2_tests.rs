@@ -2449,3 +2449,67 @@ async fn h2_2c1_one_designated_fetcher_across_readers_and_versions() {
         }
     }
 }
+/// Plan 27 T5: once the foreground read ends, its queued segment still has a mark.
+#[test]
+fn h2_2c1_segment_channel_keeps_its_fetch_in_flight() {
+    let fixture = Fixture::new();
+    let (engine, _, _, chunk) = share_engine(&fixture, true, true);
+    let data = vec![7; chunk.length as usize];
+    engine.remember_trusted_crc_table(
+        &chunk,
+        crate::node::chunk_crc32c::CrcTable::build(&data).unwrap(),
+    );
+    let flights = engine.holder_in_flight().unwrap();
+    let fetched = flights.begin(&chunk.id);
+    stage_segment(&engine, &chunk, &data, 0, chunk.length as usize / 2);
+    drop(fetched);
+    assert!(
+        flights.contains(&chunk.id),
+        "no fetch mark while the segment waits in the channel"
+    );
+}
+
+/// Plan 27 T5/T7. The completed buffer is available while still queued.
+#[tokio::test]
+async fn h2_2c1_assembled_buffer_remains_servable_through_install() {
+    let fixture = Fixture::new();
+    let (engine, _, _, chunk) = share_engine(&fixture, true, true);
+    let data = vec![7; chunk.length as usize];
+    let flights = engine.holder_in_flight().unwrap();
+    let cache = engine.distributed_cache.as_ref().unwrap();
+    let half = data.len() / 2;
+    stage_segment(&engine, &chunk, &data, 0, half);
+    cache.assemble_pending(&engine.local);
+    assert!(
+        flights.partials.covering(&chunk.id, 1, 0, 1).is_none(),
+        "a body without a trusted CRC table cannot serve"
+    );
+    engine.remember_trusted_crc_table(
+        &chunk,
+        crate::node::chunk_crc32c::CrcTable::build(&data).unwrap(),
+    );
+    stage_segment(&engine, &chunk, &data, half, half);
+    cache.assemble_pending(&engine.local);
+    assert!(!engine.local.has_servable_record(&chunk.id));
+    assert!(flights.contains(&chunk.id));
+    let jobs = cache.queued_jobs_for_test();
+    assert_eq!(jobs.len(), 1);
+    let body = flights
+        .partials
+        .covering(&chunk.id, 1, 0, chunk.length)
+        .expect("completed body available before install");
+    assert_eq!(
+        body.read(123, 17, |bytes| Ok(bytes.to_vec()))
+            .unwrap()
+            .unwrap(),
+        &data[123..140]
+    );
+    assert!(flights.partials.covering(&chunk.id, 2, 0, 1).is_none());
+    drop(body);
+    for job in jobs {
+        engine.run_install_job(job, cache.capacity()).await;
+    }
+    assert!(engine.local.has_servable_record(&chunk.id));
+    assert!(!flights.contains(&chunk.id));
+    assert!(flights.partials.covering(&chunk.id, 1, 0, 1).is_none());
+}
