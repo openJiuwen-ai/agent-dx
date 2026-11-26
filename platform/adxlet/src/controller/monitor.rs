@@ -175,16 +175,12 @@ impl Controller {
                 self.start_attempt(true, false, None).await?;
             }
         } else if self.record.state == EnvironmentState::Failed {
-            let held = self.record.resources_held;
+            let before = self.publication_snapshot();
+            let cleanup = self.cleanup().await;
+            let changed = self.note_cleanup_publication(&before)?;
             // Failed creates release capacity independently of backend cleanup.
             // Retrying cleanup must not delay publication of that released ledger.
-            let cleanup = self.cleanup().await;
-            let released = held && !self.record.resources_held;
-            if released {
-                self.record.revision =
-                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-            }
-            if released || self.durability != Some(crate::Durability::Published) {
+            if changed || self.durability != Some(crate::Durability::Published) {
                 self.sync().await?;
             }
             cleanup?;
