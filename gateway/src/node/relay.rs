@@ -5,6 +5,7 @@ use h2::SendStream;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Clone, Default)]
@@ -109,7 +110,7 @@ where
                     let capacity = poll_fn(|cx| {
                         let result = send.poll_capacity(cx);
                         if let Some(progress) = &progress {
-                            if result.is_pending() { progress.h2_wait.pending(progress.now_ms()); }
+                            if matches!(result,Poll::Pending|Poll::Ready(Some(Ok(0)))) { progress.h2_wait.pending(progress.now_ms()); }
                             else { progress.h2_wait.ready(progress.now_ms()); }
                         }
                         result

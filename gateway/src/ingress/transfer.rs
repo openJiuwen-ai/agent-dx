@@ -47,7 +47,41 @@ impl TransferGuard {
             integer(state.headers_ms.load(Ordering::Relaxed)),
         );
         if state.slow.load(Ordering::Relaxed) {
+            let h2 = state.h2_snapshot();
+            let window = state.window();
             trace.boolean_attribute("transfer.slow", true);
+            trace.attribute("transfer.slow_reason", state.reason().to_owned());
+            let (tunnel_id, stream_id) = state.h2_identity();
+            trace.attribute("transfer.h2_tunnel_id", tunnel_id);
+            trace.integer_attribute("transfer.h2_stream_id", i64::from(stream_id));
+            trace.integer_attribute("transfer.h2_capacity_wait_ms", integer(h2.wait_ms));
+            trace.integer_attribute("transfer.h2_capacity_wait_count", integer(h2.wait_count));
+            trace.integer_attribute("transfer.h2_capacity_pending_ms", integer(h2.pending_ms));
+            trace.integer_attribute("transfer.h2_enqueued_bytes", integer(h2.enqueued_bytes));
+            trace.double_attribute(
+                "transfer.h2_capacity_wait_ratio",
+                crate::common::transfer::ratio(h2.wait_ms, state.now_ms()),
+            );
+            trace.integer_attribute("transfer.window_ms", integer(window.duration_ms));
+            trace.integer_attribute("transfer.window_end_ms", integer(window.end_ms));
+            trace.integer_attribute(
+                "transfer.window_request_bytes",
+                integer(window.request_bytes),
+            );
+            trace.integer_attribute(
+                "transfer.window_response_bytes",
+                integer(window.response_bytes),
+            );
+            trace.integer_attribute(
+                "transfer.h2_window_enqueued_bytes",
+                integer(window.h2_enqueued_bytes),
+            );
+            trace.integer_attribute("transfer.h2_window_wait_ms", integer(window.h2_wait_ms));
+            trace.integer_attribute(
+                "transfer.h2_window_wait_count",
+                integer(window.h2_wait_count),
+            );
+            trace.double_attribute("transfer.h2_window_wait_ratio", window.h2_wait_ratio());
             trace.integer_attribute(
                 "http.request.body.size",
                 integer(state.request_bytes.load(Ordering::Relaxed)),

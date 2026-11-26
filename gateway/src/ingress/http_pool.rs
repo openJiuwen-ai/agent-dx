@@ -110,6 +110,7 @@ struct IdleConnection {
     sender: SendRequest<super::server::ProxyBody>,
     idle_since: Instant,
     opened_at: Instant,
+    observation: Option<Arc<crate::common::transfer::H2Observation>>,
 }
 
 impl BackendHttpPool {
@@ -183,7 +184,7 @@ impl BackendHttpPool {
     pub async fn send_recoverable<F, Fut, T, V>(
         &self,
         key: BackendHttpPoolKey,
-        mut request: Request<Incoming>,
+        request: Request<Incoming>,
         open: F,
         validate: V,
     ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
@@ -191,6 +192,28 @@ impl BackendHttpPool {
         F: FnOnce() -> Fut,
         V: FnOnce() -> io::Result<()>,
         Fut: Future<Output = io::Result<T>>,
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.send_observed_recoverable(
+            key,
+            request,
+            || async { open().await.map(|stream| (stream, None)) },
+            validate,
+        )
+        .await
+    }
+
+    pub(super) async fn send_observed_recoverable<F, Fut, T, V>(
+        &self,
+        key: BackendHttpPoolKey,
+        mut request: Request<Incoming>,
+        open: F,
+        validate: V,
+    ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
+    where
+        F: FnOnce() -> Fut,
+        V: FnOnce() -> io::Result<()>,
+        Fut: Future<Output = io::Result<(T, Option<Arc<crate::common::transfer::H2Observation>>)>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // The pool always opens HTTP/1.1 connections to the sandbox. An
@@ -215,9 +238,10 @@ impl BackendHttpPool {
                 return Err(BackendHttpPoolError::Closed);
             }
 
-            let (sender, opened_at, reused) = loop {
+            let (sender, opened_at, reused, observation) = loop {
                 let Some(mut idle) = self.inner.take_idle(&endpoint) else {
-                    let stream = open().await.map_err(BackendHttpPoolError::Connect)?;
+                    let (stream, observation) =
+                        open().await.map_err(BackendHttpPoolError::Connect)?;
                     let (sender, connection) =
                         hyper::client::conn::http1::handshake(TokioIo::new(stream))
                             .await
@@ -228,18 +252,25 @@ impl BackendHttpPool {
                             tracing::debug!(%error, "pooled environment HTTP connection closed");
                         }
                     }));
-                    break (sender, Instant::now(), false);
+                    break (sender, Instant::now(), false, observation);
                 };
                 if idle.sender.ready().await.is_ok() {
-                    break (idle.sender, idle.opened_at, true);
+                    break (idle.sender, idle.opened_at, true, idle.observation);
                 }
                 self.inner.discarded_total.fetch_add(1, Ordering::Relaxed);
             };
 
-            Ok::<_, BackendHttpPoolError>((sender, opened_at, endpoint, permit, reused))
+            Ok::<_, BackendHttpPoolError>((
+                sender,
+                opened_at,
+                endpoint,
+                permit,
+                reused,
+                observation,
+            ))
         }
         .await;
-        let (mut sender, opened_at, endpoint, permit, reused) = match prepared {
+        let (mut sender, opened_at, endpoint, permit, reused, observation) = match prepared {
             Ok(value) => value,
             Err(error) => return Err((error, Some(request))),
         };
@@ -251,6 +282,13 @@ impl BackendHttpPool {
         }
         if reused {
             self.inner.reused_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let progress = request
+            .extensions()
+            .get::<Arc<crate::common::transfer::TransferProgress>>()
+            .cloned();
+        if let (Some(progress), Some(observation)) = (&progress, observation.as_ref()) {
+            progress.attach_h2(observation.clone());
         }
         let request_allows_reuse = !has_connection_close(request.headers());
         if let Some(processing) = request
@@ -272,6 +310,8 @@ impl BackendHttpPool {
             pool: Arc::downgrade(&self.inner),
             permit: Some(permit),
             reusable,
+            observation,
+            progress,
         };
         let (parts, incoming) = response.into_parts();
         let mut body = PooledResponseBody {
@@ -327,6 +367,7 @@ impl PoolInner {
         endpoint: &EndpointPool,
         sender: SendRequest<super::server::ProxyBody>,
         opened_at: Instant,
+        observation: Option<Arc<crate::common::transfer::H2Observation>>,
     ) {
         // Serialize the validity check and insertion with invalidation's queue drain.
         let mut idle = endpoint.idle.lock().unwrap();
@@ -352,6 +393,7 @@ impl PoolInner {
             sender,
             idle_since: Instant::now(),
             opened_at,
+            observation,
         });
     }
 
@@ -412,13 +454,25 @@ struct ConnectionLease {
     pool: std::sync::Weak<PoolInner>,
     permit: Option<OwnedSemaphorePermit>,
     reusable: bool,
+    observation: Option<Arc<crate::common::transfer::H2Observation>>,
+    progress: Option<Arc<crate::common::transfer::TransferProgress>>,
 }
 
 impl ConnectionLease {
     fn finish(mut self, body_complete: bool) {
+        // Freeze the lease's counters before another request can reuse the
+        // transport, including on another executor thread.
+        if let Some(progress) = &self.progress {
+            progress.finish_h2();
+        }
         if body_complete && self.reusable {
             if let (Some(pool), Some(sender)) = (self.pool.upgrade(), self.sender.take()) {
-                pool.return_idle(&self.endpoint, sender, self.opened_at);
+                pool.return_idle(
+                    &self.endpoint,
+                    sender,
+                    self.opened_at,
+                    self.observation.take(),
+                );
             }
         } else if let Some(pool) = self.pool.upgrade() {
             pool.discarded_total.fetch_add(1, Ordering::Relaxed);

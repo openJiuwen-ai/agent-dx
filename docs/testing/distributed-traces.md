@@ -129,13 +129,19 @@ Execd 的 HTTP Span 继续覆盖其本地文件读取和 socket 写入。
 Ingress 和 Relay 各使用一个到期调度任务。每个活跃传输只登记一个可撤销的检查期限；
 正常完成立即移除，只有到期且仍活跃的传输才计算慢速状态，不按固定频率扫描全部连接。
 传输没有后续 body poll 时，到期检查仍可运行。Ingress 在超过观察窗口后检查无进展或
-窗口内吞吐低于阈值；健康的大文件传输继续按窗口检查。Relay CONNECT 是可复用的
-L4 隧道，不把空闲隧道当作慢下载，只诊断持续的 H2 容量等待或向运行时写入等待。
+窗口内吞吐低于阈值；仍在收发数据的慢传输也会触发，不要求完全停住。
+上传请求体可能已经被 HTTP 栈预读，因此 H2 等待占窗口至少 50% 时，上传吞吐按
+实际交给 H2 的字节计算，H2 仍在发送也计为进展。
+Relay CONNECT 是可复用的 L4 隧道，除持续 H2 容量等待或向运行时写入等待外，
+还检查「窗口 H2 发送吞吐低于阈值，且 H2 等待占窗口至少 50%」。反复短等待会累计，
+无需任何单次等待超过观察窗口；50% 条件用于定位容量等待占主导的低吞吐，空闲隧道
+没有这类等待，不会仅因低速触发。健康传输和已标慢的活跃传输继续按窗口采样，
+不会因此增加周期性明细输出。
 
 | 服务环境变量 | 默认值 | 含义 |
 |---|---:|---|
 | `ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS` | `10` | 观察窗口/持续等待阈值，1–86400 秒 |
-| `ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND` | `65536` | Ingress 低吞吐阈值；0 关闭低吞吐判定，仍检查无进展 |
+| `ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND` | `65536` | Ingress/Relay 低吞吐阈值；0 关闭低吞吐判定，仍检查无进展/持续等待 |
 | `ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE` | `60` | 每个服务实例每 60 秒窗口的详细摘要上限；0 关闭详细输出 |
 
 普通传输只更新固定大小的内存计数，不生成逐块事件或新增 Span。
@@ -146,10 +152,31 @@ H2 容量等待，以及前端连接级写入等待。
 连接级写等待可能包含同连接其他请求；不将其标记为单请求等待。
 各等待可能重叠，不能相加作为传输总耗时。
 
-Relay 的 `h2_enqueued_bytes` 表示交给 H2 队列的字节，不表示 Ingress 已收到；
-其 request ID 指创建 CONNECT 的请求，复用后的业务请求需结合 Ingress Trace 与时间窗关联。
+H2 明细只附加到慢传输摘要和慢文件请求的既有 Span；普通请求不输出这些字段。
+Ingress 测量上传方向的 H2 发送容量等待，Relay 测量下载方向的 H2 发送容量等待。
+
+| 慢摘要字段（Span 加 `transfer.` 前缀） | 统计范围 |
+|---|---|
+| `h2_capacity_wait_ms` / `h2_capacity_wait_count` | 累计容量等待毫秒/阻塞段次数，包含尚未结束的等待；重复 poll 同一阻塞段不增加次数 |
+| `h2_capacity_wait_ratio` | 累计等待时间 / 本次传输已耗时，0–1 |
+| `window_ms` / `window_end_ms` | 最近采样窗口的实际长度/结束时距本次传输开始的时间，毫秒；结束摘要可包含不足完整窗口的尾段 |
+| `h2_window_wait_ms` / `h2_window_wait_count` / `h2_window_wait_ratio` | 窗口内等待时间/窗口内新开始的阻塞段数/等待时间占窗口比例，0–1 |
+| `h2_enqueued_bytes` / `h2_window_enqueued_bytes` | 累计/窗口内交给 H2 队列的编码字节 |
+| `h2_tunnel_id` / `h2_stream_id` | Ingress 与 Relay 共享的 CONNECT 标识/H2 stream ID，用于结合时间窗关联 |
+
+累计和窗口等待时间包含跨窗口阻塞段在本窗口内的部分，因此窗口次数为 0 仍可能有
+等待时间。各计数是在线采样值，比例限制在 0–1。Ingress 从每次 HTTP 连接借用起计，
+归还连接时截断，复用连接不会继承上一请求的等待；Relay 从 CONNECT 建立起计。
+`window_request_bytes`、`window_response_bytes` 记录窗口正文进度，`slow_reason` 保留
+首次触发原因（Span 同样使用 `transfer.` 前缀）。
+
+`h2_enqueued_bytes` 不表示对端已收到；Ingress 上传 H2 等待为 0，也不能排除
+Relay 下载方向容量不足。Relay 的 request ID 指创建 CONNECT 的请求，复用后的
+业务请求需用 `h2_tunnel_id`、Ingress Trace 与时间窗关联，stream ID 不能跨物理连接单独定位。
 Relay TCP 字节包含 HTTP 编码，Ingress body 字节不包含编码，两个计数不能直接相减。
 只有慢摘要会写详细关联信息，慢摘要不依赖 Trace 采样，因此未采样 Trace 也能检索请求 ID。
+这些等待能说明发送容量受限，单靠它们不能区分 H2 连接窗口、流窗口和下游处理能力，
+仍需结合客户端接收进度和前端连接写等待定界。
 
 `/metrics` 暴露 `data_plane_{ingress,relay}_transfers_in_flight`、
 `slow_transfers_total`、`transfer_diagnostics_suppressed_total` 和

@@ -566,6 +566,15 @@ impl Relay {
                 request_id: target.request_id.chars().take(128).collect(),
                 trace_id: trace_id.clone(),
                 span_id: span_id.clone(),
+                tunnel_id: request
+                    .headers()
+                    .get(crate::common::protocol::H_TUNNEL_ID)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .chars()
+                    .take(128)
+                    .collect(),
+                h2_stream_id: send.stream_id().as_u32(),
             },
             None,
         );

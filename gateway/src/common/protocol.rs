@@ -12,6 +12,7 @@ pub const H_WORKLOAD_ID: &str = "x-adx-workload-id";
 pub const H_TARGET_IP: &str = "x-adx-target-ip";
 pub const H_TARGET_PORT: &str = "x-adx-target-port";
 pub const H_REQUEST_ID: &str = "x-request-id";
+pub(crate) const H_TUNNEL_ID: &str = "x-adx-tunnel-id";
 pub const H_ACCESS_KIND: &str = "x-adx-access-kind";
 pub const H_ACTIVITY_CLASS: &str = "x-adx-activity-class";
 pub const ACTIVITY_CLASS_PASSIVE: &str = "passive";

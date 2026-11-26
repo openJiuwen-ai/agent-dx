@@ -47,10 +47,14 @@ impl DataPlaneL4Connector {
         mut cancelled: watch::Receiver<bool>,
         passive: bool,
     ) -> io::Result<H2ConnectStream> {
+        let observation = crate::common::transfer::H2Observation::new();
         let (send, recv, pool_stream) = self
             .pool
-            .connect_with_activity(relay_address, target, passive)
+            .connect_observed(relay_address, target, passive, Some(&observation.tunnel_id))
             .await?;
+        observation
+            .stream_id
+            .store(send.stream_id().as_u32(), Ordering::Relaxed);
         let cancellation = Arc::new(StreamCancellation::default());
         let cancellation_observer = Arc::downgrade(&cancellation);
         tokio::spawn(async move {
@@ -77,6 +81,7 @@ impl DataPlaneL4Connector {
                 _pool_stream: pool_stream,
             }),
             cancellation,
+            observation,
         })
     }
 }
@@ -108,6 +113,7 @@ impl StreamCancellation {
 pub struct H2ConnectStream {
     io: Option<H2StreamIo>,
     cancellation: Arc<StreamCancellation>,
+    observation: Arc<crate::common::transfer::H2Observation>,
 }
 
 struct H2StreamIo {
@@ -131,6 +137,9 @@ impl std::fmt::Debug for H2ConnectStream {
 }
 
 impl H2ConnectStream {
+    pub(crate) fn observation(&self) -> Arc<crate::common::transfer::H2Observation> {
+        self.observation.clone()
+    }
     fn cancelled_error() -> io::Error {
         io::Error::new(
             io::ErrorKind::ConnectionAborted,
@@ -218,13 +227,17 @@ impl AsyncWrite for H2ConnectStream {
         }
 
         stream.send.reserve_capacity(buffer.len());
-        match stream.send.poll_capacity(context) {
+        let capacity = stream.send.poll_capacity(context);
+        this.observation
+            .poll_capacity(matches!(capacity, Poll::Pending | Poll::Ready(Some(Ok(0)))));
+        match capacity {
             Poll::Ready(Some(Ok(capacity))) if capacity > 0 => {
                 let amount = capacity.min(buffer.len());
                 stream
                     .send
                     .send_data(Bytes::copy_from_slice(&buffer[..amount]), false)
                     .map_err(Self::h2_error)?;
+                this.observation.sent(amount);
                 Poll::Ready(Ok(amount))
             }
             Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,

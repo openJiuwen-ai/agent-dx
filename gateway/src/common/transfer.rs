@@ -1,7 +1,7 @@
 //! Bounded diagnostics for transfers. The watchdog never reads or buffers payloads.
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -27,15 +27,22 @@ pub(crate) struct Wait {
     since: AtomicU64,
     total: AtomicU64,
     longest: AtomicU64,
+    count: AtomicU64,
 }
 impl Wait {
     pub fn pending(&self, now: u64) {
-        let _ = self.since.compare_exchange(
-            0,
-            now.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if self
+            .since
+            .compare_exchange(
+                0,
+                now.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub fn ready(&self, now: u64) {
         let since = self.since.swap(0, Ordering::Relaxed);
@@ -58,6 +65,92 @@ impl Wait {
             pending,
         )
     }
+}
+
+/// Counters belong to one CONNECT transport, including when HTTP reuses it.
+pub(crate) struct H2Observation {
+    pub wait: Wait,
+    pub enqueued: AtomicU64,
+    pub stream_id: AtomicU32,
+    pub tunnel_id: String,
+    last_progress: AtomicU64,
+    started: Instant,
+}
+impl H2Observation {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            wait: Wait::default(),
+            enqueued: AtomicU64::new(0),
+            stream_id: AtomicU32::new(0),
+            tunnel_id: uuid::Uuid::new_v4().to_string(),
+            last_progress: AtomicU64::new(0),
+            started: Instant::now(),
+        })
+    }
+    pub fn now_ms(&self) -> u64 {
+        milliseconds(self.started.elapsed())
+    }
+    pub fn poll_capacity(&self, pending: bool) {
+        if pending {
+            self.wait.pending(self.now_ms());
+        } else if self.wait.since.load(Ordering::Relaxed) != 0 {
+            self.wait.ready(self.now_ms());
+        }
+    }
+    pub fn sent(&self, bytes: usize) {
+        self.enqueued.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.last_progress.store(self.now_ms(), Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> H2Snapshot {
+        let (wait_ms, _, pending_ms) = self.wait.snapshot(self.now_ms());
+        H2Snapshot {
+            wait_ms,
+            pending_ms,
+            wait_count: self.wait.count.load(Ordering::Relaxed),
+            enqueued_bytes: self.enqueued.load(Ordering::Relaxed),
+        }
+    }
+}
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct H2Snapshot {
+    pub wait_ms: u64,
+    pub wait_count: u64,
+    pub pending_ms: u64,
+    pub enqueued_bytes: u64,
+}
+struct H2Transport {
+    observation: Arc<H2Observation>,
+    baseline: H2Snapshot,
+    completed: Option<H2Snapshot>,
+}
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct TransferWindow {
+    pub duration_ms: u64,
+    pub end_ms: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub h2_wait_ms: u64,
+    pub h2_wait_count: u64,
+    pub h2_enqueued_bytes: u64,
+}
+impl TransferWindow {
+    pub fn h2_wait_ratio(&self) -> f64 {
+        ratio(self.h2_wait_ms, self.duration_ms)
+    }
+    fn rate(&self, bytes: u64) -> f64 {
+        if self.duration_ms == 0 {
+            0.0
+        } else {
+            bytes as f64 * 1000.0 / self.duration_ms as f64
+        }
+    }
+}
+struct TransferSample {
+    at: Instant,
+    request_bytes: u64,
+    response_bytes: u64,
+    h2: H2Snapshot,
+    window: TransferWindow,
 }
 
 pub(crate) struct ConnectionProgress {
@@ -87,6 +180,8 @@ pub(crate) struct TransferIdentity {
     pub request_id: String,
     pub trace_id: String,
     pub span_id: String,
+    pub tunnel_id: String,
+    pub h2_stream_id: u32,
 }
 
 pub(crate) struct TransferProgress {
@@ -100,13 +195,142 @@ pub(crate) struct TransferProgress {
     pub headers_ms: AtomicU64,
     pub h2_enqueued_bytes: AtomicU64,
     pub slow: AtomicBool,
+    reason: OnceLock<&'static str>,
     started: Instant,
     last_progress: AtomicU64,
     finished: AtomicBool,
-    sample: Mutex<(Instant, u64)>,
+    sample: Mutex<TransferSample>,
+    h2_transport: Mutex<Option<H2Transport>>,
     events: Mutex<()>,
 }
 impl TransferProgress {
+    pub fn attach_h2(&self, observation: Arc<H2Observation>) {
+        let baseline = observation.snapshot();
+        *self
+            .h2_transport
+            .lock()
+            .expect("transport attachment never panics while locked") = Some(H2Transport {
+            observation,
+            baseline,
+            completed: None,
+        });
+    }
+    pub fn finish_h2(&self) {
+        let mut transport = self
+            .h2_transport
+            .lock()
+            .expect("transport attachment never panics while locked");
+        if let Some(transport) = transport.as_mut() {
+            if transport.completed.is_none() {
+                transport.completed = Some(transport.observation.snapshot());
+            }
+        }
+    }
+    pub fn h2_snapshot(&self) -> H2Snapshot {
+        let transport = self
+            .h2_transport
+            .lock()
+            .expect("transport attachment never panics while locked");
+        if let Some(transport) = transport.as_ref() {
+            let current = transport
+                .completed
+                .unwrap_or_else(|| transport.observation.snapshot());
+            return H2Snapshot {
+                wait_ms: current.wait_ms.saturating_sub(transport.baseline.wait_ms),
+                wait_count: current
+                    .wait_count
+                    .saturating_sub(transport.baseline.wait_count),
+                enqueued_bytes: current
+                    .enqueued_bytes
+                    .saturating_sub(transport.baseline.enqueued_bytes),
+                pending_ms: current.pending_ms.min(self.now_ms()),
+            };
+        }
+        let (wait_ms, _, pending_ms) = self.h2_wait.snapshot(self.now_ms());
+        H2Snapshot {
+            wait_ms,
+            pending_ms,
+            wait_count: self.h2_wait.count.load(Ordering::Relaxed),
+            enqueued_bytes: self.h2_enqueued_bytes.load(Ordering::Relaxed),
+        }
+    }
+    pub fn h2_identity(&self) -> (String, u32) {
+        let transport = self
+            .h2_transport
+            .lock()
+            .expect("transport attachment never panics while locked");
+        transport.as_ref().map_or_else(
+            || (self.identity.tunnel_id.clone(), self.identity.h2_stream_id),
+            |transport| {
+                (
+                    transport.observation.tunnel_id.clone(),
+                    transport.observation.stream_id.load(Ordering::Relaxed),
+                )
+            },
+        )
+    }
+    pub fn window(&self) -> TransferWindow {
+        self.sample
+            .lock()
+            .expect("transfer sampling never panics while locked")
+            .window
+    }
+    pub fn reason(&self) -> &'static str {
+        self.reason.get().copied().unwrap_or_default()
+    }
+    fn progress_age_ms(&self) -> u64 {
+        let age = self
+            .now_ms()
+            .saturating_sub(self.last_progress.load(Ordering::Relaxed));
+        let transport = self
+            .h2_transport
+            .lock()
+            .expect("transport attachment never panics while locked");
+        match transport.as_ref() {
+            Some(transport)
+                if transport.observation.enqueued.load(Ordering::Relaxed)
+                    > transport.baseline.enqueued_bytes =>
+            {
+                age.min(
+                    transport.observation.now_ms().saturating_sub(
+                        transport.observation.last_progress.load(Ordering::Relaxed),
+                    ),
+                )
+            }
+            _ => age,
+        }
+    }
+    fn sample_window(&self, period: Duration, partial: bool) -> TransferWindow {
+        let now = Instant::now();
+        let h2 = self.h2_snapshot();
+        let mut sample = self
+            .sample
+            .lock()
+            .expect("transfer sampling never panics while locked");
+        let elapsed = now.duration_since(sample.at);
+        if elapsed < period && !partial || milliseconds(elapsed) == 0 {
+            return sample.window;
+        }
+        let request = self.request_bytes.load(Ordering::Relaxed);
+        let response = self.response_bytes.load(Ordering::Relaxed);
+        let window = TransferWindow {
+            duration_ms: milliseconds(elapsed),
+            end_ms: self.now_ms(),
+            request_bytes: request.saturating_sub(sample.request_bytes),
+            response_bytes: response.saturating_sub(sample.response_bytes),
+            h2_wait_ms: h2.wait_ms.saturating_sub(sample.h2.wait_ms),
+            h2_wait_count: h2.wait_count.saturating_sub(sample.h2.wait_count),
+            h2_enqueued_bytes: h2.enqueued_bytes.saturating_sub(sample.h2.enqueued_bytes),
+        };
+        *sample = TransferSample {
+            at: now,
+            request_bytes: request,
+            response_bytes: response,
+            h2,
+            window,
+        };
+        window
+    }
     pub fn now_ms(&self) -> u64 {
         milliseconds(self.started.elapsed())
     }
@@ -122,17 +346,16 @@ impl TransferProgress {
         counter.fetch_add(bytes as u64, Ordering::Relaxed);
         self.last_progress.store(self.now_ms(), Ordering::Relaxed);
     }
-    pub fn bytes(&self) -> u64 {
-        self.request_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(self.response_bytes.load(Ordering::Relaxed))
-    }
     fn slow_reason(&self, policy: &TransferPolicy) -> Option<&'static str> {
-        if self.finished.load(Ordering::Acquire) || self.slow.load(Ordering::Relaxed) {
+        if self.finished.load(Ordering::Acquire) {
             return None;
         }
         let now = Instant::now();
         if now.duration_since(self.started) < policy.slow_after {
+            return None;
+        }
+        let window = self.sample_window(policy.slow_after, false);
+        if self.slow.load(Ordering::Relaxed) {
             return None;
         }
         if self.identity.component == "relay" {
@@ -143,25 +366,24 @@ impl TransferProgress {
             if self.request_wait.snapshot(now).2 >= milliseconds(policy.slow_after) {
                 return Some("runtime_write_wait");
             }
+            // A low-rate CONNECT is diagnostic only when flow-control waits
+            // dominate its observation window; idle reused transports stay quiet.
+            if window.h2_wait_ratio() >= 0.5
+                && window.rate(window.h2_enqueued_bytes) < policy.min_bytes_per_second as f64
+            {
+                return Some("h2_low_throughput");
+            }
             return None;
         }
-        let age = self
-            .now_ms()
-            .saturating_sub(self.last_progress.load(Ordering::Relaxed));
+        let age = self.progress_age_ms();
         if age >= milliseconds(policy.slow_after) {
             return Some("no_progress");
         }
-        let mut sample = self
-            .sample
-            .lock()
-            .expect("transfer sampling never panics while locked");
-        let elapsed = now.duration_since(sample.0);
-        if elapsed < policy.slow_after {
-            return None;
-        }
-        let bytes = self.bytes();
-        let rate = bytes.saturating_sub(sample.1) as f64 / elapsed.as_secs_f64();
-        *sample = (now, bytes);
+        let rate = if self.identity.direction == "upload" && window.h2_wait_ratio() >= 0.5 {
+            window.rate(window.h2_enqueued_bytes)
+        } else {
+            window.rate(window.request_bytes.saturating_add(window.response_bytes))
+        };
         (rate < policy.min_bytes_per_second as f64).then_some("low_throughput")
     }
 }
@@ -258,8 +480,16 @@ impl TransferMonitor {
             h2_enqueued_bytes: AtomicU64::new(0),
             last_progress: AtomicU64::new(0),
             slow: AtomicBool::new(false),
+            reason: OnceLock::new(),
             finished: AtomicBool::new(false),
-            sample: Mutex::new((started, 0)),
+            sample: Mutex::new(TransferSample {
+                at: started,
+                request_bytes: 0,
+                response_bytes: 0,
+                h2: H2Snapshot::default(),
+                window: TransferWindow::default(),
+            }),
+            h2_transport: Mutex::new(None),
             events: Mutex::new(()),
         });
         let id = self.0.next.fetch_add(1, Ordering::Relaxed);
@@ -341,7 +571,7 @@ impl Monitor {
             }
             self.checks.fetch_add(1, Ordering::Relaxed);
             self.consider(&state);
-            if !state.slow.load(Ordering::Relaxed) {
+            {
                 let next = Instant::now() + self.policy.slow_after;
                 self.schedule
                     .lock()
@@ -353,6 +583,7 @@ impl Monitor {
     fn consider(&self, state: &TransferProgress) {
         if let Some(reason) = state.slow_reason(&self.policy) {
             if !state.slow.swap(true, Ordering::AcqRel) {
+                let _ = state.reason.set(reason);
                 self.slow.fetch_add(1, Ordering::Relaxed);
                 self.emit(state, "slow_transfer_started", reason);
             }
@@ -375,7 +606,13 @@ impl Monitor {
         let now = state.now_ms();
         let (request_wait_ms, _, _) = state.request_wait.snapshot(now);
         let (response_wait_ms, _, _) = state.response_wait.snapshot(now);
-        let (h2_capacity_wait_ms, _, _) = state.h2_wait.snapshot(now);
+        let h2 = state.h2_snapshot();
+        let (h2_tunnel_id, h2_stream_id) = state.h2_identity();
+        let window = if event == "slow_transfer_finished" {
+            state.sample_window(self.policy.slow_after, true)
+        } else {
+            state.window()
+        };
         let (
             frontend_connection_id,
             frontend_connection_written_bytes,
@@ -395,9 +632,15 @@ impl Monitor {
             request_id = %state.identity.request_id, trace_id = %state.identity.trace_id, span_id = %state.identity.span_id,
             elapsed_ms = now, headers_ms = state.headers_ms.load(Ordering::Relaxed),
             request_bytes = state.request_bytes.load(Ordering::Relaxed), response_bytes = state.response_bytes.load(Ordering::Relaxed),
-            last_progress_age_ms = now.saturating_sub(state.last_progress.load(Ordering::Relaxed)),
-            request_wait_ms, response_wait_ms, h2_capacity_wait_ms,
-            h2_enqueued_bytes = state.h2_enqueued_bytes.load(Ordering::Relaxed),
+            last_progress_age_ms = state.progress_age_ms(), slow_reason=state.reason(),
+            request_wait_ms, response_wait_ms,
+            h2_capacity_wait_ms = h2.wait_ms, h2_capacity_wait_count=h2.wait_count,
+            h2_capacity_wait_ratio=ratio(h2.wait_ms,now),
+            h2_capacity_pending_ms=h2.pending_ms, h2_enqueued_bytes=h2.enqueued_bytes,
+            h2_tunnel_id, h2_stream_id, window_ms=window.duration_ms, window_end_ms=window.end_ms,
+            window_request_bytes=window.request_bytes, window_response_bytes=window.response_bytes,
+            h2_window_wait_ms=window.h2_wait_ms,h2_window_wait_count=window.h2_wait_count,
+            h2_window_wait_ratio=window.h2_wait_ratio(),h2_window_enqueued_bytes=window.h2_enqueued_bytes,
             frontend_connection_id, frontend_connection_written_bytes, frontend_write_wait_ms, frontend_write_pending_ms,
             "Slow transfer diagnostic");
     }
@@ -445,6 +688,13 @@ impl Drop for TransferRegistration {
 fn milliseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+pub(crate) fn ratio(wait_ms: u64, elapsed_ms: u64) -> f64 {
+    if elapsed_ms == 0 {
+        0.0
+    } else {
+        (wait_ms as f64 / elapsed_ms as f64).min(1.0)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -456,6 +706,8 @@ mod tests {
             request_id: "data-00000000-0000-0000-0000-000000000000".into(),
             trace_id: "11111111111111111111111111111111".into(),
             span_id: "2222222222222222".into(),
+            tunnel_id: "test-connect".into(),
+            h2_stream_id: 1,
         }
     }
     #[tokio::test(start_paused = true)]
@@ -518,6 +770,203 @@ mod tests {
         transfer.progress.h2_wait.ready(12000);
         assert_eq!(transfer.progress.h2_wait.snapshot(15000), (12000, 12000, 0));
         transfer.finish("complete");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn repeated_short_h2_waits_detect_sustained_low_throughput() {
+        let monitor = TransferMonitor::default();
+        let mut transfer = monitor.start(identity("relay"), None);
+        for _ in 0..10 {
+            transfer
+                .progress
+                .h2_wait
+                .pending(transfer.progress.now_ms());
+            tokio::time::advance(Duration::from_millis(900)).await;
+            transfer.progress.h2_wait.ready(transfer.progress.now_ms());
+            transfer.progress.progress(false, 12 * 1024);
+            transfer
+                .progress
+                .h2_enqueued_bytes
+                .fetch_add(12 * 1024, Ordering::Relaxed);
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        monitor.0.check();
+        assert!(
+            transfer.progress.slow.load(Ordering::Relaxed),
+            "12KiB/s with repeated subsecond H2 waits must be diagnosed"
+        );
+        let h2 = transfer.progress.h2_snapshot();
+        assert_eq!((h2.wait_ms, h2.wait_count), (9000, 10));
+        assert_eq!(transfer.progress.reason(), "h2_low_throughput");
+        assert!((transfer.progress.window().h2_wait_ratio() - 0.9).abs() < 0.01);
+        transfer.finish("complete");
+        assert_eq!(monitor.0.budget.lock().unwrap().1, 2);
+    }
+    #[test]
+    fn wait_counts_blocking_episodes_instead_of_repeated_polls() {
+        let wait = Wait::default();
+        wait.pending(0);
+        wait.pending(10);
+        wait.pending(20);
+        wait.ready(100);
+        wait.pending(200);
+        wait.ready(450);
+        assert_eq!(wait.count.load(Ordering::Relaxed), 2);
+        assert_eq!(wait.snapshot(500), (350, 250, 0));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn healthy_h2_rate_and_idle_reused_tunnels_stay_quiet() {
+        let monitor = TransferMonitor::default();
+        let mut transfer = monitor.start(identity("relay"), None);
+        for _ in 0..10 {
+            transfer
+                .progress
+                .h2_wait
+                .pending(transfer.progress.now_ms());
+            tokio::time::advance(Duration::from_millis(900)).await;
+            transfer.progress.h2_wait.ready(transfer.progress.now_ms());
+            transfer
+                .progress
+                .h2_enqueued_bytes
+                .fetch_add(1024 * 1024, Ordering::Relaxed);
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        monitor.0.check();
+        assert!(!transfer.progress.slow.load(Ordering::Relaxed));
+        tokio::time::advance(Duration::from_secs(11)).await;
+        monitor.0.check();
+        assert!(!transfer.progress.slow.load(Ordering::Relaxed));
+        assert_eq!(transfer.progress.window().h2_wait_ms, 0);
+        transfer.finish("complete");
+        assert_eq!(monitor.0.budget.lock().unwrap().1, 0);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reused_h2_counters_start_at_each_request_and_upload_keeps_progressing() {
+        let observation = H2Observation::new();
+        observation.poll_capacity(true);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        observation.poll_capacity(false);
+        observation.sent(65536);
+        let monitor = TransferMonitor::default();
+        let mut id = identity("ingress");
+        id.direction = "upload";
+        let mut first = monitor.start(id, None);
+        first.progress.attach_h2(observation.clone());
+        assert_eq!(first.progress.h2_snapshot().wait_count, 0);
+        first.progress.progress(true, 1024 * 1024);
+        for _ in 0..10 {
+            observation.poll_capacity(true);
+            tokio::time::advance(Duration::from_millis(900)).await;
+            observation.poll_capacity(false);
+            observation.sent(12 * 1024);
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        monitor.0.check();
+        assert!(first.progress.slow.load(Ordering::Relaxed));
+        assert_eq!(first.progress.reason(), "low_throughput");
+        assert_eq!(first.progress.h2_snapshot().wait_count, 10);
+        first.progress.finish_h2();
+        first.finish("complete");
+        let mut second = monitor.start(identity("ingress"), None);
+        second.progress.attach_h2(observation.clone());
+        assert_eq!(second.progress.h2_snapshot().wait_count, 0);
+        assert_eq!(second.progress.h2_snapshot().wait_ms, 0);
+        assert_eq!(second.progress.h2_snapshot().enqueued_bytes, 0);
+        observation.poll_capacity(true);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        observation.poll_capacity(false);
+        observation.sent(1024);
+        assert_eq!(second.progress.h2_snapshot().wait_count, 1);
+        assert_eq!(first.progress.h2_snapshot().wait_count, 10);
+        assert_eq!(first.progress.h2_snapshot().wait_ms, 9000);
+        second.finish("complete");
+    }
+
+    #[tokio::test]
+    async fn real_h2_window_replenishment_reports_repeated_short_waits() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+        let monitor = TransferMonitor::new(TransferPolicy {
+            slow_after: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let mut transfer = monitor.start(identity("relay"), None);
+        let progress = transfer.progress.clone();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            let _ = socket.write_all(&vec![0x5a; 256 * 1024]).await;
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            let send = response
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let tcp = TcpStream::connect(backend_address).await.unwrap();
+            tokio::select! {
+                _=crate::node::relay::relay_h2_tcp_observed(request.into_body(),send,tcp,
+                    crate::node::relay::RelayStats::default(),Some(progress))=>{},
+                _=async {while connection.accept().await.is_some(){}}=>{},
+            }
+        });
+        let socket = TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = h2::client::Builder::new()
+            .initial_window_size(1024)
+            .handshake::<_, bytes::Bytes>(socket)
+            .await
+            .unwrap();
+        let driver = tokio::spawn(connection);
+        let (response, send) = sender
+            .send_request(
+                http::Request::builder()
+                    .method("CONNECT")
+                    .uri("http://localhost/")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut recv = response.await.unwrap().into_body();
+        let mut received = 0;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            for _ in 0..40 {
+                let bytes = recv.data().await.unwrap().unwrap();
+                received += bytes.len();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                recv.flow_control().release_capacity(bytes.len()).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(received > 0);
+        assert!(transfer.progress.slow.load(Ordering::Relaxed));
+        assert_eq!(transfer.progress.reason(), "h2_low_throughput");
+        assert!(transfer.progress.h2_snapshot().wait_count > 10);
+        assert!(transfer.progress.window().h2_wait_ratio() > 0.5);
+        assert!(
+            transfer
+                .progress
+                .h2_wait
+                .snapshot(transfer.progress.now_ms())
+                .1
+                < 500,
+            "no individual wait should reach the long-stall threshold"
+        );
+        transfer.finish("cancelled");
+        drop(send);
+        drop(recv);
+        drop(sender);
+        relay.abort();
+        driver.abort();
+        writer.abort();
+        let _ = relay.await;
+        let _ = driver.await;
+        let _ = writer.await;
+        assert_eq!(monitor.0.budget.lock().unwrap().1, 2);
     }
     #[tokio::test(start_paused = true)]
     async fn concurrent_slow_transfers_share_a_bounded_output_budget() {

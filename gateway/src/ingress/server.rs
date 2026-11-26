@@ -1167,6 +1167,8 @@ impl Ingress {
                     request_id: request_id.chars().take(128).collect(),
                     trace_id: trace.trace_id().unwrap_or_default(),
                     span_id: trace.span_id().unwrap_or_default(),
+                    tunnel_id: String::new(),
+                    h2_stream_id: 0,
                 },
                 connection,
             );
@@ -2329,10 +2331,14 @@ impl Ingress {
             };
             match self
                 .http_pool
-                .send_recoverable(
+                .send_observed_recoverable(
                     key,
                     request,
-                    || self.open_authorized_stream(route.clone()),
+                    || async {
+                        let stream = self.open_authorized_stream(route.clone()).await?;
+                        let observation = stream.stream.observation();
+                        Ok((stream, Some(observation)))
+                    },
                     || {
                         if !self.ready()
                             || self.resolver.current_route_revision(&route) != Some(route_revision)
@@ -2484,10 +2490,14 @@ impl Ingress {
         };
         match self
             .http_pool
-            .send_recoverable(
+            .send_observed_recoverable(
                 key,
                 request,
-                || self.open_service_http_stream(route.clone()),
+                || async {
+                    let stream = self.open_service_http_stream(route.clone()).await?;
+                    let observation = stream.stream.observation();
+                    Ok((stream, Some(observation)))
+                },
                 || {
                     if !self.ready()
                         || self.resolver.current_route_revision(&route) != Some(route_revision)

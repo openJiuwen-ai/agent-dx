@@ -1134,6 +1134,14 @@ on completion, with a shared per-instance output budget. Configure
 `ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS` (10),
 `ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND` (65536), and
 `ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE` (60).
+Continuous low throughput is detected while bytes keep advancing. Relay also detects
+repeated short H2 capacity waits when they occupy at least half the observation window
+and H2 enqueue throughput is below the threshold. Idle CONNECT transports remain quiet.
+Slow summaries and slow native file spans include cumulative/window H2 wait time,
+blocking-episode count and wait ratio. Ingress upload counters start at each HTTP lease
+and stop when it is returned; shared tunnel identifiers associate them with Relay data.
+Normal requests do not export these H2 details. Active slow transfers keep sampling
+windows without generating additional periodic diagnostic records.
 See [file transfer diagnostics](../docs/testing/distributed-traces.md#文件传输-trace-与慢传输诊断)
 for counter boundaries, cancellation, CONNECT reuse and output limits.
 
