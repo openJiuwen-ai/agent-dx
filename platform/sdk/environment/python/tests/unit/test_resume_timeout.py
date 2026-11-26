@@ -2,6 +2,7 @@ import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from unittest.mock import patch
 
 import httpx
@@ -165,7 +166,8 @@ class ResumeTimeoutTests(unittest.TestCase):
     def test_binary_upload_retries_only_a_replayable_body(self):
         for replayable in [True, False]:
             calls = []
-            def handler(request, recorded=calls):
+
+            def handler(request, recorded):
                 recorded.append(request)
                 if len(recorded) == 1:
                     return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
@@ -173,7 +175,7 @@ class ResumeTimeoutTests(unittest.TestCase):
                         "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
                     }})
                 return httpx.Response(200, json={"ok": True})
-            client = self.client(handler)
+            client = self.client(partial(handler, recorded=calls))
             with patch("adx_environment._transport.time.sleep"):
                 if replayable:
                     client.upload_bytes_direct("env", b"payload", "/file", 10)
@@ -189,7 +191,8 @@ class ResumeTimeoutTests(unittest.TestCase):
     def test_attempt_limit_is_configurable_and_exhaustion_is_retryable(self):
         for limit in [1, 4]:
             calls = []
-            def handler(request, recorded=calls):
+
+            def handler(request, recorded):
                 recorded.append(request)
                 return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
                     "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
@@ -197,7 +200,8 @@ class ResumeTimeoutTests(unittest.TestCase):
                 }})
             with patch("adx_environment._transport.time.sleep"):
                 with self.assertRaises(EnvironmentHTTPError) as raised:
-                    self.client(handler, attempts=limit).invoke("env", "side_effect", timeout=10)
+                    client = self.client(partial(handler, recorded=calls), attempts=limit)
+                    client.invoke("env", "side_effect", timeout=10)
             self.assertEqual(len(calls), limit)
             self.assertEqual(raised.exception.code, "ENV_RESUMING")
             self.assertFalse(raised.exception.request_forwarded)
