@@ -27,7 +27,7 @@ unknown/cancelled 不表示已确认实例创建失败。`environment_create_com
 SDK 连接、传输、重试退避、身份认证和参数转换不计入此服务耗时；完整 SDK 调用仍需客户端计时。
 SSE 保留请求上下文，在最终结果交给流之前完成创建 Span，客户端读取耗时另算。
 
-HTTP Span 包含 `http.request.method`、`http.route`，Ingress/API Server 返回后记录 `http.response.status_code`。HTTP Span 当前覆盖生成响应的处理阶段；创建等流式响应可能先返回，而后台任务继续运行。Span 时长不等于 SDK 等待完整操作的总耗时，完整链路与后台执行阶段需打开 Trace 查看。实例/快照/密钥 ID 使用 `{id}` 占位，不记录查询参数、用户端口路径或文件路径。未知接口统一使用 `/unmatched`。
+HTTP Span 包含 `http.request.method`、`http.route`，Ingress/API Server 返回后记录 `http.response.status_code`。原生 `/direct/{environment}/upload` 与 `/direct/{environment}/download` 的 Ingress HTTP Span 由响应体持有，覆盖从请求进入到响应体正常结束、正文错误或请求被丢弃；其他 HTTP Span 仍覆盖生成响应的处理阶段，创建等流式响应可能先返回，而后台任务继续运行。Span 时长不等于 SDK 等待完整操作的总耗时，完整链路与后台执行阶段需打开 Trace 查看。实例/快照/密钥 ID 使用 `{id}` 占位，不记录查询参数、用户端口路径或文件路径。未知接口统一使用 `/unmatched`。
 
 创建、执行、删除是独立请求，各有自己的 Trace，通过 Environment ID 关联。SDK 目前没有新增自动事务级根 Span。
 
@@ -115,3 +115,94 @@ RPC 用例；CI harness、全工作区 Clippy、格式和文档检查通过。
 日志位于执行工作区 `out/otel-readability/background-*.log`。本次验证为源码组件
 回归；cn-north-4 的日志正文/HTTP Trace 验收镜像尚未包含此次后台埋点裁剪，
 需要后续发布镜像后才停止产生这两类旧 Span。历史 Trace 保留原记录。
+
+## 文件传输 Trace 与慢传输诊断
+
+原生 upload/download 保留原有 HTTP Span 数量，在同一 Span 上记录完整响应体生命周期，
+`transfer.headers_ms` 单独记录响应头耗时。终结属性为 `transfer.outcome`（`complete`、
+`response_body_error`、`dropped`）。只有慢传输才附加 `http.request.body.size`、
+`http.response.body.size`、`transfer.slow=true` 和读取等待属性。上传字节在转发请求体被读取时累计，下载字节在后端响应体交给
+前端 HTTP 栈时累计；提前取消、正文失败也会结束 Span，正常 EOF 不由 HTTP 200 代替。
+此边界表示服务端响应体处理完成，并不表示客户端已经收到所有字节。
+Execd 的 HTTP Span 继续覆盖其本地文件读取和 socket 写入。
+
+Ingress 和 Relay 各使用一个到期调度任务。每个活跃传输只登记一个可撤销的检查期限；
+正常完成立即移除，只有到期且仍活跃的传输才计算慢速状态，不按固定频率扫描全部连接。
+传输没有后续 body poll 时，到期检查仍可运行。Ingress 在超过观察窗口后检查无进展或
+窗口内吞吐低于阈值；仍在收发数据的慢传输也会触发，不要求完全停住。
+上传请求体可能已经被 HTTP 栈预读，因此 H2 等待占窗口至少 50% 时，上传吞吐按
+实际交给 H2 的字节计算，H2 仍在发送也计为进展。
+Relay CONNECT 是可复用的 L4 隧道，除持续 H2 容量等待或向运行时写入等待外，
+还检查「窗口 H2 发送吞吐低于阈值，且 H2 等待占窗口至少 50%」。反复短等待会累计，
+无需任何单次等待超过观察窗口；50% 条件用于定位容量等待占主导的低吞吐，空闲隧道
+没有这类等待，不会仅因低速触发。健康传输和已标慢的活跃传输继续按窗口采样，
+不会因此增加周期性明细输出。
+`no_progress` 只表示本观测点没有新的正文读取或 H2 发送进展；客户端仍可能持续接收
+HTTP 缓冲中已有的数据，不能将这一原因直接解释为客户端停止接收。
+
+| 服务环境变量 | 默认值 | 含义 |
+|---|---:|---|
+| `ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS` | `10` | 观察窗口/持续等待阈值，1–86400 秒 |
+| `ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND` | `65536` | Ingress/Relay 低吞吐阈值；0 关闭低吞吐判定，仍检查无进展/持续等待 |
+| `ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE` | `60` | 每个服务实例每 60 秒窗口的详细日志捕获预算；0 关闭详细日志 |
+
+普通传输只更新固定大小的内存计数，不生成逐块事件或新增 Span。
+每笔慢传输至多输出 `slow_transfer_started` 和 `slow_transfer_finished` 两条
+`adx_transfer` 结构化摘要；预算共享，超出后只累计抑制计数。
+摘要包含 request/trace/span ID、方向、字节、最后进度间隔、请求体/响应体读取等待、
+H2 容量等待，以及前端连接级写入等待。
+连接级写等待可能包含同连接其他请求；不将其标记为单请求等待。
+各等待可能重叠，不能相加作为传输总耗时。
+
+就绪且未发生等待的 I/O 不读取等待计时器，也不执行等待状态的原子交换；正文计数复用
+同一次时钟读取。到期调度每批最多处理 128 项，仍有到期项时让出执行线程后继续。
+慢摘要在生命周期锁内冻结数据，锁外提交到每个 monitor 的 64 条有界队列；专用日志线程
+在首次输出时创建，负责实际日志写入。队列满或线程不可用同样累计抑制计数，业务完成
+不等待日志 sink。异步摘要可能在进程退出时丢失；排查时以捕获的 elapsed/window 字段
+对齐时间，输出时刻可能晚于事件发生时刻。同一传输的检测和结束摘要可能跨线程提交，
+实际输出顺序不保证先检测后结束。预算按捕获/提交尝试时刻计算，积压恢复后可能集中输出；
+该日志预算不限制已采样 Span 的属性数量，Trace 导出由其自身配置与有界队列控制。
+
+H2 明细只附加到慢传输摘要和慢文件请求的既有 Span；普通请求不输出这些字段。
+Ingress 测量上传方向的 H2 发送容量等待，Relay 测量下载方向的 H2 发送容量等待。
+
+| 慢摘要字段（Span 加 `transfer.` 前缀） | 统计范围 |
+|---|---|
+| `h2_capacity_wait_ms` / `h2_capacity_wait_count` | 累计容量等待毫秒/阻塞段次数，包含尚未结束的等待；重复 poll 同一阻塞段不增加次数 |
+| `h2_capacity_wait_ratio` | 累计等待时间 / 本次传输已耗时，0–1 |
+| `window_ms` / `window_end_ms` | 最近采样窗口的实际长度/结束时距本次传输开始的时间，毫秒；结束摘要可包含不足完整窗口的尾段 |
+| `h2_window_wait_ms` / `h2_window_wait_count` / `h2_window_wait_ratio` | 窗口内等待时间/窗口内新开始的阻塞段数/等待时间占窗口比例，0–1 |
+| `h2_enqueued_bytes` / `h2_window_enqueued_bytes` | 累计/窗口内交给 H2 队列的编码字节 |
+| `h2_tunnel_id` / `h2_stream_id` | Ingress 与 Relay 共享的 CONNECT 标识/H2 stream ID，用于结合时间窗关联 |
+
+累计和窗口等待时间包含跨窗口阻塞段在本窗口内的部分，因此窗口次数为 0 仍可能有
+等待时间。各计数是在线采样值，比例限制在 0–1。Ingress 从每次 HTTP 连接借用起计，
+归还连接时截断，复用连接不会继承上一请求的等待；Relay 从 CONNECT 建立起计。
+`window_request_bytes`、`window_response_bytes` 记录窗口正文进度，`slow_reason` 保留
+首次触发原因（Span 同样使用 `transfer.` 前缀）。
+
+`h2_enqueued_bytes` 不表示对端已收到；Ingress 上传 H2 等待为 0，也不能排除
+Relay 下载方向容量不足。Relay 的 request ID 指创建 CONNECT 的请求，复用后的
+业务请求需用 `h2_tunnel_id`、Ingress Trace 与时间窗关联，stream ID 不能跨物理连接单独定位。
+Relay TCP 字节包含 HTTP 编码，Ingress body 字节不包含编码，两个计数不能直接相减。
+只有慢摘要会写详细关联信息，慢摘要不依赖 Trace 采样，因此未采样 Trace 也能检索请求 ID。
+这些等待能说明发送容量受限，单靠它们不能区分 H2 连接窗口、流窗口和下游处理能力，
+仍需结合客户端接收进度和前端连接写等待定界。
+
+`/metrics` 暴露 `data_plane_{ingress,relay}_transfers_in_flight`、
+`slow_transfers_total`、`transfer_diagnostics_suppressed_total` 和
+`transfer_slow_checks_total`（均带同一组件前缀）。这些指标无请求或连接 ID 标签。
+原有 HTTP 请求指标的响应头边界保持不变，完整文件传输的活动数量使用新指标。
+
+### HTTP/1 正文 EOF 与协议结束
+
+正文数据已收齐但请求仍不结束时，还需要检查 chunked 响应的 `0\r\n\r\n` 结束块。
+Hyper 1.11.0 的 HTTP/1 写入重检路径可能将结束块留在用户态缓冲区而没有刷新，
+使客户端等待协议结束；服务端正文 EOF 和在途数归零不足以排除此问题。
+Gateway 的 Hyper 最低版本为 1.11.1，锁文件包含
+[上游刷新修复](https://github.com/hyperium/hyper/pull/4143)。
+`gateway/tests/http1_streaming_eof.rs` 控制正文 EOF 出现在写入重检时，验证客户端
+在发送下一笔 keep-alive 请求前已经收到完整结束块，避免依赖后续请求触发刷新。
+
+这一故障形态与“正文只收到部分且持续低吞吐”需要分别取证；后者仍需结合客户端
+已收字节、Ingress 正文进度、前端写等待和 Relay H2 等待逐段分析。

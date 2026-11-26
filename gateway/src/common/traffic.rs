@@ -81,6 +81,7 @@ pub(crate) struct MeteredIo<T> {
     registration: Registration,
     read: u64,
     written: u64,
+    connection: Option<Arc<super::transfer::ConnectionProgress>>,
 }
 impl<T> MeteredIo<T> {
     pub fn new(inner: T, meter: &Arc<TrafficMeter>) -> Self {
@@ -89,11 +90,29 @@ impl<T> MeteredIo<T> {
             registration: meter.register(ByteCounters::default()),
             read: 0,
             written: 0,
+            connection: None,
         }
     }
+    pub fn with_connection(
+        inner: T,
+        meter: &Arc<TrafficMeter>,
+        connection: Arc<super::transfer::ConnectionProgress>,
+    ) -> Self {
+        let mut io = Self::new(inner, meter);
+        io.connection = Some(connection);
+        io
+    }
     fn written(&mut self, result: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
+        if let Some(connection) = &self.connection {
+            connection
+                .write_wait
+                .observe(result.is_pending(), || connection.now_ms());
+        }
         if let Poll::Ready(Ok(n)) = result {
             self.written = self.written.saturating_add(n as u64);
+            if let Some(connection) = &self.connection {
+                connection.written.store(self.written, Ordering::Relaxed);
+            }
             // One writer owns this direction. A relaxed store avoids a global
             // or per-connection read-modify-write on the forwarding path.
             self.registration

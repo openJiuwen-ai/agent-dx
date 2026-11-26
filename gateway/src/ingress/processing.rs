@@ -113,19 +113,31 @@ impl ProcessingDeadline {
 /// Wrap only at the forwarding boundary, preserving the original Incoming body
 /// for requests that have not yet passed route and authorization admission.
 pub(super) fn forwarding_request(
-    request: http::Request<Incoming>,
+    mut request: http::Request<Incoming>,
 ) -> http::Request<super::server::ProxyBody> {
-    let processing = request.extensions().get::<ProcessingDeadline>().cloned();
+    // Admission has consumed these process-local extensions. Keep telemetry
+    // ownership on the forwarding body rather than the backend request head.
+    request
+        .extensions_mut()
+        .remove::<Arc<crate::common::transfer::ConnectionProgress>>();
+    let processing = request.extensions_mut().remove::<ProcessingDeadline>();
+    let transfer = request
+        .extensions_mut()
+        .remove::<Arc<crate::common::transfer::TransferProgress>>();
     request.map(|body| {
-        body.map_frame(move |frame| {
-            if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) {
-                if let Some(processing) = &processing {
-                    processing.upload_progress();
+        let body = body
+            .map_frame(move |frame| {
+                if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                    if let Some(processing) = &processing {
+                        processing.upload_progress();
+                    }
                 }
-            }
-            frame
-        })
-        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
-        .boxed_unsync()
+                frame
+            })
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) });
+        match transfer {
+            Some(transfer) => super::transfer::RequestBody::new(body, transfer).boxed_unsync(),
+            None => body.boxed_unsync(),
+        }
     })
 }

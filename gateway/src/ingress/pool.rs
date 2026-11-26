@@ -150,6 +150,16 @@ impl H2ConnectionPool {
         target: &ConnectTarget,
         passive: bool,
     ) -> io::Result<(h2::SendStream<Bytes>, h2::RecvStream, PoolStreamGuard)> {
+        self.connect_observed(node, target, passive, None).await
+    }
+
+    pub(super) async fn connect_observed(
+        &self,
+        node: &str,
+        target: &ConnectTarget,
+        passive: bool,
+        tunnel_id: Option<&str>,
+    ) -> io::Result<(h2::SendStream<Bytes>, h2::RecvStream, PoolStreamGuard)> {
         let mut last_error = None;
         for _ in 0..2 {
             let (sender, pool) = self.sender_for(node).await?;
@@ -176,6 +186,9 @@ impl H2ConnectionPool {
                 .header(H_TARGET_IP, target.target_ip.to_string())
                 .header(H_TARGET_PORT, target.target_port.to_string())
                 .header(H_REQUEST_ID, &target.request_id);
+            if let Some(tunnel_id) = tunnel_id {
+                request = request.header(crate::common::protocol::H_TUNNEL_ID, tunnel_id);
+            }
             if passive {
                 request = request.header(
                     crate::common::protocol::H_ACTIVITY_CLASS,

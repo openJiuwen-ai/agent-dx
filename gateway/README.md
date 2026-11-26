@@ -1128,3 +1128,46 @@ assert this opt-in. See the [configuration and limits](../docs/deployment/e2b-co
 Credential-enabled HTTP must be explicitly selected on trusted interfaces. Authentication and tenant checks remain active. It does not enable E2B HTTP unless the E2B HTTP option is also enabled. The default plaintext listener continues rejecting credentials. HTTPS listeners cannot set `allow_http_credentials`.
 
 Route filters run before dispatch. `method` is an optional HTTP method; `path` uses existing `exact:` or segment-bounded `prefix:` syntax. Missing `allowed_routes` retains all routes; an empty list denies every route. These restrictions apply to that public listener only, including health endpoints. They do not configure host firewall or network reachability.
+
+### Native file transfer tracing
+
+Ingress keeps native `/direct/{environment}/upload` and `/direct/{environment}/download`
+HTTP spans open through response-body completion, error or cancellation. Header latency is
+recorded separately as `transfer.headers_ms`; body byte counts and `transfer.outcome` describe
+the server-side transfer boundary. Socket acceptance does not confirm client receipt.
+
+Slow transfers use one cancellable deadline entry per active transfer and a shared scheduler,
+with no periodic scan of all requests. Normal completion removes the entry immediately.
+Detailed diagnostics are emitted only for slow transfers, at most once on detection and once
+on completion, with a shared per-instance output budget. Configure
+`ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS` (10),
+`ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND` (65536), and
+`ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE` (60).
+Continuous low throughput is detected while bytes keep advancing. Relay also detects
+repeated short H2 capacity waits when they occupy at least half the observation window
+and H2 enqueue throughput is below the threshold. Idle CONNECT transports remain quiet.
+Slow summaries and slow native file spans include cumulative/window H2 wait time,
+blocking-episode count and wait ratio. Ingress upload counters start at each HTTP lease
+and stop when it is returned; shared tunnel identifiers associate them with Relay data.
+Normal requests do not export these H2 details. Ready I/O without a preceding wait
+skips wait timing and atomic state changes; body progress shares one clock reading.
+The scheduler processes at most 128 due entries before yielding to other tasks.
+Slow summaries capture counters under the lifecycle lock, then enter a bounded
+64-record queue with a lazy dedicated log thread per monitor. Full queues and
+unavailable log workers increment the existing suppression counter; request
+completion never waits for the log sink. Queued summaries may be lost at process exit.
+The log budget applies to capture/submission attempts. Backlogs can write in a burst,
+and detection/completion records can arrive out of order; use the captured elapsed/window
+fields for correlation. Detailed span attributes follow the independent trace export policy.
+Active slow transfers keep sampling
+windows without generating additional periodic diagnostic records.
+See [file transfer diagnostics](../docs/testing/distributed-traces.md#文件传输-trace-与慢传输诊断)
+for counter boundaries, cancellation, CONNECT reuse and output limits.
+
+Streaming HTTP/1 responses require Hyper 1.11.1 or newer. Earlier affected versions
+can leave the chunked response terminator buffered after the body reaches EOF,
+so a client receives the payload but continues waiting for message completion.
+The minimum dependency and lockfile include the upstream
+[write-recheck flush fix](https://github.com/hyperium/hyper/pull/4143).
+The HTTP/1 streaming regression checks that the terminator reaches a raw client
+before it sends the next request on the same connection.

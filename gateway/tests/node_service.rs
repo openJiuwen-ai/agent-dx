@@ -15,6 +15,7 @@ async fn shared_node_service_requires_sync_and_closes_owned_listeners() {
         .tempdir_in("/tmp")
         .unwrap();
     let config = RelayConfig {
+        transfer_observation: Default::default(),
         bind: "127.0.0.1:0".parse().unwrap(),
         advertise_address: String::new(),
         health_bind: "127.0.0.1:0".parse().unwrap(),

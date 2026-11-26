@@ -199,6 +199,10 @@ impl Trace {
     pub fn integer_attribute(&self, key: &'static str, value: i64) {
         self.context.span().set_attribute(KeyValue::new(key, value));
     }
+    /// Record a numeric measurement without converting it to text.
+    pub fn double_attribute(&self, key: &'static str, value: f64) {
+        self.context.span().set_attribute(KeyValue::new(key, value));
+    }
     pub fn boolean_attribute(&self, key: &'static str, value: bool) {
         self.context.span().set_attribute(KeyValue::new(key, value));
     }
