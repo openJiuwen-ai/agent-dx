@@ -710,6 +710,8 @@ struct ReadEngineTestHooks {
     pub(super) peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
     pub(super) prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
     pub(super) after_prefetch_resident_check: Mutex<Option<AfterPrefetchResidentCheck>>,
+    /// Holder RPCs started: (when, the holder deadline they ran under).
+    pub(super) holder_attempts: Arc<Mutex<Vec<(Instant, Instant)>>>,
 }
 
 #[cfg(test)]
@@ -901,7 +903,10 @@ impl DfsReadEngine {
             read_authority: self.read_authority.clone(),
             readers: Mutex::new(BoundedLru::new(0)),
             #[cfg(test)]
-            test_hooks: ReadEngineTestHooks::default(),
+            test_hooks: ReadEngineTestHooks {
+                holder_attempts: self.test_hooks.holder_attempts.clone(),
+                ..Default::default()
+            },
             source_cache: self.source_cache.clone(),
             fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
@@ -1034,6 +1039,12 @@ impl DfsReadEngine {
         }
         Ok(())
     }
+    /// Tests: holder RPCs started, with the holder deadline of each.
+    #[cfg(test)]
+    pub(crate) fn holder_attempt_log(&self) -> Vec<(Instant, Instant)> {
+        self.test_hooks.holder_attempts.lock().unwrap().clone()
+    }
+
     pub fn has_external_backend(&self) -> bool {
         self.external_backend.is_some()
     }

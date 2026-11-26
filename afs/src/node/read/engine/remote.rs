@@ -62,6 +62,28 @@ const HOLDER_READ_SHARE: u32 = 2;
 
 tokio::task_local! {
     static FETCHED: Fetched;
+    /// The holder deadline of the logical read this task serves (!318 round
+    /// 3 item 1): fixed once, before the read is split into parts.
+    static LOGICAL_HOLDER_DEADLINE: Instant;
+}
+
+/// Runs one logical read (all its parts, groups, parallel children and
+/// retries) under one holder deadline: its start plus 1/[`HOLDER_READ_SHARE`]
+/// of the time left until `deadline`. Nested calls keep the outer deadline.
+pub(super) async fn for_logical_read<T>(
+    deadline: Instant,
+    read: impl std::future::Future<Output = T>,
+) -> T {
+    if LOGICAL_HOLDER_DEADLINE.try_with(|_| ()).is_ok() {
+        return read.await;
+    }
+    let now = Instant::now();
+    LOGICAL_HOLDER_DEADLINE
+        .scope(
+            now + deadline.saturating_duration_since(now) / HOLDER_READ_SHARE,
+            read,
+        )
+        .await
 }
 
 /// Runs `read` with a scope that keeps the in-flight marks of the Chunks it
@@ -86,8 +108,14 @@ pub(super) async fn keeping_fetched<T>(
     read: impl std::future::Future<Output = T>,
 ) -> T {
     let now = Instant::now();
-    let holder_deadline =
-        deadline.map(|deadline| now + deadline.saturating_duration_since(now) / HOLDER_READ_SHARE);
+    // The logical read's, when one is set: parts of one read share it.
+    let holder_deadline = LOGICAL_HOLDER_DEADLINE
+        .try_with(|limit| *limit)
+        .ok()
+        .or_else(|| {
+            deadline
+                .map(|deadline| now + deadline.saturating_duration_since(now) / HOLDER_READ_SHARE)
+        });
     FETCHED
         .scope(
             Fetched {
@@ -106,6 +134,7 @@ fn holder_deadline() -> Option<Instant> {
         .try_with(|fetched| fetched.holder_deadline)
         .ok()
         .flatten()
+        .or_else(|| LOGICAL_HOLDER_DEADLINE.try_with(|limit| *limit).ok())
 }
 
 /// The deadline of one attempt: the read's, and for a holder also the
@@ -355,6 +384,14 @@ impl DfsReadEngine {
             .operations
             .iter()
             .all(|item| item.source.holder_grant.is_some());
+        #[cfg(test)]
+        if holder {
+            self.test_hooks
+                .holder_attempts
+                .lock()
+                .unwrap()
+                .push((Instant::now(), attempt_deadline(round.deadline, true)));
+        }
         let result = self
             .try_peer_before(
                 attempt_deadline(round.deadline, holder),

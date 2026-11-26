@@ -1658,6 +1658,10 @@ struct ReviewMeta {
     reply: crate::dfs::DfsChunkSourcesReply,
     holder: crate::dfs::VersionHolder,
     holder_delay_ms: u64,
+    /// Each lookup names another holder Node (same endpoint), so a holder
+    /// demoted by one part is not the one the next part gets.
+    rotate_holders: bool,
+    holder_lookups: AtomicUsize,
 }
 
 impl crate::node::read::engine::ReadSourceProvider for ReviewMeta {
@@ -1678,7 +1682,13 @@ impl crate::node::read::engine::ReadSourceProvider for ReviewMeta {
     ) -> crate::node::read::admission::ReadFuture<'_, Vec<crate::dfs::VersionHolder>> {
         Box::pin(async move {
             tokio::time::sleep(std::time::Duration::from_millis(self.holder_delay_ms)).await;
-            Ok(vec![self.holder.clone()])
+            let n = self.holder_lookups.fetch_add(1, Ordering::SeqCst);
+            let mut holder = self.holder.clone();
+            if self.rotate_holders {
+                holder.node_id = format!("holder-{n}");
+                holder.grant.holder_node_id = holder.node_id.clone();
+            }
+            Ok(vec![holder])
         })
     }
 }
@@ -1766,11 +1776,46 @@ struct ReviewReader {
     _servers: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Reader options of the !318 round 3 tests.
+#[derive(Clone, Copy)]
+struct ReaderShape {
+    max_ops_per_batch: Option<usize>,
+    holder_ttl: std::time::Duration,
+    rotate_holders: bool,
+}
+
+impl Default for ReaderShape {
+    fn default() -> Self {
+        Self {
+            max_ops_per_batch: None,
+            holder_ttl: std::time::Duration::from_secs(60),
+            rotate_holders: false,
+        }
+    }
+}
+
 async fn review_reader(
     temp: &std::path::Path,
     chunks: &[StagedChunk],
     holder: &str,
     holder_delay_ms: u64,
+) -> ReviewReader {
+    review_reader_shaped(
+        temp,
+        chunks,
+        holder,
+        holder_delay_ms,
+        ReaderShape::default(),
+    )
+    .await
+}
+
+async fn review_reader_shaped(
+    temp: &std::path::Path,
+    chunks: &[StagedChunk],
+    holder: &str,
+    holder_delay_ms: u64,
+    shape: ReaderShape,
 ) -> ReviewReader {
     use crate::node::read::engine::{DfsReadConfig, DfsReadEngine};
     let writer_local = Arc::new(LocalChunkStore::open(temp.join("writer"), "writer").unwrap());
@@ -1827,6 +1872,8 @@ async fn review_reader(
             grant: grant("v", "l"),
         },
         holder_delay_ms,
+        rotate_holders: shape.rotate_holders,
+        holder_lookups: AtomicUsize::new(0),
     });
     let metrics = afs_metrics::Registry::new();
     let work = crate::node::metrics::work::ReadWorkMetrics::register(&metrics).unwrap();
@@ -1854,7 +1901,12 @@ async fn review_reader(
             local,
             meta,
             transfer,
-            DfsReadConfig::default(),
+            DfsReadConfig {
+                max_ops_per_batch: shape
+                    .max_ops_per_batch
+                    .unwrap_or(DfsReadConfig::default().max_ops_per_batch),
+                ..DfsReadConfig::default()
+            },
         )
         .with_read_authority(Arc::new(
             crate::node::read::engine::LocalReadAuthority::new(
@@ -1862,7 +1914,7 @@ async fn review_reader(
                 std::time::Instant::now() + std::time::Duration::from_secs(60),
             ),
         ))
-        .with_holder_lists(std::time::Duration::from_secs(60)),
+        .with_holder_lists(shape.holder_ttl),
     );
     ReviewReader {
         engine,
@@ -2169,5 +2221,77 @@ async fn h2_round2_silent_holder_leaves_a_multi_chunk_read_its_copies() {
     assert!(
         holder_time <= budget.as_secs_f64() * 0.6,
         "holder attempts took {holder_time:.3} s of a {budget:?} read"
+    );
+}
+
+/// !318 round 3 item 1: one logical read of four CRC Chunks split into four
+/// parts (one operation per batch). Holders change between parts (a 50 ms
+/// holder list TTL, a new holder identity per lookup, all silent), so a
+/// demotion cannot hide the problem. Every part's holder RPCs run under the
+/// one holder deadline the logical read fixed, none starts after it, and
+/// every Chunk comes back from its durable copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_round3_parts_of_one_read_share_its_holder_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let chunks: Vec<StagedChunk> = (20..24).map(review_chunk).collect();
+    let (holder, _silent) = silent_holder().await;
+    let reader = review_reader_shaped(
+        temp.path(),
+        &chunks,
+        &holder,
+        0,
+        ReaderShape {
+            max_ops_per_batch: Some(1),
+            holder_ttl: std::time::Duration::from_millis(50),
+            rotate_holders: true,
+        },
+    )
+    .await;
+    let mut ops = Vec::new();
+    let mut expected = Vec::new();
+    for staged in &chunks {
+        ops.push(crate::node::read::engine::ChunkReadOp {
+            chunk_id: staged.chunk.id.clone(),
+            chunk_offset: 0,
+            length: staged.chunk.length,
+            output_offset: expected.len(),
+        });
+        expected.extend_from_slice(staged.bytes());
+    }
+    let batch = crate::node::read::engine::ReadBatch {
+        file_version_id: Some(FileVersionId::new("v")),
+        layout_root_id: LayoutRootId::new("l"),
+        ops,
+        lookahead: Vec::new(),
+    };
+    let budget = std::time::Duration::from_millis(800);
+    let read = reader
+        .engine
+        .read_native_unified_async(
+            batch,
+            expected.len(),
+            std::time::Instant::now() + budget,
+            Arc::new(()),
+        )
+        .await;
+    assert_eq!(
+        read.expect("every Chunk from its durable copy").to_vec(),
+        expected
+    );
+    assert_eq!(reader.writer.reads(), 4);
+    let attempts = reader.engine.holder_attempt_log();
+    assert!(!attempts.is_empty(), "no holder was asked");
+    let deadlines: std::collections::BTreeSet<_> = attempts.iter().map(|(_, d)| *d).collect();
+    assert_eq!(
+        deadlines.len(),
+        1,
+        "parts ran under {} holder deadlines",
+        deadlines.len()
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|(started, deadline)| started < deadline),
+        "a holder RPC started after the read's holder deadline"
     );
 }

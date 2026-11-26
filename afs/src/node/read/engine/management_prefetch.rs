@@ -178,7 +178,12 @@ impl DfsReadEngine {
         let mut body = vec![0; length];
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            route.read_remote(&batch, &sources, &mut body, true, Some(deadline)),
+            // A management prefetch is one logical read: its holder
+            // attempts share one deadline too (!318 round 3 item 1).
+            super::remote::for_logical_read(
+                deadline,
+                route.read_remote(&batch, &sources, &mut body, true, Some(deadline)),
+            ),
         )
         .await
         .map_err(|_| unavailable("DFS prefetch Chunk fetch expired"))??;
