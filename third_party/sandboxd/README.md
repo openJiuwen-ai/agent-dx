@@ -1,7 +1,7 @@
 # sandboxd protocol
 
 - Repository: https://github.com/inclusionAI/sandboxd
-- Pinned head: `03ea0a4db807c1d5dac4b11d02f2ec238083a8ae`
+- Pinned revision: `63c324c96427d14827c0b68d0e6b2b964cf76885` ([upstream PR #123](https://github.com/inclusionAI/sandboxd/pull/123))
 - ADX builds this revision without downstream source patches. Rootfs defaults,
   bootstrap mounts and managed-file paths are adapted by the control plane to
   the published sandboxd protocol.
@@ -14,15 +14,22 @@ and physical-ID Delete, including instances that appear after an empty scan. Adx
 Build and E2E inputs must use this same revision, rather than an independently
 maintained control-plane copy of the backend API.
 
+On a checkpoint filesystem that supports direct I/O, set
+`checkpoint_direct_io = true` under `[plugin.runtime.runsc]` to bypass the page
+cache for uncompressed runsc checkpoint pages. The default is buffered I/O.
+
 ## CI binary bundle
 
-[`artifacts.json`](artifacts.json) pins OBS bundles for
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, using the same sandboxd
-revision as `source.json`.
-The archive contains sandboxd, sbox, runc, runc-shim, sandbox-logger, redis-cli
-and their backend manifest. It contains no ADX platform or Execd binaries.
+[`artifacts.json`](artifacts.json) pins the published OBS bundles for
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` to the revision in
+[`source.json`](source.json). Each archive contains sandboxd, sbox, runc,
+runc-shim, sandbox-logger, redis-cli and their backend manifest. It contains no
+ADX platform or Execd binaries.
 
-The AMD64 and ARM64 bundles are built with Go 1.25.5 against Ubuntu 20.04 glibc 2.31, with libseccomp 2.5.5 linked statically. Both architectures are loader-tested on glibc 2.31; no backend executable requires a newer GLIBC symbol version. Firecracker uses
+The sandboxd binaries are built with Go 1.25.5 against Ubuntu 20.04 glibc 2.31:
+AMD64 natively, ARM64 by cross-compilation with QEMU loader and smoke checks.
+No executable requires a GLIBC symbol newer than 2.31 or a shared libseccomp.
+The upstream runc 1.5.1 binary ships with its own libseccomp 2.6.0. Firecracker uses
 `mount_setattr` for recursive virtiofs export protection, requiring Linux 5.12
 or a kernel with that feature backported. An available `/dev/kvm` alone does
 not establish host compatibility.

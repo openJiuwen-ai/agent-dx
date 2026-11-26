@@ -1,4 +1,4 @@
-//! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
+//! Adapter for the pinned sandboxd protocol. The RPC task outlives a canceled caller so cleanup
 //! cannot race its client task. Failed starts are terminal; ambiguous outcomes
 //! retain targeted cleanup retries until their backend can be removed.
 use crate::RuntimeDriver;
