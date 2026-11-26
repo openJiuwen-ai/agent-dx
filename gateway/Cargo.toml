@@ -90,6 +90,8 @@ webpki-roots = { version = "1", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 
 [dev-dependencies]
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 rand = "0.10"
 adx-activator = { path = "../agent/activator" }

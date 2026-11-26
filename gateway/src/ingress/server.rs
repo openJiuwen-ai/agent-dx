@@ -43,6 +43,10 @@ use uuid::Uuid;
 type BoxError = Box<dyn Error + Send + Sync>;
 pub(super) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
+#[cfg(all(test, feature = "mock-e2e"))]
+#[path = "server/transfer_tests.rs"]
+mod transfer_tests;
+
 struct DeadlineBody {
     body: ProxyBody,
     timer: Pin<Box<tokio::time::Sleep>>,
@@ -372,6 +376,7 @@ pub struct Ingress {
     command_watch_config: CommandWatchConfig,
     command_watch_metrics: Arc<CommandWatchMetrics>,
     request_metrics: Arc<IngressRequestMetrics>,
+    transfer_monitor: crate::common::transfer::TransferMonitor,
     /// 业务适配器的指标扩展；通用 Ingress 不认识其类型，只负责拼接渲染。
     #[cfg(feature = "agent-api")]
     metrics_extension: Option<Arc<dyn MetricsExtension>>,
@@ -423,6 +428,7 @@ impl Ingress {
             command_watch_config: CommandWatchConfig::default(),
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(IngressRequestMetrics::default()),
+            transfer_monitor: crate::common::transfer::TransferMonitor::default(),
             #[cfg(feature = "agent-api")]
             metrics_extension: None,
         }
@@ -897,6 +903,12 @@ impl Ingress {
         .await
     }
 
+    /// Configure bounded diagnostics for slow native file transfers.
+    pub fn with_transfer_policy(mut self, policy: crate::config::TransferPolicy) -> Self {
+        self.transfer_monitor = crate::common::transfer::TransferMonitor::new(policy);
+        self
+    }
+
     pub async fn serve_listener(
         self: Arc<Self>,
         listener: TcpListener,
@@ -1001,10 +1013,16 @@ impl Ingress {
     ) where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let stream = crate::common::traffic::MeteredIo::new(stream, &self.request_metrics.traffic);
+        let connection = crate::common::transfer::ConnectionProgress::new();
+        let stream = crate::common::traffic::MeteredIo::with_connection(
+            stream,
+            &self.request_metrics.traffic,
+            connection.clone(),
+        );
         let (stream, upgrade_decision) = super::http10_websocket::Http10WebSocketIo::new(stream);
         let gateway = self;
-        let service = service_fn(move |request: Request<Incoming>| {
+        let service = service_fn(move |mut request: Request<Incoming>| {
+            request.extensions_mut().insert(connection.clone());
             let gateway = gateway.clone();
             let options = options.clone();
             let upgrade_decision = upgrade_decision.clone();
@@ -1133,8 +1151,37 @@ impl Ingress {
         } else {
             None
         };
-        trace
-            .run(async {
+        let registration = if matches!(route, "/upload" | "/download") {
+            let connection = request
+                .extensions()
+                .get::<Arc<crate::common::transfer::ConnectionProgress>>()
+                .cloned();
+            let registration = self.transfer_monitor.start(
+                crate::common::transfer::TransferIdentity {
+                    component: "ingress",
+                    direction: if route == "/upload" {
+                        "upload"
+                    } else {
+                        "download"
+                    },
+                    request_id: request_id.chars().take(128).collect(),
+                    trace_id: trace.trace_id().unwrap_or_default(),
+                    span_id: trace.span_id().unwrap_or_default(),
+                },
+                connection,
+            );
+            request
+                .extensions_mut()
+                .insert(registration.progress.clone());
+            Some(registration)
+        } else {
+            None
+        };
+        let file_transfer = registration.is_some();
+        let mut transfer = super::transfer::TransferGuard::new(trace, registration);
+        let response = transfer
+            .trace()
+            .scope_future(async {
                 adx_observability::trace::inject_headers(request.headers_mut());
                 // Embedded lifecycle calls have large futures. Keep them off the
                 // worker stack while the renewable deadline drives polling.
@@ -1181,9 +1228,23 @@ impl Ingress {
                         response.headers_mut().insert("x-trace-id", value);
                     }
                 }
-                Ok(response)
+                Ok::<_, Infallible>(response)
             })
-            .await
+            .await?;
+        if file_transfer {
+            let progress = transfer.progress();
+            progress
+                .headers_ms
+                .store(progress.now_ms(), Ordering::Relaxed);
+            let (parts, body) = response.into_parts();
+            Ok(Response::from_parts(
+                parts,
+                super::transfer::ResponseBody::new(body, transfer).boxed_unsync(),
+            ))
+        } else {
+            transfer.finish("complete");
+            Ok(response)
+        }
     }
 
     async fn handle_http_inner(
@@ -1586,7 +1647,7 @@ impl Ingress {
                      data_plane_ingress_backend_http_reused_total {}\n\
                      data_plane_ingress_backend_http_discarded_total {}\n\
                      data_plane_ingress_backend_http_acquire_timeouts_total {}\n\
-                     {}command_watch_connections {}\n\
+                     {}{}command_watch_connections {}\n\
                      command_watch_subscriptions {}\n\
                      command_watch_environments {}\n\
                      command_watch_reconnects {}\n\
@@ -1608,6 +1669,7 @@ impl Ingress {
                     pool.discarded_total,
                     pool.acquire_timeouts_total,
                     self.request_metrics.prometheus(),
+                    self.transfer_monitor.prometheus("ingress"),
                     self.command_watch_metrics
                         .connections
                         .load(Ordering::Relaxed),

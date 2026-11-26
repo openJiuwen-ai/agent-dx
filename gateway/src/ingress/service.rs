@@ -179,6 +179,7 @@ impl IngressService {
             config.frontend_address.clone(),
             config.control_plane_routes.clone(),
         )
+        .with_transfer_policy(config.transfer_observation.clone())
         .with_port_host_domain(config.port_host_domain.clone())
         .with_e2b_enabled(config.e2b_enabled)
         .with_e2b_allow_http(config.e2b_allow_http)
@@ -436,6 +437,7 @@ mod tests {
         let certificate = fixture.join("ingress-cert.pem");
         let private_key = fixture.join("ingress-key.pem");
         let config = IngressConfig {
+            transfer_observation: Default::default(),
             etcd_endpoints: Vec::new(),
             listeners: None,
             tls_bind: "127.0.0.1:0".parse().unwrap(),

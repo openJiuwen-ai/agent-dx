@@ -1666,6 +1666,8 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "mime_guess",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "percent-encoding",
  "prost 0.13.5",
  "protoc-bin-vendored",

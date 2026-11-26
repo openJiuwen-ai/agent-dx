@@ -54,6 +54,7 @@ impl RelayService {
         let tracker = Arc::new(ActivityTracker::new(config.gateway_epoch.clone()));
         let gateway = Arc::new(
             Relay::new(GatewayPolicy::new(config.allowed_target_networks.clone()))
+                .with_transfer_policy(config.transfer_observation.clone())
                 .with_max_active_streams(config.max_streams)
                 .with_activity_tracker(tracker.clone())
                 .with_route_enforcement(),

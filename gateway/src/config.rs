@@ -1,3 +1,4 @@
+pub use crate::common::transfer::TransferPolicy;
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -50,6 +51,7 @@ pub struct IngressConfig {
     pub backend_http_idle_timeout: Duration,
     pub backend_http_acquire_timeout: Duration,
     pub drain_timeout: Duration,
+    pub transfer_observation: TransferPolicy,
     pub allowed_client_networks: Vec<ipnet::IpNet>,
     pub allow_any_client: bool,
     pub command_watch_max_subscriptions: usize,
@@ -93,6 +95,7 @@ pub struct RelayConfig {
     pub activity_interval: Duration,
     pub gateway_epoch: String,
     pub drain_timeout: Duration,
+    pub transfer_observation: TransferPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +164,7 @@ impl RelayConfig {
         let drain_timeout =
             Duration::from_secs(parse_env("ADX_DATA_PLANE_RELAY_DRAIN_TIMEOUT_SEC", "30")?);
         Ok(Self {
+            transfer_observation: transfer_policy()?,
             bind,
             advertise_address,
             health_bind,
@@ -415,6 +419,7 @@ impl IngressConfig {
             ));
         }
         Ok(Self {
+            transfer_observation: transfer_policy()?,
             etcd_endpoints,
             listeners,
             tls_bind,
@@ -694,6 +699,23 @@ fn fd_based_stream_budget() -> Result<usize, ConfigError> {
         )));
     }
     Ok(budget)
+}
+
+fn transfer_policy() -> Result<TransferPolicy, ConfigError> {
+    let seconds: u64 = parse_env("ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS", "10")?;
+    if !(1..=86400).contains(&seconds) {
+        return Err(ConfigError::Invalid(
+            "ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS must be 1 through 86400".into(),
+        ));
+    }
+    Ok(TransferPolicy {
+        slow_after: Duration::from_secs(seconds),
+        min_bytes_per_second: parse_env(
+            "ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND",
+            "65536",
+        )?,
+        logs_per_minute: parse_env("ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE", "60")?,
+    })
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use super::activity::ActivityTracker;
-use super::relay::{relay_h2_tcp_with_stats, RelayStats};
+use super::relay::{relay_h2_tcp_observed, RelayStats};
 use crate::common::protocol::{ConnectTarget, GatewayPolicy, ProtocolError};
 use bytes::Bytes;
 use h2::server::SendResponse;
@@ -36,6 +36,7 @@ pub struct Relay {
     draining: Arc<std::sync::atomic::AtomicBool>,
     drain_notify: Arc<Notify>,
     metrics: Arc<NodeMetrics>,
+    transfer_monitor: crate::common::transfer::TransferMonitor,
 }
 
 #[derive(Default)]
@@ -145,7 +146,17 @@ impl Relay {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_notify: Arc::new(Notify::new()),
             metrics: Arc::new(NodeMetrics::default()),
+            transfer_monitor: crate::common::transfer::TransferMonitor::default(),
         }
+    }
+
+    /// Configure bounded diagnostics for blocked CONNECT forwarding.
+    pub fn with_transfer_policy(mut self, policy: crate::config::TransferPolicy) -> Self {
+        self.transfer_monitor = crate::common::transfer::TransferMonitor::new(policy);
+        self
+    }
+    pub(crate) fn transfer_metrics(&self) -> String {
+        self.transfer_monitor.prometheus("relay")
     }
 
     pub fn active_streams(&self) -> usize {
@@ -548,8 +559,18 @@ impl Relay {
         let mut route_rx = route_rx;
         let relay_stats = RelayStats::default();
         let _traffic = relay_stats.track(&self.metrics.traffic);
+        let mut transfer = self.transfer_monitor.start(
+            crate::common::transfer::TransferIdentity {
+                component: "relay",
+                direction: "connect",
+                request_id: target.request_id.chars().take(128).collect(),
+                trace_id: trace_id.clone(),
+                span_id: span_id.clone(),
+            },
+            None,
+        );
         let result = tokio::select! {
-            result = relay_h2_tcp_with_stats(request.into_body(), send, tcp, relay_stats.clone()) => Some(result),
+            result = relay_h2_tcp_observed(request.into_body(), send, tcp, relay_stats.clone(), Some(transfer.progress.clone())) => Some(result),
             _ = connection_closed.changed() => None,
             _ = async {
                 if let Some(receiver) = route_rx.as_mut() {
@@ -559,6 +580,11 @@ impl Relay {
                 }
             } => None,
         };
+        transfer.finish(match &result {
+            Some(Ok(())) => "complete",
+            Some(Err(_)) => "relay_error",
+            None => "cancelled",
+        });
         let (bytes_up, bytes_down) = relay_stats.snapshot();
         if let Some(Err(error)) = result {
             tracing::debug!(

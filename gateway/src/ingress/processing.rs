@@ -116,16 +116,25 @@ pub(super) fn forwarding_request(
     request: http::Request<Incoming>,
 ) -> http::Request<super::server::ProxyBody> {
     let processing = request.extensions().get::<ProcessingDeadline>().cloned();
+    let transfer = request
+        .extensions()
+        .get::<Arc<crate::common::transfer::TransferProgress>>()
+        .cloned();
     request.map(|body| {
-        body.map_frame(move |frame| {
-            if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) {
-                if let Some(processing) = &processing {
-                    processing.upload_progress();
+        let body = body
+            .map_frame(move |frame| {
+                if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                    if let Some(processing) = &processing {
+                        processing.upload_progress();
+                    }
                 }
-            }
-            frame
-        })
-        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
-        .boxed_unsync()
+                frame
+            })
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
+            .boxed_unsync();
+        match transfer {
+            Some(transfer) => super::transfer::RequestBody::new(body, transfer).boxed_unsync(),
+            None => body,
+        }
     })
 }

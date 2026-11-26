@@ -49,10 +49,23 @@ where
 /// Relay with counters that remain observable even when the future is
 /// cancelled by an explicit route change or finishes with a stream error.
 pub async fn relay_h2_tcp_with_stats<S>(
+    recv: RecvStream,
+    send: SendStream<Bytes>,
+    tcp: S,
+    stats: RelayStats,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_h2_tcp_observed(recv, send, tcp, stats, None).await
+}
+
+pub(crate) async fn relay_h2_tcp_observed<S>(
     mut recv: RecvStream,
     mut send: SendStream<Bytes>,
     mut tcp: S,
     stats: RelayStats,
+    progress: Option<Arc<crate::common::transfer::TransferProgress>>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -69,7 +82,9 @@ where
                     Some(Ok(data)) => {
                         let n = data.len() as u64;
                         recv.flow_control().release_capacity(data.len()).map_err(|e| io::Error::other(e.to_string()))?;
+                        if let Some(progress) = &progress { progress.request_wait.pending(progress.now_ms()); }
                         tcp.write_all(&data).await?;
+                        if let Some(progress) = &progress { progress.request_wait.ready(progress.now_ms()); progress.progress(true, data.len()); }
                         stats.bytes_up.fetch_add(n, Ordering::Relaxed);
                     }
                     Some(Err(e)) => return Err(io::Error::other(e.to_string())),
@@ -87,16 +102,25 @@ where
                     continue;
                 }
                 stats.bytes_down.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(progress) = &progress { progress.progress(false, n); }
                 let mut data = Bytes::copy_from_slice(&buf[..n]);
                 while !data.is_empty() {
                     send.reserve_capacity(data.len());
-                    let capacity = poll_fn(|cx| send.poll_capacity(cx)).await
+                    let capacity = poll_fn(|cx| {
+                        let result = send.poll_capacity(cx);
+                        if let Some(progress) = &progress {
+                            if result.is_pending() { progress.h2_wait.pending(progress.now_ms()); }
+                            else { progress.h2_wait.ready(progress.now_ms()); }
+                        }
+                        result
+                    }).await
                         .ok_or_else(|| io::Error::other("h2 stream closed"))?
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     if capacity == 0 { continue; }
                     let amount = capacity.min(data.len());
                     let chunk = data.split_to(amount);
                     send.send_data(chunk, false).map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(progress) = &progress { progress.h2_enqueued_bytes.fetch_add(amount as u64, Ordering::Relaxed); }
                 }
             }
         }

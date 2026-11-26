@@ -59,3 +59,5 @@ pub mod agent_service;
 
 #[cfg(feature = "agent-api")]
 pub mod accounts;
+
+mod transfer;

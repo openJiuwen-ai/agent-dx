@@ -67,7 +67,7 @@ async fn health_response(
                     metrics.overload_rejections,
                     metrics.bytes_up,
                     metrics.bytes_down,
-                ),
+                ) + &gateway.transfer_metrics(),
             )
         }
         _ => (StatusCode::NOT_FOUND, "not found".to_owned()),

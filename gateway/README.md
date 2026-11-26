@@ -1119,3 +1119,20 @@ assert this opt-in. See the [configuration and limits](../docs/deployment/e2b-co
 Credential-enabled HTTP must be explicitly selected on trusted interfaces. Authentication and tenant checks remain active. It does not enable E2B HTTP unless the E2B HTTP option is also enabled. The default plaintext listener continues rejecting credentials. HTTPS listeners cannot set `allow_http_credentials`.
 
 Route filters run before dispatch. `method` is an optional HTTP method; `path` uses existing `exact:` or segment-bounded `prefix:` syntax. Missing `allowed_routes` retains all routes; an empty list denies every route. These restrictions apply to that public listener only, including health endpoints. They do not configure host firewall or network reachability.
+
+### Native file transfer tracing
+
+Ingress keeps native `/direct/{environment}/upload` and `/direct/{environment}/download`
+HTTP spans open through response-body completion, error or cancellation. Header latency is
+recorded separately as `transfer.headers_ms`; body byte counts and `transfer.outcome` describe
+the server-side transfer boundary. Socket acceptance does not confirm client receipt.
+
+Slow transfers use one cancellable deadline entry per active transfer and a shared scheduler,
+with no periodic scan of all requests. Normal completion removes the entry immediately.
+Detailed diagnostics are emitted only for slow transfers, at most once on detection and once
+on completion, with a shared per-instance output budget. Configure
+`ADX_DATA_PLANE_SLOW_TRANSFER_SECONDS` (10),
+`ADX_DATA_PLANE_SLOW_TRANSFER_MIN_BYTES_PER_SECOND` (65536), and
+`ADX_DATA_PLANE_SLOW_TRANSFER_LOGS_PER_MINUTE` (60).
+See [file transfer diagnostics](../docs/testing/distributed-traces.md#文件传输-trace-与慢传输诊断)
+for counter boundaries, cancellation, CONNECT reuse and output limits.
