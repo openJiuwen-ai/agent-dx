@@ -425,9 +425,9 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 ### 协议与格式不兼容时的停机替换
 
-AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换（OwnerFs 部署同样适用）：
+AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换。纯 OwnerFs 部署、纯 DFS 部署和同时开两者的混合 Node 都一样：所有 Node 都经同一个 Meta 注册、受同一个注册协议版本约束，所以同一 Meta 下的全部 Node 与 Meta 必须全停后配套换成同一版本：
 
-- **集群线协议**：Node 注册带 `protocol_version`（当前 11，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
+- **集群线协议**：Node 注册带 `protocol_version`（当前 12，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
 - **持久格式**：Meta 数据目录（`CURRENT`、WAL 信封、记录决策、状态 image 等）、Redis／etcd key 布局、Node catalog、外部对象 key 前缀，版本不符一律 `STORAGE_FORMAT_INCOMPATIBLE`，不迁移、不自动删除（[规则](../architecture/afs.md#持久格式与协议版本规则)）。
 
 步骤：
@@ -443,8 +443,23 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 #### 协议 11→12（DFS 版本持有者）
 
 协议 12 只改线协议：共享读者登记带共享标志、Meta 新增 `GetVersionHolders`／`ValidateHolderGrant`、`ReadRanges`
-带持有者形态，Meta 与 Node 的持久格式不变。按上文步骤整集群停机替换，Meta 数据目录与 Node 存储根原样沿用；
-回滚到协议 11 时换回旧二进制即可。共享默认关闭（`dfs_read_share_concurrent = false`）。
+带持有者形态。Meta 与 Node 的持久格式不变。纯 OwnerFs 部署也要换版：它的 Node 同样带注册协议版本，协议 11 的 Node 会被协议 12 的 Meta 拒绝（`META_NODE_PROTOCOL_VERSION`），反之亦然。
+
+升级（11→12）：
+
+1. 按上文第 1、2 步卸载挂载、停应用，先停全部 Node，再停 Meta。
+2. 备份 Meta 数据目录（Redis／etcd 前缀）和各 Node 存储根（建议做，不是必需）。
+3. 换成协议 12 的二进制。**沿用原数据**，不要新建：local-file 用原 `data_dir`，Redis／etcd 用原 `meta_store_prefix`，各 Node 用原存储根（OwnerFs 存储根、DFS chunk 目录与 catalog），DFS 外部 S3 用原桶。这里与上文第 3 步不同。
+4. 用 `--print-config` 检查配置，先启动 Meta，再启动全部 Node。共享默认关闭（`dfs_read_share_concurrent = false`）；要开时再在 Node 配置里加入共享相关的键。
+
+回滚（12→11）：
+
+1. 同样先停全部 Node，再停 Meta。
+2. 换回协议 11 的二进制，数据目录、前缀、存储根和桶都沿用（协议 12 没有写入新格式）。
+3. **恢复协议 11 的配置**：从 Node 配置中删掉 `dfs_read_share_concurrent`、`dfs_holder_ttl_ms`、`dfs_holder_wait_ms`。协议 11 的二进制不认识这些键，配置解析拒绝未知键，Node 会启动失败；即使值是默认值也要删掉。
+4. 先启动 Meta，再启动全部 Node。
+
+11→12 与 10→11 是两次独立的升级：10→11 改了持久格式，要新建 Meta 数据目录；11→12 沿用目录。从 10 升到 12 时，先按下一节完成 10→11，确认协议 11 集群正常后，再按本节升到 12；不要把两次的第 3 步合并。
 
 #### 协议 10→11（workspace 删除 tombstone）
 
@@ -966,7 +981,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 11，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 12，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node
