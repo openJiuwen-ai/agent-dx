@@ -1,5 +1,7 @@
 //! Real Redis and gRPC; runtime memory and object storage are controlled fixtures.
 mod common;
+#[path = "on_demand/managed_migration.rs"]
+mod managed_migration;
 #[path = "common/mounts.rs"]
 mod mounts;
 #[path = "support/recovery_profile.rs"]
@@ -82,6 +84,7 @@ struct Backend {
     running: Mutex<BTreeMap<String, adxlet::RuntimeObservation>>,
     restored: AtomicUsize,
     inventory_hold_ms: AtomicUsize,
+    migration_busy: AtomicBool,
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     checkpoint_entered: tokio::sync::Notify,
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -200,7 +203,7 @@ impl RuntimeDriver for Backend {
 #[async_trait]
 impl Readiness for Backend {
     async fn activity(&self, _: &EnvironmentRecord) -> Result<(u64, u64)> {
-        Ok((1, 0))
+        Ok((1, u64::from(self.migration_busy.load(Ordering::SeqCst))))
     }
     async fn wait_ready(&self, _: &EnvironmentRecord) -> Result<()> {
         Ok(())
@@ -232,13 +235,11 @@ impl Routes for Backend {
         }
         let relay = self.relay.lock().unwrap().clone();
         if let Some(relay) = relay {
-            relay
-                .activate_route(
-                    record.spec.id.clone(),
-                    record.runtime.id.clone(),
-                    record.runtime.ip.unwrap(),
-                )
-                .await;
+            relay.activate_route(
+                record.spec.id.clone(),
+                record.runtime.id.clone(),
+                record.runtime.ip.unwrap(),
+            );
         }
         Ok(())
     }
@@ -249,9 +250,7 @@ impl Routes for Backend {
         }
         let relay = self.relay.lock().unwrap().clone();
         if let Some(relay) = relay {
-            relay
-                .retire_route(record.spec.id.clone(), record.runtime.id.clone())
-                .await;
+            relay.retire_route(record.spec.id.clone(), record.runtime.id.clone());
         }
         Ok(())
     }
@@ -786,6 +785,75 @@ async fn drain_abort_settles_an_accepted_resume_before_fencing_the_source() {
     server.abort();
 }
 
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn paused_migration_releases_resume_while_original_node_is_evacuating() {
+    use tokio::time::{interval_at, timeout, Instant};
+
+    let mut rig = Rig::new(Duration::from_secs(4)).await;
+    let paused = rig.session.get("sleep").await.unwrap().result.unwrap();
+    let (address, server, migrate) = prepare_migration(&rig, paused.try_into().unwrap()).await;
+
+    let coordinator = rig.address.clone();
+    let mut resume = tokio::spawn(async move {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(&coordinator, Principal::ApiServer).await,
+        );
+        client
+            .ensure_running(pb::EnsureRunningRequest {
+                run_timeout_seconds: None,
+                expected_runtime_id: String::new(),
+                environment_id: "sleep".into(),
+                caller: caller(),
+                timeout_seconds: 8,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    assert!(timeout(Duration::from_millis(100), &mut resume)
+        .await
+        .is_err());
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+
+    let migration = tokio::spawn(async move { post_upgrade(address, MIGRATE_PATH, migrate).await });
+    let period = Duration::from_secs(60);
+    let next_tick = Instant::now() + period;
+    let mut source_tick = interval_at(next_tick, period);
+    let mut target_tick = interval_at(next_tick, period);
+    timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            rig.source.manager.wait_for_reconciliation(&mut source_tick),
+            rig.target.manager.wait_for_reconciliation(&mut target_tick)
+        )
+    })
+    .await
+    .unwrap();
+    report(&mut rig.target, &rig.address, period).await.unwrap();
+    report(&mut rig.source, &rig.address, period).await.unwrap();
+
+    let moved = timeout(Duration::from_secs(3), migration)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved["node_id"], "b");
+    assert_eq!(moved["state"], "Paused");
+    let resumed = timeout(Duration::from_secs(3), resume)
+        .await
+        .unwrap()
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(resumed.assignment.unwrap().node_id, "b");
+    assert_eq!(resumed.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+
+    let task = upgrade_request(address, "GET", "tasks/planned-migration", String::new()).await;
+    assert_eq!(task["nodes"]["a"]["phase"], "evacuating");
+    server.abort();
+}
+
 async fn prepare_migration(
     rig: &Rig,
     running: pb::EnvironmentRecord,
@@ -861,7 +929,31 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
 
     let mut rig = Rig::new(Duration::from_secs(4)).await;
     let running = rig.resume(false).await.unwrap().record.unwrap();
-    let (address, server, migrate) = prepare_migration(&rig, running).await;
+    let current_revision = running.revision;
+    let (address, server, mut migrate) = prepare_migration(&rig, running).await;
+    let inventory_revision = current_revision.checked_sub(1).unwrap();
+    migrate["expected_source_revision"] = serde_json::json!(inventory_revision);
+    // Without the inventory's ownership generation, an older revision
+    // cannot establish that the publisher inspected the same assignment.
+    let mut unidentified = migrate.clone();
+    unidentified
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_source_generation");
+    assert_eq!(
+        upgrade_response(address, "POST", MIGRATE_PATH, unidentified.to_string())
+            .await
+            .0,
+        409
+    );
+    let mut future = migrate.clone();
+    future["expected_source_revision"] = serde_json::json!(current_revision + 1);
+    assert_eq!(
+        upgrade_response(address, "POST", MIGRATE_PATH, future.to_string())
+            .await
+            .0,
+        409
+    );
     let operation = migrate.clone();
     let mut migration =
         tokio::spawn(async move { post_upgrade(address, MIGRATE_PATH, operation).await });
@@ -888,6 +980,10 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
     .await
     .expect("read requests must finish while migration is still in progress");
     assert_eq!(task["operations"]["migrate"]["phase"], "Assigned");
+    assert_eq!(
+        task["operations"]["migrate"]["source_revision"],
+        inventory_revision
+    );
     assert_eq!(node["node_id"], "a");
 
     report(&mut rig.target, &rig.address, period).await.unwrap();
@@ -905,6 +1001,14 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
         .unwrap();
     assert_eq!(completed["node_id"], "b");
     assert_eq!(completed["state"], "Running");
+    let mut changed = migrate.clone();
+    changed["expected_source_revision"] = serde_json::json!(current_revision);
+    assert_eq!(
+        upgrade_response(address, "POST", MIGRATE_PATH, changed.to_string())
+            .await
+            .0,
+        409
+    );
     assert_eq!(
         post_upgrade(address, MIGRATE_PATH, migrate).await,
         completed

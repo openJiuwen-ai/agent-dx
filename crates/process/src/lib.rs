@@ -4,6 +4,17 @@ use std::{error::Error, path::PathBuf};
 
 pub mod resource;
 
+/// Match launch-time parent identity against caller-supplied kernel observations.
+/// PID 1 is a valid parent; zero, negative and mismatched identities are rejected.
+/// Callers must obtain the current parent and peer PID from kernel credentials.
+pub fn launch_parent_matches(
+    captured_parent: i32,
+    current_parent: i32,
+    peer_pid: Option<i32>,
+) -> bool {
+    captured_parent > 0 && current_parent == captured_parent && peer_pid == Some(captured_parent)
+}
+
 /// Common command-line arguments accepted by ADX service processes.
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(disable_version_flag = true)]
@@ -52,6 +63,23 @@ mod tests {
     use super::*;
     use serde::Deserialize;
 
+    #[test]
+    fn launch_parent_requires_exact_positive_kernel_identities_including_pid_one() {
+        assert!(launch_parent_matches(1, 1, Some(1)));
+        assert!(launch_parent_matches(42, 42, Some(42)));
+        for (captured, current, peer) in [
+            (0, 0, Some(0)),
+            (-1, -1, Some(-1)),
+            (42, 43, Some(42)),
+            (42, 42, Some(43)),
+            (42, 42, None),
+            (42, 1, Some(1)),
+            (42, 1, Some(42)),
+        ] {
+            assert!(!launch_parent_matches(captured, current, peer));
+        }
+    }
+
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct Config {
         name: String,
@@ -91,6 +119,18 @@ mod tests {
             Config {
                 name: "coordinator".into()
             }
+        );
+    }
+
+    #[test]
+    fn missing_configuration_file_preserves_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let missing = read_config_file::<Config>(&path).unwrap_err();
+        assert!(missing.is::<std::io::Error>());
+        assert_eq!(
+            missing.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 }

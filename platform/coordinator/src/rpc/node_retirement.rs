@@ -3,6 +3,9 @@ use super::*;
 
 impl State {
     async fn retire_empty_node(&mut self, id: &str, now: u64, retention: u64) -> Result<bool> {
+        if self.session.process_node_protected(id).await? {
+            return Ok(false);
+        }
         let Some(node) = self.nodes.get(id) else {
             return Ok(false);
         };
@@ -104,6 +107,16 @@ impl CoordinatorRpc {
         let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
+        if state
+            .session
+            .process_node_protected(&r.node_id)
+            .await
+            .map_err(status)?
+        {
+            return Err(Status::failed_precondition(
+                "process maintenance protects node departure",
+            ));
+        }
         if !state.nodes.contains_key(&r.node_id) {
             if state
                 .session

@@ -612,13 +612,12 @@ impl Ingress {
                 "private service requires an approved HTTP policy",
             ));
         }
-        self.open_authorized_stream_with_activity(route, false)
-            .await
+        self.open_unpooled_authorized_stream(route).await
     }
 
     // Called only after the HTTP service policy has authorized this request.
     async fn open_service_http_stream(&self, route: RouteHandle) -> io::Result<IngressStream> {
-        self.open_authorized_stream_with_activity(route, false)
+        self.open_authorized_stream_with_activity(route, false, false)
             .await
     }
 
@@ -626,6 +625,7 @@ impl Ingress {
         &self,
         route: RouteHandle,
         passive: bool,
+        defer_binding_recovery: bool,
     ) -> io::Result<IngressStream> {
         if passive && route.needs_resume {
             return Err(io::Error::new(
@@ -637,6 +637,139 @@ impl Ingress {
             Ok(stream) => return Ok(stream),
             Err(error) => error,
         };
+        if defer_binding_recovery
+            && matches!(
+                error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<super::pool::RelayConnectError>()),
+                Some(super::pool::RelayConnectError::Rejected(
+                    StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+                ))
+            )
+        {
+            return Err(error);
+        }
+        let replacement = self.recover_stream_route(&route, passive, error).await?;
+        self.open_current_stream(replacement, passive).await
+    }
+
+    async fn open_unpooled_authorized_stream(
+        &self,
+        mut route: RouteHandle,
+    ) -> io::Result<IngressStream> {
+        let processing_at = route.processing.as_ref().map(|processing| processing.at);
+        let deadline_for_retry = || {
+            tokio::time::Instant::now()
+                .checked_add(self.connector.connect_timeout())
+                .map(|deadline| processing_at.map_or(deadline, |at| deadline.min(at)))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Relay deadline is out of range",
+                    )
+                })
+        };
+        let mut retry_deadline = None;
+        let mut recovered = false;
+        let timed_out = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Relay connection admission timed out",
+            )
+        };
+        loop {
+            let attempt_deadline = retry_deadline.or(processing_at);
+            if attempt_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(timed_out());
+            }
+            let revision = self.resolver.current_route_revision(&route);
+            let attempt = self.open_current_stream(route.clone(), false);
+            // An ordinary first CONNECT response keeps its original wait
+            // semantics. The shorter window starts only after a confirmed 503.
+            let result = if let Some(deadline) = attempt_deadline {
+                tokio::time::timeout_at(deadline, attempt)
+                    .await
+                    .map_err(|_| timed_out())?
+            } else {
+                attempt.await
+            };
+            let error = match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => error,
+            };
+            if matches!(
+                error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<super::pool::RelayConnectError>()),
+                Some(super::pool::RelayConnectError::Rejected(
+                    StatusCode::SERVICE_UNAVAILABLE
+                ))
+            ) {
+                if !self.ready() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        IngressOpenError::RouteChanged,
+                    ));
+                }
+                if revision.is_some() && self.resolver.current_route_revision(&route) == revision {
+                    let connect_deadline = match retry_deadline {
+                        Some(deadline) => deadline,
+                        None => {
+                            let deadline = deadline_for_retry()?;
+                            retry_deadline = Some(deadline);
+                            deadline
+                        }
+                    };
+                    // No application bytes precede CONNECT acceptance. Retry this
+                    // binding under one budget without manufacturing wake demand.
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + std::time::Duration::from_millis(25))
+                            .min(connect_deadline),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+            if recovered {
+                return Err(error);
+            }
+            // A real lifecycle transition uses the original request budget,
+            // independently of the shorter connection-admission budget.
+            let replacement = self.recover_stream_route(&route, false, error).await?;
+            let replacement = if replacement.needs_resume {
+                // recover_stream_route checked the candidate's authorization
+                // scope before this side-effecting wake. prepare_route also
+                // checks the resulting scope after the lifecycle transition.
+                self.prepare_route(replacement, &route.tenant_id)
+                    .await
+                    .map_err(|error| match error {
+                        IngressOpenError::Resolve(ResolveError::Unavailable(message)) => {
+                            io::Error::new(io::ErrorKind::NotConnected, message)
+                        }
+                        IngressOpenError::Resolve(ResolveError::NotReady) => io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "resume service is not ready",
+                        ),
+                        IngressOpenError::Resolve(error) => io::Error::other(error),
+                        error => io::Error::new(io::ErrorKind::PermissionDenied, error),
+                    })?
+            } else {
+                replacement
+            };
+            if self.resolver.current_route_revision(&replacement) != revision {
+                retry_deadline = None;
+            }
+            route = replacement;
+            recovered = true;
+        }
+    }
+
+    async fn recover_stream_route(
+        &self,
+        route: &RouteHandle,
+        passive: bool,
+        error: io::Error,
+    ) -> io::Result<RouteHandle> {
         if self.draining.load(Ordering::Acquire)
             || !matches!(
                 error.kind(),
@@ -647,9 +780,9 @@ impl Ingress {
         }
         // CONNECT was rejected before any application bytes were sent. Wait
         // only for a replacement binding, then open once against that execution.
-        let replacement = match self.resolver.replacement(&route).await {
+        let replacement = match self.resolver.replacement(route).await {
             Ok(replacement) => replacement,
-            Err(_) if !passive => match self.resolver.wake(&route).await {
+            Err(_) if !passive => match self.resolver.wake(route).await {
                 Ok(route) => route,
                 Err(error @ (ResolveError::Resuming | ResolveError::ResumeRejected(_))) => {
                     return Err(io::Error::other(error));
@@ -678,7 +811,7 @@ impl Ingress {
                 "route authorization changed while opening the stream",
             ));
         }
-        self.open_current_stream(replacement, passive).await
+        Ok(replacement)
     }
 
     #[cfg(feature = "agent-api")]
@@ -2197,7 +2330,15 @@ impl Ingress {
                     {
                         let status = match error {
                             super::environment_files::ReadError::NotFound => StatusCode::NOT_FOUND,
-                            _ => StatusCode::BAD_GATEWAY,
+                            _ => {
+                                tracing::warn!(
+                                    request_id = %route.target.request_id,
+                                    environment_id = %parsed.instance_id,
+                                    error = %error,
+                                    "Execd authorization lookup failed"
+                                );
+                                StatusCode::BAD_GATEWAY
+                            }
                         };
                         return Ok(plain(status, "Environment file access unavailable"));
                     }
@@ -2216,7 +2357,10 @@ impl Ingress {
             }
             // Probe connections stay passive even when Relay rejects a stale
             // binding. Do not pool them with business connections or demand wake.
-            let stream = match self.open_authorized_stream_with_activity(route, true).await {
+            let stream = match self
+                .open_authorized_stream_with_activity(route, true, false)
+                .await
+            {
                 Ok(stream) => stream,
                 Err(error) => {
                     let failure = IngressOpenError::Connect(error);
@@ -2253,6 +2397,23 @@ impl Ingress {
         };
         strip_hop_by_hop_headers(request.headers_mut());
         let mut retried = false;
+        // Relay retries against one binding share a connect budget. A rejected
+        // binding may require a separate, request-bounded lifecycle wait.
+        let connect_timeout = self.connector.connect_timeout();
+        let processing_at = route.processing.as_ref().map(|processing| processing.at);
+        let connect_deadline_for_binding = || {
+            let deadline = tokio::time::Instant::now().checked_add(connect_timeout)?;
+            Some(processing_at.map_or(deadline, |at| deadline.min(at)))
+        };
+        let Some(mut connect_deadline) = connect_deadline_for_binding() else {
+            return Err((
+                plain(
+                    StatusCode::BAD_GATEWAY,
+                    "Relay connection deadline is out of range",
+                ),
+                request,
+            ));
+        };
         loop {
             let Some(route_revision) = self.resolver.current_route_revision(&route) else {
                 return Err((error_response(IngressOpenError::RouteChanged), request));
@@ -2267,11 +2428,18 @@ impl Ingress {
             };
             match self
                 .http_pool
-                .send_recoverable(
+                .send_relay_recoverable(
                     key,
                     request,
-                    || self.open_authorized_stream(route.clone()),
+                    Some(connect_deadline),
+                    || self.open_authorized_stream_with_activity(route.clone(), false, true),
                     || {
+                        if tokio::time::Instant::now() >= connect_deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "Relay connection admission timed out",
+                            ));
+                        }
                         if !self.ready()
                             || self.resolver.current_route_revision(&route) != Some(route_revision)
                         {
@@ -2294,40 +2462,120 @@ impl Ingress {
                     }));
                 }
                 Err((error, Some(unconsumed))) => {
+                    if let Some(processing) = &route.processing {
+                        if processing.remaining().is_zero() {
+                            return Err((
+                                processing_timeout_response(
+                                    processing,
+                                    &route.target.request_id,
+                                    &route.target.instance_id,
+                                ),
+                                unconsumed,
+                            ));
+                        }
+                    }
+                    let error = match error {
+                        BackendHttpPoolError::Connect(error)
+                            if !retried && self.ready() && relay_binding_rejected(&error) =>
+                        {
+                            // CONNECT rejected the old binding before the HTTP
+                            // body was sent. Release the pool permit while waiting
+                            // for the Coordinator to publish the usable route.
+                            let recover = async {
+                                let replacement = self
+                                    .recover_stream_route(&route, false, error)
+                                    .await
+                                    .map_err(IngressOpenError::Connect)?;
+                                self.prepare_route(replacement, &tenant_id).await
+                            };
+                            route = match recover.await {
+                                Ok(route) => route,
+                                Err(error) => {
+                                    return Err((error_response(error), unconsumed));
+                                }
+                            };
+                            if self.resolver.current_route_revision(&route) != Some(route_revision)
+                            {
+                                connect_deadline =
+                                    connect_deadline_for_binding().unwrap_or(connect_deadline);
+                            }
+                            retried = true;
+                            request = unconsumed;
+                            continue;
+                        }
+                        error => error,
+                    };
                     let route_changed = matches!(&error, BackendHttpPoolError::Closed)
                         || matches!(&error, BackendHttpPoolError::Connect(error)
                             if matches!(error.get_ref().and_then(|e| e.downcast_ref::<IngressOpenError>()),
                                 Some(IngressOpenError::RouteChanged)));
-                    if retried || !self.ready() || !route_changed {
+                    let relay_unavailable = matches!(&error, BackendHttpPoolError::Connect(error)
+                        if error.get_ref().and_then(|e| e.downcast_ref::<super::pool::RelayConnectError>())
+                            .is_some_and(super::pool::RelayConnectError::temporary));
+                    if !self.ready()
+                        || (!route_changed && !relay_unavailable)
+                        || (route_changed && retried)
+                        || tokio::time::Instant::now() >= connect_deadline
+                    {
                         return Err((backend_pool_error_response(error), unconsumed));
                     }
                     // Only an untouched request can follow the current route. Keep
-                    // its authorization scope and deadline, and retry at most once.
-                    retried = true;
-                    let mut replacement = match self
-                        .resolve_route(
-                            &route.target.instance_id,
-                            route.target.target_port,
-                            route.access_kind,
-                            route.target.request_id.clone(),
-                        )
-                        .await
-                    {
-                        Ok(route) => route,
-                        Err(error) => return Err((error_response(error), unconsumed)),
+                    // its authorization scope and original deadline. A changed
+                    // route may be selected once; temporary Relay failures may
+                    // wait without extending that budget or reopening admission.
+                    retried |= route_changed;
+                    let recovery = async {
+                        if relay_unavailable {
+                            tracing::debug!(event = "relay_http_connect_retry",
+                                request_id = %route.target.request_id, cause = %error,
+                                "waiting for Relay connection admission");
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                        let mut replacement = self
+                            .resolve_route(
+                                &route.target.instance_id,
+                                route.target.target_port,
+                                route.access_kind,
+                                route.target.request_id.clone(),
+                            )
+                            .await
+                            .map_err(error_response)?;
+                        if replacement.tenant_id != route.tenant_id
+                            || replacement.tunnel_security_mode != route.tunnel_security_mode
+                            || replacement.port_forward_auth_mode != route.port_forward_auth_mode
+                            || replacement.private_service_ports != route.private_service_ports
+                            || replacement.e2b != route.e2b
+                        {
+                            return Err(error_response(IngressOpenError::Forbidden));
+                        }
+                        if relay_unavailable
+                            && self.resolver.current_route_revision(&route) != Some(route_revision)
+                        {
+                            return Err(error_response(IngressOpenError::RouteChanged));
+                        }
+                        replacement.processing = route.processing.clone();
+                        self.prepare_route(replacement, &tenant_id)
+                            .await
+                            .map_err(error_response)
                     };
-                    if replacement.tenant_id != route.tenant_id
-                        || replacement.tunnel_security_mode != route.tunnel_security_mode
-                        || replacement.port_forward_auth_mode != route.port_forward_auth_mode
-                        || replacement.private_service_ports != route.private_service_ports
-                        || replacement.e2b != route.e2b
-                    {
-                        return Err((error_response(IngressOpenError::Forbidden), unconsumed));
-                    }
-                    replacement.processing = route.processing.clone();
-                    route = match self.prepare_route(replacement, &tenant_id).await {
-                        Ok(route) => route,
-                        Err(error) => return Err((error_response(error), unconsumed)),
+                    route = match tokio::time::timeout_at(connect_deadline, recovery).await {
+                        Ok(Ok(route)) => route,
+                        Ok(Err(response)) => return Err((response, unconsumed)),
+                        Err(_) => {
+                            if let Some(processing) = &route.processing {
+                                if processing.remaining().is_zero() {
+                                    return Err((
+                                        processing_timeout_response(
+                                            processing,
+                                            &route.target.request_id,
+                                            &route.target.instance_id,
+                                        ),
+                                        unconsumed,
+                                    ));
+                                }
+                            }
+                            return Err((backend_pool_error_response(error), unconsumed));
+                        }
                     };
                     request = unconsumed;
                 }
@@ -2422,9 +2670,10 @@ impl Ingress {
         };
         match self
             .http_pool
-            .send_recoverable(
+            .send_relay_recoverable(
                 key,
                 request,
+                None,
                 || self.open_service_http_stream(route.clone()),
                 || {
                     if !self.ready()
@@ -2663,7 +2912,7 @@ impl CommandWatchHub {
                 request
             };
             let stream = gateway
-                .open_authorized_stream_with_activity(route, true)
+                .open_authorized_stream_with_activity(route, true, false)
                 .await?;
             let (websocket, _) = tokio_tungstenite::client_async(request, stream)
                 .await
@@ -2864,6 +3113,17 @@ fn backend_pool_error_response(error: BackendHttpPoolError) -> Response<ProxyBod
             plain(StatusCode::BAD_GATEWAY, &error.to_string())
         }
     }
+}
+
+fn relay_binding_rejected(error: &io::Error) -> bool {
+    matches!(
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<super::pool::RelayConnectError>()),
+        Some(super::pool::RelayConnectError::Rejected(
+            StatusCode::CONFLICT
+        ))
+    )
 }
 
 // Cancellation must surround the entire relay: after one direction reaches
@@ -3126,6 +3386,10 @@ pub struct IngressStream {
 }
 
 impl IngressStream {
+    pub(crate) fn reuse_guard(&self) -> Option<super::pool::RelayReuseGuard> {
+        self.stream.reuse_guard()
+    }
+
     #[cfg(feature = "agent-api")]
     pub(super) fn cancellation(&self) -> watch::Receiver<bool> {
         self.cancelled.clone()

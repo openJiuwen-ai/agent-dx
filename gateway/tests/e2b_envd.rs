@@ -51,9 +51,7 @@ async fn real_envd_interop(gateway_auth: bool) {
     let relay = Arc::new(
         Relay::new(GatewayPolicy::new(vec!["0.0.0.0/0".parse().unwrap()])).with_route_enforcement(),
     );
-    relay
-        .activate_route(SANDBOX_ID.into(), SANDBOX_ID.into(), sandbox_ip)
-        .await;
+    relay.activate_route(SANDBOX_ID.into(), SANDBOX_ID.into(), sandbox_ip);
     let relay_task = serve_relay(relay_listener, relay.clone());
 
     let store = Arc::new(RouteStore::new());

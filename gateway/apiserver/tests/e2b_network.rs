@@ -17,10 +17,28 @@ struct State {
     lookups: usize,
     node_calls: usize,
     fail_node: bool,
+    transient_network_failures: usize,
+    transient_lifecycle_failures: usize,
+    lifecycle_requests: Vec<(String, u64)>,
+    reject_network_before_admission: Option<tonic::Code>,
+    transfer_on_lookup: bool,
     unsupported_pause: bool,
     unsupported_snapshot: bool,
     bump_on_lookup: Option<usize>,
     last_request: Option<pb::UpdateNetworkPolicyRequest>,
+}
+
+impl Service {
+    fn lifecycle_ready(&self, id: &str, revision: u64) -> bool {
+        let mut state = self.0.lock().unwrap();
+        state.node_calls += 1;
+        state.lifecycle_requests.push((id.into(), revision));
+        if state.transient_lifecycle_failures > 0 {
+            state.transient_lifecycle_failures -= 1;
+            return false;
+        }
+        true
+    }
 }
 
 macro_rules! service_impl {
@@ -46,6 +64,14 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         assert_eq!(request.get_ref().environment_id, "sandbox");
         if state.bump_on_lookup == Some(state.lookups) {
             state.owner.record.as_mut().unwrap().revision += 1;
+        }
+        if state.transfer_on_lookup && request.metadata().contains_key("adx-network-source-generation") {
+            let record = state.owner.record.as_mut().unwrap();
+            record.assignment.as_mut().unwrap().generation = 2;
+            record.revision = 12;
+            let mut reply = Response::new(state.owner.clone());
+            reply.metadata_mut().insert("adx-network-migration", "ready".parse().unwrap());
+            return Ok(reply);
         }
         Ok(Response::new(state.owner.clone()))
     }
@@ -127,10 +153,13 @@ use futures_util::StreamExt;
 service_impl!(pb::node_service_server::NodeService, {
     async fn pause_environment(
         &self,
-        _: Request<pb::PauseEnvironmentRequest>,
+        request: Request<pb::PauseEnvironmentRequest>,
     ) -> Result<Response<pb::EnvironmentResult>, Status> {
-        let mut state = self.0.lock().unwrap();
-        state.node_calls += 1;
+        let request = request.into_inner();
+        if !self.lifecycle_ready(&request.operation_id, request.expected_revision) {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let state = self.0.lock().unwrap();
         if state.unsupported_pause {
             return Err(adx_protocol::status(
                 adx_core::Error::UnsupportedCapability(
@@ -143,16 +172,30 @@ service_impl!(pb::node_service_server::NodeService, {
 
     async fn create_snapshot(
         &self,
-        _: Request<pb::CreateSnapshotRequest>,
+        request: Request<pb::CreateSnapshotRequest>,
     ) -> Result<Response<pb::CreateSnapshotResponse>, Status> {
-        let mut state = self.0.lock().unwrap();
-        state.node_calls += 1;
+        let request = request.into_inner();
+        if !self.lifecycle_ready(&request.operation_id, request.expected_revision) {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let state = self.0.lock().unwrap();
         if state.unsupported_snapshot {
             return Err(adx_protocol::status(
                 adx_core::Error::UnsupportedCapability(
                     adx_core::UnsupportedCapability::CheckpointRestore,
                 ),
             ));
+        }
+        Err(Status::unimplemented("unused test RPC"))
+    }
+
+    async fn reload_environment(
+        &self,
+        request: Request<pb::ReloadEnvironmentRequest>,
+    ) -> Result<Response<pb::EnvironmentResult>, Status> {
+        let request = request.into_inner();
+        if !self.lifecycle_ready(&request.operation_id, request.expected_revision) {
+            return Err(Status::unavailable("node is reconciling"));
         }
         Err(Status::unimplemented("unused test RPC"))
     }
@@ -166,6 +209,17 @@ service_impl!(pb::node_service_server::NodeService, {
         state.node_calls += 1;
         if state.fail_node {
             return Err(Status::unavailable("injected node failure"));
+        }
+        if state.transient_network_failures > 0 {
+            state.transient_network_failures -= 1;
+            assert_eq!(request.operation_id, "network-handoff");
+            assert_eq!(request.expected_revision, 9);
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        if let Some(code) = state.reject_network_before_admission.take() {
+            let mut error = Status::new(code, "network update rejected before admission");
+            error.metadata_mut().insert("adx-network-not-admitted", "true".parse().unwrap());
+            return Err(error);
         }
         let record = {
             let record = state.owner.record.as_mut().unwrap();
@@ -201,7 +255,6 @@ service_impl!(pb::node_service_server::NodeService, {
     delete_environment(DeleteEnvironmentRequest) -> EnvironmentResult,
     resume_environment(ResumeEnvironmentRequest) -> EnvironmentResult,
     ensure_environment_running(EnsureEnvironmentRunningRequest) -> EnvironmentResult,
-    reload_environment(ReloadEnvironmentRequest) -> EnvironmentResult,
     collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
     collect_checkpoint_cleanup(CollectCheckpointCleanupRequest) -> CollectCheckpointCleanupResponse,
 ]);
@@ -227,6 +280,11 @@ impl Fixture {
             lookups: 0,
             node_calls: 0,
             fail_node: false,
+            transient_network_failures: 0,
+            transient_lifecycle_failures: 0,
+            lifecycle_requests: Vec::new(),
+            reject_network_before_admission: None,
+            transfer_on_lookup: false,
             unsupported_pause: false,
             unsupported_snapshot: false,
             bump_on_lookup: None,
@@ -389,6 +447,179 @@ async fn native_network_update_keeps_typed_policy_and_operation_fence() {
 }
 
 #[tokio::test]
+async fn native_network_update_waits_for_reconciling_node() {
+    let fixture = Fixture::new().await;
+    fixture.state.lock().unwrap().transient_network_failures = 2;
+    let response = fixture
+        .api
+        .environment_service
+        .execute(
+            adx_apiserver::operations::Kind::Network,
+            "sandbox",
+            "network-handoff",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(response, json!({"success": true}));
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.node_calls, 3);
+    let request = state.last_request.as_ref().unwrap();
+    assert_eq!(request.operation_id, "network-handoff");
+    assert_eq!(request.expected_revision, 9);
+}
+
+#[tokio::test]
+async fn native_lifecycle_calls_wait_for_reconciling_node() {
+    use adx_apiserver::operations::Kind;
+    for kind in [Kind::Pause, Kind::Snapshot, Kind::Reload] {
+        let fixture = Fixture::new().await;
+        fixture.state.lock().unwrap().transient_lifecycle_failures = 2;
+        let error = fixture
+            .api
+            .environment_service
+            .execute(
+                kind,
+                "sandbox",
+                "original-operation",
+                json!({}),
+                &pb::CallerContext {
+                    tenant_id: "tenant".into(),
+                    administrator: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        // Once the node becomes reachable, preserve its terminal capability error.
+        assert_eq!(error.code(), tonic::Code::Unimplemented, "{kind:?}");
+        assert_eq!(
+            fixture.state.lock().unwrap().lifecycle_requests,
+            vec![("original-operation".into(), 9); 3],
+            "{kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_lifecycle_retry_keeps_a_fixed_budget() {
+    let fixture = Fixture::new().await;
+    fixture.state.lock().unwrap().transient_lifecycle_failures = usize::MAX;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.api.environment_service.execute(
+            adx_apiserver::operations::Kind::Pause,
+            "sandbox",
+            "original-operation",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        ),
+    )
+    .await
+    .expect("retries must not refresh the two-second fixture budget")
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(fixture.state.lock().unwrap().node_calls >= 3);
+}
+
+#[tokio::test]
+async fn native_network_update_continues_after_a_proven_planned_transfer() {
+    for code in [tonic::Code::NotFound, tonic::Code::FailedPrecondition] {
+        let fixture = Fixture::new().await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.reject_network_before_admission = Some(code);
+            state.transfer_on_lookup = true;
+        }
+        let response = fixture
+            .api
+            .environment_service
+            .execute(
+                adx_apiserver::operations::Kind::Network,
+                "sandbox",
+                "network-migration",
+                json!({}),
+                &pb::CallerContext {
+                    tenant_id: "tenant".into(),
+                    administrator: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, json!({"success": true}));
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.node_calls, 2);
+        let request = state.last_request.as_ref().unwrap();
+        assert_eq!(request.operation_id, "network-migration");
+        assert_eq!(request.expected_revision, 12);
+        assert_eq!(request.assignment.as_ref().unwrap().generation, 2);
+    }
+}
+
+#[tokio::test]
+async fn network_update_keeps_a_conflict_without_migration_evidence() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .reject_network_before_admission = Some(tonic::Code::FailedPrecondition);
+    let error = fixture
+        .api
+        .environment_service
+        .execute(
+            adx_apiserver::operations::Kind::Network,
+            "sandbox",
+            "network-conflict",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(fixture.state.lock().unwrap().node_calls, 1);
+}
+
+#[tokio::test]
+async fn network_update_with_an_unconfirmed_attempt_is_not_rebound() {
+    let fixture = Fixture::new().await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.transient_network_failures = 1;
+        state.reject_network_before_admission = Some(tonic::Code::NotFound);
+        state.transfer_on_lookup = true;
+    }
+    let error = fixture
+        .api
+        .environment_service
+        .execute(
+            adx_apiserver::operations::Kind::Network,
+            "sandbox",
+            "network-handoff",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.node_calls, 2);
+    assert!(state.last_request.is_none());
+}
+
+#[tokio::test]
 async fn typed_network_retry_rejects_changed_policy_with_the_same_operation_id() {
     let fixture = Fixture::new().await;
     let mut policy: adx_core::execution::NetworkPolicy = {
@@ -427,6 +658,7 @@ async fn typed_network_retry_rejects_changed_policy_with_the_same_operation_id()
         .await
         .unwrap_err();
     assert_eq!(first.code(), tonic::Code::Unavailable);
+    let node_calls = fixture.state.lock().unwrap().node_calls;
     policy.traffic.as_mut().unwrap().egress_default_action =
         adx_core::execution::NetworkAction::Allow;
     let changed = service
@@ -440,7 +672,7 @@ async fn typed_network_retry_rejects_changed_policy_with_the_same_operation_id()
         .await
         .unwrap_err();
     assert_eq!(changed.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(fixture.state.lock().unwrap().node_calls, 2);
+    assert_eq!(fixture.state.lock().unwrap().node_calls, node_calls);
 }
 
 #[tokio::test]
@@ -614,10 +846,11 @@ async fn unsupported_network_forms_do_not_reach_node() {
 async fn node_failure_is_not_reported_as_no_content() {
     let fixture = Fixture::new().await;
     fixture.state.lock().unwrap().fail_node = true;
-    assert_ne!(fixture.put("{}").await.0, 204);
-    // Native operation replay retries one unavailable response with the same
-    // fenced operation; neither failure is converted to an HTTP success.
-    assert_eq!(fixture.state.lock().unwrap().node_calls, 2);
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(4), fixture.put("{}"))
+        .await
+        .expect("network retries must stop within the configured 2 second RPC budget");
+    assert_eq!(status, 503);
+    assert!(fixture.state.lock().unwrap().node_calls > 2);
 }
 
 #[tokio::test]

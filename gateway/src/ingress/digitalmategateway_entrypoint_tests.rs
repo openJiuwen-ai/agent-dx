@@ -480,13 +480,11 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         adx_activator::Activator::new(state, backend.clone()),
     )))));
     let route:crate::common::route::RouteInfo=serde_json::from_value(json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-local","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
-    relay
-        .activate_route(
-            route.instance_id.clone(),
-            route.environment_id.clone(),
-            route.environment_ip.parse().unwrap(),
-        )
-        .await;
+    relay.activate_route(
+        route.instance_id.clone(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
+    );
     let auth = Arc::new(TestAuth(std::sync::atomic::AtomicBool::new(false)));
     let mut gateways = vec![];
     for _ in 0..2 {

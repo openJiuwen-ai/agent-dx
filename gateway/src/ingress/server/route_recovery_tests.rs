@@ -36,8 +36,7 @@ async fn binding_replacement(next_tenant: Option<&str>, change_security: bool) {
         "environment".into(),
         "new-runtime".into(),
         "127.0.0.1".parse().unwrap(),
-    )
-    .await;
+    );
     let store = Arc::new(RouteStore::new());
     let mut route = RouteInfo {
         private_service_ports: Vec::new(),

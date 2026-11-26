@@ -22,6 +22,12 @@ impl Session {
             let snapshots = self.retained_snapshots().await?;
             let raw = self.store.raw().await?;
             let header = self.header(&raw.get(HEADER).cloned())?;
+            let marker_field = format!("process-upgrade:{id}");
+            if let Some(marker) = raw.get(&marker_field) {
+                let marker: NodeMaintenance = decode(marker)?;
+                marker.validate()?;
+                return Err(Error::Conflict);
+            }
             let mut counters = CounterUpdate::load(&self.store, format!("node:{id}")).await?;
             let mut saved = snapshot(&raw)?;
             saved.revision = self
@@ -180,6 +186,19 @@ impl Session {
             expected.insert(
                 membership.clone(),
                 raw.get(&membership).cloned().unwrap_or_default(),
+            );
+            expected.insert(
+                marker_field.clone(),
+                raw.get(&marker_field).cloned().unwrap_or_default(),
+            );
+            expected.insert(
+                UPGRADE.into(),
+                raw.get(UPGRADE).cloned().unwrap_or_default(),
+            );
+            let token_field = format!("node-session:{id}");
+            expected.insert(
+                token_field.clone(),
+                raw.get(&token_field).cloned().unwrap_or_default(),
             );
             counters.prepare_retirement(&self.store).await?;
             let mut command = redis::cmd("EVAL");

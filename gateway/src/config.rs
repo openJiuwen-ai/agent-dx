@@ -66,6 +66,8 @@ pub struct IngressConfig {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
+    #[error("runtime resource unavailable: {0}")]
+    Resource(String),
     #[error("{INGRESS_ETCD_ENDPOINTS_ENV} is not set")]
     MissingEtcdEndpoints,
     #[error("{INGRESS_ETCD_ENDPOINTS_ENV} must contain at least one etcd endpoint")]
@@ -681,7 +683,7 @@ fn fd_based_stream_budget() -> Result<usize, ConfigError> {
     // SAFETY: getrlimit writes the plain rlimit structure supplied above and
     // does not retain the pointer.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(ConfigError::Invalid(
+        return Err(ConfigError::Resource(
             "cannot read RLIMIT_NOFILE for the Node stream budget".into(),
         ));
     }
@@ -689,7 +691,7 @@ fn fd_based_stream_budget() -> Result<usize, ConfigError> {
     const SERVICE_RESERVED_FDS: usize = 256;
     let budget = soft_limit.saturating_sub(SERVICE_RESERVED_FDS) / 2;
     if budget == 0 {
-        return Err(ConfigError::Invalid(format!(
+        return Err(ConfigError::Resource(format!(
             "RLIMIT_NOFILE {soft_limit} leaves no capacity after reserving {SERVICE_RESERVED_FDS} service FDs"
         )));
     }

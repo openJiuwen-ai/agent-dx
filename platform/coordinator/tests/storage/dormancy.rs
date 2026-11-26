@@ -1,5 +1,27 @@
 use super::*;
 
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn ordinary_commit_and_delete_reject_retired_session_token() {
+    for deleted in [false, true] {
+        let (_rig, session, mut record) = paused_fixture().await;
+        session
+            .invalidate_node("source", "source-session")
+            .await
+            .unwrap();
+        record.revision += 10;
+        if deleted {
+            record.state = EnvironmentState::Deleted;
+            record.checkpoint = None;
+        }
+        assert!(session
+            .commit_releasing(record, "source-session", &[])
+            .await
+            .is_err());
+        assert!(session.get("sleep").await.is_ok());
+    }
+}
+
 async fn paused_fixture() -> (
     common::Redis,
     adx_coordinator::storage::Session,

@@ -83,8 +83,7 @@ async fn command_watch_authenticates_runtime_and_delivers_terminal_state() {
         route.instance_id.clone(),
         route.environment_id.clone(),
         route.environment_ip.parse().unwrap(),
-    )
-    .await;
+    );
     routes.put(route);
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
     let route = gateway

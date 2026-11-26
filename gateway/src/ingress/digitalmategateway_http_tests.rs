@@ -110,8 +110,7 @@ async fn jiuwen_http_streams_ranges_and_rechecks_registration_between_chunks() {
         route.instance_id.clone(),
         route.environment_id.clone(),
         route.environment_ip.parse().unwrap(),
-    )
-    .await;
+    );
     routes.put(route.clone());
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
     let download = |token: String| {

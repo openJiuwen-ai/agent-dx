@@ -219,6 +219,274 @@ async fn start<T: RelayService>(service: T) -> (Server, UdsRoutes) {
     (Server { directory, task }, adapter)
 }
 struct Handler(Arc<BindingService>);
+
+#[derive(Clone)]
+struct CandidateFaults {
+    service: Arc<BindingService>,
+    takeovers: Arc<std::sync::atomic::AtomicUsize>,
+    replaces: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl RelayService for CandidateFaults {
+    type WatchActivityStream = <BindingService as RelayService>::WatchActivityStream;
+    async fn watch_activity(
+        &self,
+        r: Request<pb::GetBindingStateRequest>,
+    ) -> Result<Response<Self::WatchActivityStream>, Status> {
+        self.service.watch_activity(r).await
+    }
+    async fn set_environment_admission(
+        &self,
+        r: Request<pb::EnvironmentAdmissionRequest>,
+    ) -> Result<Response<pb::EnvironmentAdmissionResponse>, Status> {
+        self.service.set_environment_admission(r).await
+    }
+    async fn get_environment_activity(
+        &self,
+        r: Request<pb::GetEnvironmentActivityRequest>,
+    ) -> Result<Response<pb::EnvironmentActivityState>, Status> {
+        self.service.get_environment_activity(r).await
+    }
+    async fn get_binding_state(
+        &self,
+        r: Request<pb::GetBindingStateRequest>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        self.service.get_binding_state(r).await
+    }
+    async fn begin_bindings(
+        &self,
+        r: Request<pb::BindingState>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        self.service.begin_bindings(r).await
+    }
+    async fn replace_bindings(
+        &self,
+        request: Request<pb::BindingSnapshot>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        let attempt = self
+            .replaces
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == 0 {
+            return Err(Status::unavailable("first full snapshot failed"));
+        }
+        let accepted = self.service.replace_bindings(request).await?;
+        if attempt == 1 {
+            return Err(Status::unavailable("lost Replace reply"));
+        }
+        Ok(accepted)
+    }
+    async fn update_binding(
+        &self,
+        r: Request<UpdateBindingRequest>,
+    ) -> Result<Response<UpdateBindingResponse>, Status> {
+        self.service.update_binding(r).await
+    }
+}
+
+#[tonic::async_trait]
+impl pb::relay_upgrade_service_server::RelayUpgradeService for CandidateFaults {
+    async fn takeover_bindings(
+        &self,
+        r: Request<pb::BindingTakeoverRequest>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        let accepted = self.service.takeover(r.into_inner()).await?;
+        if self
+            .takeovers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return Err(Status::unavailable("lost takeover reply"));
+        }
+        Ok(Response::new(accepted))
+    }
+    async fn begin_drain(
+        &self,
+        _: Request<pb::RelayUpgradeRequest>,
+    ) -> Result<Response<pb::RelayUpgradeState>, Status> {
+        panic!("candidate must not receive old-generation BeginDrain")
+    }
+}
+
+#[tokio::test]
+async fn preserving_client_retries_lost_reply_without_destructive_begin() {
+    preserving_client_retries().await;
+}
+
+async fn preserving_client_retries() {
+    let bindings = service();
+    let mut old = bindings.inspect().await;
+    old.controller_session_id = "old-route-owner".into();
+    let old = bindings.begin(old).await.unwrap();
+    let mut running = record();
+    running.state = EnvironmentState::Running;
+    let mut binding = active(42, 2);
+    binding.proxy_session_id = old.proxy_session_id.clone();
+    binding.sync_epoch = old.sync_epoch;
+    let snapshot = pb::BindingSnapshot {
+        proxy_session_id: old.proxy_session_id.clone(),
+        sync_epoch: old.sync_epoch,
+        bindings: vec![binding.clone()],
+    };
+    bindings.replace(snapshot).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("preserving.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let faults = CandidateFaults {
+        service: bindings.clone(),
+        takeovers: Arc::default(),
+        replaces: Arc::default(),
+    };
+    let handler = Handler(bindings.clone());
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RelayServiceServer::new(handler))
+            .add_service(pb::relay_upgrade_service_server::RelayUpgradeServiceServer::new(faults))
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let server = Server { directory, task };
+    let routes = UdsRoutes::new(path.clone(), Duration::from_secs(2)).unwrap();
+    assert!(routes
+        .takeover_bindings("n", &[running.clone()])
+        .await
+        .is_err());
+    routes
+        .takeover_bindings("n", &[running.clone()])
+        .await
+        .unwrap();
+    assert!(bindings.apply(binding).await.is_err());
+    let accepted = bindings.inspect().await;
+    assert_ne!(accepted.controller_session_id, "new-node-session");
+    assert_eq!(accepted.sync_epoch, old.sync_epoch + 1);
+    routes.retire(&running).await.unwrap();
+    routes
+        .takeover_bindings("n", &[running.clone()])
+        .await
+        .unwrap();
+    let mut changed = running;
+    changed.revision += 1;
+    assert!(routes.takeover_bindings("n", &[changed]).await.is_err());
+    let mut other_owner = accepted;
+    other_owner.controller_session_id = "other-owner".into();
+    assert!(bindings.begin(other_owner).await.is_ok());
+    assert!(routes.ensure_synced().await.is_err());
+    assert!(routes.begin_reconcile().await.is_err());
+    server.task.abort();
+    std::fs::remove_file(&path).unwrap();
+    let replacement = service();
+    let listener = UnixListener::bind(&path).unwrap();
+    let handler = CandidateFaults {
+        service: replacement.clone(),
+        takeovers: Arc::default(),
+        replaces: Arc::default(),
+    };
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RelayServiceServer::new(handler))
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let _replacement_server = Server {
+        directory: tempfile::tempdir().unwrap(),
+        task,
+    };
+    assert!(routes.ensure_synced().await.is_err());
+    assert!(!replacement.inspect().await.ready);
+    assert!(routes.ensure_synced().await.is_err()); // Applied reply lost.
+    routes.ensure_synced().await.unwrap();
+    assert!(replacement.inspect().await.ready);
+    routes.begin_reconcile().await.unwrap();
+    routes.finish_reconcile().await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_replays_frozen_replace_then_converges_ready_candidate_with_latest_delta() {
+    let directory = tempfile::tempdir().unwrap();
+    let old_path = directory.path().join("old.sock");
+    let candidate_path = directory.path().join("candidate.sock");
+    let old = service();
+    let candidate = service();
+    let old_listener = UnixListener::bind(&old_path).unwrap();
+    let old_handler = old.clone();
+    let old_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RelayServiceServer::new(Handler(old_handler.clone())))
+            .serve_with_incoming(UnixListenerStream::new(old_listener))
+            .await
+            .unwrap();
+    });
+    let adapter = UdsRoutes::new(old_path.clone(), Duration::from_secs(2)).unwrap();
+    adapter.begin_reconcile().await.unwrap();
+    adapter.activate(&record()).await.unwrap();
+    adapter.finish_reconcile().await.unwrap();
+    let takeovers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replaces = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = UnixListener::bind(&candidate_path).unwrap();
+    let faults = CandidateFaults {
+        service: candidate.clone(),
+        takeovers: takeovers.clone(),
+        replaces: replaces.clone(),
+    };
+    let candidate_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RelayServiceServer::new(faults.clone()))
+            .add_service(
+                pb::relay_upgrade_service_server::RelayUpgradeServiceServer::new(faults)
+                    .max_decoding_message_size(64 * 1024 * 1024),
+            )
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let state = old.inspect().await;
+    // Client and Relay generate the same schema in different Rust modules.
+    let request = adx_protocol::relay::RelayHandoffRequest {
+        task_id: "handoff".into(),
+        old_socket: old_path.to_str().unwrap().into(),
+        old_proxy_session_id: state.proxy_session_id,
+        old_controller_session_id: state.controller_session_id,
+        old_sync_epoch: state.sync_epoch,
+        candidate_socket: candidate_path.to_str().unwrap().into(),
+        candidate_proxy_session_id: candidate.inspect().await.proxy_session_id,
+    };
+    let mut reservation = request.clone();
+    reservation.candidate_proxy_session_id.clear();
+    adapter.reserve_handoff(reservation.clone()).await.unwrap();
+    let request = adx_protocol::relay::RelaySwitchRequest {
+        proof: Some(adx_protocol::relay::RelayHandoffProof {
+            identity: Some(request),
+            old_pid: 42,
+            listeners_released: true,
+            old_exited: false,
+        }),
+        replacement: None,
+    };
+    assert!(adapter.switch_handoff(request.clone()).await.is_err());
+    assert!(!candidate.inspect().await.ready);
+    assert!(adapter.retire(&record()).await.is_err()); // Canonical + old ACK retained.
+    assert!(adapter.switch_handoff(request.clone()).await.is_err()); // Replace applied, reply lost.
+    assert!(candidate.inspect().await.ready);
+    let opened = candidate.inspect().await;
+    assert_eq!(
+        adapter.switch_handoff(request.clone()).await.unwrap().phase,
+        "active_fenced"
+    );
+    assert_eq!(candidate.inspect().await, opened);
+    assert_eq!(replaces.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let current = candidate.inspect().await;
+    let mut stale = active(42, 2);
+    stale.proxy_session_id = current.proxy_session_id;
+    stale.sync_epoch = current.sync_epoch;
+    assert_eq!(
+        candidate.apply(stale).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    old_task.abort();
+    candidate_task.abort();
+}
 #[tonic::async_trait]
 impl RelayService for Handler {
     type WatchActivityStream = <BindingService as RelayService>::WatchActivityStream;

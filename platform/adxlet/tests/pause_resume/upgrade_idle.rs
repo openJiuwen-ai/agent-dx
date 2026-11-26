@@ -100,6 +100,120 @@ async fn upgrade_pause_busy_deadline_preserves_source_and_admission() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn upgrade_pause_captures_updated_policy_and_replays_the_original_request() {
+    use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+
+    let (_temp, backend, _node, handle, request) = planned_fixture().await;
+    let policy = NetworkPolicy {
+        traffic: Some(TrafficPolicy {
+            ingress_default_action: NetworkAction::Deny,
+            egress_default_action: NetworkAction::Allow,
+            rules: vec![],
+            mode: TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    let network = handle
+        .update_network_policy(
+            Some(policy.clone()),
+            "network-a".into(),
+            request.expected_revision,
+        )
+        .await
+        .unwrap();
+    assert!(network.record.revision > request.expected_revision);
+
+    let public_request = pause(request.expected_revision);
+    assert_eq!(
+        handle.pause(public_request).await.unwrap_err(),
+        Error::Conflict
+    );
+    let mut future_request = request.clone();
+    future_request.expected_revision = network.record.revision + 1;
+    assert_eq!(
+        handle.pause(future_request).await.unwrap_err(),
+        Error::Conflict
+    );
+
+    let paused = handle.pause(request.clone()).await.unwrap().record;
+    assert_eq!(paused.state, EnvironmentState::Paused);
+    assert_eq!(paused.spec.execution.network, Some(policy));
+    let replay = handle.pause(request).await.unwrap().record;
+    assert_eq!(replay.revision, paused.revision);
+    assert_eq!(replay.checkpoint, paused.checkpoint);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "checkpoint")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn upgrade_pause_can_follow_a_snapshot_of_the_same_environment() {
+    let (_temp, _backend, _node, handle, request) = planned_fixture().await;
+    let saved = handle
+        .snapshot(adxlet::checkpoint::SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
+            operation_id: "snapshot-before-migration".into(),
+            expected_revision: request.expected_revision,
+            names: vec![],
+            timeout_seconds: 60,
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.environment.record.state, EnvironmentState::Running);
+    assert!(saved.environment.record.revision > request.expected_revision);
+    assert_eq!(
+        saved.snapshot.state,
+        adx_core::snapshots::SnapshotState::Ready
+    );
+    let paused = handle.pause(request.clone()).await.unwrap().record;
+    assert_eq!(paused.state, EnvironmentState::Paused);
+    assert_eq!(
+        handle.pause(request).await.unwrap().record.revision,
+        paused.revision
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_upgrade_pause_yields_to_network_management() {
+    let (_temp, backend, _node, handle, mut request) = planned_fixture().await;
+    request.timeout_seconds = 300;
+    backend.proxy_activity.lock().unwrap().1 = 1;
+    let paused = {
+        let handle = handle.clone();
+        let request = request.clone();
+        tokio::spawn(async move { handle.pause(request).await })
+    };
+    tokio::task::yield_now().await;
+    let update = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.update_network_policy(
+            None,
+            "network-during-idle-wait".into(),
+            request.expected_revision,
+        ),
+    )
+    .await
+    .expect("waiting for migration idle must not hold the controller until the checkpoint deadline")
+    .unwrap();
+    assert!(update.record.revision > request.expected_revision);
+    assert!(matches!(paused.await.unwrap(), Err(Error::Unavailable(_))));
+    assert!(!backend.proxy_activity.lock().unwrap().2);
+
+    backend.proxy_activity.lock().unwrap().1 = 0;
+    assert_eq!(
+        handle.pause(request).await.unwrap().record.state,
+        EnvironmentState::Paused
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn upgrade_pause_idle_race_reopens_without_aborting_another_checkpoint() {
     let (_temp, backend, _node, handle, request) = planned_fixture().await;
     *backend.idle_race.lock().unwrap() = true;

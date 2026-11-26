@@ -74,6 +74,17 @@ struct RouteBinding {
 }
 
 impl Relay {
+    pub(crate) fn has_quiescing_routes(&self) -> io::Result<bool> {
+        for shard in self.route_shards.iter() {
+            let routes = shard
+                .read()
+                .map_err(|_| io::Error::other("route registry unavailable"))?;
+            if routes.values().any(|binding| binding.quiescing) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// Serialize the idle check and admission closure with stream registration.
     pub fn set_environment_admission(
         &self,
@@ -246,12 +257,7 @@ impl Relay {
     }
 
     /// Publish one authoritative environment route before FunctionProxy exposes it.
-    pub async fn activate_route(
-        &self,
-        instance_id: String,
-        workload_id: String,
-        environment_ip: IpAddr,
-    ) {
+    pub fn activate_route(&self, instance_id: String, workload_id: String, environment_ip: IpAddr) {
         if let Some(tracker) = &self.activity {
             tracker.register(&instance_id);
         }
@@ -280,7 +286,7 @@ impl Relay {
 
     /// Retire one route before sandboxd reclaims its IP. New streams are
     /// rejected immediately and existing relays observe the route revision.
-    pub async fn retire_route(&self, instance_id: String, workload_id: String) {
+    pub fn retire_route(&self, instance_id: String, workload_id: String) {
         if let Some(tracker) = &self.activity {
             tracker.retire(&instance_id);
         }

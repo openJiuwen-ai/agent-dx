@@ -792,7 +792,20 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 }
                 let r = request.into_inner();
                 let assignment = r.assignment.clone();
-                let handle = self.owned_handle(assignment, r.caller.as_ref())?;
+                let handle =
+                    self.owned_handle(assignment, r.caller.as_ref())
+                        .map_err(|mut error| {
+                            if matches!(
+                                error.code(),
+                                tonic::Code::NotFound | tonic::Code::FailedPrecondition
+                            ) {
+                                error.metadata_mut().insert(
+                                    adx_protocol::NETWORK_NOT_ADMITTED,
+                                    tonic::metadata::MetadataValue::from_static("true"),
+                                );
+                            }
+                            error
+                        })?;
                 let policy = r
                     .network
                     .map(TryInto::try_into)
@@ -801,7 +814,16 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 let result = handle
                     .update_network_policy(policy, r.operation_id, r.expected_revision)
                     .await
-                    .map_err(status)?;
+                    .map_err(|error| {
+                        let mut error = status(error);
+                        if error.message() == adx_protocol::NETWORK_PRECONDITION {
+                            error.metadata_mut().insert(
+                                adx_protocol::NETWORK_NOT_ADMITTED,
+                                tonic::metadata::MetadataValue::from_static("true"),
+                            );
+                        }
+                        error
+                    })?;
                 {
                     let mut environments = self
                         .manager

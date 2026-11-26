@@ -321,7 +321,7 @@ async fn unknown_reload_cannot_exhaust_cache_or_block_delete() {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable);
     }
-    assert_eq!(fixture.state.lock().unwrap().reloads, 24);
+    assert!(fixture.state.lock().unwrap().reloads >= 24);
     let deleted = fixture
         .operations
         .execute(

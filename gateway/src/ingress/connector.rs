@@ -30,6 +30,10 @@ impl DataPlaneL4Connector {
         self.pool.physical_connection_count()
     }
 
+    pub(super) fn connect_timeout(&self) -> Duration {
+        self.pool.connect_timeout()
+    }
+
     pub async fn connect_stream(
         &self,
         relay_address: &str,
@@ -131,6 +135,10 @@ impl std::fmt::Debug for H2ConnectStream {
 }
 
 impl H2ConnectStream {
+    pub(crate) fn reuse_guard(&self) -> Option<super::pool::RelayReuseGuard> {
+        self.io.as_ref().map(|io| io._pool_stream.reuse_guard())
+    }
+
     fn cancelled_error() -> io::Error {
         io::Error::new(
             io::ErrorKind::ConnectionAborted,

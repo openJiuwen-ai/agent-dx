@@ -15,7 +15,12 @@ pub fn raise_nofile_soft_limit_from_env() -> io::Result<libc::rlim_t> {
             )
         })?,
         Err(std::env::VarError::NotPresent) => DEFAULT_NOFILE_SOFT_LIMIT,
-        Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid FD limit environment",
+            ));
+        }
     };
 
     let mut limit = libc::rlimit {

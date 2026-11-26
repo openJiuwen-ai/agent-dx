@@ -5,7 +5,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tokio::time::{sleep_until, timeout_at, Instant};
 use tonic::{Code, Status};
+
+const OPERATION_RETRY_WINDOW: Duration = Duration::from_secs(15);
+const OPERATION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const OPERATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -41,6 +46,26 @@ struct Operation {
     kind: Kind,
     body: Value,
     network: Option<pb::NetworkPolicy>,
+    network_outcome_unknown: bool,
+    creation_request_id: String,
+}
+impl Operation {
+    fn confirms_network_update(
+        &self,
+        owner: &pb::GetEnvironmentResponse,
+        request_id: &str,
+    ) -> bool {
+        owner.record.as_ref().is_some_and(|record| {
+            (record.assignment.as_ref() == Some(&self.assignment)
+                || (!self.creation_request_id.is_empty()
+                    && record.creation_request_id == self.creation_request_id))
+                && record.last_operation.as_ref().is_some_and(|receipt| {
+                    receipt.id == request_id
+                        && receipt.kind == Kind::Network.code()
+                        && receipt.expected_revision == self.expected
+                })
+        })
+    }
 }
 struct OperationInput {
     body: Value,
@@ -146,14 +171,14 @@ impl Operations {
         } else {
             None
         };
-        self.execute_inner(
+        Box::pin(self.execute_inner(
             kind,
             id,
             request_id,
             OperationInput { body, network },
             caller,
             None,
-        )
+        ))
         .await
     }
 
@@ -169,7 +194,7 @@ impl Operations {
         if let Some(network) = &network {
             network.validate().map_err(adx_protocol::status)?;
         }
-        self.execute_inner(
+        Box::pin(self.execute_inner(
             Kind::Network,
             id,
             request_id,
@@ -179,7 +204,7 @@ impl Operations {
             },
             caller,
             Some(required_revision),
-        )
+        ))
         .await
     }
 
@@ -224,7 +249,16 @@ impl Operations {
                 caller,
                 kind == Kind::Reload || required_revision.is_some(),
             )
-            .await?;
+            .await;
+        if kind == Kind::Network
+            && required_revision.is_none()
+            && owner
+                .as_ref()
+                .is_err_and(|error| matches!(error.code(), Code::NotFound | Code::Unavailable))
+        {
+            owner = clients.owner(id, caller, true).await;
+        }
+        let mut owner = owner?;
         if kind == Kind::Delete
             && owner
                 .record
@@ -309,31 +343,46 @@ impl Operations {
                     kind,
                     body: body.clone(),
                     network: network.clone(),
+                    network_outcome_unknown: false,
+                    creation_request_id: record.creation_request_id.clone(),
                 }));
                 pending.insert(key.clone(), operation.clone());
                 operation
             }
         };
-        let operation = operation.lock().await;
-        if operation.kind != kind
-            || operation.body != body
-            || operation.network != network
-            || Some(&operation.assignment)
-                != owner
-                    .record
-                    .as_ref()
-                    .and_then(|record| record.assignment.as_ref())
-        {
+        let mut operation = operation.lock().await;
+        if operation.kind != kind || operation.body != body || operation.network != network {
             return Err(Status::failed_precondition(
                 "operation target or arguments changed",
             ));
         }
-        for attempt in 0..2 {
+        if Some(&operation.assignment) != owner.record.as_ref().and_then(|r| r.assignment.as_ref())
+        {
+            if kind == Kind::Network && operation.network_outcome_unknown {
+                let current = clients.owner(id, caller, true).await?;
+                if operation.confirms_network_update(&current, request_id) {
+                    self.pending.lock().await.remove(&key);
+                    return Ok(json!({"success": true}));
+                }
+                return Err(Status::unavailable(
+                    "network policy result is not confirmed",
+                ));
+            }
+            return Err(Status::failed_precondition(
+                "operation target or arguments changed",
+            ));
+        }
+        let retry_deadline = Instant::now()
+            .checked_add(clients.config.timeout().min(OPERATION_RETRY_WINDOW))
+            .ok_or_else(|| Status::unavailable("operation RPC timeout is too large"))?;
+        let mut retry_delay = OPERATION_RETRY_INITIAL_DELAY;
+        loop {
             let mut node = pb::node_service_client::NodeServiceClient::new(
                 clients.channel(&owner.node_address).await?,
             );
             let assignment = Some(operation.assignment.clone());
             let caller_context = Some(caller.clone());
+            let previous_network_uncertainty = operation.network_outcome_unknown;
             let mut snapshot = None;
             let result = match kind {
                 Kind::Delete => {
@@ -398,9 +447,17 @@ impl Operations {
                     Err(error) => Err(error),
                 },
                 Kind::Network => {
+                    let timeout = retry_deadline.saturating_duration_since(Instant::now());
+                    if timeout.is_zero() {
+                        return Err(Status::deadline_exceeded(
+                            "network policy RPC deadline exceeded",
+                        ));
+                    }
+                    operation.network_outcome_unknown = true;
                     clients
-                        .rpc(
+                        .rpc_with_timeout(
                             "apiserver.update_network_policy",
+                            timeout,
                             node.update_network_policy(trace::inject(
                                 pb::UpdateNetworkPolicyRequest {
                                     assignment,
@@ -523,6 +580,63 @@ impl Operations {
                     return Ok(value);
                 }
                 Err(error) => {
+                    if kind == Kind::Network
+                        && error
+                            .metadata()
+                            .get(adx_protocol::NETWORK_NOT_ADMITTED)
+                            .is_some_and(|value| value == "true")
+                    {
+                        operation.network_outcome_unknown = previous_network_uncertainty;
+                        let deadline = retry_deadline;
+                        if previous_network_uncertainty {
+                            let current =
+                                timeout_at(deadline, clients.owner(id, caller, true)).await;
+                            if current.ok().and_then(Result::ok).is_some_and(|owner| {
+                                operation.confirms_network_update(&owner, request_id)
+                            }) {
+                                self.pending.lock().await.remove(&key);
+                                return Ok(json!({"success": true}));
+                            }
+                            return Err(Status::unavailable(
+                                "network policy result is not confirmed",
+                            ));
+                        }
+                        let replacement = Box::pin(self.wait_network_migration(
+                            id,
+                            caller,
+                            &operation.assignment,
+                            deadline,
+                        ))
+                        .await;
+                        let replacement = match replacement {
+                            Ok(Some(owner)) => owner,
+                            Ok(None) => {
+                                self.pending.lock().await.remove(&key);
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                self.pending.lock().await.remove(&key);
+                                return Err(error);
+                            }
+                        };
+                        let record = replacement
+                            .record
+                            .as_ref()
+                            .ok_or_else(|| Status::data_loss("missing network migration record"))?;
+                        if required_revision.is_some_and(|required| required != record.revision)
+                            || (!operation.creation_request_id.is_empty()
+                                && record.creation_request_id != operation.creation_request_id)
+                        {
+                            self.pending.lock().await.remove(&key);
+                            return Err(Status::aborted("sandbox revision changed"));
+                        }
+                        operation.assignment = record.assignment.clone().ok_or_else(|| {
+                            Status::data_loss("missing network migration assignment")
+                        })?;
+                        operation.expected = record.revision;
+                        owner = replacement;
+                        continue;
+                    }
                     let retryable =
                         matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded)
                             || (kind == Kind::Delete
@@ -531,19 +645,40 @@ impl Operations {
                                     Code::NotFound | Code::FailedPrecondition
                                 ));
                     if !retryable {
-                        self.pending.lock().await.remove(&key);
+                        if kind != Kind::Network || !previous_network_uncertainty {
+                            self.pending.lock().await.remove(&key);
+                        }
                         return Err(error);
                     }
-                    if attempt == 1 {
+                    let next = Instant::now() + retry_delay;
+                    if next >= retry_deadline {
                         return Err(error);
                     }
-                    owner = clients.owner(id, caller, true).await?;
+                    retry_delay = (retry_delay * 2).min(OPERATION_RETRY_MAX_DELAY);
+                    owner = match timeout_at(retry_deadline, async {
+                        sleep_until(next).await;
+                        clients.owner(id, caller, true).await
+                    })
+                    .await
+                    {
+                        Ok(owner) => owner?,
+                        Err(_) => return Err(error),
+                    };
                     if owner
                         .record
                         .as_ref()
                         .and_then(|record| record.assignment.as_ref())
                         != Some(&operation.assignment)
                     {
+                        if kind == Kind::Network {
+                            if operation.confirms_network_update(&owner, request_id) {
+                                self.pending.lock().await.remove(&key);
+                                return Ok(json!({"success": true}));
+                            }
+                            return Err(Status::unavailable(
+                                "network policy result is not confirmed",
+                            ));
+                        }
                         self.pending.lock().await.remove(&key);
                         return Err(Status::failed_precondition(
                             "ownership changed; original operation cannot be replayed",
@@ -552,7 +687,40 @@ impl Operations {
                 }
             }
         }
-        unreachable!()
+    }
+
+    async fn wait_network_migration(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        assignment: &pb::Assignment,
+        deadline: Instant,
+    ) -> Result<Option<pb::GetEnvironmentResponse>, Status> {
+        let waiting = async {
+            let mut saw_migration = false;
+            loop {
+                let (owner, hint) = self
+                    .clients
+                    .authoritative_owner(id, caller, Some(assignment.generation))
+                    .await?;
+                match hint {
+                    Some(true) => saw_migration = true,
+                    Some(false)
+                        if owner.record.as_ref().is_some_and(|record| {
+                            record.state == pb::EnvironmentState::Running as i32
+                                && (saw_migration || record.assignment.as_ref() != Some(assignment))
+                        }) =>
+                    {
+                        return Ok(Some(owner))
+                    }
+                    _ => return Ok(None),
+                }
+                tokio::time::sleep(OPERATION_RETRY_INITIAL_DELAY).await;
+            }
+        };
+        timeout_at(deadline, waiting)
+            .await
+            .map_err(|_| Status::deadline_exceeded("network policy migration deadline exceeded"))?
     }
 }
 pub fn number(value: &Value, key: &str, default: u64, max: u64) -> Result<u64, Status> {

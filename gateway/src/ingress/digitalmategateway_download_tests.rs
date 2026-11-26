@@ -139,8 +139,7 @@ async fn jiuwen_execd_reads_are_authorized_bounded_and_cancelled() {
         route.instance_id.clone(),
         route.environment_id.clone(),
         route.environment_ip.parse().unwrap(),
-    )
-    .await;
+    );
     routes.put(route.clone());
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
     let reader = Files::new(&gateway, context.deadline(), "tenant", &id).unwrap();

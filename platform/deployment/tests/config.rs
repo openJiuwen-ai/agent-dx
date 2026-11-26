@@ -16,6 +16,52 @@ services:
 "#;
 
 #[test]
+fn external_declaration_is_opt_in_absolute_and_survives_profile_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("deployment.yaml");
+    std::fs::write(&path, MINIMAL_YAML).unwrap();
+    assert!(Deployment::load(&path)
+        .unwrap()
+        .external_declaration
+        .is_none());
+    std::fs::write(
+        &path,
+        "schema_version: 1\nprofile: coordinator\nexternal_declaration: /mounted/target.yaml\n",
+    )
+    .unwrap();
+    assert_eq!(
+        Deployment::load(&path)
+            .unwrap()
+            .external_declaration
+            .as_deref(),
+        Some(std::path::Path::new("/mounted/target.yaml"))
+    );
+    std::fs::write(
+        &path,
+        format!("{MINIMAL_YAML}\nexternal_declaration: relative.yaml\n"),
+    )
+    .unwrap();
+    assert!(Deployment::load(&path).is_err());
+}
+
+#[test]
+fn pod_uid_cannot_override_inherited_container_identity() {
+    let root = tempfile::tempdir().unwrap();
+    for source in [
+        MINIMAL_YAML.replace("    config: {}", "    config: {}\n    env:\n      ADX_POD_UID: forged"),
+        "schema_version: 1\nprofile: coordinator\nservice_overrides:\n  coordinator:\n    env:\n      ADX_POD_UID: forged\n".to_owned(),
+    ] {
+        let path = root.path().join("deployment.yaml");
+        std::fs::write(&path, source).unwrap();
+        let error = Deployment::load(&path).err().unwrap().to_string();
+        assert!(
+            error.contains("ADX_POD_UID") && error.contains("Downward"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn shutdown_mode_defaults_to_preserve_and_explicit_modes_survive_configuration_roundtrip() {
     let root = tempfile::tempdir().unwrap();
     for (name, source, expected) in [

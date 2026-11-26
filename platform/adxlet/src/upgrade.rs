@@ -17,6 +17,14 @@ pub use adx_protocol::control::{
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredControl {
+    #[serde(default)]
+    process: Option<adx_protocol::relay::AdxletProcessRequest>,
+    #[serde(default)]
+    process_deadline_ms: Option<u64>,
+    #[serde(default)]
+    process_sealed: bool,
+    #[serde(default)]
+    completed_successor: Option<(adx_protocol::relay::AdxletProcessRequest, String)>,
     control: Option<NodeControl>,
     bootstrap_isolated: bool,
     may_have_executed: bool,
@@ -24,10 +32,12 @@ struct StoredControl {
 
 pub struct UpgradeGate {
     session: String,
+    observed_pod_uid: String,
     path: Option<PathBuf>,
     state: Mutex<StoredControl>,
     activity: Arc<Activity>,
     transitions: tokio::sync::Mutex<()>,
+    process_monotonic_deadline: Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Default)]
@@ -52,14 +62,198 @@ impl Drop for ExecutionLease {
     }
 }
 
+fn same_process_owner(
+    saved: &adx_protocol::relay::AdxletProcessRequest,
+    requested: &adx_protocol::relay::AdxletProcessRequest,
+) -> bool {
+    saved.rollout_id == requested.rollout_id
+        && saved.local_task_id == requested.local_task_id
+        && saved.epoch == requested.epoch
+}
+
 impl UpgradeGate {
+    fn active_pod_control(&self, state: &StoredControl) -> bool {
+        state.control.as_ref().is_some_and(|control| {
+            control.phase != "released" || control.node_session_id != self.session
+        })
+    }
+
+    pub(crate) fn release_process_maintenance(
+        &self,
+        identity: &adx_protocol::relay::AdxletProcessRequest,
+    ) -> Result<()> {
+        let state = self.lock()?;
+        if state.process.is_some()
+            || self.active_pod_control(&state)
+            || state.bootstrap_isolated
+            || !state
+                .completed_successor
+                .as_ref()
+                .is_some_and(|(saved, session)| {
+                    same_process_owner(saved, identity) && session == &self.session
+                })
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    pub(crate) fn finish_successor(
+        &self,
+        identity: &adx_protocol::relay::AdxletProcessRequest,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        if identity.rollout_id.trim().is_empty()
+            || identity.local_task_id.trim().is_empty()
+            || identity.epoch == 0
+            || self.active_pod_control(&state)
+        {
+            return Err(Error::Conflict);
+        }
+        if state.process.is_none()
+            && !state.bootstrap_isolated
+            && state
+                .completed_successor
+                .as_ref()
+                .is_some_and(|(saved, session)| {
+                    same_process_owner(saved, identity) && session == &self.session
+                })
+        {
+            return Ok(());
+        }
+        // Begin retains the full immutable request. Successor startup and the
+        // parent's ready query carry its owner, not the predecessor's deadline.
+        let predecessor = state.process.as_ref().is_some_and(|saved| {
+            state.process_sealed
+                && saved.old_node_session != self.session
+                && same_process_owner(saved, identity)
+        });
+        // A reaped ready candidate may be followed by another process of the
+        // same task. Its saved completion is not readiness for this session.
+        let previous_attempt =
+            state
+                .completed_successor
+                .as_ref()
+                .is_some_and(|(saved, session)| {
+                    same_process_owner(saved, identity) && session != &self.session
+                });
+        if identity.old_node_session == self.session
+            || !(predecessor
+                || (state.process.is_none() && (state.bootstrap_isolated || previous_attempt)))
+        {
+            return Err(Error::Conflict);
+        }
+        let mut next = state.clone();
+        next.process = None;
+        next.process_deadline_ms = None;
+        next.process_sealed = false;
+        next.bootstrap_isolated = false;
+        next.completed_successor = Some((identity.clone(), self.session.clone()));
+        self.persist(&next)?;
+        *state = next;
+        Ok(())
+    }
+    pub(crate) async fn wait_process_leases(&self) -> Result<()> {
+        if self.process_identity()?.is_none() {
+            return Err(Error::Conflict);
+        }
+        self.wait().await
+    }
+    pub(crate) fn process_identity(
+        &self,
+    ) -> Result<Option<adx_protocol::relay::AdxletProcessRequest>> {
+        Ok(self.lock()?.process.clone())
+    }
+    pub(crate) fn process_state(&self) -> Result<adx_protocol::relay::AdxletProcessState> {
+        let state = self.lock()?;
+        Ok(adx_protocol::relay::AdxletProcessState {
+            identity: Some(state.process.clone().ok_or(Error::NotFound)?),
+            phase: if state.process_sealed {
+                "sealed"
+            } else {
+                "sealing_unknown"
+            }
+            .into(),
+            node_session: self.session.clone(),
+        })
+    }
+    pub(crate) fn completed_process(
+        &self,
+        identity: &adx_protocol::relay::AdxletProcessRequest,
+    ) -> Result<bool> {
+        let state = self.lock()?;
+        Ok(state.process.is_none()
+            && !state.bootstrap_isolated
+            && !self.active_pod_control(&state)
+            && state
+                .completed_successor
+                .as_ref()
+                .is_some_and(|(saved, session)| {
+                    same_process_owner(saved, identity) && session == &self.session
+                }))
+    }
+    pub(crate) fn fence_process(
+        &self,
+        identity: adx_protocol::relay::AdxletProcessRequest,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|value| !value.is_zero())
+            .ok_or(Error::Conflict)?;
+        let mut state = self.lock()?;
+        if state.process.is_some() {
+            return Err(Error::Conflict);
+        }
+        let mut next = state.clone();
+        next.process = Some(identity);
+        next.process_deadline_ms = Some(
+            adx_core::observation::now_millis()?
+                .checked_add(u64::try_from(remaining.as_millis()).map_err(|_| Error::Conflict)?)
+                .ok_or(Error::Conflict)?,
+        );
+        self.persist(&next)?;
+        *state = next;
+        *self
+            .process_monotonic_deadline
+            .lock()
+            .map_err(|_| Error::Conflict)? = Some(deadline);
+        Ok(())
+    }
+    pub(crate) fn process_remaining(&self) -> Result<std::time::Duration> {
+        if let Some(deadline) = *self
+            .process_monotonic_deadline
+            .lock()
+            .map_err(|_| Error::Conflict)?
+        {
+            return deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(Error::Conflict);
+        }
+        let deadline = self.lock()?.process_deadline_ms.ok_or(Error::Conflict)?;
+        let remaining = deadline
+            .checked_sub(adx_core::observation::now_millis()?)
+            .filter(|ms| *ms > 0)
+            .ok_or(Error::Conflict)?;
+        Ok(std::time::Duration::from_millis(remaining))
+    }
+    pub(crate) fn mark_process_sealed(&self) -> Result<()> {
+        let mut state = self.lock()?;
+        let mut next = state.clone();
+        next.process_sealed = true;
+        self.persist(&next)?;
+        *state = next;
+        Ok(())
+    }
     pub(crate) fn unmanaged() -> Self {
         Self {
             session: String::new(),
+            observed_pod_uid: String::new(),
             path: None,
             state: Mutex::new(StoredControl::default()),
             activity: Arc::default(),
             transitions: tokio::sync::Mutex::new(()),
+            process_monotonic_deadline: Mutex::new(None),
         }
     }
 
@@ -68,6 +262,21 @@ impl UpgradeGate {
         if session.trim().is_empty() {
             return Err(Error::Invalid("upgrade node session required".into()));
         }
+        let observed_pod_uid = match std::env::var("ADX_POD_UID") {
+            Ok(value)
+                if !value.is_empty()
+                    && value.len() <= 128
+                    && !value.chars().any(char::is_whitespace) =>
+            {
+                value
+            }
+            Err(std::env::VarError::NotPresent) => String::new(),
+            _ => {
+                return Err(Error::Invalid(
+                    "ADX_POD_UID must be nonblank UTF-8 of at most 128 bytes".into(),
+                ));
+            }
+        };
         let mut state: StoredControl = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Invalid(format!("invalid upgrade authority: {e}")))?,
@@ -86,10 +295,12 @@ impl UpgradeGate {
         }
         let gate = Self {
             session,
+            observed_pod_uid,
             path: Some(path),
             state: Mutex::new(state),
             activity: Arc::default(),
             transitions: tokio::sync::Mutex::new(()),
+            process_monotonic_deadline: Mutex::new(None),
         };
         gate.persist(&*gate.lock()?)?;
         Ok(gate)
@@ -154,7 +365,8 @@ impl UpgradeGate {
 
     pub fn accepting_allocations(&self) -> bool {
         self.lock().is_ok_and(|state| {
-            !state.bootstrap_isolated
+            state.process.is_none()
+                && !state.bootstrap_isolated
                 && state.control.as_ref().is_none_or(|c| {
                     c.node_session_id == self.session
                         && matches!(c.phase.as_str(), "verified" | "released")
@@ -170,6 +382,9 @@ impl UpgradeGate {
         action: &str,
         task: Option<&str>,
     ) -> bool {
+        if state.process.is_some() {
+            return false;
+        }
         let Some(control) = &state.control else {
             return task.is_none() && !state.bootstrap_isolated;
         };
@@ -237,6 +452,9 @@ impl UpgradeGate {
     /// Terminal records may be adopted for query/deletion, without opening execution.
     pub(crate) fn record_cleanup(&self) -> Result<()> {
         let mut state = self.lock()?;
+        if state.process.is_some() {
+            return Err(Error::Conflict);
+        }
         if state
             .control
             .as_ref()
@@ -311,6 +529,10 @@ impl UpgradeGate {
         let open = matches!(control.phase.as_str(), "verified" | "released" | "draining");
         {
             let mut state = self.lock()?;
+            if state.process.is_some() && matches!(control.phase.as_str(), "verified" | "released")
+            {
+                return Err(Error::Conflict);
+            }
             let unchanged = state.control.as_ref() == Some(&control) && !state.bootstrap_isolated;
             if let Some(previous) = &state.control {
                 let same_task = previous.task_id == control.task_id;
@@ -542,6 +764,7 @@ impl crate::Adxlet {
             .runtime_rootfs_identity()
             .unwrap_or_default();
         Ok(adx_protocol::control::NodeUpgradeInspection {
+            observed_pod_uid: self.services.upgrade.observed_pod_uid.clone(),
             protocol_version: 3,
             guarded_resume: true,
             runtime_rootfs_sha256: rootfs.sha256,
@@ -582,4 +805,157 @@ fn scoped_count<K: Ord, V>(
             .filter(|key| environment.is_none_or(|expected| id(key) == expected))
             .count(),
     )
+}
+
+#[cfg(test)]
+mod process_upgrade_tests {
+    #[test]
+    fn observed_pod_identity_is_not_durable_authority() {
+        let mut gate = super::UpgradeGate::unmanaged();
+        assert!(gate.observed_pod_uid.is_empty());
+        gate.observed_pod_uid = "actual-startup-pod".into();
+        let control = super::NodeControl {
+            task_id: "task-bound-to-another-pod".into(),
+            ..Default::default()
+        };
+        gate.lock().unwrap().control = Some(control);
+        let stored = serde_json::to_value(&*gate.lock().unwrap()).unwrap();
+        assert!(!stored.to_string().contains("actual-startup-pod"));
+        assert_eq!(gate.observed_pod_uid, "actual-startup-pod");
+    }
+
+    #[test]
+    fn successor_gate_remains_isolated_until_finish_and_only_exact_generation_replays() {
+        let gate = super::UpgradeGate::unmanaged();
+        gate.isolate_bootstrap().unwrap();
+        let identity = adx_protocol::relay::AdxletProcessRequest {
+            rollout_id: "task".into(),
+            local_task_id: "local".into(),
+            epoch: 1,
+            old_node_session: "old".into(),
+            ..Default::default()
+        };
+        assert!(gate.lock().unwrap().bootstrap_isolated);
+        gate.finish_successor(&identity).unwrap();
+        assert!(!gate.lock().unwrap().bootstrap_isolated);
+        gate.finish_successor(&identity).unwrap();
+        let mut wrong = identity;
+        wrong.epoch += 1;
+        assert!(gate.finish_successor(&wrong).is_err());
+    }
+
+    #[test]
+    fn successor_owner_does_not_bypass_seal_session_or_pod_authority() {
+        use adx_protocol::relay::AdxletProcessRequest;
+        for fault in [
+            "rollout",
+            "task",
+            "epoch",
+            "unsealed",
+            "origin",
+            "active-pod",
+            "foreign-release",
+        ] {
+            let mut gate = super::UpgradeGate::unmanaged();
+            gate.session = "candidate".into();
+            gate.isolate_bootstrap().unwrap();
+            let mut identity = AdxletProcessRequest {
+                rollout_id: "rollout".into(),
+                local_task_id: "local".into(),
+                epoch: 1,
+                ..Default::default()
+            };
+            {
+                let mut state = gate.lock().unwrap();
+                state.process = Some(AdxletProcessRequest {
+                    old_node_session: "origin".into(),
+                    old_relay_session: "relay".into(),
+                    deadline_unix_millis: 100,
+                    ..identity.clone()
+                });
+                state.process_sealed = true;
+                match fault {
+                    "rollout" => identity.rollout_id.push_str("-other"),
+                    "task" => identity.local_task_id.push_str("-other"),
+                    "epoch" => identity.epoch += 1,
+                    "unsealed" => state.process_sealed = false,
+                    "origin" => {
+                        state.process.as_mut().unwrap().old_node_session = gate.session.clone()
+                    }
+                    _ => {
+                        state.control = Some(super::NodeControl {
+                            node_session_id: if fault == "foreign-release" {
+                                "other"
+                            } else {
+                                "candidate"
+                            }
+                            .into(),
+                            phase: if fault == "active-pod" {
+                                "evacuating"
+                            } else {
+                                "released"
+                            }
+                            .into(),
+                            ..Default::default()
+                        })
+                    }
+                }
+            }
+            assert!(gate.finish_successor(&identity).is_err(), "{fault}");
+            assert!(!gate.completed_process(&identity).unwrap(), "{fault}");
+            assert!(gate.process_identity().unwrap().is_some(), "{fault}");
+        }
+    }
+
+    #[test]
+    fn completed_owner_is_not_ready_after_another_fence_or_bootstrap_isolation() {
+        let mut gate = super::UpgradeGate::unmanaged();
+        gate.session = "candidate".into();
+        let identity = adx_protocol::relay::AdxletProcessRequest {
+            rollout_id: "rollout".into(),
+            local_task_id: "local".into(),
+            epoch: 1,
+            ..Default::default()
+        };
+        gate.isolate_bootstrap().unwrap();
+        gate.finish_successor(&identity).unwrap();
+        assert!(gate.completed_process(&identity).unwrap());
+        gate.isolate_bootstrap().unwrap();
+        assert!(!gate.completed_process(&identity).unwrap());
+        gate.finish_successor(&identity).unwrap();
+        let mut next = identity.clone();
+        next.local_task_id = "another-task".into();
+        next.old_node_session = gate.session.clone();
+        gate.fence_process(
+            next,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(!gate.completed_process(&identity).unwrap());
+        assert!(gate.finish_successor(&identity).is_err());
+    }
+    #[test]
+    fn accepted_process_uses_grant_limited_deadline_and_replay_cannot_refresh() {
+        let gate = super::UpgradeGate::unmanaged();
+        let identity = adx_protocol::relay::AdxletProcessRequest::default();
+        assert!(matches!(
+            gate.fence_process(identity.clone(), std::time::Instant::now()),
+            Err(Error::Conflict)
+        ));
+        assert!(gate.process_identity().unwrap().is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        gate.fence_process(identity.clone(), deadline).unwrap();
+        assert!(gate.process_remaining().unwrap() <= std::time::Duration::from_secs(10));
+        assert!(gate
+            .fence_process(
+                identity,
+                std::time::Instant::now() + std::time::Duration::from_secs(500)
+            )
+            .is_err());
+        assert_eq!(
+            *gate.process_monotonic_deadline.lock().unwrap(),
+            Some(deadline)
+        );
+    }
+    use super::*;
 }

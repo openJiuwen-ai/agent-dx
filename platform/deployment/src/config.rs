@@ -157,9 +157,11 @@ fn validate_trace_endpoint(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
+    #[serde(default)]
+    pub external_declaration: Option<PathBuf>,
     #[serde(default)]
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
@@ -248,6 +250,8 @@ impl Profile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileDeployment {
+    #[serde(default)]
+    external_declaration: Option<PathBuf>,
     schema_version: u32,
     profile: Profile,
     #[serde(default)]
@@ -280,11 +284,11 @@ struct ProfileDeployment {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ServiceOverride {
+pub(crate) struct ServiceOverride {
     #[serde(default)]
-    config: Option<Value>,
+    pub(crate) config: Option<Value>,
     #[serde(default)]
-    env: BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -361,8 +365,19 @@ impl RedisConfig {
         ))
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessSource {
+    pub version: Option<String>,
+    pub archive_sha256: Option<String>,
+    pub raw_config_sha256: Option<String>,
+}
+
+/// Rendered process. Serialized only as the private adxlet rollout snapshot.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Process {
+    pub sources: BTreeMap<Role, ProcessSource>,
+    pub configuration_sha256: String,
     pub id: String,
     pub role: Role,
     pub binary: PathBuf,
@@ -416,6 +431,17 @@ fn ingress_process_mode(service: &Service, ingress_declared: bool) -> Result<Ing
 }
 
 impl Deployment {
+    pub(crate) fn rollout_mode(&self, service: &Service) -> crate::rollout::Mode {
+        use crate::rollout::Mode;
+        if service.role == Role::Adxlet
+            && service.config.get("proxy_mode").and_then(Value::as_str) != Some("standalone")
+        {
+            Mode::Embedded
+        } else {
+            Mode::Standalone
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         if !matches!(
             path.extension().and_then(|extension| extension.to_str()),
@@ -444,6 +470,13 @@ impl Deployment {
             .map_err(|error| format!("cannot serialize effective deployment: {error}").into())
     }
     pub fn validate(&self) -> Result<()> {
+        if self
+            .external_declaration
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("external_declaration must be absolute".into());
+        }
         self.logging.validate()?;
         self.tracing.validate()?;
         if let Some(environment) = &self.runtime_profile {
@@ -542,6 +575,11 @@ impl Deployment {
                         );
                     }
                 }
+            }
+            if service.env.contains_key("ADX_POD_UID") {
+                return Err(
+                    "ADX_POD_UID is reserved for inherited container Downward API identity".into(),
+                );
             }
             if service.env.iter().any(|(key, value)| {
                 key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
@@ -679,6 +717,14 @@ impl Deployment {
     }
 
     pub fn render(&self, output_directory: &Path) -> Result<Vec<Process>> {
+        self.render_selected(output_directory, None)
+    }
+
+    fn render_selected(
+        &self,
+        output_directory: &Path,
+        selected: Option<&str>,
+    ) -> Result<Vec<Process>> {
         self.validate()?;
         fs::create_dir(output_directory)?;
         fs::set_permissions(output_directory, fs::Permissions::from_mode(0o700))?;
@@ -695,6 +741,9 @@ impl Deployment {
             .transpose()?
             == Some(IngressProcessMode::Embedded);
         for service in &self.services {
+            if selected.is_some_and(|id| id != service.id) {
+                continue;
+            }
             if embedded_ingress && service.role == Role::Ingress {
                 continue;
             }
@@ -835,6 +884,8 @@ impl Deployment {
             }
             let binary = self.package_dir.join("bin").join(service.role.binary());
             processes.push(Process {
+                sources: BTreeMap::new(),
+                configuration_sha256: configuration_sha256(&config, &environment)?,
                 id: service.id.clone(),
                 role: service.role,
                 binary,
@@ -847,6 +898,117 @@ impl Deployment {
         processes.sort_by_key(|process| process.role);
         Ok(processes)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigInput {
+    pub mount_path: PathBuf,
+}
+
+impl ConfigInput {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.mount_path.is_absolute() {
+            return Err("invalid component configuration descriptor".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn configuration_sha256(
+    config: &Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let environment: BTreeMap<_, _> = environment
+        .iter()
+        .filter(|(key, _)| {
+            !key.starts_with("ADX_SUPERVISOR_")
+                && key.as_str() != "ADX_DATA_PLANE_RELAY_ROUTE_SOCKET"
+        })
+        .collect();
+    let mut normalized = serde_json::to_value((config, environment))?;
+    normalized.sort_all_objects();
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&normalized)?)
+    ))
+}
+
+pub(crate) fn prepare_component(
+    deployment: &Deployment,
+    current: &Process,
+    input: Option<&ConfigInput>,
+    directory: &Path,
+    deadline: std::time::Instant,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Result<Process> {
+    let Some(input) = input else {
+        return Ok(current.clone());
+    };
+    let patch = crate::external::config_snapshot(input, deadline, stopped)?;
+    if patch
+        .env
+        .get("ADX_DATA_PLANE_RELAY_ROUTE_SOCKET")
+        .is_some_and(|value| current.env.get("ADX_DATA_PLANE_RELAY_ROUTE_SOCKET") != Some(value))
+    {
+        return Err("component override changes parent-managed Relay route socket".into());
+    }
+    let mut candidate = deployment.clone();
+    let service = candidate
+        .services
+        .iter_mut()
+        .find(|service| service.id == current.id && service.role == current.role)
+        .ok_or("component missing from deployment")?;
+    let config_path = current
+        .args
+        .windows(2)
+        .find(|args| args[0] == "--config")
+        .map(|args| PathBuf::from(&args[1]));
+    let base = if let Some(path) = config_path {
+        serde_json::from_slice(&fs::read(path)?)?
+    } else {
+        Value::Null
+    };
+    if current.role == Role::Relay
+        && patch
+            .config
+            .as_ref()
+            .is_some_and(|value| !value.as_object().is_some_and(Map::is_empty))
+    {
+        return Err("Relay component configuration accepts env only".into());
+    }
+    if let Some(config) = patch.config {
+        merge_value(&mut service.config, config);
+    }
+    service.env.extend(patch.env);
+    let mut rendered = candidate.render_selected(directory, Some(&current.id))?;
+    let process = rendered
+        .iter_mut()
+        .find(|process| process.id == current.id)
+        .ok_or("rendered component missing")?;
+    let actual = if current.role == Role::Adxlet {
+        serde_json::from_slice(&fs::read(directory.join(format!("{}.json", current.id)))?)?
+    } else {
+        Value::Null
+    };
+    process.binary = current.binary.clone();
+    for (key, value) in &current.env {
+        if key.starts_with("ADX_SUPERVISOR_") || key == "ADX_DATA_PLANE_RELAY_ROUTE_SOCKET" {
+            process.env.insert(key.clone(), value.clone());
+        }
+    }
+    crate::external::protected_boundary(&base, &actual, current, process)?;
+    if stopped.load(std::sync::atomic::Ordering::Acquire) || std::time::Instant::now() >= deadline {
+        return Err("component preparation stopped or expired".into());
+    }
+    process.sources = current.sources.clone();
+    process
+        .sources
+        .entry(current.role)
+        .or_default()
+        .raw_config_sha256 = None;
+    Ok(process.clone())
 }
 
 fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
@@ -864,6 +1026,7 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     let mut deployment: Deployment = serde_saphyr::from_str(input.profile.template())
         .map_err(|error| format!("invalid built-in deployment profile: {error}"))?;
     deployment.schema_version = input.schema_version;
+    deployment.external_declaration = input.external_declaration;
     deployment.with_afs = input.with_afs;
     if let Some(value) = input.package_dir {
         deployment.package_dir = value;
@@ -961,7 +1124,7 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     Ok(deployment)
 }
 
-fn merge_value(target: &mut Value, patch: Value) {
+pub(crate) fn merge_value(target: &mut Value, patch: Value) {
     match (target, patch) {
         (Value::Object(target), Value::Object(patch)) => {
             for (key, value) in patch {
@@ -1065,4 +1228,125 @@ pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .open(path)?;
     file.write_all(bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod component_config_tests {
+    use super::*;
+
+    #[test]
+    fn component_configuration_preserves_actual_or_renders_fixed_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut deployment: Deployment = serde_saphyr::from_str(Profile::Node.template()).unwrap();
+        deployment.state_dir = root.path().join("state");
+        deployment.package_dir = root.path().join("package");
+        let mut processes = deployment.render(&root.path().join("initial")).unwrap();
+        let mut current = processes.remove(
+            processes
+                .iter()
+                .position(|process| process.role == Role::Adxlet)
+                .unwrap(),
+        );
+        current.env.insert("PREVIOUS_TUNING".into(), "old".into());
+        assert!(current.sources.is_empty());
+        current.sources.insert(
+            Role::Adxlet,
+            ProcessSource {
+                version: Some("a".repeat(40)),
+                archive_sha256: Some("b".repeat(64)),
+                raw_config_sha256: Some("c".repeat(64)),
+            },
+        );
+        current.env.insert(
+            "ADX_DATA_PLANE_RELAY_ROUTE_SOCKET".into(),
+            "/generation/route.sock".into(),
+        );
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let retained = prepare_component(
+            &deployment,
+            &current,
+            None,
+            &root.path().join("unused"),
+            deadline,
+            &stopped,
+        )
+        .unwrap();
+        assert_eq!(retained.args, current.args);
+        assert_eq!(retained.env, current.env);
+        assert_eq!(retained.configuration_sha256, current.configuration_sha256);
+        assert_eq!(retained.sources, current.sources);
+        let path = root.path().join("override.json");
+        let bytes = br#"{"env":{"NEW_TUNING":"new"}}"#;
+        fs::write(&path, bytes).unwrap();
+        let input = ConfigInput { mount_path: path };
+        let prepared = prepare_component(
+            &deployment,
+            &current,
+            Some(&input),
+            &root.path().join("explicit"),
+            deadline,
+            &stopped,
+        )
+        .unwrap();
+        assert!(!prepared.env.contains_key("PREVIOUS_TUNING"));
+        assert_eq!(prepared.sources[&Role::Adxlet].raw_config_sha256, None);
+        assert_eq!(
+            prepared.sources[&Role::Adxlet].version,
+            current.sources[&Role::Adxlet].version
+        );
+        assert_eq!(
+            prepared.sources[&Role::Adxlet].archive_sha256,
+            current.sources[&Role::Adxlet].archive_sha256
+        );
+        assert_eq!(prepared.env["NEW_TUNING"], "new");
+        assert_eq!(
+            prepared.env["ADX_DATA_PLANE_RELAY_ROUTE_SOCKET"],
+            "/generation/route.sock"
+        );
+        let bytes = br#"{"env":{"ADX_DATA_PLANE_RELAY_ROUTE_SOCKET":"/forged/route.sock"}}"#;
+        fs::write(&input.mount_path, bytes).unwrap();
+        assert!(prepare_component(
+            &deployment,
+            &current,
+            Some(&input),
+            &root.path().join("rejected"),
+            deadline,
+            &stopped
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn removed_supervisor_process_configuration_is_rejected() {
+        // adxctl no longer talks to the Coordinator; the old credential block
+        // is not silently accepted and ignored.
+        let old = serde_json::json!({"actual-node":{"coordinator":"coordinator:50051",
+            "ca":"/tls/ca", "certificate":"/tls/supervisor", "private_key":"/tls/key",
+            "server_name":"coordinator"}});
+        let mut profile = serde_json::json!({
+            "schema_version":1,"profile":"node",
+            "service_overrides":{"adxlet":{"config":{"node_id":"actual-node", "proxy_mode":"standalone",
+                "proxy_socket":"/run/adx/route.sock"}}}
+        });
+        assert!(serde_json::from_value::<ProfileDeployment>(profile.clone()).is_ok());
+        profile["supervisor_process"] = old.clone();
+        let error = serde_json::from_value::<ProfileDeployment>(profile)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("supervisor_process"), "{error}");
+        let mut deployment = serde_json::json!({
+            "schema_version":1, "package_dir":"/opt/adx/package", "state_dir":"/var/lib/adx",
+            "redis_url":"redis://127.0.0.1:6379", "namespace":"adx", "restart_delay_ms":1000,
+            "stop_timeout_seconds":10, "services":[]
+        });
+        assert!(serde_json::from_value::<Deployment>(deployment.clone()).is_ok());
+        deployment["supervisor_process"] = old;
+        let error = serde_json::from_value::<Deployment>(deployment)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("supervisor_process"), "{error}");
+    }
 }

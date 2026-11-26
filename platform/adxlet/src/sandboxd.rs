@@ -1616,7 +1616,13 @@ impl RuntimeDriver for Sandboxd {
         ports: &[u16],
         tunnel_http_port: Option<u16>,
     ) -> Result<()> {
-        let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
+        let id = self
+            .physical_id(runtime_id)
+            .await?
+            .ok_or_else(|| Error::BackendFailure {
+                code: adx_core::BackendFailureCode::NotFound,
+                message: adx_protocol::NETWORK_PRECONDITION.into(),
+            })?;
         self.client
             .clone()
             .set_network_policy(self.request(proto::SetNetworkPolicyRequest {

@@ -3,6 +3,7 @@ mod admission;
 mod checkpoint_cleanup;
 mod envd;
 mod environment_control;
+pub mod process_bootstrap;
 pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;
@@ -21,6 +22,15 @@ mod scheduling;
 
 /// gRPC metadata key for a typed runtime capability rejection.
 const UNSUPPORTED_CAPABILITY_METADATA: &str = "adx-unsupported-capability";
+
+/// The node rejected a network-policy request before changing the runtime.
+pub const NETWORK_NOT_ADMITTED: &str = "adx-network-not-admitted";
+/// Request a Coordinator check for a planned migration involving this generation.
+pub const NETWORK_SOURCE_GENERATION: &str = "adx-network-source-generation";
+/// Coordinator's planned-migration evidence, returned only for the requested generation.
+pub const NETWORK_MIGRATION: &str = "adx-network-migration";
+/// Internal error message reserved for network-policy checks before the runtime write.
+pub const NETWORK_PRECONDITION: &str = "network update was rejected before changing the runtime";
 
 impl From<adx_core::Resources> for control::Resources {
     fn from(value: adx_core::Resources) -> Self {

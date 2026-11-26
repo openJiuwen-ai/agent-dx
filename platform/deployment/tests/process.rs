@@ -26,6 +26,28 @@ fn install_test_binary(root: &Path, name: &str, script: &str) {
     std::fs::rename(&temporary_path, binary_path).unwrap();
 }
 
+#[tokio::test]
+async fn invalid_external_declaration_never_spawns_process() {
+    let root = tempfile::Builder::new()
+        .prefix("adx-external-invalid-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    install_test_binary(
+        root.path(),
+        "adx-coordinator",
+        "#!/bin/sh\nprintf spawned > \"$0.spawned\"\n",
+    );
+    let mut deployment = test_deployment(
+        root.path(),
+        json!([{"id":"coordinator","role":"coordinator","config":{}}]),
+    );
+    let declaration = root.path().join("target.yaml");
+    std::fs::write(&declaration, "schema: 1\nmode: embedded\ncomponents: {}\n").unwrap();
+    deployment.external_declaration = Some(declaration);
+    assert!(supervisor::run(deployment).await.is_err());
+    assert!(!root.path().join("bin/adx-coordinator.spawned").exists());
+}
+
 #[test]
 fn install_test_binary_replaces_busy_fixture_atomically() {
     let temp_directory = tempfile::Builder::new()
@@ -237,6 +259,12 @@ async fn spawn_failures_keep_retrying_and_clear_failure_after_recovery() {
 struct NodeAdmin(Arc<AtomicBool>);
 #[tonic::async_trait]
 impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {
+    async fn inspect(
+        &self,
+        _: tonic::Request<pb::AdxletRuntimeInspectRequest>,
+    ) -> Result<tonic::Response<pb::AdxletRuntimeInspection>, tonic::Status> {
+        Err(tonic::Status::unimplemented("drain-only fixture"))
+    }
     async fn drain(
         &self,
         _: tonic::Request<pb::DrainRequest>,

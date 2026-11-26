@@ -18,7 +18,7 @@ impl ActivityHub {
             .or_insert_with(|| watch::channel(None).0)
             .subscribe()
     }
-    fn disconnect(&self) {
+    pub(super) fn disconnect(&self) {
         let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
         slots.retain(|_, slot| {
             slot.send_replace(None);
@@ -64,12 +64,15 @@ impl UdsRoutes {
     ) -> watch::Receiver<Option<Stamp>> {
         let receiver = self.activity.subscribe(record);
         if !self.activity.started.swap(true, Ordering::AcqRel) {
-            let path = self.path.clone();
+            let mut paths = self.path.subscribe();
+            let topology = self.topology.clone();
+            let handoff = self.handoff.clone();
             let timeout = self.timeout;
             let observations = self.activity.clone();
             let lifetime = Arc::downgrade(&self.local);
             tokio::spawn(async move {
                 while lifetime.strong_count() > 0 {
+                    let path = paths.borrow_and_update().clone();
                     let session = async {
                         let mut client = Self::connect_at(path.clone(), timeout).await?;
                         let response = tokio::time::timeout(
@@ -84,11 +87,26 @@ impl UdsRoutes {
                             if lifetime.strong_count() == 0 {
                                 return Ok::<(), Error>(());
                             }
-                            observations.apply(snapshot);
+                            let _topology = topology.read().await;
+                            if handoff
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_none_or(|task| task.is_completed())
+                            {
+                                observations.apply(snapshot);
+                            }
                         }
                         Ok(())
-                    }
-                    .await;
+                    };
+                    let session = tokio::select! {
+                        result = session => result,
+                        changed = paths.changed() => {
+                            observations.disconnect();
+                            if changed.is_err() { break; }
+                            continue;
+                        }
+                    };
                     if let Err(error) = session {
                         adx_observability::warn!(%error, "proxy activity subscription interrupted");
                     }

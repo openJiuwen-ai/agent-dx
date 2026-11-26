@@ -250,13 +250,11 @@ async fn shared_forwarding(application: &'static str) {
     let (gateway, _, routes) = fixture_with_routes().await;
     for binding in &bindings {
         let route: crate::common::route::RouteInfo = serde_json::from_value(json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":format!("runtime-{}",binding.scope.binding_id),"environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
-        relay
-            .activate_route(
-                route.instance_id.clone(),
-                route.environment_id.clone(),
-                route.environment_ip.parse().unwrap(),
-            )
-            .await;
+        relay.activate_route(
+            route.instance_id.clone(),
+            route.environment_id.clone(),
+            route.environment_ip.parse().unwrap(),
+        );
         routes.put(route);
     }
     let auth = Arc::new(ModelAuth::new());

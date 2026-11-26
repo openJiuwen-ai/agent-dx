@@ -74,9 +74,9 @@ fn published_route(public: Option<bool>, native_private: bool, instance_id: &str
         tenant_id: "tenant-a".into(),
         environment_id: "runtime-a".into(),
         environment_ip: "192.0.2.1".into(),
-        // Reaching this unavailable Relay returns 502. Authorization failures
-        // must instead be returned before any Relay connection is attempted.
-        relay_address: "127.0.0.1:0".into(),
+        // The missing port makes the destination invalid and yields 502
+        // immediately. Authorization failures must take precedence.
+        relay_address: "127.0.0.1".into(),
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
         private_service_ports: if public.is_some() {
