@@ -198,7 +198,7 @@ impl ReplicatedSources<'_> {
             .ops
             .windows(2)
             .all(|pair| pair[0].chunk_id == pair[1].chunk_id);
-        super::remote::keeping_fetched(one_chunk, async {
+        super::remote::keeping_fetched(one_chunk, Some(deadline), async {
             let reading = self.engine.time_route("remote");
             self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
                 .await?;

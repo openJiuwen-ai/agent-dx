@@ -2329,7 +2329,7 @@ fn h2_round2_wait_order_for_a_chunk_is_the_same_in_every_version() {
         }
     };
     let waits = |budget| {
-        super::remote::keeping_fetched(true, async move {
+        super::remote::keeping_fetched(true, None, async move {
             (
                 holders::holder_wait_ms(&item("node-a", "node-b", "v1"), budget),
                 holders::holder_wait_ms(&item("node-b", "node-a", "v2"), budget),

@@ -2109,3 +2109,65 @@ async fn h2_pr318_cancelled_reads_are_timed_at_the_reader() {
     assert_eq!(count("afs_dfs_read_route_seconds", "stage=\"remote\""), 1);
     assert_eq!(count("afs_dfs_read_route_seconds", "stage=\"sources\""), 1);
 }
+
+/// !318 round 2 item 2: four CRC Chunks read in one batch, one at a time
+/// (parallelism 1); the version's one holder never answers, every durable
+/// copy answers at once. The holder attempts of the whole read share one
+/// deadline (half the read's time): they cannot eat the time the copies
+/// need one Chunk after another. Everything is read, in time, and the
+/// holder is not asked again once that deadline passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_round2_silent_holder_leaves_a_multi_chunk_read_its_copies() {
+    let temp = tempfile::tempdir().unwrap();
+    let chunks: Vec<StagedChunk> = (10..14).map(review_chunk).collect();
+    let (holder, _silent) = silent_holder().await;
+    let reader = review_reader(temp.path(), &chunks, &holder, 0).await;
+    let mut ops = Vec::new();
+    let mut expected = Vec::new();
+    for staged in &chunks {
+        ops.push(crate::node::read::engine::ChunkReadOp {
+            chunk_id: staged.chunk.id.clone(),
+            chunk_offset: 0,
+            length: staged.chunk.length,
+            output_offset: expected.len(),
+        });
+        expected.extend_from_slice(staged.bytes());
+    }
+    let batch = crate::node::read::engine::ReadBatch {
+        file_version_id: Some(FileVersionId::new("v")),
+        layout_root_id: LayoutRootId::new("l"),
+        ops,
+        lookahead: Vec::new(),
+    };
+    let budget = std::time::Duration::from_millis(800);
+    let started = std::time::Instant::now();
+    let read = reader
+        .engine
+        .read_native_unified_async(
+            batch,
+            expected.len(),
+            std::time::Instant::now() + budget,
+            Arc::new(()),
+        )
+        .await;
+    let took = started.elapsed();
+    assert_eq!(
+        read.expect("every Chunk from its durable copy").to_vec(),
+        expected
+    );
+    assert_eq!(
+        reader.writer.reads(),
+        4,
+        "each durable copy got its request"
+    );
+    assert!(took < budget, "{took:?}");
+    let holder_time = histogram_sum(
+        &reader.metrics,
+        "afs_dfs_read_peer_attempt_seconds",
+        "role=\"peer_holder\"",
+    );
+    assert!(
+        holder_time <= budget.as_secs_f64() * 0.6,
+        "holder attempts took {holder_time:.3} s of a {budget:?} read"
+    );
+}

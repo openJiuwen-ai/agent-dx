@@ -51,7 +51,14 @@ struct Fetched {
     marks: std::cell::RefCell<Vec<crate::node::read::holders::InFlightGuard>>,
     /// Whether this read may ask a holder to wait (!318 P2-4).
     holder_wait: bool,
+    /// When this read stops trying holders (!318 round 2 item 2): one
+    /// deadline for all its groups and parallel children.
+    holder_deadline: Option<Instant>,
 }
+
+/// Holders together get at most this share (1/n) of a read's time left when
+/// it starts; the rest stays with the copies it already has.
+const HOLDER_READ_SHARE: u32 = 2;
 
 tokio::task_local! {
     static FETCHED: Fetched;
@@ -67,19 +74,47 @@ tokio::task_local! {
 /// for a Chunk the other installs only after its own wait. A read that may
 /// wait marks nothing but that one Chunk, for which waits only go to
 /// higher-ranked holders (re-review P2), so no wait cycle can form.
+///
+/// `deadline`: the read's own. Its holder attempts, in every group and
+/// parallel child, end by one shared holder deadline: the read's start plus
+/// 1/[`HOLDER_READ_SHARE`] of its time left. Holders not yet tried by then
+/// are skipped, so several silent holders cannot take the time of the copies
+/// one Chunk after another (!318 round 2 item 2).
 pub(super) async fn keeping_fetched<T>(
     holder_wait: bool,
+    deadline: Option<Instant>,
     read: impl std::future::Future<Output = T>,
 ) -> T {
+    let now = Instant::now();
+    let holder_deadline =
+        deadline.map(|deadline| now + deadline.saturating_duration_since(now) / HOLDER_READ_SHARE);
     FETCHED
         .scope(
             Fetched {
                 marks: std::cell::RefCell::new(Vec::new()),
                 holder_wait,
+                holder_deadline,
             },
             read,
         )
         .await
+}
+
+/// The current read's shared holder deadline, if it has one.
+fn holder_deadline() -> Option<Instant> {
+    FETCHED
+        .try_with(|fetched| fetched.holder_deadline)
+        .ok()
+        .flatten()
+}
+
+/// The deadline of one attempt: the read's, and for a holder also the
+/// read's shared holder deadline.
+fn attempt_deadline(deadline: Instant, holder: bool) -> Instant {
+    match holder_deadline() {
+        Some(limit) if holder => deadline.min(limit),
+        _ => deadline,
+    }
 }
 
 /// Keeps `marks` until the enclosing [`keeping_fetched`] scope ends, or
@@ -207,6 +242,25 @@ impl DfsReadEngine {
         progress: &mut PeerRangeProgress,
     ) -> Result<()> {
         let batch = round.batch;
+        let holder_group = group.iter().all(|&index| {
+            progress.candidates[index][progress.next[index]]
+                .holder_grant
+                .is_some()
+        });
+        if holder_group && Instant::now() >= attempt_deadline(round.deadline, true) {
+            // The read's holder time is over: go on to the copies.
+            self.local
+                .record_read_cache_event("holder_skipped_deadline");
+            progress.last_error = Some(Error::coded(
+                afs_error::NODE_TRANSFER_NOT_READY,
+                "the read's holder deadline passed",
+            ));
+            for &index in group {
+                progress.next[index] += 1;
+                progress.pending.push(index);
+            }
+            return Ok(());
+        }
         let mut length = 0;
         let operations = group
             .iter()
@@ -302,7 +356,12 @@ impl DfsReadEngine {
             .iter()
             .all(|item| item.source.holder_grant.is_some());
         let result = self
-            .try_peer_before(round.deadline, choices, holder, fetch)
+            .try_peer_before(
+                attempt_deadline(round.deadline, holder),
+                choices,
+                holder,
+                fetch,
+            )
             .await;
         if let Some(timer) = timer {
             let outcome = match &result {
@@ -804,7 +863,12 @@ impl DfsReadEngine {
                     .read_ranges_async(&single_batch, &mut single_scratch);
                 let holder = item.source.holder_grant.is_some();
                 match self
-                    .try_peer_before(round.deadline, choices, holder, fetch)
+                    .try_peer_before(
+                        attempt_deadline(round.deadline, holder),
+                        choices,
+                        holder,
+                        fetch,
+                    )
                     .await
                 {
                     Ok(()) => {
