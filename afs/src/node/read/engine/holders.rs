@@ -16,20 +16,18 @@ const HOLDER_LOOKUP_WAIT: Duration = Duration::from_millis(250);
 const HOLDER_LOOKUP_SHARE: u32 = 4;
 /// The wait a holder read asks for: `budget` (`dfs_holder_wait_ms`, default
 /// 30 ms, review/19) only when the holder ranks above this reader for the
-/// Chunk (rendezvous over the version, the Chunk and the Node, re-review P2)
-/// and the read covers one Chunk only (!318 P2-4,
-/// [`super::remote::keeping_fetched`]), otherwise none. Two readers fetching
-/// the same Chunk at once are each other's holders; with this order only one
-/// of them waits for the other, so the waits for one Chunk can never form a
-/// cycle and the highest-ranked reader never waits at all.
-pub(crate) fn holder_wait_ms(version: &FileVersionId, item: &ResolvedReadOp, budget: u32) -> u32 {
+/// Chunk ([`holder_ranks_above`], re-review P2) and the read covers one Chunk
+/// only (!318 P2-4, [`super::remote::keeping_fetched`]), otherwise none. Two
+/// readers fetching the same Chunk at once are each other's holders; with
+/// this order only one of them waits for the other, so the waits for one
+/// Chunk can never form a cycle and the highest-ranked reader never waits.
+pub(crate) fn holder_wait_ms(item: &ResolvedReadOp, budget: u32) -> u32 {
     let Some(grant) = &item.source.holder_grant else {
         return 0;
     };
     if budget != 0
         && super::remote::holder_wait_allowed()
         && holder_ranks_above(
-            version,
             &item.op.chunk_id,
             &grant.holder_node_id,
             &grant.caller_node_id,
@@ -41,14 +39,18 @@ pub(crate) fn holder_wait_ms(version: &FileVersionId, item: &ResolvedReadOp, bud
     }
 }
 
-/// Whether `holder` ranks above `caller` for `chunk` of `version`.
-pub(crate) fn holder_ranks_above(
-    version: &FileVersionId,
-    chunk: &ChunkId,
-    holder: &str,
-    caller: &str,
-) -> bool {
-    let weight = |node: &str| super::distribution::rendezvous_weight(&version.0, chunk, node);
+/// Rendezvous domain of the wait order (not a version: see below).
+const WAIT_ORDER_DOMAIN: &str = "holder-wait-order";
+
+/// Whether `holder` ranks above `caller` for `chunk`: rendezvous over the
+/// Chunk and the Node only. An in-flight mark names a Chunk whatever version
+/// its reader reads, so the order a wait follows must not depend on the
+/// version either: two readers of two versions sharing a Chunk must agree
+/// on who may wait for whom, or each could wait for the other's mark
+/// (!318 round 2 item 5).
+pub(crate) fn holder_ranks_above(chunk: &ChunkId, holder: &str, caller: &str) -> bool {
+    let weight =
+        |node: &str| super::distribution::rendezvous_weight(WAIT_ORDER_DOMAIN, chunk, node);
     weight(holder) > weight(caller)
 }
 const MAX_HOLDER_LISTS: usize = 256;

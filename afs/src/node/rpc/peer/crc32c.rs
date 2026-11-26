@@ -134,11 +134,7 @@ impl GrpcChunkTransfer {
                     .is_none()
                     .then(|| wire_dfs_read_grant(&item.source.read_grant)),
                 holder_grant: item.source.holder_grant.clone().map(Into::into),
-                wait_ms: crate::node::read::engine::holder_wait_ms(
-                    &batch.file_version_id,
-                    item,
-                    self.peers.holder_wait_ms,
-                ),
+                wait_ms: crate::node::read::engine::holder_wait_ms(item, self.peers.holder_wait_ms),
                 fetch_if_absent: false,
             }],
         };

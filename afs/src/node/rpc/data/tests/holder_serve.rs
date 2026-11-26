@@ -1290,9 +1290,8 @@ fn pair_chunks(two: bool) -> Vec<(StagedChunk, Vec<u8>)> {
             StagedChunk::new_crc32c(crate::dfs::OperationId::new("pair"), bytes.clone()).unwrap();
         (staged, bytes)
     };
-    let version = FileVersionId::new("v");
     let r1_above = |staged: &StagedChunk| {
-        crate::node::read::engine::holder_ranks_above(&version, &staged.chunk.id, "r1", "r2")
+        crate::node::read::engine::holder_ranks_above(&staged.chunk.id, "r1", "r2")
     };
     if !two {
         return vec![make(0)];
@@ -1545,7 +1544,6 @@ async fn pair_read(
     };
     // r1 ranks above r2 for chunks[0] (`pair_chunks`); for one Chunk, find out.
     let higher = usize::from(!crate::node::read::engine::holder_ranks_above(
-        &FileVersionId::new("v"),
         &chunks[0].0.chunk.id,
         names[0],
         names[1],

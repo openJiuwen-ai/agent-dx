@@ -2291,3 +2291,58 @@ fn h2_pr318_failed_source_lookup_is_timed() {
         .sum::<u64>();
     assert_eq!(sources, 1);
 }
+
+/// !318 round 2 item 5: in-flight marks name a Chunk, whatever version its
+/// reader reads. The wait order must not depend on the version either:
+/// otherwise, for a Chunk two versions share, A could wait for B under one
+/// version while B waits for A under the other, each for the other's mark.
+#[test]
+fn h2_round2_wait_order_for_a_chunk_is_the_same_in_every_version() {
+    let chunk = ChunkId::new("shared-by-versions");
+    // The order takes no version: two readers of different versions
+    // compute the same one, and exactly one of them may wait.
+    for (a, b) in [("node-a", "node-b"), ("node-c", "node-d")] {
+        assert_ne!(
+            holders::holder_ranks_above(&chunk, a, b),
+            holders::holder_ranks_above(&chunk, b, a),
+            "{a} vs {b}"
+        );
+    }
+    // A wait follows that order, whatever version the request names.
+    let grant = |holder: &str, caller: &str, version: &str| crate::dfs::DfsHolderGrant {
+        namespace_id: crate::dfs::NamespaceId::new("default"),
+        file_version_id: FileVersionId::new(version),
+        layout_root_id: LayoutRootId::new("layout"),
+        caller_node_id: caller.into(),
+        caller_node_epoch: 1,
+        holder_node_id: holder.into(),
+        holder_node_epoch: 3,
+        expires_at_unix_ms: 4_000_000_000_000,
+        token: String::new(),
+    };
+    let item = |holder: &str, caller: &str, version: &str| {
+        let mut source = candidate("h", &chunk, holder, CopyRole::VerifiedCache);
+        source.holder_grant = Some(grant(holder, caller, version));
+        ResolvedReadOp {
+            op: read_op(chunk.clone(), 4).ops[0].clone(),
+            source,
+        }
+    };
+    let waits = |budget| {
+        super::remote::keeping_fetched(true, async move {
+            (
+                holders::holder_wait_ms(&item("node-a", "node-b", "v1"), budget),
+                holders::holder_wait_ms(&item("node-b", "node-a", "v2"), budget),
+            )
+        })
+    };
+    let (a_waits_b, b_waits_a) = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(waits(30));
+    assert_eq!(
+        [a_waits_b, b_waits_a].iter().filter(|w| **w != 0).count(),
+        1,
+        "across versions, exactly one of two readers may wait for the other"
+    );
+}
