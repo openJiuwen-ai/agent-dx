@@ -1,6 +1,6 @@
 //! OCI Registry protocol and immutable source metadata. No AFS dependency.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,6 +16,8 @@ use tokio::sync::watch;
 use super::RegistryConfig;
 
 const MANIFEST_LIMIT: usize = 4 * 1024 * 1024;
+const MANIFEST_CACHE_LIMIT: usize = 16 * 1024 * 1024;
+const MANIFEST_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -37,10 +39,48 @@ pub struct ImagePlan {
     pub blobs: Vec<RegistrySource>,
 }
 
+#[derive(Clone)]
 pub(super) struct RegistryManifest {
     pub digest: String,
     pub content_type: header::HeaderValue,
     pub body: Bytes,
+}
+
+#[derive(Default)]
+struct ManifestCache {
+    entries: VecDeque<(String, RegistryManifest)>,
+    body_bytes: usize,
+}
+
+impl ManifestCache {
+    fn get(&mut self, source: &str, digest: &str) -> Option<RegistryManifest> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(key, manifest)| key == source && manifest.digest == digest)?;
+        let entry = self.entries.remove(index)?;
+        let manifest = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(manifest)
+    }
+
+    fn insert(&mut self, source: &str, manifest: &RegistryManifest) {
+        if self.get(source, &manifest.digest).is_some() {
+            return;
+        }
+        let size = manifest.body.len();
+        while self.body_bytes + size > MANIFEST_CACHE_LIMIT
+            || self.entries.len() >= MANIFEST_CACHE_ENTRIES
+        {
+            let Some((_, old)) = self.entries.pop_front() else {
+                return;
+            };
+            self.body_bytes -= old.body.len();
+        }
+        self.body_bytes += size;
+        self.entries
+            .push_back((source.to_owned(), manifest.clone()));
+    }
 }
 
 struct Source {
@@ -55,6 +95,7 @@ pub struct RegistryProvider {
     proxy_sources: BTreeMap<String, String>,
     node_id: String,
     tokens: tokio::sync::Mutex<BTreeMap<String, (String, Instant)>>,
+    manifests: tokio::sync::Mutex<ManifestCache>,
     stopping: watch::Sender<bool>,
 }
 
@@ -95,6 +136,7 @@ impl RegistryProvider {
             proxy_sources,
             node_id: node_id.into(),
             tokens: Default::default(),
+            manifests: Default::default(),
             stopping: watch::channel(false).0,
         }))
     }
@@ -244,7 +286,8 @@ impl RegistryProvider {
         reference: &str,
         deadline: Instant,
     ) -> Result<RegistryManifest> {
-        if reference.contains(':') {
+        let immutable = reference.contains(':');
+        if immutable {
             require_digest(reference)?;
         } else if reference.len() > 128
             || !reference
@@ -258,6 +301,14 @@ impl RegistryProvider {
             return Err(invalid("invalid Registry manifest reference"));
         }
         let source = self.source(key)?;
+        if Instant::now() >= deadline || *self.stopping.borrow() {
+            return Err(unavailable(
+                "Nydus Registry manifest request expired or stopping",
+            ));
+        }
+        if immutable && let Some(manifest) = self.manifests.lock().await.get(key, reference) {
+            return Ok(manifest);
+        }
         let url = format!(
             "{}/v2/{}/manifests/{reference}",
             source.config.registry.trim_end_matches('/'),
@@ -279,16 +330,19 @@ impl RegistryProvider {
             .while_running(bounded_body(response, MANIFEST_LIMIT, deadline))
             .await?;
         let digest = format!("sha256:{:x}", Sha256::digest(&body));
-        if reference.contains(':') && reference != digest
-            || claimed.is_some_and(|value| value != digest.as_str())
+        if immutable && reference != digest || claimed.is_some_and(|value| value != digest.as_str())
         {
             return Err(invalid("Registry manifest digest mismatch"));
         }
-        Ok(RegistryManifest {
+        let manifest = RegistryManifest {
             digest,
             content_type,
             body,
-        })
+        };
+        if immutable {
+            self.manifests.lock().await.insert(key, &manifest);
+        }
+        Ok(manifest)
     }
 
     pub(super) async fn blob_size(&self, key: &str, blob: &str, deadline: Instant) -> Result<u64> {
@@ -707,13 +761,14 @@ mod tests {
         assert!(RegistryProvider::new(&duplicate, "node-a").is_err());
     }
     async fn response_fixture(
-        response: &'static str,
+        response: impl Into<String>,
     ) -> (
         Arc<RegistryProvider>,
         RegistrySource,
         tokio::task::JoinHandle<String>,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let response = response.into();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let registry = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -748,6 +803,52 @@ mod tests {
             size: 8,
         };
         (provider, source, server)
+    }
+
+    #[tokio::test]
+    async fn described_digest_manifest_remains_available_after_origin_disconnects() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"digest": format!("sha256:{}", "a".repeat(64)), "size": 8},
+            "layers": [{"digest": format!("sha256:{}", "b".repeat(64)), "size": 16}],
+        }))
+        .unwrap();
+        let manifest = format!("sha256:{:x}", Sha256::digest(&body));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(&body).unwrap()
+        );
+        let (provider, _, origin) = response_fixture(response).await;
+
+        let plan = provider
+            .describe("test", &manifest, Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(plan.blobs.len(), 2);
+        assert!(
+            origin
+                .await
+                .unwrap()
+                .starts_with("GET /v2/test/image/manifests/")
+        );
+
+        let cached = provider
+            .fetch_manifest("test", &manifest, Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(cached.digest, manifest);
+        assert_eq!(cached.body, body);
+        assert_eq!(
+            cached.content_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert!(
+            provider
+                .fetch_manifest("test", "latest", Instant::now() + Duration::from_secs(2))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

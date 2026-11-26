@@ -345,6 +345,19 @@ pub trait Backend: Send + Sync {
         Ok(out)
     }
 
+    /// Install a per-handle metadata-only range hint. This neither reads body
+    /// bytes nor grants access; backends without source caching keep a no-op.
+    /// Invalid handles/ranges or an expired deadline may return an error.
+    fn set_read_source_range(
+        &self,
+        _ctx: &types::RequestContext,
+        _handle: types::FileHandle,
+        _range: std::ops::Range<u64>,
+        _deadline: std::time::Instant,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn supports_async_reads(&self) -> bool {
         false
     }

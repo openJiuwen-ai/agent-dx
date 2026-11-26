@@ -80,6 +80,10 @@ Registry proxy 可将 manifest 的 HEAD／GET、blob 的 HEAD／GET Range 交给
 原生 Nydus 的 `/nydus/` 路由继续按镜像 manifest 定位文件。ADX 部署和验证见
 [Nydus 沙箱启动教程](../docs/deployment/afs-nydus-startup.md)。
 
+### HTTP Range 来源批量查询
+
+blob GET 打开只读句柄后记录当前 HTTP Range。已提交范围首次需要远端读取时，DFS 可以在现有来源查询中附带同一 Range 内后续 chunk，复用来源缓存的大小、有效期和授权检查。较大的 Range 按来源查询上限分批处理。正文仍按每片最多 256 KiB 流式读取。
+
 ## 核心流程和失败边界
 
 1. 首次 HEAD 或直接 GET：Service 查询并校验固定 manifest，预建 `.afs-nydus/images/{source}/{manifest-hex}/blobs/{blob-hex}` 以及 `descriptor.json`；不展开容器内部文件树，不下载 blob 正文。每个 blob 是一个文件。不同镜像目录下的共享 blob 尚不合并为同一个 inode。

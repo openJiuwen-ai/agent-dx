@@ -34,7 +34,7 @@ registry_proxy = true
 
 供数节点使用一致的 source 名、Registry URL 和仓库名。需要认证时，按 [Connector 配置](../../afs/CONNECTORS.md#配置与调用)在节点本机设置 Registry 凭据。默认使用 HTTPS 回源；隔离测试的明文 Registry 需要显式配置 `allow_insecure_http = true`。
 
-将下面的 `proxy` 对象合并到 sandboxd 使用的 Registry 后端模板中的 `registry` 对象。保留原镜像引用。sandboxd 和 AFS Node 要能通过同一网络命名空间的回环地址通信，且 sandboxd 的镜像格式探测仍需访问原 Registry 的 manifest。已验证的客户端到 AFS 代理链路使用 HTTP。强制经代理用 HTTPS `CONNECT` 传输正文时，当前入口返回 `404`。
+将下面的 `proxy` 对象合并到 sandboxd 使用的 Registry 后端模板中的 `registry` 对象。保留原镜像引用。sandboxd 和 AFS Node 要能通过同一网络命名空间的回环地址通信。使用旧版 sandboxd 时，镜像格式探测仍会直连原 Registry 查询 manifest。已验证的客户端到 AFS 代理链路使用 HTTP。强制经代理用 HTTPS `CONNECT` 传输正文时，当前入口返回 `404`。
 
 ```json
 {
@@ -121,3 +121,9 @@ adx_worker_id = "worker-b" # 种子专用节点可省略
 Meta 的 `GET /v1/admin/nodes` 返回节点快照。Nydus connector 在各 Node 上提供 `POST /v1/admin/nydus/seed-jobs`、`POST /v1/admin/nydus/prewarm-jobs` 和各自的 `GET /{job_id}` 后缀。客户端把来源别名和固定 manifest digest 传给接收 Node。铺种额外传显式 `node_ids`，预热额外传采样得到的 blob 范围。工具生成 `request_id` 并轮询 POST 返回的 `job_id`。任务记录属于接收 Node，重启后可按相同请求重提，DFS 依据实际持久副本和缓存判断已完成工作。
 
 预热任务由 DFS 按已提交布局找到所需 Chunk。远端取回的完整 Chunk 直接进入 DFS 读缓存安装队列，重叠任务共享同一 Chunk 的安装结果。DFS 在同一个本地 Chunk 目录视图中确认整份清单仍可读，再报告预热就绪。缓存容量须覆盖这些 Chunk 的完整大小和每个 Chunk 的缓存开销。容量不足时任务以明确错误失败。缓存继续受正常淘汰策略管理。
+
+### 预热后的 manifest 查询
+
+按 digest 执行 Worker 范围预热时，本地 AFS Reader 会缓存校验过的原始 Registry manifest。缓存按来源和 digest 隔离，最多保存 64 项和 16 MiB 的 manifest 正文，并随 Reader 进程重启而清空。Tag 查询仍按上游仓库的当前结果解析。
+
+支持复用 Registry 代理的 sandboxd 会从 `[plugin.image].nydus_template` 读取 `registry.proxy.url`，用于首次镜像格式探测；bootstrap 和数据 blob 也使用同一份模板中的代理配置。格式探测的代理请求失败时，sandboxd 会回源。预热命中时，格式识别和 bootstrap 准备用到的 digest manifest 都可从 Reader 本地缓存返回。

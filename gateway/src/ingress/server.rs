@@ -993,6 +993,9 @@ impl Ingress {
                         );
                         continue;
                     }
+                    if let Err(error) = stream.set_nodelay(true) {
+                        tracing::warn!(%peer, %error, "failed to enable TCP_NODELAY on ingress socket");
+                    }
                     let gateway = self.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let options = options.clone();
