@@ -527,6 +527,7 @@ fn spawn_controller(
         auto_pause_guard: None,
         create_deadline: None,
         stopped_runtime_ids,
+        published_stopped_runtime_ids: BTreeSet::new(),
     };
     controller.publish_view();
     tokio::spawn(async move {
@@ -1120,6 +1121,12 @@ struct ExecutionReference {
     pin: Option<Box<dyn Send + Sync>>,
 }
 
+struct PublicationSnapshot {
+    resources_held: bool,
+    execution_artifacts: Vec<adx_core::CheckpointArtifact>,
+    stopped_runtime_ids: Vec<String>,
+}
+
 struct Controller {
     submissions: Arc<Submissions>,
     run_timer: Option<run_timer::RunTimer>,
@@ -1128,6 +1135,7 @@ struct Controller {
     // One validated reload may retry after its intent-only state revisions.
     intent_retry: Option<adx_core::CompletedOperation>,
     stopped_runtime_ids: Vec<String>,
+    published_stopped_runtime_ids: BTreeSet<String>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
     snapshot_publication: Option<snapshots::SnapshotPublication>,
     create_deadline: Option<tokio::time::Instant>,
@@ -1174,6 +1182,29 @@ impl Controller {
             .observe(&self.metrics_registration, eligible.then_some(&self.record));
         self.observed
             .send_replace((self.record.clone(), self.durability));
+    }
+
+    fn publication_snapshot(&self) -> PublicationSnapshot {
+        PublicationSnapshot {
+            resources_held: self.record.resources_held,
+            execution_artifacts: self.record.execution_artifacts.clone(),
+            stopped_runtime_ids: self.stopped_runtime_ids.clone(),
+        }
+    }
+
+    // Cleanup can change facts that the Journal publishes with the record.
+    // Never sync changed facts under the previous revision: the Journal
+    // correctly rejects that as the same identity with different content.
+    fn note_cleanup_publication(&mut self, before: &PublicationSnapshot) -> Result<bool> {
+        let changed = before.resources_held != self.record.resources_held
+            || before.execution_artifacts != self.record.execution_artifacts
+            || before.stopped_runtime_ids != self.stopped_runtime_ids;
+        if changed {
+            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+            self.durability = None;
+            self.publish_view();
+        }
+        Ok(changed)
     }
 
     pub(super) fn hold_artifact(
@@ -1448,12 +1479,9 @@ impl Controller {
                 .or_else(|| self.record.snapshot_source.clone())
                 .ok_or(Error::Conflict)?;
             self.services.checkpoint.as_ref().ok_or(Error::Conflict)?;
-            let had_inputs = !self.record.execution_artifacts.is_empty();
+            let before = self.publication_snapshot();
             self.cleanup().await?;
-            if had_inputs {
-                self.record.revision =
-                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-            }
+            self.note_cleanup_publication(&before)?;
             if cp.expired(super::checkpoint::now()?) {
                 self.operation_intent(adx_core::observation::OperationIntent::Policy);
                 return self.delete(false).await;
@@ -1468,15 +1496,19 @@ impl Controller {
             if lost_running && !self.intended_execution_absence() {
                 self.mark_interruption(adx_core::observation::EvidenceSource::Reconcile)?;
             }
+            let before = self.publication_snapshot();
             self.cleanup().await?;
+            let changed = self.note_cleanup_publication(&before)?;
             if !matches!(
                 self.record.state,
                 EnvironmentState::Deleted | EnvironmentState::Failed
             ) {
                 self.record.state = EnvironmentState::Failed;
-                self.record.revision =
-                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-            } else if self.record.state == EnvironmentState::Failed {
+                if !changed {
+                    self.record.revision =
+                        self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                }
+            } else if self.record.state == EnvironmentState::Failed && !changed {
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
             }
@@ -1548,7 +1580,8 @@ impl Controller {
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
         self.durability = Some(durability);
         if durability == Durability::Published {
-            self.stopped_runtime_ids.clear();
+            self.published_stopped_runtime_ids
+                .extend(std::mem::take(&mut self.stopped_runtime_ids));
         }
         self.publish_view();
         self.clean_obsolete_checkpoints().await?;
@@ -1922,8 +1955,10 @@ impl Controller {
                     return Err(start_error);
                 }
                 let mut commit = self.sync().await;
+                let before = self.publication_snapshot();
                 let cleanup = self.cleanup().await;
-                if cleanup.is_ok() && (restore_cancelled || !self.stopped_runtime_ids.is_empty()) {
+                let changed = self.note_cleanup_publication(&before)?;
+                if changed || (cleanup.is_ok() && restore_cancelled) {
                     // Failure publication precedes physical cleanup. Publish the
                     // completed cleanup separately before opening Volume admission.
                     commit = self.sync().await;
@@ -2071,6 +2106,9 @@ impl Controller {
     }
 
     fn record_stopped_runtime(&mut self) {
+        let runtime_id = self.record.runtime.id.clone();
+        self.published_stopped_runtime_ids
+            .retain(|published| published == &runtime_id);
         if self
             .record
             .spec
@@ -2078,10 +2116,10 @@ impl Controller {
             .mounts
             .iter()
             .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))
-            && !self.stopped_runtime_ids.contains(&self.record.runtime.id)
+            && !self.published_stopped_runtime_ids.contains(&runtime_id)
+            && !self.stopped_runtime_ids.contains(&runtime_id)
         {
-            self.stopped_runtime_ids
-                .push(self.record.runtime.id.clone());
+            self.stopped_runtime_ids.push(runtime_id);
             self.durability = None;
         }
     }
