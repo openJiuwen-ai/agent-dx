@@ -123,6 +123,13 @@ struct DfsTransport {
     rdma_pool: Option<Arc<rpc::peer::DfsRdmaPool>>,
 }
 
+/// H2 step 2: the shared-version registry and the in-flight Chunks a holder
+/// serves from.
+pub(super) type HolderSources = (
+    Arc<read::holders::HolderRegistry>,
+    Arc<read::holders::HolderInFlight>,
+);
+
 /// Everything the DFS assembly hands to the later stages (段 8–9). The
 /// `Option` handles stay `None` when `cfg.dfs` is off.
 pub(super) struct DfsAssembly {
@@ -136,6 +143,9 @@ pub(super) struct DfsAssembly {
     pub(super) peer_cache: Option<Arc<read::peer_cache::DiskPeerCache>>,
     pub(super) fetcher: Option<Arc<read::object_fetch::ObjectFetcher>>,
     pub(super) gc_collector: Option<Arc<gc::Collector>>,
+    /// H2 step 2: what the data plane needs to serve holder-form reads, when
+    /// `dfs_read_share_concurrent` applies to this Node.
+    pub(super) holder_sources: Option<HolderSources>,
     pub(super) writeback_passes: background::tick::WritebackPassMetrics,
     /// Moved into `Node` once the mounts exist.
     pub(super) instance: Option<Arc<vfs::dfs::DistributedFs>>,
@@ -232,6 +242,7 @@ impl DfsAssembly {
             peer_cache: None,
             fetcher: None,
             gc_collector: None,
+            holder_sources: None,
             writeback_passes: background::tick::WritebackPassMetrics::register(&obs.registry)?,
             instance: None,
         };
@@ -360,6 +371,16 @@ impl DfsAssembly {
             gc::GcReleaseMetrics::register(&obs.registry)?,
         ));
         let read_engine = read_engine.with_read_pipeline(cfg.dfs_read_pipeline)?;
+        // H2 step 2: read from other readers sharing the version.
+        let read_engine = if read_sharing(
+            cfg.dfs_read_share_concurrent,
+            cfg.dfs_read_cache_bytes,
+            external_store.is_some(),
+        ) {
+            read_engine.with_holder_lists(std::time::Duration::from_millis(cfg.dfs_holder_ttl_ms))
+        } else {
+            read_engine
+        };
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
             None => read_engine,
@@ -382,6 +403,17 @@ impl DfsAssembly {
                 ),
             })
         });
+        // H2 step 2: sharing needs the native read cache (the holder serves
+        // its installed copies) and soft readers (the shared registrations).
+        let share = read_sharing(
+            cfg.dfs_read_share_concurrent,
+            cfg.dfs_read_cache_bytes,
+            self.external_store.is_some(),
+        );
+        self.holder_sources = match (&gc_references, read_engine.holder_in_flight()) {
+            (Some(references), Some(in_flight)) if share => Some((references.holders(), in_flight)),
+            _ => None,
+        };
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),
             timeout,
@@ -396,6 +428,7 @@ impl DfsAssembly {
         )
         .with_lazy_fill_registry(self.connectors.register_lazy_handlers()?)
         .with_gc_references(gc_references)
+        .with_read_sharing(share)
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
@@ -652,8 +685,23 @@ fn dfs_rdma_startup_device(
     }
 }
 
+/// H2 step 2: whether this Node shares read opens and reads from holders.
+/// One rule for both sides: the switch, the native read cache (a holder
+/// serves its installed copies), and native DFS (code review N1).
+fn read_sharing(switch: bool, read_cache_bytes: u64, external_backend: bool) -> bool {
+    switch && read_cache_bytes != 0 && !external_backend
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h2_n1_read_sharing_needs_the_read_cache_and_native_dfs() {
+        assert!(super::read_sharing(true, 1, false));
+        assert!(!super::read_sharing(false, 1, false));
+        assert!(!super::read_sharing(true, 0, false));
+        assert!(!super::read_sharing(true, 1, true), "external backend");
+    }
+
     #[cfg(feature = "dfs")]
     #[test]
     fn dfs_auto_rdma_startup_uses_device_only_when_available() {

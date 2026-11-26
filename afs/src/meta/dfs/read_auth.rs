@@ -1,6 +1,11 @@
 //! Read sources and read authorization, native and external.
 
 use super::*;
+use crate::dfs::{
+    DfsAuthorizedHolderRead, DfsHolderGrant, DfsVersionHoldersRequest, ValidateDfsHolderGrant,
+    VersionHolder,
+};
+pub(super) use crate::dfs::{read_chunk_intervals, read_range_covered};
 
 struct MissingExternalReadContext<'a> {
     view: &'a MetaReadView,
@@ -172,6 +177,7 @@ impl DfsService {
                     data_endpoint,
                     load_hint: 0,
                     read_grant,
+                    holder_grant: None,
                 });
             }
             chunks.push(ChunkSources {
@@ -840,6 +846,258 @@ impl DfsService {
     }
 }
 
+/// H2 step 2: at most this many holders are offered per version.
+pub(super) const MAX_VERSION_HOLDERS: usize = 8;
+/// A holder grant lives at least as long as a per-copy one.
+const HOLDER_GRANT_TTL_MS: u64 = 30_000;
+/// Holder grant deadlines are aligned to this grid, so a reader refreshing
+/// its holder list within one window gets the same grant (and token) again
+/// and holders keep hitting their authorization cache (code review S2).
+const HOLDER_GRANT_WINDOW_MS: u64 = 10_000;
+
+/// The deadline of a holder grant issued at `now`: at least
+/// [`HOLDER_GRANT_TTL_MS`] ahead, at most one window more, on the grid.
+pub(super) fn holder_grant_deadline(now: u64) -> u64 {
+    (now.saturating_add(HOLDER_GRANT_TTL_MS) / HOLDER_GRANT_WINDOW_MS)
+        .saturating_add(1)
+        .saturating_mul(HOLDER_GRANT_WINDOW_MS)
+}
+/// A holder may keep a validated holder grant at most this long (plan/15
+/// §2.2.4): the window in which a fenced caller can still read through it.
+pub(super) const HOLDER_AUTHORIZATION_MS: u64 = 2_000;
+
+impl DfsService {
+    /// H2 step 2 (`GetDfsVersionHolders`, plan/15 §1.2): the other Nodes that
+    /// share their read-cache copies of `file_version_id`, each with a grant
+    /// for this caller. Only a caller that reads the version itself learns
+    /// who else does (N1); native DFS only (S2). The list is empty, never an
+    /// error, when there is nobody to offer.
+    pub async fn version_holders(
+        &self,
+        request: DfsVersionHoldersRequest,
+    ) -> Result<Vec<VersionHolder>> {
+        require_id(&request.caller_id, "caller_id")?;
+        require_id(&request.namespace_id.0, "namespace_id")?;
+        require_id(&request.file_version_id.0, "file_version_id")?;
+        require_id(&request.layout_root_id.0, "layout_root_id")?;
+        if self.is_external_backend() {
+            return Ok(Vec::new());
+        }
+        let view = self.store.read_view().await?;
+        let now = now_unix_ms();
+        let deadline = holder_grant_deadline(now);
+        let caller = match view
+            .read(MetaRead::CurrentNodeSession {
+                node_id: request.caller_id.clone(),
+            })
+            .await?
+            .entity
+        {
+            Some(MetaEntity::NodeSession(session)) if session.is_live_at_unix_ms(now) => session,
+            _ => {
+                return Err(conflict(
+                    "DFS version holders request requires a live caller session",
+                ));
+            }
+        };
+        holder_scope(
+            &view,
+            &request.namespace_id,
+            &request.file_version_id,
+            &request.layout_root_id,
+        )
+        .await
+        .map_err(|_| invalid("DFS version holders request names no current version"))?;
+        if !self.readers.reads(
+            &caller.node_id,
+            &caller.session_id,
+            &request.file_version_id,
+        ) {
+            return Ok(Vec::new());
+        }
+        // Live sharing sessions first; only the first MAX_VERSION_HOLDERS in
+        // rendezvous order are signed (code review N4).
+        let mut live = Vec::new();
+        for (node, session) in self.readers.sharing(&request.file_version_id) {
+            if node == request.caller_id {
+                continue;
+            }
+            let Some(MetaEntity::NodeSession(current)) = view
+                .read(MetaRead::CurrentNodeSession {
+                    node_id: node.clone(),
+                })
+                .await?
+                .entity
+            else {
+                continue;
+            };
+            if current.session_id != session || !current.is_live_at_unix_ms(now) {
+                continue;
+            }
+            live.push(current);
+        }
+        live.sort_by_cached_key(|current| {
+            std::cmp::Reverse(holder_weight(&request.file_version_id, &current.node_id))
+        });
+        live.truncate(MAX_VERSION_HOLDERS);
+        let mut holders = Vec::with_capacity(live.len());
+        for current in live {
+            let mut grant = DfsHolderGrant {
+                namespace_id: request.namespace_id.clone(),
+                file_version_id: request.file_version_id.clone(),
+                layout_root_id: request.layout_root_id.clone(),
+                caller_node_id: caller.node_id.clone(),
+                caller_node_epoch: caller.lease_epoch,
+                holder_node_id: current.node_id.clone(),
+                holder_node_epoch: current.lease_epoch,
+                expires_at_unix_ms: deadline,
+                token: String::new(),
+            };
+            grant.token = self.holder_grant_token(&grant)?;
+            holders.push(VersionHolder {
+                node_id: current.node_id.clone(),
+                node_epoch: current.lease_epoch,
+                data_endpoint: current.data_addr.clone(),
+                grant,
+            });
+        }
+        Ok(holders)
+    }
+
+    fn holder_grant_mac(&self, grant: &DfsHolderGrant) -> Result<blake3::Hash> {
+        let key = self
+            .read_grant_key
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| permission_denied("Meta read grant entropy is unavailable"))?;
+        let mut unsigned = grant.clone();
+        unsigned.token.clear();
+        let canonical = serde_json::to_vec(&("afs-dfs-read-holder-v1", unsigned))
+            .map_err(|_| invalid("holder grant canonical serialization failed"))?;
+        Ok(blake3::keyed_hash(key, &canonical))
+    }
+
+    fn holder_grant_token(&self, grant: &DfsHolderGrant) -> Result<String> {
+        Ok(format!(
+            "{}{}",
+            crate::dfs::HOLDER_GRANT_TOKEN_PREFIX,
+            self.holder_grant_mac(grant)?.to_hex()
+        ))
+    }
+
+    /// H2 step 2 (`ValidateDfsHolderGrants`, plan/15 §2.2.2): a holder asks
+    /// whether `grant` lets `peer_node_id` read the version from it. Ranges
+    /// are not Meta's here: the holder checks them against the layout.
+    pub async fn validate_holder_grant(
+        &self,
+        request: ValidateDfsHolderGrant,
+    ) -> Result<DfsAuthorizedHolderRead> {
+        let grant = &request.grant;
+        let denied = || permission_denied("holder grant is not valid");
+        // Native DFS only, like the holder list (code review N1).
+        if self.is_external_backend() {
+            return Err(denied());
+        }
+        // 1. token prefix and MAC
+        let supplied = grant
+            .token
+            .strip_prefix(crate::dfs::HOLDER_GRANT_TOKEN_PREFIX)
+            .filter(|_| grant.token.len() == crate::dfs::HOLDER_GRANT_TOKEN_LEN)
+            .and_then(|hex| blake3::Hash::from_hex(hex).ok())
+            .ok_or_else(denied)?;
+        if supplied != self.holder_grant_mac(grant)? {
+            return Err(denied());
+        }
+        // 2. caller is the authenticated peer, not expired
+        let now = now_unix_ms();
+        if grant.caller_node_id != request.peer_node_id || grant.expires_at_unix_ms <= now {
+            return Err(denied());
+        }
+        // 4. the receiver is the holder the grant names
+        if grant.holder_node_id != request.receiver_node_id
+            || grant.holder_node_epoch != request.receiver_node_epoch
+        {
+            return Err(denied());
+        }
+        let view = self.store.read_view().await?;
+        // 3. and 4. both sessions live in the epochs the grant names
+        let caller =
+            live_read_session(&view, &grant.caller_node_id, grant.caller_node_epoch, now).await?;
+        let holder =
+            live_read_session(&view, &grant.holder_node_id, grant.holder_node_epoch, now).await?;
+        // 5. version, layout and namespace still exist and agree
+        holder_scope(
+            &view,
+            &grant.namespace_id,
+            &grant.file_version_id,
+            &grant.layout_root_id,
+        )
+        .await
+        .map_err(|_| denied())?;
+        // 6. the holder still shares the version (S4)
+        if !self
+            .readers
+            .shares(&holder.node_id, &holder.session_id, &grant.file_version_id)
+        {
+            return Err(denied());
+        }
+        let expires_at_unix_ms = now
+            .saturating_add(HOLDER_AUTHORIZATION_MS)
+            .min(grant.expires_at_unix_ms)
+            .min(caller.expires_at_unix_ms)
+            .min(holder.expires_at_unix_ms);
+        Ok(DfsAuthorizedHolderRead {
+            grant: request.grant,
+            expires_at_unix_ms,
+        })
+    }
+}
+
+/// The version, its layout and its inode's namespace agree in `view`.
+async fn holder_scope(
+    view: &MetaReadView,
+    namespace: &NamespaceId,
+    version_id: &FileVersionId,
+    layout_id: &LayoutRootId,
+) -> Result<()> {
+    let version = match view
+        .read(MetaRead::DfsFileVersion(version_id.clone()))
+        .await?
+        .entity
+    {
+        Some(MetaEntity::DfsFileVersion(value)) if value.layout_root == *layout_id => value,
+        _ => return Err(permission_denied("holder scope version or layout differs")),
+    };
+    match view
+        .read(MetaRead::DfsLayoutRoot(layout_id.clone()))
+        .await?
+        .entity
+    {
+        Some(MetaEntity::DfsLayoutRoot(_)) => {}
+        _ => return Err(permission_denied("holder scope layout is missing")),
+    }
+    match view
+        .read(MetaRead::DfsInode(version.inode_id))
+        .await?
+        .entity
+    {
+        Some(MetaEntity::DfsInode(inode)) if inode.namespace_id == *namespace => Ok(()),
+        _ => Err(permission_denied("holder scope namespace differs")),
+    }
+}
+
+/// Highest-random-weight order of the holders of one version.
+fn holder_weight(version: &FileVersionId, node: &str) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for part in [version.0.as_bytes(), node.as_bytes()] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let mut weight = [0_u8; 8];
+    weight.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(weight)
+}
+
 /// A committed copy records the process that produced its durable receipt;
 /// reads use the live process serving that same persistent device. After a
 /// restart, registration follows LocalChunkStore recovery and advertises the
@@ -908,50 +1166,4 @@ async fn live_read_session(
         }
         _ => Err(permission_denied("read grant Node session is not live")),
     }
-}
-
-pub(super) fn read_chunk_intervals(
-    layout: &LayoutRoot,
-    chunk: &crate::dfs::ChunkObject,
-) -> Result<Vec<(u64, u64)>> {
-    let mut intervals = Vec::new();
-    for extent in layout
-        .inline_extents
-        .iter()
-        .filter(|extent| extent.chunk_id == chunk.id)
-    {
-        let length = extent
-            .length
-            .min(layout.file_length.saturating_sub(extent.file_offset));
-        let end = extent
-            .chunk_offset
-            .checked_add(length)
-            .filter(|end| *end <= chunk.length)
-            .ok_or_else(|| invalid("read layout extent exceeds immutable chunk"))?;
-        if length != 0 {
-            intervals.push((extent.chunk_offset, end));
-        }
-    }
-    intervals.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::new();
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    Ok(merged
-        .into_iter()
-        .map(|(start, end)| (start, end - start))
-        .collect())
-}
-
-pub(super) fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
-    length != 0
-        && offset.checked_add(length).is_some_and(|end| {
-            intervals.iter().any(|(start, len)| {
-                offset >= *start && start.checked_add(*len).is_some_and(|limit| end <= limit)
-            })
-        })
 }

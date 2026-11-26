@@ -6,6 +6,8 @@ use super::*;
 #[derive(Default)]
 pub(super) struct GcCoordinator {
     pub(super) references: Option<Arc<crate::node::gc::GcReferences>>,
+    /// H2 step 2: read opens register their head as a shared reader.
+    pub(super) share_read_cache: bool,
 }
 
 impl GcCoordinator {

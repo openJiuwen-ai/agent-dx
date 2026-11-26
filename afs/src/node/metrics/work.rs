@@ -147,6 +147,8 @@ const READ_CHECK_NAMES: [&str; 10] = [
 pub struct ReadWorkMetrics {
     #[cfg(feature = "dfs")]
     pub(crate) activities: super::super::read::activity::Activities,
+    #[cfg(feature = "dfs")]
+    pub(crate) share: ShareTimingMetrics,
     core: ReadCoreMetrics,
     #[cfg(any(feature = "dfs", test))]
     buffers: ReadBufferMetrics,
@@ -264,6 +266,8 @@ const READ_RPC_METHODS: &[&str] = &[
     "get_chunk_sources",
     "validate_read_grants",
     "peer_read_ranges",
+    "get_version_holders",
+    "validate_holder_grant",
 ];
 #[cfg(feature = "dfs")]
 const SOURCE_CACHE_RESOURCES: &[&str] = &["entries", "bytes", "peak_bytes", "limit_bytes"];
@@ -304,13 +308,29 @@ pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
     "crc_table_reused",
     "crc_table_built",
     "denied_reauthorized",
+    // H2 step 2: what this Node answered as a version holder.
+    "holder_served",
+    "holder_waited",
+    "holder_wait_timeout",
+    "holder_wait_rejected",
+    "holder_not_ready",
+    "holder_denied",
+    // H2 step 2: what this Node met as a reader of a holder.
+    "holder_answered_not_ready",
+    "holder_answered_busy",
 ];
 /// Where a native read's bytes came from: this Node, a durable replica, or
 /// another reader's verified cache copy.
 #[cfg(feature = "dfs")]
 /// `object`: BLAKE3 whole-object paths (fan-out fills and the peer disk
 /// cache), which do not report which copy served them; never CRC objects.
-pub(crate) const READ_SOURCE_ROLES: &[&str] = &["local", "durable", "verified_cache", "object"];
+pub(crate) const READ_SOURCE_ROLES: &[&str] = &[
+    "local",
+    "durable",
+    "verified_cache",
+    "object",
+    "peer_holder",
+];
 /// Read cache body bytes held off the FUSE path (D1-6): staged for install,
 /// and partial Chunks being assembled, each with its peak and its limit.
 #[cfg(feature = "dfs")]
@@ -957,6 +977,132 @@ impl PeerDiskCacheMetrics {
     }
 }
 
+/// H2 step 2 timings, measurement only (review/18 §8.3): nothing schedules,
+/// admits or authorizes from them.
+#[cfg(feature = "dfs")]
+#[derive(Clone, Debug)]
+pub(crate) struct ShareTimingMetrics {
+    holder_wait: afs_metrics::HistogramVec,
+    holder_waiters: afs_metrics::Histogram,
+    holder_request: afs_metrics::HistogramVec,
+    peer_attempt: afs_metrics::HistogramVec,
+    route: afs_metrics::HistogramVec,
+}
+
+#[cfg(feature = "dfs")]
+impl ShareTimingMetrics {
+    fn register(registry: &afs_metrics::Registry) -> Result<Self, afs_metrics::MetricsError> {
+        let histogram = |name: &str, help: &str, labels: &[&str]| {
+            let metric = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(name, help).buckets(afs_metrics::latency_buckets()),
+                labels,
+            )?;
+            afs_metrics::register_collector(registry, &metric)?;
+            Ok::<_, afs_metrics::MetricsError>(metric)
+        };
+        let holder_waiters = afs_metrics::Histogram::with_opts(
+            afs_metrics::HistogramOpts::new(
+                "afs_dfs_read_holder_waiters",
+                "Requests waiting at this holder, this one included, when a wait starts.",
+            )
+            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
+        )?;
+        afs_metrics::register_collector(registry, &holder_waiters)?;
+        Ok(Self {
+            holder_wait: histogram(
+                "afs_dfs_read_holder_wait_seconds",
+                "How long a holder kept a request waiting for an in-flight Chunk, by how the wait ended.",
+                &["outcome"],
+            )?,
+            holder_waiters,
+            holder_request: histogram(
+                "afs_dfs_read_holder_request_seconds",
+                "Holder-form request stages at the holder: Meta authorization, read slot wait, serving.",
+                &["stage"],
+            )?,
+            peer_attempt: histogram(
+                "afs_dfs_read_peer_attempt_seconds",
+                "One remote read attempt at the reader, by source role and outcome.",
+                &["role", "outcome"],
+            )?,
+            route: histogram(
+                "afs_dfs_read_route_seconds",
+                "Remote read stages at the reader: sources, holder list, remote read, staging.",
+                &["stage"],
+            )?,
+        })
+    }
+
+    /// Times one holder wait until it ends; `outcome` (`ready`, `not_ready`
+    /// or `timeout`) is set by [`ShareTimer::end`], and a wait dropped
+    /// before (its request cancelled) is recorded as `cancelled`.
+    pub(crate) fn holder_wait(&self) -> ShareTimer {
+        ShareTimer::new(&self.holder_wait, ["cancelled", ""], 1)
+    }
+
+    pub(crate) fn holder_waiters(&self, waiting: usize) {
+        self.holder_waiters.observe(waiting as f64);
+    }
+
+    /// Times one holder request stage (`authorize`, `slot` or `serve`) until
+    /// it ends, whatever the end: done, failed or cancelled.
+    pub(crate) fn holder_request(&self, stage: &'static str) -> ShareTimer {
+        ShareTimer::new(&self.holder_request, [stage, ""], 1)
+    }
+
+    /// Times one remote read attempt; `role`: `durable`, `verified_cache` or
+    /// `peer_holder`; `outcome` (`ok`, `not_ready`, `busy`, `denied` or
+    /// `error`) is set by [`ShareTimer::end`], an attempt dropped before (its
+    /// read cancelled) is recorded as `cancelled`.
+    pub(crate) fn peer_attempt(&self, role: &'static str) -> ShareTimer {
+        ShareTimer::new(&self.peer_attempt, [role, "cancelled"], 2)
+    }
+
+    /// Times one remote read stage (`sources`, `holder_list`, `remote` or
+    /// `staging`) until it ends, whatever the end: done, failed or cancelled.
+    pub(crate) fn route(&self, stage: &'static str) -> ShareTimer {
+        ShareTimer::new(&self.route, [stage, ""], 1)
+    }
+}
+
+/// One timing sample of [`ShareTimingMetrics`], recorded when dropped, so a
+/// stage that fails or is cancelled is counted like one that completes
+/// (!318 P3-2). Its last label is the outcome where the metric has one.
+#[cfg(feature = "dfs")]
+#[must_use = "a timer records when it is dropped"]
+pub(crate) struct ShareTimer {
+    histogram: afs_metrics::HistogramVec,
+    labels: [&'static str; 2],
+    arity: usize,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "dfs")]
+impl ShareTimer {
+    fn new(histogram: &afs_metrics::HistogramVec, labels: [&'static str; 2], arity: usize) -> Self {
+        Self {
+            histogram: histogram.clone(),
+            labels,
+            arity,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Ends the sample with `outcome` as its last label.
+    pub(crate) fn end(mut self, outcome: &'static str) {
+        self.labels[self.arity - 1] = outcome;
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for ShareTimer {
+    fn drop(&mut self) {
+        self.histogram
+            .with_label_values(&self.labels[..self.arity])
+            .observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
 impl ReadWorkMetrics {
     pub fn register(registry: &afs_metrics::Registry) -> Result<Self, afs_metrics::MetricsError> {
         registry.get_or_register(|registry| {
@@ -970,6 +1116,8 @@ impl ReadWorkMetrics {
                 peer_serve: PeerServeMetrics::register(registry)?,
                 #[cfg(any(feature = "dfs", test))]
                 peer_disk: PeerDiskCacheMetrics::register(registry)?,
+                #[cfg(feature = "dfs")]
+                share: ShareTimingMetrics::register(registry)?,
                 // Activities register last, after every work collector above.
                 #[cfg(feature = "dfs")]
                 activities: super::super::read::activity::Activities::register(registry)?,
@@ -1636,6 +1784,8 @@ impl ReadWorkMetrics {
                 | "get_chunk_sources"
                 | "validate_read_grants"
                 | "peer_read_ranges"
+                | "get_version_holders"
+                | "validate_holder_grant"
         ) {
             self.core.read_rpc_calls.with_label_values(&[method]).inc();
         }
@@ -1832,6 +1982,9 @@ mod tests {
         "afs_dfs_read_cache_resources",
         "afs_dfs_read_cache_work_nanoseconds_total",
         "afs_dfs_read_cache_work_total",
+        // A plain histogram is exported before its first sample; the
+        // labelled H2 timing histograms appear with their first sample.
+        "afs_dfs_read_holder_waiters",
         "afs_dfs_read_pipeline_active",
         "afs_dfs_read_pipeline_bytes",
         "afs_dfs_read_pipeline_calls_total",
@@ -2171,6 +2324,8 @@ mod tests {
             "get_chunk_sources",
             "validate_read_grants",
             "peer_read_ranges",
+            "get_version_holders",
+            "validate_holder_grant",
         ] {
             metrics.read_rpc(method);
             assert_eq!(
@@ -2184,7 +2339,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
             .unwrap();
-        assert_eq!(calls.get_metric().len(), 5);
+        assert_eq!(calls.get_metric().len(), 7);
     }
 
     #[test]

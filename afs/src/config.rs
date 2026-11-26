@@ -646,6 +646,9 @@ struct FileConfig {
     dfs_read_cache_bytes: Option<u64>,
     dfs_read_cache_queue_bytes: Option<u64>,
     dfs_read_cache_partial_bytes: Option<u64>,
+    dfs_read_share_concurrent: Option<bool>,
+    dfs_holder_ttl_ms: Option<u64>,
+    dfs_holder_wait_ms: Option<u32>,
     id: Option<String>,
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
@@ -796,6 +799,17 @@ pub struct Config {
     /// Partial read cache bodies being assembled (default 32 MiB; 0 or
     /// 4MiB..=1GiB, 0 disables assembling bodies from separate reads).
     pub dfs_read_cache_partial_bytes: u64,
+    /// H2 step 2 (default false; needs `dfs_read_cache_bytes`): register read
+    /// opens as shared readers so other readers of the same version may read
+    /// this Node's read-cache copies of it, and read from theirs.
+    pub dfs_read_share_concurrent: bool,
+    /// How long a reader keeps the holder list of a version (default 250 ms,
+    /// 50..=5000). Used only with `dfs_read_share_concurrent`.
+    pub dfs_holder_ttl_ms: u64,
+    /// How long a reader asks a holder ranked above it to wait for a Chunk
+    /// that holder is fetching (default 30, 0..=500; 0 never asks). Used only
+    /// with `dfs_read_share_concurrent` (review/19).
+    pub dfs_holder_wait_ms: u32,
     pub id: String,
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
@@ -1008,6 +1022,9 @@ impl Config {
             dfs_read_cache_bytes: file.dfs_read_cache_bytes.unwrap_or(0),
             dfs_read_cache_queue_bytes: read.dfs_read_cache_queue_bytes,
             dfs_read_cache_partial_bytes: read.dfs_read_cache_partial_bytes,
+            dfs_read_share_concurrent: read.dfs_read_share_concurrent,
+            dfs_holder_ttl_ms: read.dfs_holder_ttl_ms,
+            dfs_holder_wait_ms: read.dfs_holder_wait_ms,
             meta_store: meta.meta_store,
             meta_redis_url: meta.meta_redis_url,
             meta_etcd_endpoints: meta.meta_etcd_endpoints,
@@ -1179,6 +1196,41 @@ mod certificate_tests {
     /// Read cache staging budgets: queue 256 MiB and partial 32 MiB by default
     /// (report 14 D: 256 MiB drops nothing on the disk backend); values are
     /// range-checked when the configuration is resolved.
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn h2_read_sharing_defaults_off_and_holder_ttl_is_range_checked() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let resolve = |text: &str| {
+            std::fs::write(path, text).unwrap();
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path]))
+        };
+        let config = resolve("fs = 'dfs'\n").unwrap();
+        assert!(!config.dfs_read_share_concurrent);
+        assert_eq!(config.dfs_holder_ttl_ms, 250);
+        let config =
+            resolve("fs = 'dfs'\ndfs_read_share_concurrent = true\ndfs_holder_ttl_ms = 50\n")
+                .unwrap();
+        assert!(config.dfs_read_share_concurrent);
+        assert_eq!(config.dfs_holder_ttl_ms, 50);
+        assert_eq!(
+            config.dfs_holder_wait_ms, 30,
+            "30 ms by default (review/19)"
+        );
+        let config = resolve("fs = 'dfs'\ndfs_holder_wait_ms = 0\n").unwrap();
+        assert_eq!(config.dfs_holder_wait_ms, 0);
+        let config = resolve("fs = 'dfs'\ndfs_holder_wait_ms = 200\n").unwrap();
+        assert_eq!(config.dfs_holder_wait_ms, 200);
+        for bad in [
+            "dfs_holder_ttl_ms = 49",
+            "dfs_holder_ttl_ms = 5001",
+            "dfs_holder_wait_ms = 501",
+        ] {
+            let error = resolve(&format!("fs = 'dfs'\n{bad}\n")).unwrap_err();
+            assert!(error.to_string().contains("holder"), "{bad}: {error}");
+        }
+    }
+
     #[cfg(feature = "dfs")]
     #[test]
     fn dfs_read_cache_budgets_default_and_are_range_checked() {

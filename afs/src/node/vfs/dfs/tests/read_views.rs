@@ -1015,6 +1015,7 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
                                 fence: 1,
                                 token: "test-token".into(),
                             },
+                            holder_grant: None,
                         }],
                     })
                     .collect(),

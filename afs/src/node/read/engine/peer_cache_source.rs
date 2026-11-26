@@ -54,7 +54,11 @@ impl DfsReadEngine {
             && grant.caller_node_id == self.local_node_id
             && grant.caller_node_epoch != 0
             && grant.expires_at_unix_ms > now_unix_ms()
-            && !grant.token.is_empty()
+            && match &source.holder_grant {
+                // A version holder carries its token in the holder grant.
+                Some(holder) => !holder.token.is_empty(),
+                None => !grant.token.is_empty(),
+            }
     }
 
     /// A remote candidate the verified peer cache can fill from: a current

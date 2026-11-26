@@ -148,6 +148,16 @@ pub(super) fn start(
             payload_metrics: Some(rpc::data::DfsPayloadMetrics::register(
                 &state.observability.registry,
             )?),
+            holders: match (dfs_meta.as_ref(), backends.dfs.holder_sources.as_ref()) {
+                (Some(meta), Some((registry, in_flight))) => Some(rpc::data::HolderServe::new(
+                    meta.clone(),
+                    registry.clone(),
+                    in_flight.clone(),
+                    cfg.id.clone(),
+                    registered_node_epoch,
+                )),
+                _ => None,
+            },
         },
     );
     #[cfg(feature = "ownerfs")]

@@ -138,6 +138,14 @@ subsystem = "Transfer"
 description = "原生传输结果或排空状态未确认，相关资源代际被隔离保留"
 
 [[error]]
+name = "NODE_TRANSFER_NOT_READY"
+value = "0x02040008"
+kind = "Unavailable"
+component = "Node"
+subsystem = "Transfer"
+description = "DFS 版本持有者还没有这一块的已安装副本（未共享该版本、块未到或已被驱逐）；读者改读其他副本，不算副本失败"
+
+[[error]]
 name = "NODE_STORAGE_INVALID"
 value = "0x02070001"
 kind = "InvalidArgument"

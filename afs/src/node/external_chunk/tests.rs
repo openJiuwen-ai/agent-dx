@@ -251,6 +251,7 @@ fn source(chunk: &ChunkObject, key: String) -> SourceCandidate {
             fence: 1,
             token: "validated-by-engine".into(),
         },
+        holder_grant: None,
     }
 }
 

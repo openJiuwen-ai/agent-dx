@@ -93,6 +93,15 @@ pub(crate) fn remote_copy_content_suspect(error: &Error) -> bool {
     error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA
 }
 
+/// H2 step 2: a version holder has no current copy of the Chunk (not shared
+/// there, its layout unknown, or absent and not being fetched). Not a failed
+/// copy and not backpressure: the reader moves on to its next candidate.
+/// Set: code `NODE_TRANSFER_NOT_READY`.
+#[cfg(feature = "dfs")]
+pub(crate) fn peer_not_ready(error: &Error) -> bool {
+    error.code() == afs_error::NODE_TRANSFER_NOT_READY
+}
+
 /// A peer refused only because its slots or queue were full: the same request
 /// may succeed after a short wait. Set: kind `ResourceExhausted` without code
 /// `IO_CAPACITY` (a full disk is not retried). Used by the replica sender (R71b).

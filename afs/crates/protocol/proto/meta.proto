@@ -515,6 +515,8 @@ service DfsMeta {
   rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
   rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
+  rpc GetVersionHolders(GetDfsVersionHoldersRequest) returns (GetDfsVersionHoldersReply);
+  rpc ValidateHolderGrant(ValidateDfsHolderGrantRequest) returns (ValidateDfsHolderGrantReply);
   rpc ValidateExternalReadGrants(ValidateExternalReadGrantsRequest) returns (ValidateExternalReadGrantsReply);
   rpc AuthorizeCurrentExternalRead(AuthorizeCurrentExternalReadRequest) returns (AuthorizeCurrentExternalReadReply);
   rpc AuthorizeExternalVersionRead(AuthorizeExternalVersionReadRequest) returns (AuthorizeExternalVersionReadReply);
@@ -1376,6 +1378,45 @@ message ValidateDfsReadGrantsRequest {
 }
 message ValidateDfsReadGrantsReply { repeated DfsAuthorizedRead authorizations = 1; }
 
+// H2 step 2 (protocol 12): a version-scoped grant to read one version from
+// one holder. It names no Chunk; the holder checks ranges against the
+// version's layout. Token prefix `dfs-read-holder-v1:`.
+message DfsHolderGrant {
+  string namespace_id = 1;
+  string file_version_id = 2;
+  string layout_root_id = 3;
+  string caller_node_id = 4;
+  uint64 caller_node_epoch = 5;
+  string holder_node_id = 6;
+  uint64 holder_node_epoch = 7;
+  uint64 expires_at_unix_ms = 8;
+  string token = 9;
+}
+message DfsVersionHolder {
+  string node_id = 1;
+  uint64 node_epoch = 2;
+  string data_endpoint = 3;
+  DfsHolderGrant grant = 4;
+}
+// The other readers sharing `file_version_id`; empty unless the caller reads it.
+message GetDfsVersionHoldersRequest {
+  string caller_id = 1;
+  string namespace_id = 2;
+  string file_version_id = 3;
+  string layout_root_id = 4;
+}
+message GetDfsVersionHoldersReply { repeated DfsVersionHolder holders = 1; }
+message ValidateDfsHolderGrantRequest {
+  string receiver_node_id = 1;
+  uint64 receiver_node_epoch = 2;
+  string peer_node_id = 3;
+  DfsHolderGrant grant = 4;
+}
+message ValidateDfsHolderGrantReply {
+  DfsHolderGrant grant = 1;
+  uint64 expires_at_unix_ms = 2;
+}
+
 message DfsExternalAuthorizedRead {
   DfsAuthorizedRead authorized = 1;
   DfsChunkObject chunk = 2;
@@ -1473,6 +1514,9 @@ message DfsReaderEntry {
   uint64 reader = 1;
   string inode_id = 2;
   string version_id = 3;
+  // H2 step 2: this reader serves its read-cache copies of `version_id` to
+  // other readers of it. Absent (false) on every other registration.
+  bool share_read_cache = 4;
 }
 // Restores all live `readers`; removes absent entries only up to `low_watermark`.
 // `meta_term` is the term the Node believed current; the session counts as
@@ -1498,6 +1542,8 @@ message DfsOpenFileReadRequest {
   string namespace_id = 6;
   string parent_inode_id = 7;
   bytes name = 8;
+  // H2 step 2: register the opened head as a shared reader (protocol 12).
+  bool share_read_cache = 9;
 }
 message DfsOpenFileReadReply {
   // Absent: the checked name no longer names the inode.

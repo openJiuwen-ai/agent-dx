@@ -1179,6 +1179,95 @@ pub struct DfsMissingReadSource {
     pub length: u64,
 }
 
+/// H2 step 2: a version-scoped grant to read one version from one holder
+/// (plan/15 §2.2.1). It names no Chunk: the holder checks every operation
+/// against the version's layout itself (§2.2.3). Its own structure, MAC
+/// domain and token prefix keep it apart from [`DfsReadGrant`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DfsHolderGrant {
+    pub namespace_id: NamespaceId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub caller_node_id: String,
+    pub caller_node_epoch: u64,
+    pub holder_node_id: String,
+    pub holder_node_epoch: u64,
+    pub expires_at_unix_ms: u64,
+    pub token: String,
+}
+
+/// Token prefix of a [`DfsHolderGrant`]; a per-copy grant uses `dfs-read-v1:`.
+pub const HOLDER_GRANT_TOKEN_PREFIX: &str = "dfs-read-holder-v1:";
+/// Length of a holder token: the prefix and a hex BLAKE3 MAC.
+pub const HOLDER_GRANT_TOKEN_LEN: usize = HOLDER_GRANT_TOKEN_PREFIX.len() + 64;
+
+impl From<DfsHolderGrant> for afs_protocol::meta::DfsHolderGrant {
+    fn from(grant: DfsHolderGrant) -> Self {
+        Self {
+            namespace_id: grant.namespace_id.0,
+            file_version_id: grant.file_version_id.0,
+            layout_root_id: grant.layout_root_id.0,
+            caller_node_id: grant.caller_node_id,
+            caller_node_epoch: grant.caller_node_epoch,
+            holder_node_id: grant.holder_node_id,
+            holder_node_epoch: grant.holder_node_epoch,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            token: grant.token,
+        }
+    }
+}
+
+impl From<afs_protocol::meta::DfsHolderGrant> for DfsHolderGrant {
+    fn from(grant: afs_protocol::meta::DfsHolderGrant) -> Self {
+        Self {
+            namespace_id: NamespaceId::new(grant.namespace_id),
+            file_version_id: FileVersionId::new(grant.file_version_id),
+            layout_root_id: LayoutRootId::new(grant.layout_root_id),
+            caller_node_id: grant.caller_node_id,
+            caller_node_epoch: grant.caller_node_epoch,
+            holder_node_id: grant.holder_node_id,
+            holder_node_epoch: grant.holder_node_epoch,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            token: grant.token,
+        }
+    }
+}
+
+/// One reader of a version that shares its read-cache copies of it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VersionHolder {
+    pub node_id: String,
+    pub node_epoch: u64,
+    pub data_endpoint: String,
+    pub grant: DfsHolderGrant,
+}
+
+/// Who may serve a reader of one version (H2 step 2, `GetDfsVersionHolders`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DfsVersionHoldersRequest {
+    pub caller_id: String,
+    pub namespace_id: NamespaceId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+}
+
+/// A holder asks Meta whether `grant` is current (`ValidateDfsHolderGrants`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ValidateDfsHolderGrant {
+    pub receiver_node_id: String,
+    pub receiver_node_epoch: u64,
+    pub peer_node_id: String,
+    pub grant: DfsHolderGrant,
+}
+
+/// Meta's answer: the grant holds until `expires_at_unix_ms`. No ranges: the
+/// holder checks them against the version's layout (plan/15 §2.2.3).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DfsAuthorizedHolderRead {
+    pub grant: DfsHolderGrant,
+    pub expires_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DfsAuthorizedRead {
     pub validation: DfsReadValidation,
@@ -1263,6 +1352,11 @@ pub struct SourceCandidate {
     pub data_endpoint: Option<String>,
     pub load_hint: u32,
     pub read_grant: DfsReadGrant,
+    /// H2 step 2: set for another reader of the same version that shares its
+    /// read-cache copies (a version holder). The read then sends this grant
+    /// in the holder form instead of `read_grant`.
+    #[serde(default)]
+    pub holder_grant: Option<DfsHolderGrant>,
 }
 
 impl SourceCandidate {
@@ -1460,4 +1554,96 @@ mod crc32c_format_tests {
             "Crc32cSegmentsV1"
         );
     }
+}
+
+/// The byte intervals of `chunk` that `layout` exposes, each extent cut at the
+/// file length and overlapping intervals merged, as `(offset, length)`. Meta
+/// signs and checks read grants with it; a Node checking a version-scoped holder
+/// grant (H2 step 2) must use this same function, never its own copy.
+pub fn read_chunk_intervals(
+    layout: &LayoutRoot,
+    chunk: &ChunkObject,
+) -> afs_error::Result<Vec<(u64, u64)>> {
+    chunk_extent_intervals(
+        layout.file_length,
+        layout.inline_extents.iter().filter(|extent| {
+            #[cfg(test)]
+            count_interval_extent_visit();
+            extent.chunk_id == chunk.id
+        }),
+        chunk,
+    )
+}
+
+/// [`read_chunk_intervals`] over `extents`, which must be exactly the
+/// layout's extents of `chunk` (in any order): the same trimming at
+/// `file_length`, overflow and length checks, and merging. A caller that
+/// indexes every Chunk of a layout groups the extents once and calls this
+/// per Chunk instead of scanning the layout per Chunk (!318 P2-1).
+pub fn chunk_extent_intervals<'a>(
+    file_length: u64,
+    extents: impl IntoIterator<Item = &'a Extent>,
+    chunk: &ChunkObject,
+) -> afs_error::Result<Vec<(u64, u64)>> {
+    let mut intervals = Vec::new();
+    for extent in extents {
+        let length = extent
+            .length
+            .min(file_length.saturating_sub(extent.file_offset));
+        let end = extent
+            .chunk_offset
+            .checked_add(length)
+            .filter(|end| *end <= chunk.length)
+            .ok_or_else(|| {
+                afs_error::Error::coded(
+                    afs_error::META_CATALOG_INVALID_REQUEST,
+                    "read layout extent exceeds immutable chunk",
+                )
+            })?;
+        if length != 0 {
+            intervals.push((extent.chunk_offset, end));
+        }
+    }
+    intervals.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    Ok(merged
+        .into_iter()
+        .map(|(start, end)| (start, end - start))
+        .collect())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Extents examined while computing read intervals on this thread (review
+    /// !318 P2-1: a holder index must look at each extent once).
+    static INTERVAL_EXTENT_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_interval_extent_visit() {
+    INTERVAL_EXTENT_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+/// Extents examined on this thread since the last call (tests).
+#[cfg(test)]
+pub(crate) fn take_interval_extent_visits() -> u64 {
+    INTERVAL_EXTENT_VISITS.with(|visits| visits.replace(0))
+}
+
+/// Whether `[offset, offset + length)` lies inside one interval of
+/// [`read_chunk_intervals`]. An empty range is never covered.
+pub fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
+    length != 0
+        && offset.checked_add(length).is_some_and(|end| {
+            intervals.iter().any(|(start, len)| {
+                offset >= *start && start.checked_add(*len).is_some_and(|limit| end <= limit)
+            })
+        })
 }

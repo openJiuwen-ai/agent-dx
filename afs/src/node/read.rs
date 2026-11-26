@@ -15,6 +15,8 @@ pub(super) mod direct_prefetch;
 #[cfg(feature = "dfs")]
 pub mod engine;
 #[cfg(feature = "dfs")]
+pub(crate) mod holders;
+#[cfg(feature = "dfs")]
 pub(super) mod object_fetch;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;

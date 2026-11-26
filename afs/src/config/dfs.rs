@@ -103,6 +103,9 @@ pub(super) struct DfsReadBudget {
     pub(super) dfs_source_single_ttl_ms: u64,
     pub(super) dfs_read_cache_queue_bytes: u64,
     pub(super) dfs_read_cache_partial_bytes: u64,
+    pub(super) dfs_read_share_concurrent: bool,
+    pub(super) dfs_holder_ttl_ms: u64,
+    pub(super) dfs_holder_wait_ms: u32,
     pub(super) dfs_source_lookahead_chunks: usize,
     pub(super) dfs_source_cache_bytes: usize,
 }
@@ -145,6 +148,18 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
             "DFS read cache budgets require queue 4MiB..=1GiB and partial 0 or 4MiB..=1GiB",
         ));
     }
+    // H2 step 2: off by default (plan/15 U2).
+    let dfs_read_share_concurrent = file.dfs_read_share_concurrent.unwrap_or(false);
+    let dfs_holder_ttl_ms = file.dfs_holder_ttl_ms.unwrap_or(250);
+    if !(50..=5000).contains(&dfs_holder_ttl_ms) {
+        return Err(invalid("DFS holder list TTL must be 50..=5000 ms"));
+    }
+    // A short wait keeps most of the sharing of readers that start together
+    // at N >= 3 for a bounded cost (review/19: 30 ms); 0 never waits.
+    let dfs_holder_wait_ms = file.dfs_holder_wait_ms.unwrap_or(30);
+    if dfs_holder_wait_ms > 500 {
+        return Err(invalid("DFS holder wait must be 0..=500 ms"));
+    }
     if dfs_source_lookahead_chunks > 128 || dfs_source_cache_bytes > 4 * 1024 * 1024 {
         return Err(invalid(
             "DFS source metadata requires lookahead <= 128 chunks and cache <= 4194304 bytes",
@@ -166,6 +181,9 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
         dfs_source_single_ttl_ms,
         dfs_read_cache_queue_bytes,
         dfs_read_cache_partial_bytes,
+        dfs_read_share_concurrent,
+        dfs_holder_ttl_ms,
+        dfs_holder_wait_ms,
         dfs_source_lookahead_chunks,
         dfs_source_cache_bytes,
     })

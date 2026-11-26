@@ -193,7 +193,7 @@ fn stream_crc32c_op(
     let descriptor =
         serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
     local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
-    validate_dfs_read_request(request)?;
+    validate_served_read(request)?;
     local.ensure_peer_serve_open().map_err(error_to_status)?;
     send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
         read_id: request.read_id.clone(),
@@ -209,7 +209,7 @@ fn stream_crc32c_op(
     let body = verified.into_shared_bytes();
     for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
         local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
-        validate_dfs_read_request(request)?;
+        validate_served_read(request)?;
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
         local.record_peer_read_event("data_frame");
@@ -267,8 +267,7 @@ fn stream_grouped_op(
                 Status::cancelled("DFS range consumer disconnected"),
             ));
         }
-        validate_dfs_read_request(request)
-            .map_err(afs_transport::grpc::error_status::status_to_error)
+        validate_served_read(request).map_err(afs_transport::grpc::error_status::status_to_error)
     };
     check_caller().map_err(error_to_status)?;
     local.ensure_peer_serve_open().map_err(error_to_status)?;
@@ -371,7 +370,7 @@ fn stream_verified_op(
     // A fill follower can wait behind I/O. Content sharing never renews the
     // caller's grant or bypasses a known Node stop; no new Meta RPC here.
     local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
-    validate_dfs_read_request(request)?;
+    validate_served_read(request)?;
     local.ensure_peer_serve_open().map_err(error_to_status)?;
     send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
         crc32c_table: Default::default(),

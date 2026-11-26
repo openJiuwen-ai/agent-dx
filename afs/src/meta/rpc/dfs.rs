@@ -123,6 +123,7 @@ impl DfsMetaService for DfsMetaRpc {
                     reader: entry.reader,
                     inode_id: crate::dfs::InodeId::new(entry.inode_id),
                     version_id: optional_id(entry.version_id).map(crate::dfs::FileVersionId::new),
+                    share_read_cache: entry.share_read_cache,
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
@@ -169,6 +170,7 @@ impl DfsMetaService for DfsMetaRpc {
                 reader: request.reader,
                 inode_id: crate::dfs::InodeId::new(request.inode_id),
                 name,
+                share_read_cache: request.share_read_cache,
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
@@ -1153,6 +1155,64 @@ impl DfsMetaService for DfsMetaRpc {
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(
             afs_protocol::meta::ReportDfsChunkCorruptionReply {},
+        ))
+    }
+
+    async fn get_version_holders(
+        &self,
+        request: Request<afs_protocol::meta::GetDfsVersionHoldersRequest>,
+    ) -> Result<Response<afs_protocol::meta::GetDfsVersionHoldersReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let holders = dfs_service(&self.0)?
+            .version_holders(crate::dfs::DfsVersionHoldersRequest {
+                caller_id: request.caller_id,
+                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                file_version_id: crate::dfs::FileVersionId::new(request.file_version_id),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::GetDfsVersionHoldersReply {
+                holders: holders
+                    .into_iter()
+                    .map(|holder| afs_protocol::meta::DfsVersionHolder {
+                        node_id: holder.node_id,
+                        node_epoch: holder.node_epoch,
+                        data_endpoint: holder.data_endpoint,
+                        grant: Some(holder.grant.into()),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn validate_holder_grant(
+        &self,
+        request: Request<afs_protocol::meta::ValidateDfsHolderGrantRequest>,
+    ) -> Result<Response<afs_protocol::meta::ValidateDfsHolderGrantReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.receiver_node_id)?;
+        let grant = request
+            .grant
+            .ok_or_else(|| invalid("holder grant is missing"))?;
+        let authorized = dfs_service(&self.0)?
+            .validate_holder_grant(crate::dfs::ValidateDfsHolderGrant {
+                receiver_node_id: request.receiver_node_id,
+                receiver_node_epoch: request.receiver_node_epoch,
+                peer_node_id: request.peer_node_id,
+                grant: grant.into(),
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::ValidateDfsHolderGrantReply {
+                grant: Some(authorized.grant.into()),
+                expires_at_unix_ms: authorized.expires_at_unix_ms,
+            },
         ))
     }
 

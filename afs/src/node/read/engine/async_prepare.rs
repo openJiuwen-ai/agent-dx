@@ -192,12 +192,18 @@ impl DfsReadEngine {
         lifetime: crate::node::read::admission::ReadLifetime,
     ) -> Result<()> {
         let sources = self.replicated_sources();
-        for part in self.native_read_batches(batch) {
-            sources
-                .read_async(&part, out, true, Some(deadline), lifetime.clone())
-                .await
-                .inspect_err(|error| self.invalidate_native_batch_on_error(&part, error))?;
-        }
+        // One holder deadline for the whole logical read, fixed before it is
+        // split into parts (!318 round 3 item 1).
+        super::remote::for_logical_read(deadline, async {
+            for part in self.native_read_batches(batch) {
+                sources
+                    .read_async(&part, out, true, Some(deadline), lifetime.clone())
+                    .await
+                    .inspect_err(|error| self.invalidate_native_batch_on_error(&part, error))?;
+            }
+            Ok::<_, Error>(())
+        })
+        .await?;
         Ok(())
     }
 

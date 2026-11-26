@@ -413,6 +413,25 @@ impl LocalChunkStore {
         }))
     }
 
+    /// H2 step 2: whether a durable copy of `id` (any role) is cataloged here.
+    /// Only the in-memory catalog is read: no file is opened or verified.
+    pub(crate) fn has_servable_record(&self, id: &ChunkId) -> bool {
+        self.catalog.lock().is_ok_and(|catalog| {
+            catalog
+                .records
+                .get(id)
+                .is_some_and(|record| record.state == LocalChunkState::Durable)
+        })
+    }
+
+    /// Whether the catalog has any record of `id`, whatever its state: a
+    /// Chunk without one was evicted or collected, not damaged (!318 P2-3).
+    pub(crate) fn has_catalog_record(&self, id: &ChunkId) -> bool {
+        self.catalog
+            .lock()
+            .is_ok_and(|catalog| catalog.records.contains_key(id))
+    }
+
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
         Ok(self
             .catalog

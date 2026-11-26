@@ -96,6 +96,7 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
                                 .as_ref()
                                 .map(|id| id.0.clone())
                                 .unwrap_or_default(),
+                            share_read_cache: reader.shared,
                         })
                         .collect(),
                 }),

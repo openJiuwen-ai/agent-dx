@@ -49,6 +49,24 @@ struct MetaStub {
     lookup_delay_ms: std::sync::atomic::AtomicU64,
     /// Lookups after this many are refused as an invalid caller (0 = never).
     deny_after: AtomicUsize,
+    /// H2 step 2: the holders `version_holders_async` offers, and its calls.
+    holders: Mutex<Vec<crate::dfs::VersionHolder>>,
+    holder_lookups: AtomicUsize,
+    /// Added to every holder lookup (review/18 a2).
+    holder_delay_ms: std::sync::atomic::AtomicU64,
+    /// review/18 a1: whether a lookup ran while this Chunk was in flight.
+    watch: std::sync::OnceLock<(Arc<crate::node::read::holders::HolderInFlight>, ChunkId)>,
+    lookup_saw_in_flight: std::sync::atomic::AtomicBool,
+}
+
+impl MetaStub {
+    fn probe_in_flight(&self) {
+        if let Some((flights, chunk)) = self.watch.get()
+            && flights.contains(chunk)
+        {
+            self.lookup_saw_in_flight.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl MetaStub {
@@ -62,6 +80,7 @@ impl MetaStub {
 
 impl ReadSourceProvider for MetaStub {
     fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply> {
+        self.probe_in_flight();
         let seen = self.lookups.fetch_add(1, Ordering::SeqCst);
         let deny_after = self.deny_after.load(Ordering::SeqCst);
         if deny_after != 0 && seen >= deny_after {
@@ -76,6 +95,19 @@ impl ReadSourceProvider for MetaStub {
             .chunks
             .retain(|set| request.chunk_ids.contains(&set.chunk_id));
         Ok(reply)
+    }
+
+    fn version_holders_async(
+        &self,
+        _request: crate::dfs::DfsVersionHoldersRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, Vec<crate::dfs::VersionHolder>> {
+        Box::pin(async move {
+            self.probe_in_flight();
+            self.holder_lookups.fetch_add(1, Ordering::SeqCst);
+            let delay = self.holder_delay_ms.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            Ok(self.holders.lock().unwrap().clone())
+        })
     }
 
     /// Like a network adapter: an asynchronous lookup that can be slow.
@@ -130,11 +162,28 @@ struct NodeTransfer {
     batch_unavailable: Vec<String>,
     /// Nodes that answer as if the copy were gone.
     missing: Vec<String>,
+    /// H2 step 2: holders that answer NOT_READY.
+    not_ready: Vec<String>,
+    /// Whether each attempted operation carried a holder grant.
+    holder_form: Mutex<Vec<bool>>,
+    /// review/18 a1: per attempt, the node and whether its Chunk was in flight.
+    watch: std::sync::OnceLock<Arc<crate::node::read::holders::HolderInFlight>>,
+    in_flight_seen: Mutex<Vec<(String, bool)>>,
     attempts: Mutex<Vec<String>>,
     served: Mutex<Vec<String>>,
 }
 
 impl ChunkTransfer for NodeTransfer {
+    /// CRC-segment Chunks (what holders are offered for) read like any range.
+    fn read_crc32c_range(
+        &self,
+        batch: &PeerReadBatch,
+        _chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.read_ranges(batch, out)
+    }
+
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
         if let [first, _, ..] = batch.operations.as_slice()
             && let CopyLocation::Node { node_id, .. } = &first.source.location
@@ -148,6 +197,27 @@ impl ChunkTransfer for NodeTransfer {
                 return Err(invalid("node source expected"));
             };
             self.attempts.lock().unwrap().push(node_id.clone());
+            if let Some(flights) = self.watch.get() {
+                self.in_flight_seen
+                    .lock()
+                    .unwrap()
+                    .push((node_id.clone(), flights.contains(&item.op.chunk_id)));
+            }
+            self.holder_form
+                .lock()
+                .unwrap()
+                .push(item.source.holder_grant.is_some());
+            // A holder candidate never carries a per-copy token (review P1).
+            assert!(
+                item.source.holder_grant.is_none() || item.source.read_grant.token.is_empty(),
+                "a holder candidate carries a per-copy token"
+            );
+            if self.not_ready.contains(node_id) {
+                return Err(Error::coded(
+                    afs_error::NODE_TRANSFER_NOT_READY,
+                    "injected: holder has no current copy",
+                ));
+            }
             if self.retired.contains(node_id) {
                 return Err(Error::new(
                     afs_error::CLIENT_REMOTE_STATUS,
@@ -1694,4 +1764,585 @@ fn h2_cpu_out_of_order_segments_zero_fill_only_the_gap() {
     let jobs = cache.queued_jobs_for_test();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].body(), &body[..]);
+}
+
+/// H2 step 2b: a reader with sharing on, A (node-b) as the durable copy, and
+/// `holders` (node ids) offered by Meta for the version.
+/// A CRC-segment Chunk object of `length` bytes (its digest is never checked
+/// by these tests' transfers).
+fn crc_object(chunk: &ChunkId, length: u64) -> ChunkObject {
+    ChunkObject {
+        id: chunk.clone(),
+        length,
+        content_digest: crate::dfs::ContentDigest {
+            algorithm: crate::dfs::DigestAlgorithm::Crc32cSegmentsV1,
+            bytes: [1; 32],
+        },
+        encoding: crate::dfs::ChunkEncoding::Raw,
+    }
+}
+
+fn holder_fixture(
+    fixture: &Fixture,
+    holders: &[&str],
+    transfer: NodeTransfer,
+    published: Option<&str>,
+) -> (DfsReadEngine, Arc<MetaStub>, Arc<NodeTransfer>, ChunkId) {
+    let chunk = ChunkId::new("shared-chunk");
+    let mut candidates = vec![candidate("a", &chunk, "node-b", CopyRole::DurableReplica)];
+    if let Some(node) = published {
+        candidates.push(candidate("cache", &chunk, node, CopyRole::VerifiedCache));
+    }
+    let mut reply = sources_reply(vec![(chunk.clone(), candidates)]);
+    // !318 P3-1: holders are offered only for Chunks Meta describes as
+    // CRC-segment objects, as its replies for native writes do.
+    reply.chunks[0].chunk = Some(crc_object(&chunk, 4));
+    let meta = Arc::new(MetaStub::new(reply));
+    *meta.holders.lock().unwrap() = holders
+        .iter()
+        .map(|node| crate::dfs::VersionHolder {
+            node_id: (*node).into(),
+            node_epoch: 3,
+            data_endpoint: format!("http://{node}"),
+            grant: crate::dfs::DfsHolderGrant {
+                namespace_id: crate::dfs::NamespaceId::new("default"),
+                file_version_id: FileVersionId::new("version"),
+                layout_root_id: LayoutRootId::new("layout"),
+                caller_node_id: "node-a".into(),
+                caller_node_epoch: 1,
+                holder_node_id: (*node).into(),
+                holder_node_epoch: 3,
+                expires_at_unix_ms: crate::clock::now_unix_ms() + 30_000,
+                token: format!("dfs-read-holder-v1:{}", "0".repeat(64)),
+            },
+        })
+        .collect();
+    let transfer = Arc::new(transfer);
+    let engine = fixture
+        .engine(meta.clone(), transfer.clone(), DfsReadConfig::default())
+        .with_holder_lists(Duration::from_secs(60));
+    (engine, meta, transfer, chunk)
+}
+
+/// Holders come after a published copy and before the durable one, and are
+/// read in the holder form; their bytes count as `peer_holder`.
+#[test]
+fn h2_step2b_holders_rank_after_published_copies_before_the_writer() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        missing: vec!["node-c".into()],
+        ..Default::default()
+    };
+    let (engine, _, transfer, chunk) =
+        holder_fixture(&fixture, &["node-d"], transfer, Some("node-c"));
+    let mut out = [0; 4];
+    engine.read_batch(&read_op(chunk, 4), &mut out).unwrap();
+    assert_eq!(out, [7; 4]);
+    assert_eq!(
+        *transfer.attempts.lock().unwrap(),
+        vec!["node-c".to_owned(), "node-d".to_owned()]
+    );
+    assert_eq!(*transfer.holder_form.lock().unwrap(), vec![false, true]);
+    assert_eq!(fixture.metric(&source_bytes("peer_holder")), 4);
+    assert_eq!(fixture.metric(&source_bytes("durable")), 0);
+}
+
+/// NOT_READY moves on to the writer without demoting the holder, and the
+/// holder list is asked once per TTL, not once per read.
+#[test]
+fn h2_step2b_not_ready_holder_falls_back_to_the_writer_without_demotion() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        not_ready: vec!["node-d".into()],
+        ..Default::default()
+    };
+    let (engine, meta, transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    for _ in 0..2 {
+        let mut out = [0; 4];
+        engine
+            .read_batch(&read_op(chunk.clone(), 4), &mut out)
+            .unwrap();
+        assert_eq!(out, [7; 4]);
+    }
+    assert_eq!(
+        *transfer.attempts.lock().unwrap(),
+        vec!["node-d", "node-b", "node-d", "node-b"]
+    );
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.metric(&cache_event("holder_answered_not_ready")), 2);
+    assert!(
+        engine.demoted_now().is_empty(),
+        "NOT_READY is not a failure"
+    );
+    assert_eq!(fixture.metric(&source_bytes("durable")), 8);
+}
+
+/// S2/N5 (code review): a holder whose validations are full answers busy:
+/// the reader goes on to the writer without demoting the holder and without
+/// dropping the version's sources.
+#[test]
+fn h2_step2b_busy_holder_is_skipped_without_demotion() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        busy: vec!["node-d".into()],
+        ..Default::default()
+    };
+    let (engine, meta, transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    for _ in 0..2 {
+        let mut out = [0; 4];
+        engine
+            .read_batch(&read_op(chunk.clone(), 4), &mut out)
+            .unwrap();
+        assert_eq!(out, [7; 4]);
+    }
+    assert_eq!(
+        *transfer.attempts.lock().unwrap(),
+        vec!["node-d", "node-b", "node-d", "node-b"]
+    );
+    assert!(
+        engine.demoted_now().is_empty(),
+        "a busy holder is not demoted"
+    );
+    assert_eq!(fixture.metric(&cache_event("holder_answered_busy")), 2);
+    assert_eq!(meta.lookups.load(Ordering::SeqCst), 1, "sources kept");
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 1, "list kept");
+}
+
+/// A holder that refuses the grant does not fail the read; the list is
+/// dropped so the next read asks Meta again.
+#[test]
+fn h2_step2b_denying_holder_is_skipped_and_its_list_dropped() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        retired: vec!["node-d".into()],
+        ..Default::default()
+    };
+    let (engine, meta, transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    let mut out = [0; 4];
+    engine
+        .read_batch(&read_op(chunk.clone(), 4), &mut out)
+        .unwrap();
+    assert_eq!(out, [7; 4]);
+    assert_eq!(*transfer.attempts.lock().unwrap(), vec!["node-d", "node-b"]);
+    engine.read_batch(&read_op(chunk, 4), &mut out).unwrap();
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 2);
+}
+
+/// Without sharing no holder is ever asked for or offered.
+#[test]
+fn h2_step2b_sharing_off_offers_no_holder() {
+    let fixture = Fixture::new();
+    let chunk = ChunkId::new("plain");
+    let meta = Arc::new(MetaStub::new(sources_reply(vec![(
+        chunk.clone(),
+        vec![candidate("a", &chunk, "node-b", CopyRole::DurableReplica)],
+    )])));
+    let transfer = Arc::new(NodeTransfer::default());
+    let engine = fixture.engine(meta.clone(), transfer.clone(), DfsReadConfig::default());
+    let mut out = [0; 4];
+    engine.read_batch(&read_op(chunk, 4), &mut out).unwrap();
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(*transfer.holder_form.lock().unwrap(), vec![false]);
+}
+
+/// Code review follow-up: a holder serves the range form without a BLAKE3
+/// outboard, so only a Chunk Meta describes as a CRC-segment object gets a
+/// holder candidate: not one verified by its whole-body BLAKE3, and (!318
+/// P3-1) not one whose object the reply leaves out.
+#[tokio::test]
+async fn h2_step2b_holders_are_offered_only_for_range_verifiable_chunks() {
+    let fixture = Fixture::new();
+    let (engine, _meta, _transfer, _) =
+        holder_fixture(&fixture, &["node-d"], NodeTransfer::default(), None);
+    let object = |id: &ChunkId, algorithm| ChunkObject {
+        id: id.clone(),
+        length: 4,
+        content_digest: crate::dfs::ContentDigest {
+            algorithm,
+            bytes: [1; 32],
+        },
+        encoding: crate::dfs::ChunkEncoding::Raw,
+    };
+    let crc = ChunkId::new("crc");
+    let blake3 = ChunkId::new("blake3");
+    let unknown = ChunkId::new("unknown");
+    let set = |id: &ChunkId, chunk| ChunkSources {
+        chunk_id: id.clone(),
+        chunk,
+        allowed_ranges: Vec::new(),
+        sources: vec![candidate("a", id, "node-b", CopyRole::DurableReplica)],
+    };
+    let sources = vec![
+        set(
+            &crc,
+            Some(object(&crc, crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)),
+        ),
+        set(
+            &blake3,
+            Some(object(&blake3, crate::dfs::DigestAlgorithm::Blake3)),
+        ),
+        set(&unknown, None),
+    ];
+    let with = engine
+        .with_version_holders(
+            &read_op(crc.clone(), 4),
+            &sources,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+    let holders = |index: usize| {
+        with[index]
+            .sources
+            .iter()
+            .filter(|source| source.holder_grant.is_some())
+            .count()
+    };
+    assert_eq!((holders(0), holders(1), holders(2)), (1, 0, 0));
+}
+
+/// P3 (re-review): a demoted holder is not a candidate. The writer answers
+/// busy once: with the holder gone it is the only candidate, so the read
+/// backs off and asks it again instead of trying the failing holder last and
+/// ending with no readable copy.
+#[test]
+fn h2_step2b_demoted_holder_is_left_out_so_a_busy_writer_is_retried() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        busy: vec!["node-b".into()],
+        busy_answers: Some(AtomicUsize::new(1)),
+        missing: vec!["node-d".into()],
+        ..Default::default()
+    };
+    let (engine, _meta, transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    let holder = candidate("holder:node-d:3", &chunk, "node-d", CopyRole::VerifiedCache);
+    engine.demote_cache_copy(&holder);
+    let mut out = [0; 4];
+    engine
+        .read_batch(&read_op(chunk.clone(), 4), &mut out)
+        .expect("the busy writer is asked again");
+    assert_eq!(out, [7; 4]);
+    assert_eq!(*transfer.attempts.lock().unwrap(), vec!["node-b", "node-b"]);
+}
+
+/// review/18 a1: a Chunk counts as in flight only while this reader fetches
+/// it from a copy that is not a holder: not while it looks up its sources or
+/// holders, nor while it asks a holder (which may be waiting for it).
+#[test]
+fn h2_a1_in_flight_only_while_fetching_from_a_copy() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        not_ready: vec!["node-d".into()],
+        ..Default::default()
+    };
+    let (engine, meta, transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    let engine = engine.with_distributed_cache("session".into(), 1 << 30);
+    let flights = engine.holder_in_flight().unwrap();
+    transfer.watch.set(flights.clone()).unwrap();
+    meta.watch.set((flights, chunk.clone())).unwrap();
+    let mut out = [0; 4];
+    engine.read_batch(&read_op(chunk, 4), &mut out).unwrap();
+    assert_eq!(out, [7; 4]);
+    assert_eq!(
+        *transfer.in_flight_seen.lock().unwrap(),
+        vec![("node-d".to_owned(), false), ("node-b".to_owned(), true)]
+    );
+    assert!(
+        !meta.lookup_saw_in_flight.load(Ordering::SeqCst),
+        "not in flight while looking up sources or holders"
+    );
+    // review/18 §8.3: each attempt is timed under its source role and outcome.
+    let attempts = |role: &str, outcome: &str| {
+        afs_metrics::encode_text(&fixture.registry)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.starts_with("afs_dfs_read_peer_attempt_seconds_count")
+                    && line.contains(&format!("role=\"{role}\""))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum::<u64>()
+    };
+    assert_eq!(attempts("peer_holder", "not_ready"), 1);
+    assert_eq!(attempts("durable", "ok"), 1);
+    assert_eq!(attempts("peer_holder", "ok"), 0);
+}
+
+/// review/18 a2: reads that find the holder list missing at the same time
+/// ask Meta once; the others go on without holders instead of waiting.
+#[test]
+fn h2_a2_concurrent_reads_share_one_holder_list_lookup() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer {
+        not_ready: vec!["node-d".into()],
+        ..Default::default()
+    };
+    let (engine, meta, _transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    meta.holder_delay_ms.store(200, Ordering::SeqCst);
+    let engine = Arc::new(engine);
+    let started = Instant::now();
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let engine = engine.clone();
+            let chunk = chunk.clone();
+            std::thread::spawn(move || {
+                let mut out = [0; 4];
+                engine.read_batch(&read_op(chunk, 4), &mut out).unwrap();
+                out
+            })
+        })
+        .collect();
+    for reader in readers {
+        assert_eq!(reader.join().unwrap(), [7; 4]);
+    }
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// review/18 a3: of a version's holders, a Chunk is offered only the one
+/// ranked highest for it (rendezvous over the version, the Chunk and the
+/// Node); its NOT_READY sends the read straight to the copies.
+#[tokio::test]
+async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
+    let fixture = Fixture::new();
+    let nodes = ["node-d", "node-e", "node-f"];
+    let (engine, _meta, _transfer, _) =
+        holder_fixture(&fixture, &nodes, NodeTransfer::default(), None);
+    let chunks: Vec<ChunkId> = (0..16)
+        .map(|i| ChunkId::new(format!("chunk-{i}")))
+        .collect();
+    let sources: Vec<ChunkSources> = chunks
+        .iter()
+        .map(|chunk| ChunkSources {
+            chunk_id: chunk.clone(),
+            chunk: Some(crc_object(chunk, 4)),
+            allowed_ranges: Vec::new(),
+            sources: vec![candidate("a", chunk, "node-b", CopyRole::DurableReplica)],
+        })
+        .collect();
+    let with = engine
+        .with_version_holders(
+            &read_op(chunks[0].clone(), 4),
+            &sources,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+    let mut chosen = std::collections::BTreeSet::new();
+    for set in &with {
+        let holders: Vec<&str> = set
+            .sources
+            .iter()
+            .filter(|source| source.holder_grant.is_some())
+            .map(|source| match &source.location {
+                CopyLocation::Node { node_id, .. } => node_id.as_str(),
+                CopyLocation::External { .. } => "",
+            })
+            .collect();
+        let best = nodes
+            .iter()
+            .max_by_key(|node| {
+                super::distribution::rendezvous_weight("version", &set.chunk_id, node)
+            })
+            .unwrap();
+        assert_eq!(holders, vec![*best], "{}", set.chunk_id.0);
+        chosen.insert(*best);
+    }
+    assert!(
+        chosen.len() > 1,
+        "different Chunks rank different holders first"
+    );
+}
+
+/// !318 P2-5: a reader of one CRC Chunk with the read cache and sharing each
+/// on or off; Meta offers one durable copy (the transfer serves 7s, which is
+/// the Chunk's body) and no holder.
+fn share_engine(
+    fixture: &Fixture,
+    cache: bool,
+    share: bool,
+) -> (
+    Arc<DfsReadEngine>,
+    Arc<MetaStub>,
+    Arc<NodeTransfer>,
+    ChunkObject,
+) {
+    let body = vec![7; 256 * 1024];
+    let chunk = StagedChunk::new_crc32c(OperationId::new("share"), body)
+        .unwrap()
+        .chunk;
+    let mut reply = sources_reply(vec![(
+        chunk.id.clone(),
+        vec![candidate(
+            "a",
+            &chunk.id,
+            "node-b",
+            CopyRole::DurableReplica,
+        )],
+    )]);
+    reply.chunks[0].chunk = Some(chunk.clone());
+    reply.chunks[0].allowed_ranges = vec![(0, chunk.length)];
+    let meta = Arc::new(MetaStub::new(reply));
+    let transfer = Arc::new(NodeTransfer::default());
+    let mut engine = fixture
+        .engine(meta.clone(), transfer.clone(), DfsReadConfig::default())
+        .with_read_authority(authority());
+    if cache {
+        engine = engine.with_distributed_cache("session".into(), 1 << 30);
+    }
+    if share {
+        engine = engine.with_holder_lists(Duration::from_secs(60));
+    }
+    (Arc::new(engine), meta, transfer, chunk)
+}
+
+async fn read_whole(engine: &Arc<DfsReadEngine>, chunk: &ChunkObject) {
+    let engine = engine.clone();
+    let batch = read_op(chunk.id.clone(), chunk.length);
+    let out = tokio::task::spawn_blocking(move || {
+        let mut out = vec![0; batch.ops[0].length as usize];
+        engine.read_batch(&batch, &mut out).map(|()| out)
+    })
+    .await
+    .unwrap()
+    .expect("read");
+    assert!(out.iter().all(|b| *b == 7));
+}
+
+async fn until_published(meta: &MetaStub, chunk: &ChunkObject) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !meta.published.lock().unwrap().contains(&chunk.id) {
+        assert!(
+            Instant::now() < deadline,
+            "the cache copy was not published"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// !318 P2-5: with sharing off (read cache off, or on) nothing is tracked
+/// for holders: no in-flight set, no holder lookup or holder-form read; the
+/// read cache still installs and publishes the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_pr318_sharing_off_tracks_nothing_in_flight() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = share_engine(&fixture, false, false);
+    read_whole(&engine, &chunk).await;
+    assert!(engine.holder_in_flight().is_none());
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(*transfer.holder_form.lock().unwrap(), vec![false]);
+
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = share_engine(&fixture, true, false);
+    let mut services = crate::runtime::Services::new();
+    engine.start_distributed_cache(&mut services);
+    read_whole(&engine, &chunk).await;
+    until_published(&meta, &chunk).await;
+    assert_eq!(fixture.metric(&cache_event("installed")), 1);
+    assert!(
+        engine.holder_in_flight().is_none(),
+        "in-flight tracking without sharing"
+    );
+    assert_eq!(meta.holder_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(*transfer.holder_form.lock().unwrap(), vec![false]);
+}
+
+/// !318 P2-5: with sharing on, the Chunk is in flight while it is fetched
+/// from the durable copy, is installed and published, and nothing is left
+/// in flight afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_pr318_sharing_on_tracks_the_fetch_and_clears_it() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = share_engine(&fixture, true, true);
+    let flights = engine
+        .holder_in_flight()
+        .expect("sharing tracks in-flight Chunks");
+    transfer.watch.set(flights.clone()).unwrap();
+    let mut services = crate::runtime::Services::new();
+    engine.start_distributed_cache(&mut services);
+    read_whole(&engine, &chunk).await;
+    until_published(&meta, &chunk).await;
+    assert_eq!(
+        *transfer.in_flight_seen.lock().unwrap(),
+        vec![("node-b".to_owned(), true)]
+    );
+    assert_eq!(fixture.metric(&cache_event("installed")), 1);
+    assert!(!flights.contains(&chunk.id), "left in flight");
+}
+
+/// !318 P3-2: a read whose source lookup fails still leaves its `sources`
+/// stage sample (stages are timed whatever their end).
+#[test]
+fn h2_pr318_failed_source_lookup_is_timed() {
+    let fixture = Fixture::new();
+    let transfer = NodeTransfer::default();
+    let (engine, meta, _transfer, chunk) = holder_fixture(&fixture, &["node-d"], transfer, None);
+    meta.deny_after.store(1, Ordering::SeqCst);
+    meta.lookups.store(1, Ordering::SeqCst);
+    let mut out = [0; 4];
+    assert!(engine.read_batch(&read_op(chunk, 4), &mut out).is_err());
+    let sources = afs_metrics::encode_text(&fixture.registry)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            line.starts_with("afs_dfs_read_route_seconds_count")
+                && line.contains("stage=\"sources\"")
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum::<u64>();
+    assert_eq!(sources, 1);
+}
+
+/// !318 round 2 item 5: in-flight marks name a Chunk, whatever version its
+/// reader reads. The wait order must not depend on the version either:
+/// otherwise, for a Chunk two versions share, A could wait for B under one
+/// version while B waits for A under the other, each for the other's mark.
+#[test]
+fn h2_round2_wait_order_for_a_chunk_is_the_same_in_every_version() {
+    let chunk = ChunkId::new("shared-by-versions");
+    // The order takes no version: two readers of different versions
+    // compute the same one, and exactly one of them may wait.
+    for (a, b) in [("node-a", "node-b"), ("node-c", "node-d")] {
+        assert_ne!(
+            holders::holder_ranks_above(&chunk, a, b),
+            holders::holder_ranks_above(&chunk, b, a),
+            "{a} vs {b}"
+        );
+    }
+    // A wait follows that order, whatever version the request names.
+    let grant = |holder: &str, caller: &str, version: &str| crate::dfs::DfsHolderGrant {
+        namespace_id: crate::dfs::NamespaceId::new("default"),
+        file_version_id: FileVersionId::new(version),
+        layout_root_id: LayoutRootId::new("layout"),
+        caller_node_id: caller.into(),
+        caller_node_epoch: 1,
+        holder_node_id: holder.into(),
+        holder_node_epoch: 3,
+        expires_at_unix_ms: 4_000_000_000_000,
+        token: String::new(),
+    };
+    let item = |holder: &str, caller: &str, version: &str| {
+        let mut source = candidate("h", &chunk, holder, CopyRole::VerifiedCache);
+        source.holder_grant = Some(grant(holder, caller, version));
+        ResolvedReadOp {
+            op: read_op(chunk.clone(), 4).ops[0].clone(),
+            source,
+        }
+    };
+    let waits = |budget| {
+        super::remote::keeping_fetched(true, None, async move {
+            (
+                holders::holder_wait_ms(&item("node-a", "node-b", "v1"), budget),
+                holders::holder_wait_ms(&item("node-b", "node-a", "v2"), budget),
+            )
+        })
+    };
+    let (a_waits_b, b_waits_a) = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(waits(30));
+    assert_eq!(
+        [a_waits_b, b_waits_a].iter().filter(|w| **w != 0).count(),
+        1,
+        "across versions, exactly one of two readers may wait for the other"
+    );
 }

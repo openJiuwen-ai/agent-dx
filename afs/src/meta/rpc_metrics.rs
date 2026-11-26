@@ -70,6 +70,8 @@ const META_RPCS: &[&str] = &[
     "afs.meta.v1.DfsMeta/ReportChunkCorruption",
     "afs.meta.v1.DfsMeta/GetChunkSources",
     "afs.meta.v1.DfsMeta/ValidateReadGrants",
+    "afs.meta.v1.DfsMeta/GetVersionHolders",
+    "afs.meta.v1.DfsMeta/ValidateHolderGrant",
     "afs.meta.v1.DfsMeta/ValidateExternalReadGrants",
     "afs.meta.v1.DfsMeta/AuthorizeCurrentExternalRead",
     "afs.meta.v1.DfsMeta/AuthorizeExternalVersionRead",

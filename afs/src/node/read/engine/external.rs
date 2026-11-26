@@ -1445,6 +1445,7 @@ impl DfsReadEngine {
                 data_endpoint: None,
                 load_hint: 0,
                 read_grant: validation.grant.clone(),
+                holder_grant: None,
             };
             if !self.source_matches(&selection.batch, &source)
                 || !matches!(source.location, CopyLocation::External { .. })

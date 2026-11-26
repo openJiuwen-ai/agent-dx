@@ -27,6 +27,9 @@ pub struct ReaderEntry {
     pub reader: u64,
     pub inode_id: InodeId,
     pub version_id: Option<FileVersionId>,
+    /// H2 step 2: the reader shares its read-cache copies of the version.
+    /// A report without the field means `false`.
+    pub share_read_cache: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +37,7 @@ struct Entry {
     inode_id: InodeId,
     version_id: Option<FileVersionId>,
     seq: u64,
+    shared: bool,
 }
 
 #[derive(Debug, Default)]
@@ -139,12 +143,14 @@ impl SoftReaders {
         reader: u64,
         inode_id: &InodeId,
         version_id: Option<&FileVersionId>,
+        shared: bool,
     ) -> u64 {
         let mut inner = self.lock();
         let key = (node.to_owned(), session.to_owned(), reader);
         if let Some(entry) = inner.entries.get(&key)
             && &entry.inode_id == inode_id
             && entry.version_id.as_ref() == version_id
+            && entry.shared == shared
         {
             return entry.seq;
         }
@@ -158,9 +164,45 @@ impl SoftReaders {
                 inode_id: inode_id.clone(),
                 version_id: version_id.cloned(),
                 seq,
+                // Only a registered version can be shared.
+                shared: shared && version_id.is_some(),
             },
         );
         seq
+    }
+
+    /// Whether `(node, session)` holds any reader of `version`.
+    pub(super) fn reads(&self, node: &str, session: &str, version: &FileVersionId) -> bool {
+        let inner = self.lock();
+        inner
+            .entries
+            .range(
+                (node.to_owned(), session.to_owned(), 0)
+                    ..=(node.to_owned(), session.to_owned(), u64::MAX),
+            )
+            .any(|(_, entry)| entry.version_id.as_ref() == Some(version))
+    }
+
+    /// Whether `(node, session)` holds a shared reader of `version`.
+    pub(super) fn shares(&self, node: &str, session: &str, version: &FileVersionId) -> bool {
+        let inner = self.lock();
+        inner
+            .entries
+            .range(
+                (node.to_owned(), session.to_owned(), 0)
+                    ..=(node.to_owned(), session.to_owned(), u64::MAX),
+            )
+            .any(|(_, entry)| entry.shared && entry.version_id.as_ref() == Some(version))
+    }
+
+    /// Every `(node, session)` holding a shared reader of `version`, once each.
+    pub(super) fn sharing(&self, version: &FileVersionId) -> BTreeSet<SessionKey> {
+        self.lock()
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.shared && entry.version_id.as_ref() == Some(version))
+            .map(|((node, session, _), _)| (node.clone(), session.clone()))
+            .collect()
     }
 
     /// Undoes `insert` after a failed validation, unless a later
@@ -217,6 +259,7 @@ impl SoftReaders {
                 entry.reader,
                 &entry.inode_id,
                 entry.version_id.as_ref(),
+                entry.share_read_cache,
             );
         }
         if current_term {
@@ -356,6 +399,8 @@ pub struct OpenFileRead {
     pub inode_id: InodeId,
     /// `(namespace, parent, name)` that must still name the inode.
     pub name: Option<(NamespaceId, InodeId, Vec<u8>)>,
+    /// H2 step 2: register the head as a shared reader.
+    pub share_read_cache: bool,
 }
 
 /// See `DfsService::open_file_read`.
@@ -415,7 +460,7 @@ impl DfsService {
             .register_then_check(
                 || {
                     self.readers
-                        .insert(node, session, reader, inode_id, version_id)
+                        .insert(node, session, reader, inode_id, version_id, false)
                 },
                 || self.validate_reader(node, session, inode_id, version_id),
             )
@@ -523,6 +568,7 @@ impl DfsService {
                     request.reader,
                     &request.inode_id,
                     head.as_ref(),
+                    request.share_read_cache,
                 )
             };
             let check = || async {
@@ -685,6 +731,7 @@ mod tests {
             reader,
             inode_id: InodeId::new(inode),
             version_id: Some(FileVersionId::new(version)),
+            share_read_cache: false,
         }
     }
 
@@ -694,7 +741,7 @@ mod tests {
     fn a_report_replaces_only_readers_up_to_its_low_watermark() {
         let table = SoftReaders::new(1);
         for reader in [1, 2, 5] {
-            table.insert("n", "s", reader, &InodeId::new("i"), None);
+            table.insert("n", "s", reader, &InodeId::new("i"), None, false);
         }
         table.report("n", "s", 3, &[entry(1, "i", "v"), entry(7, "i", "v")], true);
         let readers = table
@@ -723,20 +770,20 @@ mod tests {
     #[test]
     fn the_recheck_sees_registrations_after_the_plan_on_its_inodes() {
         let table = SoftReaders::new(1);
-        table.insert("n", "s", 1, &InodeId::new("a"), None);
+        table.insert("n", "s", 1, &InodeId::new("a"), None, false);
         let since = table
             .snapshot(&[("n".into(), "s".into())].into(), &BTreeMap::new(), 0, 0)
             .since;
         let planned = BTreeSet::from([InodeId::new("a")]);
         assert!(!table.registered_since(since, &planned));
-        table.insert("n", "s", 1, &InodeId::new("a"), None);
+        table.insert("n", "s", 1, &InodeId::new("a"), None, false);
         assert!(
             !table.registered_since(since, &planned),
             "same entry, same seq"
         );
-        table.insert("n", "s", 2, &InodeId::new("b"), None);
+        table.insert("n", "s", 2, &InodeId::new("b"), None, false);
         assert!(!table.registered_since(since, &planned), "another inode");
-        let seq = table.insert("n", "s", 3, &InodeId::new("a"), None);
+        let seq = table.insert("n", "s", 3, &InodeId::new("a"), None, false);
         assert!(table.registered_since(since, &planned));
         table.remove_if("n", "s", 3, seq);
         assert!(!table.registered_since(since, &planned));
@@ -747,7 +794,7 @@ mod tests {
     #[test]
     fn a_departed_session_keeps_its_readers_until_deadline_plus_grace() {
         let table = SoftReaders::new(1);
-        table.insert("n", "old", 1, &InodeId::new("i"), None);
+        table.insert("n", "old", 1, &InodeId::new("i"), None, false);
         let deadlines = BTreeMap::from([(("n".to_owned(), "old".to_owned()), 1_000)]);
         let none = BTreeSet::new();
         let at = |now| table.snapshot(&none, &deadlines, now, 100);
@@ -784,5 +831,44 @@ mod tests {
             !table.restart_gate_closed(&sessions, &BTreeSet::new(), 1_100, 100),
             "stays open"
         );
+    }
+
+    /// H2 step 2 T21 ①②: after a Meta restart the table is rebuilt from the
+    /// reports, so whether a reader shares is exactly what it reported; a
+    /// report without the flag (or an older Node) shares nothing.
+    #[test]
+    fn h2_t21_reports_rebuild_the_shared_flag_as_reported() {
+        let table = SoftReaders::new(2);
+        let version = FileVersionId::new("v");
+        let mut shared = entry(1, "i", "v");
+        shared.share_read_cache = true;
+        table.report("n", "s", 2, &[shared, entry(2, "i", "v")], true);
+        table.report("m", "t", 1, &[entry(1, "i", "v")], true);
+        assert!(table.shares("n", "s", &version));
+        assert!(!table.shares("m", "t", &version));
+        assert!(table.reads("m", "t", &version));
+        assert_eq!(
+            table.sharing(&version),
+            BTreeSet::from([("n".to_owned(), "s".to_owned())])
+        );
+        // Releasing the shared reader leaves the unshared one: no longer shared.
+        table.release("n", "s", &[1]);
+        assert!(!table.shares("n", "s", &version));
+        assert!(table.reads("n", "s", &version));
+        assert!(table.sharing(&version).is_empty());
+    }
+
+    /// A re-registration that changes only the shared flag is a new entry,
+    /// and a registration without a version is never shared.
+    #[test]
+    fn h2_shared_flag_is_part_of_the_entry() {
+        let table = SoftReaders::new(1);
+        let version = FileVersionId::new("v");
+        let first = table.insert("n", "s", 1, &InodeId::new("i"), Some(&version), false);
+        let second = table.insert("n", "s", 1, &InodeId::new("i"), Some(&version), true);
+        assert_ne!(first, second);
+        assert!(table.shares("n", "s", &version));
+        table.insert("n", "s", 2, &InodeId::new("j"), None, true);
+        assert_eq!(table.sharing(&version).len(), 1);
     }
 }

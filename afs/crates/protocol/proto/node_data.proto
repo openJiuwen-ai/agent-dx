@@ -249,6 +249,16 @@ message DfsChunkReadOp {
   string source_copy_id = 6;
   // Authorization remains scoped to this copy/range when batching one peer.
   DfsReadGrant grant = 7;
+  // H2 step 2 (protocol 12): a version-scoped holder grant instead of
+  // `grant`. A request carries one kind of grant in every operation.
+  afs.meta.v1.DfsHolderGrant holder_grant = 8;
+  // Holder form only: how long the holder may wait for this Chunk if it is
+  // being fetched or installed there; it answers NODE_TRANSFER_NOT_READY
+  // when the Chunk is neither present nor expected in time.
+  uint32 wait_ms = 9;
+  // Reserved for pulling an absent Chunk through the holder (H2 step 2c).
+  // Step 2b holders treat an absent Chunk as not ready whatever it says.
+  bool fetch_if_absent = 10;
 }
 
 message DfsReadRangesRequest {

@@ -178,6 +178,25 @@ mod tests {
             assert_eq!(status_to_error(status), error);
         }
     }
+    /// !318 round 2 item 1: the OwnerFs HIXL resource error and the DFS
+    /// holder's not-ready answer keep their own numbers and kinds across gRPC.
+    #[test]
+    fn node_transfer_resource_exhausted_and_not_ready_stay_distinct() {
+        for (code, raw, kind) in [
+            (
+                NODE_TRANSFER_RESOURCE_EXHAUSTED,
+                0x0204_0006,
+                ErrorKind::ResourceExhausted,
+            ),
+            (NODE_TRANSFER_NOT_READY, 0x0204_0008, ErrorKind::Unavailable),
+        ] {
+            let decoded = status_to_error(coded_status(code, "peer answer"));
+            assert_eq!(decoded.code(), code);
+            assert_eq!(decoded.code().raw(), raw);
+            assert_eq!(decoded.kind(), kind);
+        }
+        assert_ne!(NODE_TRANSFER_RESOURCE_EXHAUSTED, NODE_TRANSFER_NOT_READY);
+    }
     #[test]
     fn future_code_and_future_kind_survive_without_guessing() {
         let error = Error::new(
