@@ -956,6 +956,9 @@ impl Controller {
             origin.environment_id == self.record.spec.id
                 && origin.ownership_generation != self.record.assignment.generation
         });
+        // A capture without the release identity was produced by an older ADX
+        // build. Reject it explicitly instead of reporting a generic mismatch.
+        crate::sandboxd::recovery::require_release_identity(&cp.recovery_profile)?;
         if (transferred || !cp.recovery_profile.is_empty())
             && (cp.recovery_profile.is_empty()
                 || self.services.runtime.recovery_profile(&self.record.spec)?

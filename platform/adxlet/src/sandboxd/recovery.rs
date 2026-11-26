@@ -46,16 +46,24 @@ pub(super) fn profiles(
 
 /// ADX release identity that produced the runtime rootfs.
 ///
-/// The packaged runtime rootfs lives in `<package>/runtime/`, so the release
-/// manifest is two levels above it. A missing manifest leaves the release
-/// unqualified; a manifest that exists but cannot be parsed fails closed.
+/// The packaged runtime rootfs lives in `<package>/runtime/`. Other layouts are
+/// not ADX packages and stay unqualified. A missing manifest leaves the release
+/// unqualified; a manifest that exists but cannot be read or parsed fails closed.
 fn release_identity(rootfs_path: &str) -> Result<Option<String>> {
-    let Some(package) = Path::new(rootfs_path).parent().and_then(Path::parent) else {
+    let Some(runtime) = Path::new(rootfs_path).parent() else {
+        return Ok(None);
+    };
+    if runtime.file_name() != Some(std::ffi::OsStr::new("runtime")) {
+        return Ok(None);
+    }
+    let Some(package) = runtime.parent() else {
         return Ok(None);
     };
     let manifest = package.join("manifest.json");
-    if !manifest.is_file() {
-        return Ok(None);
+    match std::fs::metadata(&manifest) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(super::unavailable(error)),
     }
     let bytes = std::fs::read(&manifest).map_err(super::unavailable)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -69,6 +77,21 @@ fn release_identity(rootfs_path: &str) -> Result<Option<String>> {
         "{commit}@sha256:{:x}",
         Sha256::digest(&bytes)
     )))
+}
+
+/// Conservative gate for captures made before the release identity existed.
+///
+/// A checkpoint whose profile carries the other recovery keys but no
+/// `ADX_RECOVERY_RELEASE` was captured by an older ADX build. Restoring it on a
+/// build that publishes the release identity would mix executor versions, so it
+/// is rejected explicitly instead of surfacing a generic profile mismatch.
+pub(crate) fn require_release_identity(profile: &BTreeMap<String, String>) -> Result<()> {
+    if !profile.is_empty() && !profile.contains_key("ADX_RECOVERY_RELEASE") {
+        return Err(Error::Invalid(
+            "checkpoint predates ADX release identity; refusing restore across builds".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn binary_digest(path: &Path, arch: &str) -> Result<String> {
@@ -274,5 +297,55 @@ mod tests {
         let profile = &published["runsc"];
         assert!(profile["ADX_RECOVERY_RELEASE"].starts_with("abc123@sha256:"));
         assert_eq!(profile["ADX_RECOVERY_ROOTFS_SHA256"], "rootfs-sha");
+    }
+
+    #[test]
+    fn release_identity_ignores_custom_rootfs_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let custom = directory.path().join("custom");
+        std::fs::create_dir_all(&custom).unwrap();
+        let rootfs = custom.join("root.img");
+        std::fs::write(&rootfs, b"image").unwrap();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            br#"{"commit":"abc123"}"#,
+        )
+        .unwrap();
+        assert_eq!(release_identity(rootfs.to_str().unwrap()).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_identity_fails_closed_when_manifest_cannot_be_read() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("release");
+        std::fs::create_dir_all(package.join("runtime")).unwrap();
+        let rootfs = package.join("runtime").join("adx-runtime-rootfs.img");
+        std::fs::write(&rootfs, b"image").unwrap();
+        let manifest = package.join("manifest.json");
+        // Self-referential symlink: metadata fails with ELOOP, not NotFound.
+        symlink(&manifest, &manifest).unwrap();
+        assert!(release_identity(rootfs.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn legacy_capture_without_release_identity_is_rejected() {
+        let mut profile = BTreeMap::from([
+            ("ADX_RECOVERY_RUNTIME_runsc".to_owned(), "a".repeat(64)),
+            ("ADX_RECOVERY_ROOTFS_SHA256".to_owned(), "b".repeat(64)),
+            (
+                "ADX_RECOVERY_ROOTFS_PATH".to_owned(),
+                "/package/runtime/rootfs.img".to_owned(),
+            ),
+        ]);
+        assert!(require_release_identity(&profile).is_err());
+        profile.insert(
+            "ADX_RECOVERY_RELEASE".to_owned(),
+            "abc123@sha256:def".to_owned(),
+        );
+        assert!(require_release_identity(&profile).is_ok());
+        assert!(require_release_identity(&BTreeMap::new()).is_ok());
     }
 }
