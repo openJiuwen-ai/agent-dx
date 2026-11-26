@@ -9,8 +9,8 @@ enable_network_acl = false
 
 [plugin.resource]
 cpu_limit_mode = "quota"
-cgroup_cache_size = 1
-interface_cache_size = 1
+cgroup_cache_size = 1000
+interface_cache_size = 1000
 cgroup_root_name = "/adx-sandboxd"
 
 [plugin.runtime]
