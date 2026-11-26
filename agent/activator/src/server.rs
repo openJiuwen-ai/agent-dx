@@ -79,6 +79,10 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
     Ok(Router::new()
         .route("/internal/adx/v1/templates/publish", post(publish))
         .route("/internal/adx/v1/templates/get", post(template))
+        .route("/internal/adx/v1/templates/list", post(templates_catalog))
+        .route("/internal/adx/v1/versions/list", post(versions_catalog))
+        .route("/internal/adx/v1/aliases/list", post(aliases_catalog))
+        .route("/internal/adx/v1/bindings/catalog", post(bindings_catalog))
         .route("/internal/adx/v1/aliases/get", post(alias))
         .route("/internal/adx/v1/aliases/put", post(update_alias))
         .route("/internal/adx/v1/prewarm/retire", post(retire_golden))
@@ -123,6 +127,18 @@ async fn template(State(s): State<Service>, Json(r): Json<TemplateRequest>) -> R
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }
+}
+async fn templates_catalog(State(s): State<Service>, Json(r): Json<CatalogRequest>) -> Response {
+    match s.activator.list_templates(&r).await { Ok(v) => Json(v).into_response(), Err(e) => failure(e) }
+}
+async fn versions_catalog(State(s): State<Service>, Json(r): Json<CatalogRequest>) -> Response {
+    match s.activator.list_versions(&r).await { Ok(v) => Json(v).into_response(), Err(e) => failure(e) }
+}
+async fn aliases_catalog(State(s): State<Service>, Json(r): Json<CatalogRequest>) -> Response {
+    match s.activator.list_aliases(&r).await { Ok(v) => Json(v).into_response(), Err(e) => failure(e) }
+}
+async fn bindings_catalog(State(s): State<Service>, Json(r): Json<BindingCatalog>) -> Response {
+    match s.activator.list_bindings_tenant(&r).await { Ok(v) => Json(v).into_response(), Err(e) => failure(e) }
 }
 async fn alias(State(s): State<Service>, Json(r): Json<AliasRequest>) -> Response {
     match s.activator.alias_config(&r).await {

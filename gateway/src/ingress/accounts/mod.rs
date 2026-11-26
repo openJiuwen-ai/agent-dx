@@ -1,5 +1,9 @@
 //! Business accounts and sessions. Independent of ADX tenant/service authentication.
 mod credentials;
+pub mod admin;
+pub mod admin_http;
+#[cfg(test)]
+mod admin_tests;
 mod privacy_store;
 mod service_store;
 pub(crate) use privacy_store::{ExpectedRevision, PrivacyOwner, StoredPrivacyGrant};
@@ -142,6 +146,10 @@ pub trait BusinessAuth: Send + Sync {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
+    #[serde(default)]
+    pub model_namespace: Option<String>,
+    #[serde(default)]
+    pub admin: Option<admin::AdminConfig>,
     pub developer_scope: String,
     pub agreement_version: String,
     pub database_url_env: String,
@@ -260,6 +268,9 @@ impl AccountService {
             return Err(Error::Configuration);
         }
         config.litellm.validate()?;
+        if let Some(admin) = &config.admin {
+            admin.validate()?;
+        }
         Ok(Self {
             store,
             identity,

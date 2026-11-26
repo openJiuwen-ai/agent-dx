@@ -326,17 +326,17 @@ async fn handle_one_request(
         let trace_id = parse_header(&head, "x-trace-id").unwrap_or_default();
         let route = request_path(&path);
         execd_info!(
-        "[execd-http] request method={} path={} body_mode={} content_len={} initial_body={} trace={}",
-        method,
-        route,
-        body_mode.label(),
-        body_mode
-            .expected_len()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        buf[header_end..].len(),
-        trace_id
-    );
+            "[execd-http] request method={} path={} body_mode={} content_len={} initial_body={} trace={}",
+            method,
+            route,
+            body_mode.label(),
+            body_mode
+                .expected_len()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            buf[header_end..].len(),
+            trace_id
+        );
 
         // Health checks do not need a body.
         if method == "GET" && route == "/healthz" {
@@ -350,16 +350,16 @@ async fn handle_one_request(
         if method == "GET" && route == "/metrics" {
             let metrics = super::cmd::command_metrics();
             let body = format!(
-            "command_records {}\ncommand_running {}\ncommand_completed {}\ncommand_result_bytes {}\ncommand_result_truncated_total {}\ncommand_record_expired_total {}\ncommand_id_conflict_total {}\ncommand_watch_connections {}\n",
-            metrics.records,
-            metrics.running,
-            metrics.completed,
-            metrics.result_bytes,
-            metrics.result_truncated_total,
-            metrics.record_expired_total,
-            metrics.id_conflict_total,
-            COMMAND_WATCHERS.load(std::sync::atomic::Ordering::Relaxed),
-        );
+                "command_records {}\ncommand_running {}\ncommand_completed {}\ncommand_result_bytes {}\ncommand_result_truncated_total {}\ncommand_record_expired_total {}\ncommand_id_conflict_total {}\ncommand_watch_connections {}\n",
+                metrics.records,
+                metrics.running,
+                metrics.completed,
+                metrics.result_bytes,
+                metrics.result_truncated_total,
+                metrics.record_expired_total,
+                metrics.id_conflict_total,
+                COMMAND_WATCHERS.load(std::sync::atomic::Ordering::Relaxed),
+            );
             return write_resp(sock, 200, &body).await;
         }
         // Auth: EXECD requires token authentication. /invoke, /upload, and /download are all control-plane capabilities.
@@ -508,8 +508,8 @@ async fn handle_one_request(
 
 async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedResponse {
     use adx_core::{
-        runtime::{AbortCheckpoint, FinishWorkloadCheckpoint, PrepareCheckpoint},
         Error,
+        runtime::{AbortCheckpoint, FinishWorkloadCheckpoint, PrepareCheckpoint},
     };
     let Some(controller) = super::control::current() else {
         return CachedResponse {
@@ -549,7 +549,7 @@ async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedRespon
             return CachedResponse {
                 status: 404,
                 body: err_json("unknown control operation"),
-            }
+            };
         }
     };
     match result {
@@ -711,6 +711,11 @@ async fn handle_command_watch(
     Ok(())
 }
 
+fn apply_pty_cwd(command: &mut portable_pty::CommandBuilder) -> std::io::Result<()> {
+    command.cwd(std::env::current_dir()?);
+    Ok(())
+}
+
 /// Close code for a PTY that failed after the WebSocket upgrade succeeded.
 ///
 /// RFC 6455 reserves 4000-4999 for application use. The failure reason travels
@@ -820,6 +825,24 @@ async fn handle_pty(
     )
     .await;
 
+<<<<<<< HEAD
+    let pty = portable_pty::native_pty_system();
+    let pair = pty.openpty(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let mut process = portable_pty::CommandBuilder::new(&command[0]);
+    for argument in &command[1..] {
+        process.arg(argument);
+    }
+    super::child_env::apply_pty(&mut process);
+    // Preserve Execd's validated working directory. portable-pty otherwise
+    // defaults to HOME, which can be inaccessible before the helper drops uid.
+    apply_pty_cwd(&mut process)?;
+    let mut child = pair.slave.spawn_command(process)?;
+=======
     static NEXT_PTY: AtomicU64 = AtomicU64::new(1);
     let session_id = format!(
         "pty-{}-{}",
@@ -857,6 +880,7 @@ async fn handle_pty(
             return Ok(());
         }
     };
+>>>>>>> 7a116c74b755b1f5de7a0502f52c85b0aeb76f69
     let mut killer = child.clone_killer();
     let mut writer = Some(writer);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1525,7 +1549,7 @@ async fn handle_download(
         _ => {
             return write_resp(sock, 400, "{\"error\":\"missing path\"}")
                 .await
-                .map(|_| false)
+                .map(|_| false);
         }
     };
     match upload_type(raw_path).as_str() {
@@ -1605,7 +1629,7 @@ async fn handle_file_download(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return write_resp(sock, 404, &err_json("file not found"))
                 .await
-                .map(|_| false)
+                .map(|_| false);
         }
         Err(error) => return Err(error.into()),
     };
@@ -2196,7 +2220,11 @@ mod tests {
         });
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
         let body = serde_json::json!({"action": action, "args": args}).to_string();
-        let request = format!("POST /invoke HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+        let request = format!(
+            "POST /invoke HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
         client.write_all(request.as_bytes()).await.unwrap();
         let (head, body) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2704,7 +2732,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_preserves_target_mode_and_symlink() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target");
         let link = directory.path().join("link");
@@ -2741,10 +2769,12 @@ mod tests {
         let response =
             invoke_over_http_status("file.list", serde_json::json!({"path":missing}), 400).await;
         assert_eq!(response["error_code"], "FILE_NOT_FOUND");
-        assert!(response["error"]
-            .as_str()
-            .unwrap()
-            .contains(missing.to_str().unwrap()));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains(missing.to_str().unwrap())
+        );
         let file = directory.path().join("file");
         std::fs::write(&file, b"data").unwrap();
         let response =
@@ -2886,11 +2916,13 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fifo");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
         let writer_path = path.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (opened_tx, opened_rx) = mpsc::channel();
@@ -2951,11 +2983,13 @@ mod tests {
     async fn fifo_download_is_rejected_without_waiting_for_a_writer() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fifo");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
         let listener = bind(0).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3021,12 +3055,14 @@ mod tests {
         .unwrap();
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(head.contains("Transfer-Encoding: chunked\r\n"));
-        assert!(tar
-            .windows(b"payload.txt".len())
-            .any(|v| v == b"payload.txt"));
-        assert!(tar
-            .windows(b"tar-roundtrip".len())
-            .any(|v| v == b"tar-roundtrip"));
+        assert!(
+            tar.windows(b"payload.txt".len())
+                .any(|v| v == b"payload.txt")
+        );
+        assert!(
+            tar.windows(b"tar-roundtrip".len())
+                .any(|v| v == b"tar-roundtrip")
+        );
 
         client
             .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -3325,6 +3361,19 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pty_uses_runtime_cwd_instead_of_unavailable_home() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/pwd");
+        command.env("HOME", "/nonexistent-adx-terminal-home");
+        super::apply_pty_cwd(&mut command).unwrap();
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]

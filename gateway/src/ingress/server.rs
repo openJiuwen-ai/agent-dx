@@ -347,6 +347,8 @@ pub struct Ingress {
     #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
     #[cfg(feature = "agent-api")]
+    accounts_admin: Option<Arc<super::accounts::AccountService>>,
+    #[cfg(feature = "agent-api")]
     digitalmategateway_api:
         Option<Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>>,
     resolver: Arc<IngressRouteResolver>,
@@ -399,6 +401,8 @@ impl Ingress {
             #[cfg(feature = "agent-api")]
             agent_api: None,
             #[cfg(feature = "agent-api")]
+            accounts_admin: None,
+            #[cfg(feature = "agent-api")]
             digitalmategateway_api: None,
             resolver,
             connector,
@@ -440,6 +444,12 @@ impl Ingress {
     #[cfg(feature = "agent-api")]
     pub fn with_agent_api(mut self, api: Arc<super::agent_api::AgentApi>) -> Self {
         self.agent_api = Some(api);
+        self
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_accounts_admin(mut self, service: Arc<super::accounts::AccountService>) -> Self {
+        self.accounts_admin = Some(service);
         self
     }
 
@@ -1238,6 +1248,21 @@ impl Ingress {
             self.proxy_direct(request, ingress_security).await
         } else {
             match request.uri().path() {
+                #[cfg(feature = "agent-api")]
+                path if super::accounts::admin_http::matches(path) => {
+                    use super::accounts::admin_http;
+                    if ingress_security == IngressSecurity::Plaintext {
+                        tls_required()
+                    } else {
+                        match self.authenticator.authenticate_request_with_policy(&request,true).await {
+                            Ok(tenant) if !tenant.is_empty() => match &self.accounts_admin {
+                                Some(service) => admin_http::handle(service,request,&tenant).await,
+                                None => admin_http::failure(StatusCode::NOT_FOUND,"not_found"),
+                            },
+                            _ => admin_http::failure(StatusCode::UNAUTHORIZED,"unauthorized"),
+                        }
+                    }
+                }
                 #[cfg(feature = "agent-api")]
                 path if super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(
                     path,

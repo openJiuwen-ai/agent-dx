@@ -83,17 +83,21 @@ async fn passive_polls_do_not_export_but_requests_keep_context() {
     assert!(exporter.get_finished_spans().unwrap().is_empty());
 
     let parent = "00-11111111111111111111111111111111-2222222222222222-01";
-    assert!(request("GET", "/control/v1/status", Some(parent), "")
-        .await
-        .starts_with("HTTP/1.1 200"));
+    assert!(
+        request("GET", "/control/v1/status", Some(parent), "")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
     assert!(
         request("POST", "/control/v1/checkpoint/prepare", None, "{}")
             .await
             .starts_with("HTTP/1.1 400")
     );
-    assert!(request("POST", "/invoke", None, r#"{"action":"ping"}"#)
-        .await
-        .starts_with("HTTP/1.1 200"));
+    assert!(
+        request("POST", "/invoke", None, r#"{"action":"ping"}"#)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 3);
@@ -102,9 +106,11 @@ async fn passive_polls_do_not_export_but_requests_keep_context() {
     // Checkpoint control currently uses the bounded fallback HTTP route name.
     assert_eq!(spans[1].name, "POST /unmatched");
     assert_eq!(spans[2].name, "POST /invoke");
-    assert!(spans[2]
-        .attributes
-        .iter()
-        .any(|a| a.key.as_str() == "http.response.status_code" && a.value.to_string() == "200"));
+    assert!(
+        spans[2]
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "http.response.status_code" && a.value.to_string() == "200")
+    );
     provider.shutdown().unwrap();
 }

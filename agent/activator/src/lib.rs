@@ -633,6 +633,20 @@ impl Activator {
     pub async fn binding(&self, scope: &Scope) -> Result<AgentBinding> {
         self.state.binding(scope).await?.ok_or(Error::NotFound)
     }
+    pub async fn list_templates(&self, query: &adx_agent_core::activator::CatalogRequest) -> Result<adx_agent_core::activator::TemplateSummaryPage> {
+        Ok(self.state.list_templates(&query.tenant, &query.page).await?)
+    }
+    pub async fn list_versions(&self, query: &adx_agent_core::activator::CatalogRequest) -> Result<adx_agent_core::activator::VersionSummaryPage> {
+        let template = query.template.as_deref().ok_or_else(|| Error::Invalid("template required".into()))?;
+        Ok(self.state.list_versions(&query.tenant, template, &query.page).await?)
+    }
+    pub async fn list_aliases(&self, query: &adx_agent_core::activator::CatalogRequest) -> Result<adx_agent_core::activator::AliasPage> {
+        let template = query.template.as_deref().ok_or_else(|| Error::Invalid("template required".into()))?;
+        Ok(self.state.list_aliases(&query.tenant, template, &query.page).await?)
+    }
+    pub async fn list_bindings_tenant(&self, query: &adx_agent_core::activator::BindingCatalog) -> Result<adx_agent_core::activator::BindingCatalogPage> {
+        Ok(self.state.list_bindings_tenant(query).await?)
+    }
     pub async fn list_bindings(
         &self,
         query: &adx_agent_core::activator::BindingList,

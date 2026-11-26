@@ -41,6 +41,18 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn list_templates(&self, ctx: &RequestContext, query: &adx_agent_core::activator::CatalogRequest) -> Result<adx_agent_core::activator::TemplateSummaryPage> {
+        ctx.run(self.activator.list_templates(query)).await
+    }
+    async fn list_versions(&self, ctx: &RequestContext, query: &adx_agent_core::activator::CatalogRequest) -> Result<adx_agent_core::activator::VersionSummaryPage> {
+        ctx.run(self.activator.list_versions(query)).await
+    }
+    async fn list_aliases(&self, ctx: &RequestContext, query: &adx_agent_core::activator::CatalogRequest) -> Result<adx_agent_core::activator::AliasPage> {
+        ctx.run(self.activator.list_aliases(query)).await
+    }
+    async fn list_bindings_tenant(&self, ctx: &RequestContext, query: &adx_agent_core::activator::BindingCatalog) -> Result<adx_agent_core::activator::BindingCatalogPage> {
+        ctx.run(self.activator.list_bindings_tenant(query)).await
+    }
     async fn retire_golden(
         &self,
         ctx: &RequestContext,

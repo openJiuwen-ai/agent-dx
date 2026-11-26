@@ -1,0 +1,21 @@
+ARG BUILD_IMAGE=swr.cn-north-4.myhuaweicloud.com/openjiuwen-online-test/adx-jiuwen-build:digital-mate-build-v6
+FROM node:22-bookworm-slim AS frontend
+WORKDIR /frontend
+COPY agent/console/frontend/package*.json ./
+RUN npm ci
+COPY agent/console/frontend/ ./
+RUN npm test && npm run build
+
+FROM ${BUILD_IMAGE} AS build
+WORKDIR /workspace
+COPY . .
+COPY --from=frontend /frontend/dist /workspace/agent/console/frontend/dist
+RUN cargo build --locked --release -p adx-agent-console
+
+# Match the build image's libc; the service runs with a fixed unprivileged UID.
+FROM ${BUILD_IMAGE} AS runtime
+COPY --from=build /workspace/target/release/adx-agent-console /usr/local/bin/adx-agent-console
+USER 65532:65532
+ENV ADX_CONSOLE_CONFIG=/etc/adx-console/config.json
+EXPOSE 8088
+ENTRYPOINT ["/usr/local/bin/adx-agent-console"]

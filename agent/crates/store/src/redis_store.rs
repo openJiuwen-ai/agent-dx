@@ -180,6 +180,35 @@ impl RedisRepository {
 
 #[async_trait]
 impl Repository for RedisRepository {
+    async fn scan(&self, kind: &str, parts: &[&str]) -> Result<Vec<(String, Record)>> {
+        let key = Key::new(kind, parts)?;
+        let prefix = format!("{}{}2c", self.prefix, &key.as_str()[..key.as_str().len() - 2]);
+        let pattern = format!("{prefix}*");
+        let enumeration = async {
+            let mut cursor = 0u64;
+            let mut records = std::collections::BTreeMap::new();
+            loop {
+                let mut command = redis::cmd("SCAN");
+                command.arg(cursor).arg("MATCH").arg(&pattern).arg("COUNT").arg(256);
+                let (next, keys): (u64, Vec<String>) = self.execute(command, false).await?;
+                for key in keys {
+                    if !key.starts_with(&prefix) { return Err(Error::Corrupt("catalog key mismatch".into())); }
+                    let mut get = redis::cmd("GET");
+                    get.arg(&key);
+                    let raw: Option<String> = self.execute(get, false).await?;
+                    if let Some(raw) = raw {
+                        let value: Record = serde_json::from_str(&raw).map_err(|e| Error::Corrupt(e.to_string()))?;
+                        records.insert(key[self.prefix.len()..].to_owned(), value);
+                    }
+                    if records.len() > 100_000 { return Err(Error::Unavailable("catalog enumeration limit exceeded".into())); }
+                }
+                cursor = next;
+                if cursor == 0 { return Ok(records.into_iter().collect()); }
+            }
+        };
+        tokio::time::timeout(self.timeout, enumeration).await
+            .map_err(|_| Error::Unavailable("catalog enumeration timed out".into()))?
+    }
     async fn get(&self, key: &Key) -> Result<Option<Record>> {
         let mut command = redis::cmd("GET");
         command.arg(self.key(key));

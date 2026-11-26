@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-proxy
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    events {}
+    http {
+      access_log /dev/stdout;
+      error_log /dev/stderr;
+      client_body_temp_path /tmp/client;
+      proxy_temp_path /tmp/proxy;
+      fastcgi_temp_path /tmp/fastcgi;
+      uwsgi_temp_path /tmp/uwsgi;
+      scgi_temp_path /tmp/scgi;
+      map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+      server {
+        listen 8443 ssl;
+        server_name localhost;
+        ssl_certificate /etc/console-tls/tls.crt;
+        ssl_certificate_key /etc/console-tls/tls.key;
+        location / {
+          proxy_pass http://127.0.0.1:8088;
+          proxy_http_version 1.1;
+          proxy_set_header Host $http_host;
+          proxy_set_header X-Forwarded-Proto https;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_read_timeout 3600s;
+          proxy_buffering off;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: {{ .Release.Name }}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          image: {{ printf "%s:%s" (required "image.repository is required" .Values.image.repository) (required "image.tag is required" .Values.image.tag) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - {name: ADX_CONSOLE_CONFIG, value: /etc/adx-console/config.json}
+          ports:
+            - {name: http, containerPort: 8088}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet:
+              path: /console/
+              port: 8443
+              scheme: HTTPS
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/adx-console, readOnly: true}
+            - {name: credentials, mountPath: /run/secrets, readOnly: true}
+            - {name: console-tmp, mountPath: /tmp}
+            {{- if .Values.sharedStorage.enabled }}
+            - name: shared
+              mountPath: {{ .Values.sharedStorage.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+        - name: https
+          image: {{ .Values.proxyImage | quote }}
+          command: [nginx, -g, "daemon off;"]
+          ports:
+            - {name: https, containerPort: 8443}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            tcpSocket: {port: https}
+          resources:
+            {{- toYaml .Values.proxyResources | nindent 12 }}
+          volumeMounts:
+            - {name: proxy, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
+            - {name: tls, mountPath: /etc/console-tls, readOnly: true}
+            - {name: proxy-tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ .Values.configSecret | quote }}
+            defaultMode: 0440
+        - name: credentials
+          secret:
+            secretName: {{ .Values.credentialsSecret | quote }}
+            defaultMode: 0440
+        - name: tls
+          secret:
+            secretName: {{ .Values.tlsSecret | quote }}
+            defaultMode: 0440
+        - name: proxy
+          configMap:
+            name: {{ .Release.Name }}-proxy
+        - name: console-tmp
+          emptyDir: {sizeLimit: 32Mi}
+        - name: proxy-tmp
+          emptyDir: {sizeLimit: 32Mi}
+        {{- if .Values.sharedStorage.enabled }}
+        - name: shared
+          persistentVolumeClaim:
+            claimName: {{ .Values.sharedStorage.claimName | quote }}
+            readOnly: true
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: {{ .Release.Name }}}
+  ports:
+    - {name: https, port: 8443, targetPort: https}

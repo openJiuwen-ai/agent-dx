@@ -1,0 +1,6 @@
+.git
+target
+out
+**/node_modules
+agent/console/frontend/dist
+**/__pycache__
