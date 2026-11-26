@@ -626,7 +626,8 @@ async fn run_workspace_bind_root_commands(
                         "after_revision" => after_revision,
                         "since_last_success_ms" => u64::try_from(received_at.duration_since(last_success).as_millis()).unwrap_or(u64::MAX),
                         "error" => error.to_string());
-                    delay = META_RETRY_INTERVAL.min(deadline.saturating_duration_since(received_at));
+                    delay =
+                        META_RETRY_INTERVAL.min(deadline.saturating_duration_since(received_at));
                     continue;
                 }
                 return Err(control_fatal(after_revision, error).into());
