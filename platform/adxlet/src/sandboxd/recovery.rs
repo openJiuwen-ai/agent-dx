@@ -26,20 +26,49 @@ pub(super) fn profiles(
     let Some(rootfs) = rootfs.filter(|root| Path::new(&root.path).is_absolute()) else {
         return Ok(profiles);
     };
+    let release = release_identity(&rootfs.path)?;
     for (class, path) in binaries {
-        profiles.insert(
-            class.clone(),
-            BTreeMap::from([
-                (
-                    format!("ADX_RECOVERY_RUNTIME_{class}"),
-                    binary_digest(path, std::env::consts::ARCH)?,
-                ),
-                ("ADX_RECOVERY_ROOTFS_SHA256".into(), rootfs.sha256.clone()),
-                ("ADX_RECOVERY_ROOTFS_PATH".into(), rootfs.path.clone()),
-            ]),
-        );
+        let mut profile = BTreeMap::from([
+            (
+                format!("ADX_RECOVERY_RUNTIME_{class}"),
+                binary_digest(path, std::env::consts::ARCH)?,
+            ),
+            ("ADX_RECOVERY_ROOTFS_SHA256".into(), rootfs.sha256.clone()),
+            ("ADX_RECOVERY_ROOTFS_PATH".into(), rootfs.path.clone()),
+        ]);
+        if let Some(release) = &release {
+            profile.insert("ADX_RECOVERY_RELEASE".into(), release.clone());
+        }
+        profiles.insert(class.clone(), profile);
     }
     Ok(profiles)
+}
+
+/// ADX release identity that produced the runtime rootfs.
+///
+/// The packaged runtime rootfs lives in `<package>/runtime/`, so the release
+/// manifest is two levels above it. A missing manifest leaves the release
+/// unqualified; a manifest that exists but cannot be parsed fails closed.
+fn release_identity(rootfs_path: &str) -> Result<Option<String>> {
+    let Some(package) = Path::new(rootfs_path).parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let manifest = package.join("manifest.json");
+    if !manifest.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&manifest).map_err(super::unavailable)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Invalid("invalid ADX release manifest".into()))?;
+    let commit = value
+        .get("commit")
+        .and_then(serde_json::Value::as_str)
+        .filter(|commit| !commit.is_empty())
+        .ok_or_else(|| Error::Invalid("ADX release manifest requires a commit".into()))?;
+    Ok(Some(format!(
+        "{commit}@sha256:{:x}",
+        Sha256::digest(&bytes)
+    )))
 }
 
 fn binary_digest(path: &Path, arch: &str) -> Result<String> {
@@ -185,5 +214,65 @@ mod tests {
         assert!(binary_digest(&directory.path().join("missing"), "x86_64").is_err());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(binary_digest(&path, "x86_64").is_err());
+    }
+
+    #[test]
+    fn release_identity_requires_a_parsable_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("release");
+        std::fs::create_dir_all(package.join("runtime")).unwrap();
+        let rootfs = package.join("runtime").join("adx-runtime-rootfs.img");
+        std::fs::write(&rootfs, b"image").unwrap();
+        let manifest = package.join("manifest.json");
+        let path = rootfs.to_str().unwrap();
+
+        assert_eq!(release_identity(path).unwrap(), None);
+        std::fs::write(&manifest, br#"{"commit":"abc123"}"#).unwrap();
+        let identity = release_identity(path).unwrap().unwrap();
+        assert!(identity.starts_with("abc123@sha256:"));
+        std::fs::write(&manifest, b"not json").unwrap();
+        assert!(release_identity(path).is_err());
+        std::fs::write(&manifest, br#"{"commit":""}"#).unwrap();
+        assert!(release_identity(path).is_err());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn profile_includes_release_identity_from_package_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("release");
+        std::fs::create_dir_all(package.join("runtime")).unwrap();
+        let rootfs = package.join("runtime").join("adx-runtime-rootfs.img");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        std::fs::write(package.join("manifest.json"), br#"{"commit":"abc123"}"#).unwrap();
+        let runsc = package.join("runsc");
+        let mut binary = vec![0; 64];
+        binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        let machine = if cfg!(target_arch = "x86_64") {
+            62u16
+        } else {
+            183u16
+        };
+        binary[18..20].copy_from_slice(&machine.to_le_bytes());
+        std::fs::write(&runsc, binary).unwrap();
+        std::fs::set_permissions(&runsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let identity = RuntimeRootfsIdentity {
+            path: rootfs.to_str().unwrap().to_owned(),
+            sha256: "rootfs-sha".into(),
+        };
+        let published = profiles(
+            Some(&identity),
+            &BTreeMap::from([("runsc".to_owned(), runsc)]),
+        )
+        .unwrap();
+        let profile = &published["runsc"];
+        assert!(profile["ADX_RECOVERY_RELEASE"].starts_with("abc123@sha256:"));
+        assert_eq!(profile["ADX_RECOVERY_ROOTFS_SHA256"], "rootfs-sha");
     }
 }
