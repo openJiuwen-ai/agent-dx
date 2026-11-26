@@ -840,14 +840,20 @@ the running command; automatic idle checkpointing waits for client activity to e
 For watch-backed waits with a positive `timeout`, the initial registry read,
 watch intervals, subsequent reads and transport retries share the same deadline.
 For `wait_async()`, this includes waiting for a thread to run the registry read.
-If this client-side timer expires, the SDK reports `COMMAND_STATE_UNAVAILABLE`
-with an unknown outcome. HTTP request timeouts are enforced per network phase.
-Retryable failures in periodic reads during a checkpoint or transport interruption keep their
-30-second retry ceiling within the caller's remaining budget. Terminal errors
-and exhausted retries preserve their exception metadata. If the command was
-last observed running and the watch budget expires, the wait returns
-`CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`. The handle can wait
-again. `wait(0)` and `wait_async(0)` query the registry without opening a watch.
+If the initial read fails, its exception is preserved; an async timer expiry
+before the first observation reports `COMMAND_STATE_UNAVAILABLE` with an unknown
+outcome. HTTP request timeouts are enforced per network phase. Retryable failures
+in periodic reads during a checkpoint or transport interruption keep their
+30-second retry ceiling within the caller's remaining budget. If the command was
+last observed pending or running and the caller's wait deadline expires during
+the watch or a retryable periodic read, the wait returns
+`CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT", exit_code=None)` using
+the last observed output. This also applies when an async periodic read is still
+queued for a worker. This result ends only the local wait; it does not confirm
+the command's current state. The same handle can wait again for its authoritative
+result. Terminal and nonretryable errors, and read retries exhausted before the
+caller's wait deadline, preserve their exception metadata. `wait(0)` and
+`wait_async(0)` query the registry without opening a watch.
 A client restart also
 does not terminate the remote command. `CommandHandle.kill()` and
 `environment.commands.kill()` return `False` when the command is absent or already
