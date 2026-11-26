@@ -677,7 +677,7 @@ async fn h2_p1_crc_chunk_is_read_from_a_holder_end_to_end() {
         },
         data_endpoint: Some("http://127.0.0.1:9".into()),
         load_hint: 0,
-        read_grant: crate::dfs::DfsReadGrant {
+        grant: crate::dfs::SourceGrant::Copy(crate::dfs::DfsReadGrant {
             namespace_id: NamespaceId::new("namespace"),
             file_version_id: FileVersionId::new("v"),
             layout_root_id: LayoutRootId::new("l"),
@@ -686,8 +686,7 @@ async fn h2_p1_crc_chunk_is_read_from_a_holder_end_to_end() {
             expires_at_unix_ms: 4_000_000_000_000,
             fence: 1,
             token: "per-copy".into(),
-        },
-        holder_grant: None,
+        }),
     };
     let reader_meta = Arc::new(E2eMeta {
         reply: crate::dfs::DfsChunkSourcesReply {
@@ -1434,8 +1433,7 @@ async fn pair_read(
             },
             data_endpoint: Some(writer_endpoints[index].clone()),
             load_hint: 0,
-            read_grant: per_copy.clone(),
-            holder_grant: None,
+            grant: crate::dfs::SourceGrant::Copy(per_copy.clone()),
         };
         let mut holder_grant = grant("v", "l");
         holder_grant.caller_node_id = (*name).into();
@@ -1840,7 +1838,7 @@ async fn review_reader_shaped(
         },
         data_endpoint: Some(writer_endpoint.clone()),
         load_hint: 0,
-        read_grant: crate::dfs::DfsReadGrant {
+        grant: crate::dfs::SourceGrant::Copy(crate::dfs::DfsReadGrant {
             namespace_id: NamespaceId::new("namespace"),
             file_version_id: FileVersionId::new("v"),
             layout_root_id: LayoutRootId::new("l"),
@@ -1849,8 +1847,7 @@ async fn review_reader_shaped(
             expires_at_unix_ms: 4_000_000_000_000,
             fence: 1,
             token: "per-copy".into(),
-        },
-        holder_grant: None,
+        }),
     };
     let meta = Arc::new(ReviewMeta {
         reply: crate::dfs::DfsChunkSourcesReply {

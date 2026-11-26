@@ -176,8 +176,7 @@ impl DfsService {
                     location: serving_copy.location.clone(),
                     data_endpoint,
                     load_hint: 0,
-                    read_grant,
-                    holder_grant: None,
+                    grant: crate::dfs::SourceGrant::Copy(read_grant),
                 });
             }
             chunks.push(ChunkSources {

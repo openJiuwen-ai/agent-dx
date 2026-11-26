@@ -689,7 +689,7 @@ pub(super) fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCan
         },
         data_endpoint: Some(format!("http://{node_id}")),
         load_hint: 0,
-        read_grant: DfsReadGrant {
+        grant: crate::dfs::SourceGrant::Copy(DfsReadGrant {
             namespace_id: crate::dfs::NamespaceId::new("default"),
             file_version_id: FileVersionId::new("version"),
             layout_root_id: LayoutRootId::new("layout"),
@@ -698,8 +698,7 @@ pub(super) fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCan
             expires_at_unix_ms: u64::MAX,
             fence: 1,
             token: "test-token".into(),
-        },
-        holder_grant: None,
+        }),
     }
 }
 
@@ -781,7 +780,10 @@ fn p2_r1_source_cache_short_grant_is_usable_but_not_retained() {
     let mut sources = source_cache_lru_set(0);
     // The current source is still authorized, but cannot cover the fixed
     // 1000 ms safety margin for a future cached read.
-    sources.sources[0].read_grant.expires_at_unix_ms = now_unix_ms().saturating_add(500);
+    sources.sources[0]
+        .grant
+        .copy_mut_for_test()
+        .expires_at_unix_ms = now_unix_ms().saturating_add(500);
     let provider = Arc::new(StaticSources::new(DfsChunkSourcesReply {
         revision: 1,
         chunks: vec![sources.clone()],
@@ -813,7 +815,7 @@ fn p2_r1_source_cache_oversized_metadata_is_usable_but_not_retained() {
     let mut sources = source_cache_lru_set(0);
     // Use actual content length so cloning cannot shrink the oversized
     // allocation below the approved 4 MiB resident metadata limit.
-    sources.sources[0].read_grant.token = "t".repeat(4 * 1024 * 1024 + 1);
+    sources.sources[0].grant.copy_mut_for_test().token = "t".repeat(4 * 1024 * 1024 + 1);
     let provider = Arc::new(StaticSources::new(DfsChunkSourcesReply {
         revision: 1,
         chunks: vec![sources.clone()],
@@ -879,13 +881,15 @@ impl ReadSourceProvider for R1Sources {
                         *node_epoch = self.node_epoch.load(Ordering::Relaxed).max(1);
                         *device_epoch = self.device_epoch.load(Ordering::Relaxed).max(1);
                     }
-                    candidate.read_grant.file_version_id = request.file_version_id.clone();
-                    candidate.read_grant.layout_root_id = request.layout_root_id.clone();
-                    candidate.read_grant.namespace_id = request.namespace_id.clone();
-                    candidate.read_grant.caller_node_id = request.caller_id.clone();
+                    candidate.grant.copy_mut_for_test().file_version_id =
+                        request.file_version_id.clone();
+                    candidate.grant.copy_mut_for_test().layout_root_id =
+                        request.layout_root_id.clone();
+                    candidate.grant.copy_mut_for_test().namespace_id = request.namespace_id.clone();
+                    candidate.grant.copy_mut_for_test().caller_node_id = request.caller_id.clone();
                     // Different signed copy fences within one reply are legal.
-                    candidate.read_grant.fence = index as u64 + 1;
-                    candidate.read_grant.token = format!("r1-call-{call}");
+                    candidate.grant.copy_mut_for_test().fence = index as u64 + 1;
+                    candidate.grant.copy_mut_for_test().token = format!("r1-call-{call}");
                     ChunkSources {
                         chunk_id,
                         chunk: None,
@@ -1131,7 +1135,7 @@ fn p2_r1_invalidation_race_discards_old_hits_and_revalidates_all_current_ids() {
         assert!(
             result
                 .iter()
-                .all(|set| set.sources[0].read_grant.token == "r1-call-3")
+                .all(|set| set.sources[0].grant.copy().unwrap().token == "r1-call-3")
         );
     }
 }
@@ -1181,7 +1185,10 @@ fn p2_r1_observed_remote_epochs_retire_related_sources_only() {
             .unwrap();
         let mut unrelated = source_cache_lru_set(80);
         unrelated.sources[0] = source("other-copy", &unrelated.chunk_id, "node-c");
-        unrelated.sources[0].read_grant.file_version_id = FileVersionId::new("other-version");
+        unrelated.sources[0]
+            .grant
+            .copy_mut_for_test()
+            .file_version_id = FileVersionId::new("other-version");
         let unrelated_key = (
             FileVersionId::new("other-version"),
             LayoutRootId::new("layout"),
@@ -1259,7 +1266,7 @@ fn p2_r1_new_remote_epoch_discards_already_resolved_old_cache_hits() {
         assert!(
             result
                 .iter()
-                .all(|set| set.sources[0].read_grant.token == "r1-call-3")
+                .all(|set| set.sources[0].grant.copy().unwrap().token == "r1-call-3")
         );
     }
 }
@@ -1275,17 +1282,17 @@ fn p2_r1_source_deadline_consumes_rpc_time_and_hits_do_not_renew_it() {
     let sent = Instant::now() - Duration::from_secs(2);
     let wall = now_unix_ms().saturating_sub(2_000);
     let mut set = source_cache_lru_set(0);
-    set.sources[0].read_grant.expires_at_unix_ms = wall + 4_000;
+    set.sources[0].grant.copy_mut_for_test().expires_at_unix_ms = wall + 4_000;
     assert_eq!(
         engine.source_deadline(&set, sent, wall),
         Some(sent + Duration::from_secs(3))
     );
-    set.sources[0].read_grant.expires_at_unix_ms = u64::MAX;
+    set.sources[0].grant.copy_mut_for_test().expires_at_unix_ms = u64::MAX;
     assert_eq!(
         engine.source_deadline(&set, sent, wall),
         Some(sent + Duration::from_secs(5))
     );
-    set.sources[0].read_grant.expires_at_unix_ms = wall + 1_000;
+    set.sources[0].grant.copy_mut_for_test().expires_at_unix_ms = wall + 1_000;
     assert!(engine.source_deadline(&set, sent, wall).is_none());
 }
 
@@ -1342,8 +1349,8 @@ fn p2_r1_source_cache_capacity_and_metrics_follow_real_retained_metadata() {
         let mut cache = engine.source_cache.lock().unwrap();
         for index in 0..8 {
             let mut set = source_cache_lru_set(index);
-            set.sources[0].read_grant.token = String::with_capacity(700 * 1024);
-            set.sources[0].read_grant.token.push('t');
+            set.sources[0].grant.copy_mut_for_test().token = String::with_capacity(700 * 1024);
+            set.sources[0].grant.copy_mut_for_test().token.push('t');
             cache.insert(
                 source_cache_lru_key(&set.chunk_id),
                 CachedSources {
@@ -4267,7 +4274,10 @@ fn r7_saturated_foreground_queue_stops_at_the_original_grant_deadline() {
     second.output_offset = 2;
     batch.ops.push(second);
     let mut sources = fixture.sources.reply.lock().unwrap().chunks.clone();
-    sources[0].sources[0].read_grant.expires_at_unix_ms = now_unix_ms().saturating_add(75);
+    sources[0].sources[0]
+        .grant
+        .copy_mut_for_test()
+        .expires_at_unix_ms = now_unix_ms().saturating_add(75);
     let (finished_tx, finished_rx) = mpsc::channel();
     let reading = std::thread::spawn(move || {
         let mut out = [91; 4];
@@ -4975,7 +4985,8 @@ fn native_peer_disk_cache_final_grant_expiry_does_not_admit_or_publish() {
         Duration::from_millis(100),
     );
     fixture.sources.reply.lock().unwrap().chunks[0].sources[0]
-        .read_grant
+        .grant
+        .copy_mut_for_test()
         .expires_at_unix_ms = now_unix_ms() + 50;
     assert!(
         fixture
@@ -5011,7 +5022,7 @@ fn native_peer_disk_cache_new_version_cannot_reuse_old_object_content() {
     let bytes = vec![97; 64 * 1024];
     let next = StagedChunk::new(OperationId::new("next-native-cache"), bytes.clone());
     let mut next_source = source("next-copy", &next.chunk.id, "node-b");
-    next_source.read_grant.file_version_id = FileVersionId::new("next-version");
+    next_source.grant.copy_mut_for_test().file_version_id = FileVersionId::new("next-version");
     fixture.sources.reply.lock().unwrap().chunks = vec![ChunkSources {
         allowed_ranges: vec![(0, next.chunk.length)],
         chunk: Some(next.chunk.clone()),
@@ -5044,7 +5055,8 @@ fn native_peer_disk_cache_hit_still_requires_current_grant() {
     );
     fixture.engine.source_cache.lock().unwrap().clear();
     fixture.sources.reply.lock().unwrap().chunks[0].sources[0]
-        .read_grant
+        .grant
+        .copy_mut_for_test()
         .expires_at_unix_ms = 0;
     let mut output = [b'!'; 2];
     assert!(
@@ -5543,7 +5555,12 @@ impl ChunkTransfer for OwnedTransferProbe {
         }
         out.fill(b'x');
         if self.expire_before_return {
-            let deadline = batch.operations[0].source.read_grant.expires_at_unix_ms;
+            let deadline = batch.operations[0]
+                .source
+                .grant
+                .copy()
+                .unwrap()
+                .expires_at_unix_ms;
             while now_unix_ms() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -5607,7 +5624,7 @@ fn native_owned_peer_rejects_late_failure_expiry_and_excess_budget() {
         let chunk = ChunkId::new("missing-owned");
         let mut candidate = source("b", &chunk, "node-b");
         if expire_before_return {
-            candidate.read_grant.expires_at_unix_ms = now_unix_ms() + 100;
+            candidate.grant.copy_mut_for_test().expires_at_unix_ms = now_unix_ms() + 100;
         }
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
@@ -5709,8 +5726,8 @@ fn peer_batch_keeps_each_copy_and_grant_while_coalescing_one_peer() {
     let temp = tempfile::tempdir().unwrap();
     let chunks = [ChunkId::new("one"), ChunkId::new("two")];
     let mut second = source("b-copy", &chunks[1], "node-b");
-    second.read_grant.token = "another-copy-grant".into();
-    second.read_grant.fence = 2;
+    second.grant.copy_mut_for_test().token = "another-copy-grant".into();
+    second.grant.copy_mut_for_test().fence = 2;
     let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
         revision: 1,
         chunks: vec![
@@ -5759,8 +5776,8 @@ fn peer_batch_keeps_each_copy_and_grant_while_coalescing_one_peer() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].operations.len(), 2);
     assert_ne!(
-        calls[0].operations[0].source.read_grant.token,
-        calls[0].operations[1].source.read_grant.token
+        calls[0].operations[0].source.grant.copy().unwrap().token,
+        calls[0].operations[1].source.grant.copy().unwrap().token
     );
 }
 
@@ -5802,7 +5819,8 @@ fn same_chunk_in_another_version_refreshes_grant_without_rewriting_identity() {
     // A source lookup that returns the old grant must fail rather than rewrite the batch.
     assert!(engine.read_batch(&batch, &mut [0]).is_err());
     sources.reply.lock().unwrap().chunks[0].sources[0]
-        .read_grant
+        .grant
+        .copy_mut_for_test()
         .file_version_id = FileVersionId::new("next-version");
     engine.read_batch(&batch, &mut [0]).unwrap();
     assert_eq!(*sources.calls.lock().unwrap(), 3);
@@ -6055,7 +6073,7 @@ impl ExternalFixture {
         let mut validations = request.validations;
         validations.extend(request.missing_sources.into_iter().map(|missing| {
             crate::dfs::DfsReadValidation {
-                grant: self.candidate.read_grant.clone(),
+                grant: self.candidate.grant.copy().unwrap().clone(),
                 chunk_id: missing.chunk_id,
                 copy_id: self.candidate.copy_id.clone(),
                 chunk_offset: missing.chunk_offset,
@@ -6108,7 +6126,7 @@ impl ExternalReadAuthorizer for ExternalFixture {
             .requests
             .into_iter()
             .map(|op| {
-                let mut grant = self.candidate.read_grant.clone();
+                let mut grant = self.candidate.grant.copy().unwrap().clone();
                 grant.namespace_id = request.namespace_id.clone();
                 grant.file_version_id = request.file_version_id.clone();
                 grant.layout_root_id = request.layout_root_id.clone();
@@ -6424,7 +6442,7 @@ impl ExternalReadAuthorizer for CurrentExternalChunks {
                 .find(|fixture| fixture.chunk.id == missing.chunk_id)
                 .unwrap();
             crate::dfs::DfsReadValidation {
-                grant: fixture.candidate.read_grant.clone(),
+                grant: fixture.candidate.grant.copy().unwrap().clone(),
                 chunk_id: missing.chunk_id,
                 copy_id: fixture.candidate.copy_id.clone(),
                 chunk_offset: missing.chunk_offset,
@@ -6740,10 +6758,13 @@ fn external_backend_current_cached_invalid_grant_is_not_resolved_as_missing() {
             .with_external_backend(fixture.clone(), authorizer.clone());
         let mut source = fixture.candidate.clone();
         match case {
-            0 => source.read_grant.namespace_id = crate::dfs::NamespaceId::new("other"),
-            1 => source.read_grant.caller_node_epoch = 0,
-            2 => source.read_grant.expires_at_unix_ms = 0,
-            _ => source.read_grant.token.clear(),
+            0 => {
+                source.grant.copy_mut_for_test().namespace_id =
+                    crate::dfs::NamespaceId::new("other")
+            }
+            1 => source.grant.copy_mut_for_test().caller_node_epoch = 0,
+            2 => source.grant.copy_mut_for_test().expires_at_unix_ms = 0,
+            _ => source.grant.copy_mut_for_test().token.clear(),
         }
         prime_external_source_cache_with(&engine, &fixture, source, Duration::from_secs(60));
 
@@ -7202,7 +7223,8 @@ fn external_backend_new_version_requires_its_original_grant() {
     assert!(engine.read_batch(&batch, &mut out).is_err());
     assert_eq!(&out, b"!!");
     sources.reply.lock().unwrap().chunks[0].sources[0]
-        .read_grant
+        .grant
+        .copy_mut_for_test()
         .file_version_id = FileVersionId::new("next-version");
     engine.read_batch(&batch, &mut out).unwrap();
     assert_eq!(&out, b"bc");
@@ -7609,7 +7631,7 @@ fn external_version_cache_caps_entries_and_bytes_while_pinned() {
         let mut fixture = ExternalFixture::new(b"abcdef");
         // Exercise budget accounting independently of trusted transport decoding.
         if large_metadata {
-            fixture.candidate.read_grant.token = "x".repeat(16_384);
+            fixture.candidate.grant.copy_mut_for_test().token = "x".repeat(16_384);
         }
         let fixture = Arc::new(fixture);
         let engine = fixture.engine(
@@ -7909,7 +7931,7 @@ impl ExternalReadAuthorizer for AheadChunks {
                 .iter()
                 .find(|fixture| fixture.chunk.id == op.chunk_id)
                 .unwrap();
-            let mut grant = fixture.candidate.read_grant.clone();
+            let mut grant = fixture.candidate.grant.copy().unwrap().clone();
             grant.namespace_id = request.namespace_id.clone();
             grant.file_version_id = request.file_version_id.clone();
             grant.layout_root_id = request.layout_root_id.clone();

@@ -390,7 +390,7 @@ impl PeerReadBatch {
         }
         .validate_for_output(output_len, &DfsReadConfig::default())?;
         for item in &self.operations {
-            let grant = &item.source.read_grant;
+            let grant = item.source.grant.context();
             if item.op.length == 0
                 || item
                     .source
@@ -398,8 +398,8 @@ impl PeerReadBatch {
                     .as_deref()
                     .is_none_or(str::is_empty)
                 || item.source.chunk_id != item.op.chunk_id
-                || grant.file_version_id != self.file_version_id
-                || grant.layout_root_id != self.layout_root_id
+                || grant.file_version_id != &self.file_version_id
+                || grant.layout_root_id != &self.layout_root_id
                 || grant.expires_at_unix_ms <= now_unix_ms()
                 || !same_peer_context(&first.source, &item.source)
             {
@@ -642,8 +642,8 @@ fn same_peer_context(left: &SourceCandidate, right: &SourceCandidate) -> bool {
         (CopyLocation::Node { node_id: a, node_epoch: ae, .. },
          CopyLocation::Node { node_id: b, node_epoch: be, .. }) if a == b && ae == be
     );
-    let a = &left.read_grant;
-    let b = &right.read_grant;
+    let a = left.grant.context();
+    let b = right.grant.context();
     same_node
         && left.data_endpoint == right.data_endpoint
         && a.namespace_id == b.namespace_id
@@ -652,7 +652,7 @@ fn same_peer_context(left: &SourceCandidate, right: &SourceCandidate) -> bool {
         && a.caller_node_id == b.caller_node_id
         && a.caller_node_epoch == b.caller_node_epoch
         // One kind of grant per request (plan/15 R4).
-        && left.holder_grant.is_some() == right.holder_grant.is_some()
+        && left.grant.is_holder() == right.grant.is_holder()
 }
 
 fn range_covered(ranges: &[(u64, u64)], requested_start: u64, requested_len: u64) -> bool {

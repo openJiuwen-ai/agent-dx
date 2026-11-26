@@ -1331,8 +1331,11 @@ impl DfsReadEngine {
         }) else {
             return Err(unavailable("committed Chunk has no readable external copy"));
         };
+        let Some(grant) = source.grant.copy() else {
+            return Err(invalid("external copy requires a per-copy grant"));
+        };
         let validation = DfsReadValidation {
-            grant: source.read_grant.clone(),
+            grant: grant.clone(),
             chunk_id: op.chunk_id.clone(),
             copy_id: source.copy_id.clone(),
             chunk_offset: op.chunk_offset,
@@ -1444,8 +1447,7 @@ impl DfsReadEngine {
                 location: entry.location.clone(),
                 data_endpoint: None,
                 load_hint: 0,
-                read_grant: validation.grant.clone(),
-                holder_grant: None,
+                grant: crate::dfs::SourceGrant::Copy(validation.grant.clone()),
             };
             if !self.source_matches(&selection.batch, &source)
                 || !matches!(source.location, CopyLocation::External { .. })
@@ -1478,7 +1480,7 @@ impl DfsReadEngine {
                     ));
                 }
                 let expected_validation = DfsReadValidation {
-                    grant: expected_source.read_grant.clone(),
+                    grant: expected_source.grant.copy().unwrap().clone(),
                     chunk_id: expected_source.chunk_id.clone(),
                     copy_id: expected_source.copy_id.clone(),
                     chunk_offset: selected.chunk_offset,

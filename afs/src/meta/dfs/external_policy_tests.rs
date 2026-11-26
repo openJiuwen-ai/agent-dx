@@ -159,7 +159,7 @@ async fn current_read_fixture() -> CurrentReadFixture {
         expected_head_version: commit.file_version.id,
         layout_root_id: commit.layout_root.id,
         validations: vec![crate::dfs::DfsReadValidation {
-            grant: source.read_grant.clone(),
+            grant: source.grant.copy().unwrap().clone(),
             chunk_id: source.chunk_id.clone(),
             copy_id: source.copy_id.clone(),
             chunk_offset: 0,
@@ -765,7 +765,7 @@ async fn external_policy_and_published_reference_survive_local_file_store_reload
         if store_id == "seaweed-test" && object_key == &commit.chunk_receipts[0].external_commit.as_ref().unwrap().object_key)
     );
     let validation = crate::dfs::DfsReadValidation {
-        grant: source.read_grant.clone(),
+        grant: source.grant.copy().unwrap().clone(),
         chunk_id: source.chunk_id.clone(),
         copy_id: source.copy_id.clone(),
         chunk_offset: 0,

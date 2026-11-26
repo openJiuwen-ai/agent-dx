@@ -206,12 +206,7 @@ impl ChunkTransfer for NodeTransfer {
             self.holder_form
                 .lock()
                 .unwrap()
-                .push(item.source.holder_grant.is_some());
-            // A holder candidate never carries a per-copy token (review P1).
-            assert!(
-                item.source.holder_grant.is_none() || item.source.read_grant.token.is_empty(),
-                "a holder candidate carries a per-copy token"
-            );
+                .push(item.source.grant.is_holder());
             if self.not_ready.contains(node_id) {
                 return Err(Error::coded(
                     afs_error::NODE_TRANSFER_NOT_READY,
@@ -1245,7 +1240,7 @@ fn h2_review_all_stale_candidates_are_kept_for_reauthorization() {
         ],
     );
     for source in &mut set.sources {
-        source.read_grant.expires_at_unix_ms = 1;
+        source.grant.copy_mut_for_test().expires_at_unix_ms = 1;
     }
     let ordered = engine.distributed_sources(&read_op(chunk, 1), &[set]);
     assert_eq!(ordered[0].sources.len(), 2);
@@ -1994,7 +1989,7 @@ async fn h2_step2b_holders_are_offered_only_for_range_verifiable_chunks() {
         with[index]
             .sources
             .iter()
-            .filter(|source| source.holder_grant.is_some())
+            .filter(|source| source.grant.is_holder())
             .count()
     };
     assert_eq!((holders(0), holders(1), holders(2)), (1, 0, 0));
@@ -2132,7 +2127,7 @@ async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
         let holders: Vec<&str> = set
             .sources
             .iter()
-            .filter(|source| source.holder_grant.is_some())
+            .filter(|source| source.grant.is_holder())
             .map(|source| match &source.location {
                 CopyLocation::Node { node_id, .. } => node_id.as_str(),
                 CopyLocation::External { .. } => "",
@@ -2322,7 +2317,7 @@ fn h2_round2_wait_order_for_a_chunk_is_the_same_in_every_version() {
     };
     let item = |holder: &str, caller: &str, version: &str| {
         let mut source = candidate("h", &chunk, holder, CopyRole::VerifiedCache);
-        source.holder_grant = Some(grant(holder, caller, version));
+        source.grant = crate::dfs::SourceGrant::Holder(grant(holder, caller, version));
         ResolvedReadOp {
             op: read_op(chunk.clone(), 4).ops[0].clone(),
             source,

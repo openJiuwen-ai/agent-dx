@@ -1342,6 +1342,74 @@ pub struct ValidateDfsReadGrants {
     pub validations: Vec<DfsReadValidation>,
 }
 
+/// Grant carried by a read source. A version holder has no per-copy grant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SourceGrant {
+    Copy(DfsReadGrant),
+    Holder(DfsHolderGrant),
+}
+
+pub(crate) struct SourceGrantContext<'a> {
+    pub(crate) namespace_id: &'a NamespaceId,
+    pub(crate) file_version_id: &'a FileVersionId,
+    pub(crate) layout_root_id: &'a LayoutRootId,
+    pub(crate) caller_node_id: &'a String,
+    pub(crate) caller_node_epoch: u64,
+    pub(crate) expires_at_unix_ms: u64,
+    pub(crate) token: &'a String,
+}
+
+impl SourceGrant {
+    pub(crate) fn context(&self) -> SourceGrantContext<'_> {
+        match self {
+            Self::Copy(grant) => SourceGrantContext {
+                namespace_id: &grant.namespace_id,
+                file_version_id: &grant.file_version_id,
+                layout_root_id: &grant.layout_root_id,
+                caller_node_id: &grant.caller_node_id,
+                caller_node_epoch: grant.caller_node_epoch,
+                expires_at_unix_ms: grant.expires_at_unix_ms,
+                token: &grant.token,
+            },
+            Self::Holder(grant) => SourceGrantContext {
+                namespace_id: &grant.namespace_id,
+                file_version_id: &grant.file_version_id,
+                layout_root_id: &grant.layout_root_id,
+                caller_node_id: &grant.caller_node_id,
+                caller_node_epoch: grant.caller_node_epoch,
+                expires_at_unix_ms: grant.expires_at_unix_ms,
+                token: &grant.token,
+            },
+        }
+    }
+
+    pub(crate) fn copy(&self) -> Option<&DfsReadGrant> {
+        match self {
+            Self::Copy(grant) => Some(grant),
+            Self::Holder(_) => None,
+        }
+    }
+
+    pub(crate) fn holder(&self) -> Option<&DfsHolderGrant> {
+        match self {
+            Self::Copy(_) => None,
+            Self::Holder(grant) => Some(grant),
+        }
+    }
+
+    pub(crate) fn is_holder(&self) -> bool {
+        matches!(self, Self::Holder(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copy_mut_for_test(&mut self) -> &mut DfsReadGrant {
+        match self {
+            Self::Copy(grant) => grant,
+            Self::Holder(_) => panic!("expected a per-copy grant"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceCandidate {
     pub copy_id: CopyId,
@@ -1351,12 +1419,7 @@ pub struct SourceCandidate {
     pub location: CopyLocation,
     pub data_endpoint: Option<String>,
     pub load_hint: u32,
-    pub read_grant: DfsReadGrant,
-    /// H2 step 2: set for another reader of the same version that shares its
-    /// read-cache copies (a version holder). The read then sends this grant
-    /// in the holder form instead of `read_grant`.
-    #[serde(default)]
-    pub holder_grant: Option<DfsHolderGrant>,
+    pub grant: SourceGrant,
 }
 
 impl SourceCandidate {

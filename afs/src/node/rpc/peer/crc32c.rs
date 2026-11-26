@@ -114,7 +114,10 @@ impl GrpcChunkTransfer {
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = DfsReadRangesRequest {
-            read_id: format!("crc-{}-{sequence}", item.source.read_grant.caller_node_id),
+            read_id: format!(
+                "crc-{}-{sequence}",
+                item.source.grant.context().caller_node_id
+            ),
             attempt_id: format!("{node_id}-{node_epoch}-{sequence}"),
             file_version_id: batch.file_version_id.0.clone(),
             layout_root_id: batch.layout_root_id.0.clone(),
@@ -128,12 +131,8 @@ impl GrpcChunkTransfer {
                 source_copy_id: item.source.copy_id.0.clone(),
                 // H2 step 2: a version holder gets its holder grant, never a
                 // per-copy one (plan/15 R4; code review P1).
-                grant: item
-                    .source
-                    .holder_grant
-                    .is_none()
-                    .then(|| wire_dfs_read_grant(&item.source.read_grant)),
-                holder_grant: item.source.holder_grant.clone().map(Into::into),
+                grant: item.source.grant.copy().map(wire_dfs_read_grant),
+                holder_grant: item.source.grant.holder().cloned().map(Into::into),
                 wait_ms: crate::node::read::engine::holder_wait_ms(item, self.peers.holder_wait_ms),
                 fetch_if_absent: false,
             }],

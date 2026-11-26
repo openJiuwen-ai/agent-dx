@@ -22,7 +22,7 @@ const HOLDER_LOOKUP_SHARE: u32 = 4;
 /// this order only one of them waits for the other, so the waits for one
 /// Chunk can never form a cycle and the highest-ranked reader never waits.
 pub(crate) fn holder_wait_ms(item: &ResolvedReadOp, budget: u32) -> u32 {
-    let Some(grant) = &item.source.holder_grant else {
+    let Some(grant) = item.source.grant.holder() else {
         return 0;
     };
     if budget != 0
@@ -173,23 +173,7 @@ pub(super) fn holder_candidate(
         },
         data_endpoint: Some(holder.data_endpoint.clone()),
         load_hint: 0,
-        // The per-copy grant fields mirror the holder grant so the usual
-        // freshness filter (`source_matches`) applies, except the token: it
-        // stays empty, so a send path that forgot the holder form sends an
-        // empty per-copy token, which every per-copy entry of the holder
-        // refuses, instead of the holder token. The transfers send
-        // `holder_grant`.
-        read_grant: crate::dfs::DfsReadGrant {
-            namespace_id: grant.namespace_id.clone(),
-            file_version_id: grant.file_version_id.clone(),
-            layout_root_id: grant.layout_root_id.clone(),
-            caller_node_id: grant.caller_node_id.clone(),
-            caller_node_epoch: grant.caller_node_epoch,
-            expires_at_unix_ms: grant.expires_at_unix_ms,
-            fence: 0,
-            token: String::new(),
-        },
-        holder_grant: Some(grant.clone()),
+        grant: crate::dfs::SourceGrant::Holder(grant.clone()),
     }
 }
 
@@ -281,7 +265,7 @@ impl DfsReadEngine {
             let offered = set
                 .sources
                 .iter()
-                .any(|source| source.holder_grant.is_some() && source.location == best.location);
+                .any(|source| source.grant.is_holder() && source.location == best.location);
             if !offered {
                 set.sources.push(best);
             }

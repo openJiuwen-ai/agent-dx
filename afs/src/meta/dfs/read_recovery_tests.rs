@@ -32,7 +32,7 @@ impl Fixture {
                 receiver_node_epoch: epoch,
                 peer_node_id: "reader".into(),
                 validations: vec![DfsReadValidation {
-                    grant: source.read_grant.clone(),
+                    grant: source.grant.copy().unwrap().clone(),
                     chunk_id: source.chunk_id.clone(),
                     copy_id: source.copy_id.clone(),
                     chunk_offset: 0,
@@ -313,7 +313,7 @@ async fn chunk_sources_publish_only_committed_grant_ranges() {
         receiver_node_epoch: 1,
         peer_node_id: "reader".into(),
         validations: vec![DfsReadValidation {
-            grant: set.sources[0].read_grant.clone(),
+            grant: set.sources[0].grant.copy().unwrap().clone(),
             chunk_id: set.chunk_id,
             copy_id: set.sources[0].copy_id.clone(),
             chunk_offset: 1,
@@ -360,7 +360,7 @@ async fn chunk_sources_fragmented_ranges_keep_grants_but_omit_cache_hint() {
         receiver_node_epoch: 1,
         peer_node_id: "reader".into(),
         validations: vec![DfsReadValidation {
-            grant: set.sources[0].read_grant.clone(),
+            grant: set.sources[0].grant.copy().unwrap().clone(),
             chunk_id: set.chunk_id,
             copy_id: set.sources[0].copy_id.clone(),
             chunk_offset: 0,
@@ -2450,7 +2450,7 @@ mod holder_grants {
         );
         let source = f.sources().await.remove(0);
         let mut as_holder = grant.clone();
-        as_holder.token = source.read_grant.token.clone();
+        as_holder.token = source.grant.copy().unwrap().token.clone();
         assert!(validate(&f, &as_holder).await.is_err());
     }
 }

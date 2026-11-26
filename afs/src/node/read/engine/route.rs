@@ -226,7 +226,7 @@ impl ReplicatedSources<'_> {
             && sources
                 .iter()
                 .flat_map(|set| &set.sources)
-                .any(|source| source.read_grant.caller_node_epoch != authority.epoch)
+                .any(|source| source.grant.context().caller_node_epoch != authority.epoch)
         {
             self.engine.invalidate_native_batch_authority(batch);
             return Err(external_denied(

@@ -139,7 +139,7 @@ impl RdmaChunkTransfer {
                                 afs_protocol::node_data::dfs_negotiate_rdma_request::Authority::ReadRequest(
                                     request.clone(),
                                 ),
-                                first.read_grant.caller_node_epoch,
+                                first.grant.context().caller_node_epoch,
                             )
                             .await?
                         {
@@ -244,7 +244,7 @@ pub(super) fn pack_dfs_rdma_read_windows(
     batch: &crate::node::read::engine::PeerReadBatch,
     sequence: u64,
 ) -> afs_error::Result<Vec<DfsRdmaReadWindow>> {
-    let first = &batch.operations[0].source.read_grant;
+    let first = batch.operations[0].source.grant.context();
     let mut windows = Vec::new();
     let mut request = DfsReadRangesRequest {
         include_blake3_outboard: false,
@@ -262,12 +262,12 @@ pub(super) fn pack_dfs_rdma_read_windows(
     for item in &batch.operations {
         // H2 step 2: holder reads travel only over gRPC; the reader skips the
         // holder exactly as if it had no copy.
-        if item.source.holder_grant.is_some() {
+        let Some(grant) = item.source.grant.copy() else {
             return Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_NOT_READY,
                 "DFS holder reads are not carried over RDMA",
             ));
-        }
+        };
         let count = usize::try_from(item.op.length)
             .map_err(|_| dfs_protocol_error("RDMA range length overflow"))?;
         if count == 0 || count > crate::node::chunk::MAX_STAGED_CHUNK_BYTES {
@@ -291,7 +291,7 @@ pub(super) fn pack_dfs_rdma_read_windows(
             length: item.op.length,
             destination_offset: length as u64,
             source_copy_id: item.source.copy_id.0.clone(),
-            grant: Some(wire_dfs_read_grant(&item.source.read_grant)),
+            grant: Some(wire_dfs_read_grant(grant)),
             holder_grant: None,
             wait_ms: 0,
             fetch_if_absent: false,

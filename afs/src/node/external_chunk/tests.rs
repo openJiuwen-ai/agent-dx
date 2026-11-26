@@ -241,7 +241,7 @@ fn source(chunk: &ChunkObject, key: String) -> SourceCandidate {
         },
         data_endpoint: None,
         load_hint: 0,
-        read_grant: DfsReadGrant {
+        grant: crate::dfs::SourceGrant::Copy(DfsReadGrant {
             namespace_id: NamespaceId::new("namespace"),
             file_version_id: FileVersionId::new("version"),
             layout_root_id: LayoutRootId::new("layout"),
@@ -250,8 +250,7 @@ fn source(chunk: &ChunkObject, key: String) -> SourceCandidate {
             expires_at_unix_ms: u64::MAX,
             fence: 1,
             token: "validated-by-engine".into(),
-        },
-        holder_grant: None,
+        }),
     }
 }
 

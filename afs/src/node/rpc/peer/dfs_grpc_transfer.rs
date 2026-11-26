@@ -72,11 +72,12 @@ impl GrpcChunkTransfer {
         let sequence = self
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let caller = first.grant.context();
         let request = DfsReadRangesRequest {
             include_blake3_outboard: chunk.is_some(),
             read_id: format!(
                 "{}-{}-{sequence}",
-                first.read_grant.caller_node_id, first.read_grant.caller_node_epoch
+                caller.caller_node_id, caller.caller_node_epoch
             ),
             attempt_id: format!("{node_id}-{node_epoch}-{sequence}"),
             file_version_id: batch.file_version_id.0.clone(),
@@ -94,12 +95,8 @@ impl GrpcChunkTransfer {
                     source_copy_id: item.source.copy_id.0.clone(),
                     // H2 step 2: a version holder gets its holder grant, never
                     // a per-copy one (one kind per request, plan/15 R4).
-                    grant: item
-                        .source
-                        .holder_grant
-                        .is_none()
-                        .then(|| wire_dfs_read_grant(&item.source.read_grant)),
-                    holder_grant: item.source.holder_grant.clone().map(Into::into),
+                    grant: item.source.grant.copy().map(wire_dfs_read_grant),
+                    holder_grant: item.source.grant.holder().cloned().map(Into::into),
                     wait_ms: crate::node::read::engine::holder_wait_ms(
                         item,
                         self.peers.holder_wait_ms,
@@ -392,7 +389,10 @@ impl GrpcChunkTransfer {
         let endpoint = source
             .node_data_endpoint()
             .ok_or_else(|| dfs_protocol_error("Peer stream source endpoint is missing"))?;
-        let grant = &source.read_grant;
+        // Whole-object streams require a per-copy grant.
+        let Some(grant) = source.grant.copy() else {
+            return Ok(None);
+        };
         let metadata = [
             node_id.as_str(),
             endpoint,
@@ -417,11 +417,6 @@ impl GrpcChunkTransfer {
             // drains this sink and acquires the original exclusive full-body fill.
             return Ok(None);
         }
-        // H2 step 2: holders serve the range form only; this whole-object
-        // path never sends a holder's grant as a per-copy one.
-        if source.holder_grant.is_some() {
-            return Ok(None);
-        }
         let node_id = node_id.clone();
         let node_epoch = *node_epoch;
         let endpoint = endpoint.to_owned();
@@ -432,7 +427,7 @@ impl GrpcChunkTransfer {
             include_blake3_outboard: true,
             read_id: format!(
                 "{}-{}-{sequence}",
-                source.read_grant.caller_node_id, source.read_grant.caller_node_epoch
+                grant.caller_node_id, grant.caller_node_epoch
             ),
             attempt_id: format!("{node_id}-{node_epoch}-{sequence}"),
             file_version_id: batch.file_version_id.0.clone(),
@@ -444,7 +439,7 @@ impl GrpcChunkTransfer {
                 length: chunk.length,
                 destination_offset: 0,
                 source_copy_id: source.copy_id.0.clone(),
-                grant: Some(wire_dfs_read_grant(&source.read_grant)),
+                grant: Some(wire_dfs_read_grant(grant)),
                 holder_grant: None,
                 wait_ms: 0,
                 fetch_if_absent: false,
