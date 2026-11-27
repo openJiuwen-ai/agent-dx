@@ -356,7 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut env = config.execd_env;
     if config.checkpoint_dir.is_some() || config.checkpoint_storage.is_some() {
         env.entry("ADX_EXECD_CONTROL_SOCKET_PATH".into())
-            .or_insert_with(|| "/run/adx".into());
+            .or_insert_with(|| "/tmp/adx".into());
     } else if env
         .get("ADX_EXECD_CONTROL_SOCKET_PATH")
         .is_some_and(|v| !v.is_empty())
