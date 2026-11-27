@@ -52,6 +52,11 @@ Env creation identity; a replacement Env returns false. Recovery after a lost
 response may conservatively return false. The creation request ID alone is not
 evidence that this caller owns initialization rollback.
 
+A CREATE that resolves to an existing PAUSED Env is not a resume: it returns
+HTTP 409 `CONFLICT` with the stable `environmentId` in the error object and
+preserves the retained checkpoint. The caller attaches to that ID and resumes
+explicitly; CREATE never resumes, replaces or deletes it.
+
 Clients may automatically delete during local initialization rollback only
 when `newlyCreated` is exactly boolean true. Reuse, attachment, missing or
 malformed ownership must preserve the remote workload and close local clients.

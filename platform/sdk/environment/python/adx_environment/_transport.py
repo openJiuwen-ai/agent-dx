@@ -762,6 +762,10 @@ class EnvironmentClient:
                 if resp.status_code not in _RETRYABLE_GATEWAY_STATUS_CODES:
                     try:
                         result = self._json(resp)
+                    except EnvironmentHTTPError:
+                        # Lifecycle callers need the stable status, code, retry
+                        # and outcome fields to decide retry and cleanup.
+                        raise
                     except EnvironmentError as exc:
                         raise EnvironmentError(
                             f"environment {operation} failed (requestId={request_id}): {exc}"

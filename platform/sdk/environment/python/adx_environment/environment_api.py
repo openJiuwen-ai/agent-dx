@@ -862,11 +862,14 @@ class Environment:
         environment_id: str,
         *,
         connection: Optional[ConnectionConfig] = None,
+        require_running: bool = True,
     ) -> "Environment":
         """Reconstruct a local handle for an existing environment by ID.
 
         The returned object owns only its local clients. ``close()`` never
         deletes the remote environment; use :meth:`delete` for explicit teardown.
+        ``require_running=False`` also attaches to a paused environment so the
+        caller can resume it explicitly.
         """
         if not isinstance(environment_id, str) or not environment_id.strip():
             raise ValueError("environment_id must be a non-empty string")
@@ -876,7 +879,7 @@ class Environment:
         client = EnvironmentClient() if connection is None else EnvironmentClient(connection=connection)
         try:
             info = client.environment_info(environment_id)
-            if str(info.get("status", "")).lower() != "running":
+            if require_running and str(info.get("status", "")).lower() != "running":
                 raise RuntimeError(f"environment {environment_id} is not running: {info.get('status', 'unknown')}")
             environment = cls.__new__(cls)
             environment._sid = environment_id
