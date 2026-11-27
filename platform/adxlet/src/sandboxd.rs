@@ -378,13 +378,6 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
-        if spec.execution.user.is_some() || spec.execution.group.is_some() {
-            adx_observability::warn!(
-                environment_id = %spec.id,
-                runtime_class = %spec.runtime_class,
-                "sandboxd ignores tool user/group overrides and uses its configured identity"
-            );
-        }
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller
         // values that could redirect the privileged checkpoint handoff.
@@ -753,14 +746,22 @@ pub fn start_request(
     devices: &[adx_core::scheduling::DeviceAllocation],
     config: &Config,
 ) -> Result<proto::StartRequest> {
-    build_start_request(
+    let mut request = build_start_request(
         spec,
         runtime_id,
         ownership_generation,
         devices,
         config,
         true,
-    )
+    )?;
+    request.process_user = spec
+        .execution
+        .numeric_process_user()?
+        .map(|user| proto::ProcessUser {
+            uid: user.uid,
+            gid: user.gid,
+        });
+    Ok(request)
 }
 
 pub(crate) fn build_start_request(
@@ -983,6 +984,7 @@ pub(crate) fn build_start_request(
         .transpose()?
         .unwrap_or_default();
     Ok(proto::StartRequest {
+        prefer_image_path: options.prefer_image_path.unwrap_or(false),
         xpu_allocations: xpu
             .into_iter()
             .map(|(kind, mut device_ids)| {

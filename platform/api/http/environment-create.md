@@ -6,6 +6,23 @@ On sandboxd, an explicitly selected rootfs skips the built-in profile's
 override. For an OCI image with no request or node override, sandboxd uses
 the image's `PATH` if present and otherwise its runtime template.
 
+`preferImagePath=true` asks sandboxd to prefer an OCI image's `PATH` over the
+request's value; when the image has no `PATH`, the request remains the fallback.
+Omitted or `false` preserves the fresh-create behavior above. `processUser` takes
+numeric `uid` and `gid` from 0 through 4294967294 and configures sandboxd's initial
+OCI process. Omission preserves its base OCI user; an explicit `{"uid":0,"gid":0}`
+selects root. These options do not alter the managed workload's `process.user`,
+resolve account names, or change mounted-file ownership. Conch and Supervisor
+reject `processUser` and `preferImagePath=true`.
+
+The existing paired `user`/`group` strings also reach sandboxd as numeric UID/GID.
+Conch continues to accept account names or decimal IDs; Supervisor rejects the
+pair. Do not combine the pair with `processUser`, `inheritEntrypoint`, or
+`snapshotId`. For snapshot creation, omitted `preferImagePath` and `processUser`
+inherit the captured settings; explicit values, including `false` and `0:0`,
+configure the target runtime. The runtime owns restored credentials and restore
+compatibility checks.
+
 An explicit `process.commands` starts a managed workload independently of OCI
 entrypoint inheritance, including on a local EROFS rootfs. Its optional user and
 working directory default to the Execd identity and `/`; readiness and healthcheck

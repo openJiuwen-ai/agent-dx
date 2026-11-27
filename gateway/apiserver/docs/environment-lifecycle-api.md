@@ -34,9 +34,15 @@ omitted or empty namespace uses `default`.
 depend on the selected sandboxd runtime. Jiuwenbox Supervisor and Conch do not
 support nonempty `extra_config` objects. Such requests return `INVALID_ARGUMENT`
 before assignment; an empty object configures no additional options. Top-level
-`user` and `group` select the tool identity and are supported only by Conch;
-other resolved runtimes reject the pair during the same request validation.
-The workload's `process.user` is a separate option.
+`user` and `group` select the tool identity: sandboxd accepts decimal UID/GID,
+Conch also resolves POSIX names, and Supervisor rejects the pair. Sandboxd's
+typed `processUser: {uid, gid}` selects the initial OCI process identity and
+cannot be combined with `user`/`group`. Omission preserves its base OCI identity;
+explicit `0:0` selects root. The workload's `process.user` is a separate option.
+`preferImagePath=true` enables image PATH precedence in sandboxd; omission or
+false preserves fresh-create defaults. Snapshot creates inherit omitted
+`processUser`/`preferImagePath` settings and pass explicit target settings to the
+runtime. Conch and Supervisor reject `processUser` and `preferImagePath=true`.
 
 Omit `restartPolicy` to disable automatic restart through that policy. An explicit
 policy requires `maxAttempts` from 1 through 4294967295, a positive

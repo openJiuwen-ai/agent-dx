@@ -4,12 +4,69 @@ use adx_core::{
 use adx_protocol::control;
 
 #[test]
+fn start_options_preserve_presence_through_storage_and_wire() {
+    use adx_core::execution::{ExecutionOptions, ProcessUser};
+    use prost::Message;
+
+    for options in [
+        ExecutionOptions::default(),
+        ExecutionOptions {
+            prefer_image_path: Some(false),
+            process_user: Some(ProcessUser { uid: 0, gid: 0 }),
+            ..Default::default()
+        },
+        ExecutionOptions {
+            prefer_image_path: Some(true),
+            user: Some("1001".into()),
+            group: Some("1002".into()),
+            ..Default::default()
+        },
+    ] {
+        let stored = serde_json::to_value(&options).unwrap();
+        assert_eq!(
+            stored.get("process_user").is_some(),
+            options.process_user.is_some()
+        );
+        assert_eq!(
+            stored.get("prefer_image_path").is_some(),
+            options.prefer_image_path.is_some()
+        );
+        let recovered: ExecutionOptions = serde_json::from_value(stored).unwrap();
+        assert_eq!(recovered, options);
+        let wire = control::ExecutionOptions::from(recovered).encode_to_vec();
+        let decoded = control::ExecutionOptions::decode(wire.as_slice()).unwrap();
+        assert_eq!(ExecutionOptions::try_from(decoded).unwrap(), options);
+    }
+    for user in [
+        control::ProcessUser {
+            uid: u32::MAX,
+            gid: 0,
+        },
+        control::ProcessUser {
+            uid: 0,
+            gid: u32::MAX,
+        },
+    ] {
+        assert!(ExecutionOptions::try_from(control::ExecutionOptions {
+            process_user: Some(user),
+            ..Default::default()
+        })
+        .is_err());
+    }
+}
+
+#[test]
 fn environment_options_roundtrip_preserves_backend_contract() {
     use adx_core::execution as model;
 
     let options = model::ExecutionOptions {
-        user: Some("1001".into()),
-        group: Some("1002".into()),
+        prefer_image_path: Some(true),
+        process_user: Some(model::ProcessUser {
+            uid: 1001,
+            gid: 1002,
+        }),
+        user: None,
+        group: None,
         cwd: Some("/workspace/task".into()),
         tunnel_http_port: Some(18766),
         rootfs: Some(model::Rootfs {

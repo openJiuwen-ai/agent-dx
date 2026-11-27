@@ -24,6 +24,7 @@ from .types import (
     ConnectionConfig,
     DataPlaneSecurityPolicy,
     Mount,
+    ProcessUser,
     VolumeSpec,
     VolumeInfo,
     _volume_id,
@@ -394,6 +395,8 @@ class Environment:
         pause_policy: Optional[PausePolicy] = None,
         failover: bool = False,
         inherit_entrypoint: bool = False,
+        prefer_image_path: Optional[bool] = None,
+        process_user: Optional[ProcessUser] = None,
         readiness_probe: Optional[ReadinessProbe] = None,
         healthcheck_probe: Optional[HealthcheckProbe] = None,
         init_timeout: int = 30,
@@ -420,9 +423,9 @@ class Environment:
                 setting, including when replacing the source with *image* or
                 *rootfs*.
             user: Tool runtime POSIX user name or decimal UID; requires group.
-                Supported by Conch; unsupported runtimes fail explicitly.
+                Sandboxd accepts decimal IDs; Conch also resolves POSIX names.
             group: Tool runtime POSIX group name or decimal GID. Cannot combine
-                with an inherited entrypoint or a snapshot identity override.
+                with process_user, an inherited entrypoint or a snapshot override.
             runtime: Environment isolation runtime identifier. Defaults to
                 ``runsc`` and is validated by the runtime layer.
             cpu: CPU scheduling request in milli-cores (default 1000).
@@ -467,6 +470,13 @@ class Environment:
             inherit_entrypoint: Start the effective ``Entrypoint`` and ``Cmd``
                 configured by an image and manage it as the environment workload.
                 This option is valid for fresh image or registered-template creates.
+            prefer_image_path: Prefer the image PATH over the request fallback
+                when True. Omitted keeps request precedence on fresh starts and
+                inherits the saved setting when restoring a snapshot.
+            process_user: Numeric UID/GID for sandboxd's initial process. Omitted
+                preserves the base OCI user on fresh starts and inherits on restore.
+                ProcessUser(uid=0, gid=0) explicitly selects root. Restored live
+                credentials and compatibility checks belong to the runtime.
             readiness_probe: One-time Execd startup check. Requires
                 ``inherit_entrypoint=True``; retries until first success or
                 ``init_timeout``. Failure raises ``EnvironmentError`` with
@@ -522,6 +532,12 @@ class Environment:
             raise TypeError("failover must be a boolean")
         if not isinstance(inherit_entrypoint, bool):
             raise TypeError("inherit_entrypoint must be a boolean")
+        if prefer_image_path is not None and not isinstance(prefer_image_path, bool):
+            raise TypeError("prefer_image_path must be a boolean or None")
+        if process_user is not None and not isinstance(process_user, ProcessUser):
+            raise TypeError("process_user must be a ProcessUser or None")
+        if process_user is not None and user is not None:
+            raise ValueError("process_user cannot be combined with user/group")
         if inherit_entrypoint and image is None:
             raise ValueError("inherit_entrypoint requires an image rootfs")
         if inherit_entrypoint and snapshot_id is not None:
@@ -652,6 +668,10 @@ class Environment:
             body["cwd"] = cwd
         if inherit_entrypoint:
             body["inheritEntrypoint"] = True
+        if prefer_image_path is not None:
+            body["preferImagePath"] = prefer_image_path
+        if process_user is not None:
+            body["processUser"] = process_user.to_dict()
         if readiness_probe is not None:
             body["readinessProbe"] = readiness_probe.to_dict()
         if healthcheck_probe is not None:

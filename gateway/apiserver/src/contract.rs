@@ -8,6 +8,10 @@ use tonic::Status;
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Create {
+    #[serde(rename = "preferImagePath")]
+    prefer_image_path: Option<bool>,
+    #[serde(rename = "processUser")]
+    process_user: Option<adx_core::execution::ProcessUser>,
     process: Option<adx_core::execution::WorkloadProcess>,
     name: String,
     namespace: String,
@@ -835,6 +839,8 @@ pub fn create_spec_with_environment(
             .map_err(|_| invalid("invalid environment extra_config"))?
     };
     let environment = adx_core::execution::ExecutionOptions {
+        prefer_image_path: r.prefer_image_path,
+        process_user: r.process_user,
         protected_ingress: Vec::new(),
         private_service_ports: Vec::new(),
         user: r.user,
@@ -888,10 +894,20 @@ pub fn create_spec_with_environment(
             "extra_config is not supported by Jiuwenbox Supervisor or Conch",
         ));
     }
-    if environment.user.is_some() && root.runtime != "conch" {
+    if matches!(root.runtime.as_str(), "supervisor" | "conch")
+        && (environment.prefer_image_path == Some(true) || environment.process_user.is_some())
+    {
+        return Err(invalid("preferImagePath and processUser require sandboxd"));
+    }
+    if environment.user.is_some() && root.runtime == "supervisor" {
         return Err(invalid(
-            "tool identity override currently requires the Conch runtime",
+            "Supervisor does not support a tool identity override",
         ));
+    }
+    if !matches!(root.runtime.as_str(), "conch" | "supervisor") {
+        environment
+            .numeric_process_user()
+            .map_err(|error| invalid(&error.to_string()))?;
     }
     let mut policy = policy;
     if r.pause

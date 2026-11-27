@@ -356,7 +356,7 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 | --- | --- | --- |
 | SDK产品目标 | `ADX_E2E_TARGET_CASE=afs-sdk` → `.buildkite/run-e2e.sh` → K8s `run.py --profile full --case afs-sdk` → `afs_product.py` / `afs_sdk.py` | Full #81真实两模式/12子项通过；只运行两种AFS产品模式，不是公共11组Full |
 | 两种模式的必需断言 | OwnerFs、DFS各要求挂载device/inode/mountinfo、三版本双向write/fsync/新OPEN全内容、权限EACCES、只读EROFS、删除、Environment回收六个结果；DFS另需B端peer计数增长 | 不以READY、普通目录、零退出码或缺失结果作为通过；AFS正常卸载、ADX backend为空及K8s删除分别验收 |
-| 现有后端能力与环境 | sandboxd不支持tool user/group覆盖；测试不请求该能力。只有SDK目标通过已有`basic_spec`配置`afs_runc_spec.json`：默认三项capability加SETUID、SETGID、DAC_OVERRIDE，后者供root SDK Files接口访问普通用户私有工作区 | 普通POSIX工作负载先降到10000或10001，再要求CapEff/CapPrm/CapAmb全0；权限拒绝因此仍由普通用户实际验证。该配置是测试部署前提，不宣称共享默认环境支持身份切换 |
+| 验收时的后端能力与环境 | 该轮固定包不支持sandboxd tool user/group覆盖；测试未请求该能力。当前数值UID/GID接入见[创建合同](../../platform/api/http/environment-create.md)。只有SDK目标通过已有`basic_spec`配置`afs_runc_spec.json`：默认三项capability加SETUID、SETGID、DAC_OVERRIDE，后者供root SDK Files接口访问普通用户私有工作区 | 普通POSIX工作负载先降到10000或10001，再要求CapEff/CapPrm/CapAmb全0；权限拒绝因此仍由普通用户实际验证。该配置是测试部署前提，不宣称共享默认环境支持身份切换 |
 | 正常AFS ON门禁 | `.buildkite/run-e2e.sh`未选定向目标时 → `afs_gate.py`：公共原profile → 原五项AFS组件 → 两个SDK模式；缺结果/缺项/失败/清理不明即失败，三子harness整体必须一致 | #84/#85以固定包重放L0组合并通过原CI summary身份检查；OFF沿用公共路径。公共Full嵌套时保留stop的Collector/Gateway指标/trace收据要求；该Full分支只有工具回归，未实跑公共11组 |
 | 固定包重放冒烟 | `ADX_E2E_TARGET_CASE=afs-required-smoke`，同一wrapper以`l0`执行上述三部分 | 已在#85用已有Full管道重放Base等价冒烟；不重编或替换产品，不因此声称新head已跑完Base构建、公共11组Full或线上合入保护 |
 

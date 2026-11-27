@@ -675,14 +675,17 @@ fn unsupported_runtime_create_options_are_rejected_before_rpc() {
             assert!(create_spec(body, &caller()).is_ok());
         }
     }
-    for runtime in ["supervisor", "runsc"] {
+    for (runtime, user, group, message) in [
+        ("supervisor", "1001", "1002", "Supervisor"),
+        ("runsc", "alice", "staff", "decimal UID/GID"),
+    ] {
         let error = create_spec(
-            json!({"image":"tools:1", "runtime":runtime, "user":"1001", "group":"1002"}),
+            json!({"image":"tools:1", "runtime":runtime, "user":user, "group":group}),
             &caller(),
         )
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("Conch"), "{error}");
+        assert!(error.message().contains(message), "{error}");
     }
 }
 

@@ -975,7 +975,7 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-          description: Tool runtime POSIX name or decimal UID. Requires group. Currently supported by Conch; other runtimes reject. Cannot combine with inheritEntrypoint or snapshotId.
+          description: Tool runtime identity, paired with group. Sandboxd accepts decimal UID/GID; Conch also resolves POSIX names. Supervisor rejects the pair. Cannot combine with processUser, inheritEntrypoint or snapshotId.
         group:
           type: string
           minLength: 1
@@ -1064,6 +1064,16 @@ components:
           type: boolean
           default: false
           description: Run the effective OCI image Entrypoint and Cmd as the EXECD-managed workload. Image rootfs only.
+        preferImagePath:
+          type: boolean
+          description: |
+            Sandboxd option to prefer an OCI image's PATH over the request PATH.
+            False or omitted on a fresh create preserves request PATH precedence;
+            when the image has no PATH the request remains the fallback. Omitted
+            on snapshot create inherits the source setting; explicit false overrides
+            it. The custom-rootfs profile PATH suppression remains unchanged.
+            Conch and Supervisor reject true.
+        processUser: {$ref: "#/components/schemas/ProcessUser"}
         process: {$ref: "#/components/schemas/WorkloadProcess"}
         readinessProbe: {$ref: "#/components/schemas/ReadinessProbe"}
         healthcheckProbe: {$ref: "#/components/schemas/HealthcheckProbe"}
@@ -1107,6 +1117,21 @@ components:
           type: string
           description: GPU/NPU whole-device request encoded by the compatibility API.
         tunnel: {$ref: "#/components/schemas/TunnelRequest"}
+    ProcessUser:
+      type: object
+      additionalProperties: false
+      required: [uid, gid]
+      description: |
+        Numeric UID/GID for sandboxd's initial OCI process. Omitted on fresh create
+        preserves the runtime's base OCI identity; a present 0:0 explicitly selects
+        root. Omitted on snapshot create inherits the source configuration; explicit
+        target configuration is passed to the runtime, which owns restored process
+        credentials and compatibility. No account lookup or mount ownership changes.
+        Cannot combine with user/group. Conch and Supervisor reject this option.
+        The managed workload's process.user remains a separate setting.
+      properties:
+        uid: {type: integer, format: int64, minimum: 0, maximum: 4294967294}
+        gid: {type: integer, format: int64, minimum: 0, maximum: 4294967294}
     WorkloadProcess:
       type: object
       additionalProperties: false

@@ -462,8 +462,33 @@ impl WorkloadProcess {
     }
 }
 
+/// Numeric identity configured in sandboxd's target OCI bundle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessUser {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl ProcessUser {
+    pub fn validate(&self) -> Result<()> {
+        if self.uid == u32::MAX || self.gid == u32::MAX {
+            return Err(Error::Invalid(
+                "process_user uid/gid must be below 4294967295".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOptions {
+    /// Omitted preserves request PATH precedence on fresh starts and inherits on restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_image_path: Option<bool>,
+    /// Omitted preserves the base OCI user; Some(0:0) explicitly selects root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_user: Option<ProcessUser>,
     /// Identity for the runtime daemon and its tool operations. Backend support is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -506,6 +531,32 @@ pub struct ExecutionOptions {
 }
 
 impl ExecutionOptions {
+    /// Resolve the validated initial-process identity for a numeric-only backend.
+    pub fn numeric_process_user(&self) -> Result<Option<ProcessUser>> {
+        if let Some(user) = self.process_user {
+            return Ok(Some(user));
+        }
+        match (self.user.as_deref(), self.group.as_deref()) {
+            (None, None) => Ok(None),
+            (Some(uid), Some(gid)) => {
+                let parse = |id: &str| {
+                    id.parse::<u32>().map_err(|_| {
+                        Error::Invalid("sandboxd user/group require decimal UID/GID".into())
+                    })
+                };
+                let user = ProcessUser {
+                    uid: parse(uid)?,
+                    gid: parse(gid)?,
+                };
+                user.validate()?;
+                Ok(Some(user))
+            }
+            _ => Err(Error::Invalid(
+                "user and group must both be configured".into(),
+            )),
+        }
+    }
+
     /// Reject removal or replacement of persisted inbound policy. Ordinary
     /// executions without protected ingress retain their native policy behavior.
     pub fn validate_protected_ingress(&self, policy: Option<&NetworkPolicy>) -> Result<()> {
@@ -612,6 +663,14 @@ impl ExecutionOptions {
         }
     }
     pub fn validate(&self, requests: &crate::Resources) -> Result<()> {
+        if let Some(user) = &self.process_user {
+            user.validate()?;
+            if self.user.is_some() || self.group.is_some() {
+                return Err(Error::Invalid(
+                    "process_user cannot be combined with user/group".into(),
+                ));
+            }
+        }
         validate_process_identity(self.user.as_deref(), self.group.as_deref())?;
         if self.user.is_some() && self.inherit_entrypoint {
             return Err(Error::Invalid(

@@ -72,6 +72,15 @@ fn inherit_template(
         limits.disk_bytes = saved_limits.disk_bytes;
     }
     let captured: pb::ExecutionOptions = template.execution.clone().into();
+    execution.prefer_image_path = execution.prefer_image_path.or(captured.prefer_image_path);
+    if execution.process_user.is_none() {
+        execution.process_user =
+            if matches!(template.runtime_class.as_str(), "conch" | "supervisor") {
+                captured.process_user
+            } else {
+                template.execution.numeric_process_user()?.map(Into::into)
+            };
+    }
     if execution
         .rootfs
         .as_ref()
@@ -296,6 +305,70 @@ mod tests {
             snapshot_id: Some(snapshot.id.clone()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn clone_inherits_start_options_and_preserves_explicit_target_values() {
+        let mut snapshot = source("local");
+        snapshot.template.execution.prefer_image_path = Some(true);
+        snapshot.template.execution.process_user = Some(adx_core::execution::ProcessUser {
+            uid: 1001,
+            gid: 1002,
+        });
+        let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert_eq!(inherited.execution.prefer_image_path, Some(true));
+        assert_eq!(
+            inherited.execution.process_user,
+            snapshot.template.execution.process_user
+        );
+        for user in [
+            pb::ProcessUser { uid: 0, gid: 0 },
+            pb::ProcessUser {
+                uid: 2001,
+                gid: 2002,
+            },
+        ] {
+            let expected = (user.uid, user.gid);
+            let mut request = clone_request(&snapshot);
+            request.execution = Some(pb::ExecutionOptions {
+                prefer_image_path: Some(false),
+                process_user: Some(user),
+                ..Default::default()
+            });
+            let explicit = inherit_template(request, &snapshot, None).unwrap();
+            assert_eq!(explicit.execution.prefer_image_path, Some(false));
+            let selected = explicit.execution.process_user.unwrap();
+            assert_eq!((selected.uid, selected.gid), expected);
+            assert_eq!(
+                inherit_template(explicit.clone().into(), &snapshot, Some(&explicit)).unwrap(),
+                explicit
+            );
+        }
+        let legacy = source("local");
+        let defaults = inherit_template(clone_request(&legacy), &legacy, None).unwrap();
+        assert_eq!(defaults.execution.prefer_image_path, None);
+        assert_eq!(defaults.execution.process_user, None);
+    }
+
+    #[test]
+    fn clone_carries_numeric_tool_identity_as_initial_process_configuration() {
+        let mut snapshot = source("local");
+        snapshot.template.execution.user = Some("1001".into());
+        snapshot.template.execution.group = Some("1002".into());
+        let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert_eq!(
+            inherited.execution.process_user,
+            Some(adx_core::execution::ProcessUser {
+                uid: 1001,
+                gid: 1002,
+            })
+        );
+        assert_eq!(inherited.execution.user, None);
+        assert_eq!(inherited.execution.group, None);
+        assert_eq!(
+            inherit_template(inherited.clone().into(), &snapshot, Some(&inherited)).unwrap(),
+            inherited
+        );
     }
 
     #[test]

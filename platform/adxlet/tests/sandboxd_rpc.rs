@@ -361,7 +361,7 @@ fn spec() -> EnvironmentSpec {
 }
 
 #[tokio::test]
-async fn sandboxd_create_accepts_tool_user_and_group() {
+async fn sandboxd_create_maps_numeric_tool_user_and_group() {
     let server = Server::default();
     let (adapter, _harness) = connect(server.clone()).await;
     let mut environment = spec();
@@ -376,6 +376,13 @@ async fn sandboxd_create_accepts_tool_user_and_group() {
     let starts = server.starts.lock().unwrap();
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].runtime, "runsc");
+    assert_eq!(
+        starts[0].process_user,
+        Some(ProcessUser {
+            uid: 1000,
+            gid: 1000
+        })
+    );
     assert!(!starts[0]
         .envs
         .contains_key(adx_core::execution::WORKLOAD_PROCESS_ENV));
@@ -402,6 +409,41 @@ fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
         "noexec",
     ] {
         assert!(pts.options.iter().any(|value| value == option));
+    }
+}
+
+#[tokio::test]
+async fn sandboxd_start_options_cross_rpc_with_root_presence_intact() {
+    for (prefer, user) in [
+        (None, None),
+        (
+            Some(true),
+            Some(ProcessUser {
+                uid: 1001,
+                gid: 1002,
+            }),
+        ),
+        (Some(false), Some(ProcessUser { uid: 0, gid: 0 })),
+    ] {
+        let server = Server::default();
+        let (adapter, _harness) = connect(server.clone()).await;
+        let mut environment = spec();
+        let mut options = serde_json::to_value(&environment.execution).unwrap();
+        options["prefer_image_path"] = serde_json::json!(prefer);
+        options["process_user"] = user.as_ref().map_or(
+            serde_json::Value::Null,
+            |u| serde_json::json!({"uid":u.uid,"gid":u.gid}),
+        );
+        environment.execution = serde_json::from_value(options).unwrap();
+        environment.env.insert("PATH".into(), "/caller/bin".into());
+        adapter
+            .start(&environment, "start-options", 1, &[])
+            .await
+            .unwrap();
+        let starts = server.starts.lock().unwrap();
+        assert_eq!(starts[0].prefer_image_path, prefer.unwrap_or(false));
+        assert_eq!(starts[0].process_user, user);
+        assert_eq!(starts[0].envs["PATH"], "/caller/bin");
     }
 }
 
@@ -1256,7 +1298,11 @@ async fn checkpoint_uses_physical_id_and_restore_generates_new_backend_id_with_f
     let starts = server.starts.clone();
     server.release.add_permits(1);
     let (adapter, _harness) = connect(server.clone()).await;
-    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let mut source = spec();
+    source.execution.prefer_image_path = Some(true);
+    source.execution.user = Some("1001".into());
+    source.execution.group = Some("1002".into());
+    adapter.start(&source, "i-1", 1, &[]).await.unwrap();
     let checkpoint = tempfile::tempdir().unwrap();
     adapter
         .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
@@ -1269,13 +1315,29 @@ async fn checkpoint_uses_physical_id_and_restore_generates_new_backend_id_with_f
         .iter()
         .any(|r| r == "checkpoint:leave_running=false"));
     adapter.remove("i-1").await.unwrap();
+    let mut target = spec();
+    target.execution.prefer_image_path = Some(false);
+    target.execution.process_user = Some(adx_core::execution::ProcessUser { uid: 0, gid: 0 });
     adapter
-        .restore(&spec(), "i-1-r5", 1, &[], checkpoint.path())
+        .restore(&target, "i-1-r5", 1, &[], checkpoint.path())
         .await
         .unwrap();
     assert!(adapter.is_running("i-1-r5").await.unwrap());
     let requests = starts.lock().unwrap();
     assert_eq!(requests.len(), 2);
+    assert!(requests[0].prefer_image_path);
+    assert_eq!(
+        requests[0].process_user,
+        Some(ProcessUser {
+            uid: 1001,
+            gid: 1002
+        })
+    );
+    assert!(!requests[1].prefer_image_path);
+    assert_eq!(
+        requests[1].process_user,
+        Some(ProcessUser { uid: 0, gid: 0 })
+    );
     assert!(requests.iter().all(|r| r.sandbox_id.is_empty()));
     assert_eq!(
         requests[0].envs["ADX_CHECKPOINT_HANDOFF_FILE"],
