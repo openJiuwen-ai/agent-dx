@@ -157,9 +157,13 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Same key as the autofs error body.
         let mut response = (
             self.status,
-            Json(json!({"code": self.code, "message": self.message})),
+            Json(json!({
+                "error": self.code,
+                "message": self.message,
+            })),
         )
             .into_response();
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
@@ -731,7 +735,7 @@ impl WorkspaceApi {
             return if force {
                 Err(ApiError::missing())
             } else {
-                Ok((StatusCode::OK, json!({"owner": owner})))
+                Ok((StatusCode::OK, json!({"owner": owner, "deleted": false})))
             };
         };
         if epoch.is_some_and(|epoch| epoch != location.epoch) {
@@ -793,9 +797,24 @@ impl WorkspaceApi {
                 })?;
             }
         }
-        let mut result = json!({"owner": owner});
+        let node_ip = info
+            .node
+            .as_ref()
+            .filter(|_| info.found)
+            .and_then(|node| node.endpoint.as_ref())
+            .and_then(|endpoint| endpoint_host(&endpoint.grpc_addr));
+        // Same fields as the autofs delete response.
+        let mut result = json!({
+            "owner": owner.as_str(),
+            "node_id": location.home_node_id,
+            "node_ip": node_ip,
+            "state": "ready",
+        });
         if force {
+            result["access_path"] = json!(self.public_path(&owner));
             result["data_lost"] = json!(data_lost);
+        } else {
+            result["deleted"] = json!(true);
         }
         Ok((StatusCode::OK, result))
     }
