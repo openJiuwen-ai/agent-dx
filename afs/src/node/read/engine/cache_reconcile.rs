@@ -1526,6 +1526,13 @@ impl DfsReadEngine {
             .assemble_pending(&self.local);
     }
 
+    pub(crate) fn checkpoint_expire_partials(&self) {
+        self.distributed_cache
+            .as_ref()
+            .unwrap()
+            .sweep_partial_at(&self.local, Instant::now() + PARTIAL_MAX_AGE);
+    }
+
     pub(crate) fn checkpoint_after_freeze(&self, hook: impl FnOnce() + Send + 'static) {
         *self
             .distributed_cache

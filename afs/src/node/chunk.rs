@@ -293,6 +293,13 @@ pub struct LocalChunkStore {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct ChunkStoreTestHooks {
+    #[cfg(feature = "dfs")]
+    holder_op_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     pub(super) catalog_commit_test: CatalogCommitTestControl,
     pub(super) sidecar_install_test: Arc<SidecarInstallTestControl>,
     pub(super) peer_fill_test_blocks: Mutex<HashMap<ChunkId, PeerFillTestBlock>>,

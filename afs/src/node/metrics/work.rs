@@ -311,6 +311,7 @@ pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
     // H2 step 2: what this Node answered as a version holder.
     "holder_served",
     "holder_served_partial",
+    "holder_abandoned_after_send",
     "holder_waited",
     "holder_wait_timeout",
     "holder_wait_rejected",
@@ -450,6 +451,8 @@ struct ReadCoreMetrics {
     #[cfg(feature = "dfs")]
     holder_partial_bytes: afs_metrics::IntCounter,
     #[cfg(feature = "dfs")]
+    holder_abandoned_bytes: afs_metrics::IntCounter,
+    #[cfg(feature = "dfs")]
     read_source_bytes: afs_metrics::IntCounterVec,
     #[cfg(feature = "dfs")]
     read_cache_resources: afs_metrics::IntGaugeVec,
@@ -581,6 +584,12 @@ impl ReadCoreMetrics {
                 "Native read cache and holder events. Designations count Chunk selections; partial serves count completed range operations.",
                 &["event"],
                 READ_CACHE_EVENTS,
+            )?,
+            #[cfg(feature = "dfs")]
+            holder_abandoned_bytes: counter(
+                registry,
+                "afs_dfs_holder_abandoned_after_send_bytes_total",
+                "Payload bytes enqueued before a holder response ended without completing all ranges.",
             )?,
             #[cfg(feature = "dfs")]
             holder_partial_bytes: counter(
@@ -1259,6 +1268,12 @@ impl ReadWorkMetrics {
                 .with_label_values(&[event])
                 .inc();
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn holder_abandoned(&self, bytes: u64) {
+        self.read_cache_event("holder_abandoned_after_send");
+        self.core.holder_abandoned_bytes.inc_by(bytes);
     }
 
     #[cfg(feature = "dfs")]
@@ -1990,6 +2005,7 @@ mod tests {
         "afs_dfs_fetch_events_total",
         "afs_dfs_fetch_resources",
         "afs_dfs_holder_served_partial_bytes_total",
+        "afs_dfs_holder_abandoned_after_send_bytes_total",
         "afs_dfs_native_write_resources",
         "afs_dfs_native_writeback_errors_total",
         "afs_dfs_peer_disk_cache_events_total",

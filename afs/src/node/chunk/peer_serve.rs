@@ -1078,8 +1078,35 @@ impl LocalChunkStore {
     }
 
     #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn pause_after_holder_op(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached, at_op) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *self.test_hooks.holder_op_gate.lock().unwrap() = Some((reached, paused));
+        (at_op, resume)
+    }
+
+    #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn holder_op_complete(&self) {
+        let gate = self.test_hooks.holder_op_gate.lock().unwrap().take();
+        if let Some((reached, paused)) = gate {
+            let _ = reached.send(());
+            paused
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("holder op gate timed out");
+        }
+    }
+
+    #[cfg(all(test, feature = "dfs"))]
     pub(crate) fn occupy_peer_payload_budget(&self) -> Result<PeerReadReservation> {
-        self.reserve_peer_read_payload(self.peer_read_budget.limit as usize)
+        self.reserve_peer_read_payload(
+            (self.peer_read_budget.limit - self.peer_read_budget.used.load(Ordering::Acquire))
+                as usize,
+        )
     }
 
     /// RDMA packed and object payloads share one configured actual-capacity ledger.

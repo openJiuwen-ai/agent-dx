@@ -73,6 +73,8 @@ use crate::node::vfs::dfs::owner_api::{
 mod dfs_chunks;
 #[cfg(feature = "dfs")]
 mod dfs_holder_serve;
+#[cfg(feature = "dfs")]
+mod dfs_holder_stream;
 #[cfg(all(test, feature = "dfs"))]
 pub(crate) use dfs_holder_serve::TestPoint as HolderTestPoint;
 #[cfg(feature = "dfs")]

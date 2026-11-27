@@ -649,6 +649,10 @@ CRC 片段由发送方核验覆盖段，只发送请求授权的字节。节点�
 读者的 `afs_dfs_read_cache_events_total` 中，`designated_self` 和 `designated_remote` 按每次选源所处理的块计数。同一块分多段读或重新选源可计多次。
 持有者从拼装中或等待安装的内存体成功发送一个授权范围后，`holder_served_partial` 事件加一，`afs_dfs_holder_served_partial_bytes_total` 累加该范围的字节数。已安装副本走磁盘供数路径，两项部分体计数都保持原值。
 
+持有者取得读槽后先为整组请求准备已验证的授权范围，再发送首帧。每个请求最多保留 8 个范围，超过上限、部分体已回收或 payload 额度不足时，读者可直接回退副本。磁盘数据和部分体数据共用既有 payload 额度。持有者在发布快照前核验本地 CRC；请求方的 CRC 模式继续决定线上校验标记。
+
+若发送首段后响应中断，持有者将 `holder_abandoned_after_send` 事件加一，并把该请求已成功放入 gRPC 响应队列的正文计入 `afs_dfs_holder_abandoned_after_send_bytes_total`。首帧前拒绝和完整响应的增量均为零。对账时还应核对持久副本发送量和读者实收量。
+
 Linux DFS挂载完成后仅设置自身FUSE设备的BDI `read_ahead_kb`，默认16384KiB；显式0禁用。
 INIT协商值与BDI有效值分别记录在`dfs.fuse_cache_init`和`dfs.fuse_readahead`。
 后者成功记录`applied=true`及读回值；权限不足或sysfs不可用记录`applied=false`和原因，

@@ -1,4 +1,6 @@
 //! H2 step 2b: the holder form of `ReadRanges` (plan/15 v3 §1.3, §2.2.2–§2.2.4).
+mod duplicate;
+
 use super::*;
 use crate::dfs::{
     DfsAuthorizedHolderRead, DfsHolderGrant, Extent, FileVersionId, LayoutRoot, LayoutRootId,
@@ -1249,6 +1251,38 @@ async fn h2_2c1_two_grpc_readers_share_eight_chunks_by_segment() {
     assert!(pair.partial_bytes > 0, "no verified partial bytes sent");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_2c1_dup_two_grpc_readers_under_partial_pressure() {
+    const RECEIVED: u64 = (2 * 8 * 4) << 20;
+    for mib in [4, 32] {
+        let p = pair_read(
+            |pool| pool.with_holder_wait_ms(30),
+            Start::Pressure(mib << 20),
+        )
+        .await;
+        let sent = p.writer_bytes + p.holder_bytes;
+        eprintln!(
+            "partial_budget_mib={mib} writer_bytes={} holder_bytes={} received={RECEIVED} duplicate={} writer_ratio={:.5} holder_served_partial={} holder_answered_not_ready={} designated_self={} designated_remote={} dropped_partial={} abandoned={} abandoned_bytes={}",
+            p.writer_bytes,
+            p.holder_bytes,
+            sent as i64 - RECEIVED as i64,
+            p.writer_bytes as f64 / RECEIVED as f64,
+            p.partial_ops,
+            p.not_ready,
+            p.designated_self,
+            p.designated_remote,
+            p.displaced,
+            p.abandoned,
+            p.abandoned_bytes
+        );
+        assert_eq!(sent, RECEIVED);
+        assert_eq!((p.abandoned, p.abandoned_bytes), (0, 0));
+        if mib == 4 {
+            assert!(p.displaced > 0, "partial pressure was not exercised");
+        }
+    }
+}
+
 /// review/18 a5: with no holder wait (`dfs_holder_wait_ms = 0`, also a bare
 /// pool) a reader asks a holder for nothing it does not have yet: no holder
 /// ever waits, whoever starts first.
@@ -1299,6 +1333,7 @@ enum Start {
     Asymmetric,
     /// Eight 4 MiB Chunks, read by both readers in four 1 MiB requests each.
     Segments,
+    Pressure(u64),
     /// Two Chunks ranked oppositely; each reader reads both, its own top
     /// Chunk first (!318 P2-4).
     Crossed,
@@ -1315,6 +1350,13 @@ struct PairOutcome {
     partial_bytes: u64,
     writer_reads: usize,
     writer_bytes: u64,
+    holder_bytes: u64,
+    not_ready: u64,
+    designated_self: u64,
+    designated_remote: u64,
+    displaced: u64,
+    abandoned: u64,
+    abandoned_bytes: u64,
 }
 
 fn cache_event_count(registry: &afs_metrics::Registry, event: &str) -> u64 {
@@ -1379,7 +1421,7 @@ async fn pair_read(
     use crate::node::read::engine::{ChunkReadOp, DfsReadConfig, DfsReadEngine, ReadBatch};
     let temp = tempfile::tempdir().unwrap();
     const PART: usize = 1024 * 1024;
-    let chunks = if matches!(start, Start::Segments) {
+    let chunks = if matches!(start, Start::Segments | Start::Pressure(_)) {
         (0..8)
             .map(|index| {
                 let bytes: Vec<_> = (0..4 * PART)
@@ -1570,14 +1612,23 @@ async fn pair_read(
                     std::time::Instant::now() + std::time::Duration::from_secs(30),
                 ),
             ))
-            .with_distributed_cache(
+            .with_distributed_cache_budgets(
                 "session".into(),
-                if matches!(start, Start::Segments) {
+                if matches!(start, Start::Segments | Start::Pressure(_)) {
                     6 * PART as u64
                 } else {
                     1 << 30
                 },
+                crate::node::read::engine::ReadCacheBudgets {
+                    partial_bytes: if let Start::Pressure(bytes) = start {
+                        bytes
+                    } else {
+                        32 << 20
+                    },
+                    ..Default::default()
+                },
             )
+            .unwrap()
             .with_holder_lists(std::time::Duration::from_secs(60)),
         );
         engine.start_distributed_cache(&mut services);
@@ -1585,6 +1636,7 @@ async fn pair_read(
         shared.retain(&FileVersionId::new("v"), 1);
         shared.attach(&FileVersionId::new("v"), &layout);
         let mut service = dfs_reuse_test_service(local, Arc::new(DenyDfsReadAuthorizer));
+        service.payload_metrics = Some(DfsPayloadMetrics::register(&registry).unwrap());
         service.authenticator = Arc::new(FixedPeer(other));
         service.holders = Some(crate::node::rpc::data::HolderServe::new(
             Arc::new(AnyHolderGrant),
@@ -1633,9 +1685,11 @@ async fn pair_read(
         )
     };
     let order = match start {
-        Start::Together | Start::HigherFirst | Start::Crossed | Start::Segments => {
-            [higher, 1 - higher]
-        }
+        Start::Together
+        | Start::HigherFirst
+        | Start::Crossed
+        | Start::Segments
+        | Start::Pressure(_) => [higher, 1 - higher],
         Start::LowerFirst | Start::Asymmetric => [1 - higher, higher],
     };
     let read_of = |index: usize| {
@@ -1657,11 +1711,13 @@ async fn pair_read(
     };
     let started = std::time::Instant::now();
     let deadline = started
-        + std::time::Duration::from_secs(if matches!(start, Start::Segments) {
-            30
-        } else {
-            10
-        });
+        + std::time::Duration::from_secs(
+            if matches!(start, Start::Segments | Start::Pressure(_)) {
+                30
+            } else {
+                10
+            },
+        );
     // Bounded until-loops that stop early when a read already ended (its
     // result then decides the test instead of a hang).
     async fn until_or_ended(
@@ -1702,14 +1758,24 @@ async fn pair_read(
             })
             .await;
         }
-        Start::Segments => {
-            for (chunk, expected) in &chunks {
+        Start::Segments | Start::Pressure(_) => {
+            let mut schedule = Vec::new();
+            for chunk in 0..chunks.len() {
+                for offset in (0..4 * PART).step_by(PART) {
+                    schedule.push((chunk, offset));
+                }
+            }
+            if matches!(start, Start::Pressure(_)) {
+                schedule.sort_by_key(|&(chunk, offset)| (offset, chunk));
+            }
+            for (chunk_index, offset) in schedule {
+                let (chunk, expected) = &chunks[chunk_index];
                 let provider = usize::from(!crate::node::read::engine::holder_ranks_above(
                     &chunk.chunk.id,
                     names[0],
                     names[1],
                 ));
-                for offset in (0..expected.len()).step_by(PART) {
+                {
                     let launch = |reader: usize| {
                         let engine = nodes[reader].engine.clone();
                         let bytes = expected[offset..offset + PART].to_vec();
@@ -1730,6 +1796,13 @@ async fn pair_read(
                                 .read_batch(&batch, &mut output)
                                 .map(|()| output == bytes)
                         })
+                    };
+                    // Alternate a designated fetch already in flight with a designated reader
+                    // that has not started. The writer gate fixes the ordering on both versions.
+                    let provider = if matches!(start, Start::Pressure(_)) && chunk_index % 2 == 1 {
+                        1 - provider
+                    } else {
+                        provider
                     };
                     let waiting = cache_event_count(&nodes[provider].registry, "holder_waited");
                     let prior = writer_reads.reads();
@@ -1803,6 +1876,27 @@ async fn pair_read(
         .iter()
         .map(|node| partial_bytes_count(&node.registry))
         .sum();
+    let sum_event = |event| {
+        nodes
+            .iter()
+            .map(|node| cache_event_count(&node.registry, event))
+            .sum()
+    };
+    let holder_bytes = nodes.iter().map(|node| metric_value(&node.registry, "afs_dfs_payload_bytes_total{direction=\"send\",operation=\"read\",transport=\"grpc\"} ")).sum();
+    let not_ready = sum_event("holder_answered_not_ready");
+    let designated_self = sum_event("designated_self");
+    let designated_remote = sum_event("designated_remote");
+    let displaced = sum_event("dropped_partial");
+    let abandoned = sum_event("holder_abandoned_after_send");
+    let abandoned_bytes = nodes
+        .iter()
+        .map(|node| {
+            metric_value(
+                &node.registry,
+                "afs_dfs_holder_abandoned_after_send_bytes_total ",
+            )
+        })
+        .sum();
     for node in nodes {
         node.server.abort();
     }
@@ -1810,6 +1904,13 @@ async fn pair_read(
         server.abort();
     }
     PairOutcome {
+        holder_bytes,
+        not_ready,
+        designated_self,
+        designated_remote,
+        displaced,
+        abandoned,
+        abandoned_bytes,
         elapsed,
         waited_at_higher,
         waited_at_lower,
@@ -1964,6 +2065,7 @@ async fn review_holder(
 /// Chunk's durable copy at a writer that answers at once, and `holder` as
 /// the version's one holder.
 struct ReviewReader {
+    writer_payload: DfsPayloadMetrics,
     engine: Arc<crate::node::read::engine::DfsReadEngine>,
     writer: Arc<CountingWriter>,
     metrics: afs_metrics::Registry,
@@ -2017,7 +2119,9 @@ async fn review_reader_shaped(
         writer_local.put(staged.clone()).unwrap();
     }
     let writer = Arc::new(CountingWriter::default());
+    let writer_payload = DfsPayloadMetrics::register(&afs_metrics::Registry::new()).unwrap();
     let mut service = dfs_reuse_test_service(writer_local, writer.clone());
+    service.payload_metrics = Some(writer_payload.clone());
     service.authenticator = Arc::new(FixedPeer("reader"));
     let (writer_endpoint, writer_server) = serve(service).await;
     let source = |staged: &StagedChunk| crate::dfs::SourceCandidate {
@@ -2110,6 +2214,7 @@ async fn review_reader_shaped(
         .with_holder_lists(shape.holder_ttl),
     );
     ReviewReader {
+        writer_payload,
         engine,
         writer,
         metrics,
@@ -2796,7 +2901,19 @@ fn checkpoint_engine(
     name: &str,
     epoch: u64,
 ) -> Arc<crate::node::read::engine::DfsReadEngine> {
-    use crate::node::read::engine::{DfsReadConfig, DfsReadEngine, LocalReadAuthority};
+    checkpoint_engine_with_partial_budget(local, namespace, name, epoch, 32 << 20)
+}
+
+fn checkpoint_engine_with_partial_budget(
+    local: Arc<LocalChunkStore>,
+    namespace: NamespaceId,
+    name: &str,
+    epoch: u64,
+    partial_bytes: u64,
+) -> Arc<crate::node::read::engine::DfsReadEngine> {
+    use crate::node::read::engine::{
+        DfsReadConfig, DfsReadEngine, LocalReadAuthority, ReadCacheBudgets,
+    };
     let meta = Arc::new(PairMeta {
         reply: Default::default(),
         holder: None,
@@ -2825,7 +2942,15 @@ fn checkpoint_engine(
             epoch,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         )))
-        .with_distributed_cache("checkpoints".into(), 64 << 20)
+        .with_distributed_cache_budgets(
+            "checkpoints".into(),
+            64 << 20,
+            ReadCacheBudgets {
+                partial_bytes,
+                ..Default::default()
+            },
+        )
+        .unwrap()
         .with_holder_lists(std::time::Duration::from_secs(1)),
     )
 }

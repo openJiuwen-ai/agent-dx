@@ -204,7 +204,7 @@ fn stream_crc32c_op(
 }
 
 #[cfg(feature = "dfs")]
-fn crc_range_metadata(
+pub(super) fn crc_range_metadata(
     stream: &RangeStream<'_>,
     op: &afs_protocol::node_data::DfsChunkReadOp,
     table: &crate::node::chunk_crc32c::CrcTable,
@@ -261,49 +261,6 @@ fn crc_range_metadata(
         crc32c_table: Default::default(),
     };
     Ok((header, completion))
-}
-
-#[cfg(feature = "dfs")]
-pub(super) async fn stream_holder_memory_range(
-    stream: &RangeStream<'_>,
-    op: &afs_protocol::node_data::DfsChunkReadOp,
-    table: &crate::node::chunk_crc32c::CrcTable,
-    body: prost::bytes::Bytes,
-) -> Result<(), Status> {
-    use dfs_read_ranges_frame::Body;
-    let (header, completion) = crc_range_metadata(stream, op, table, &body)?;
-    let deadline = tokio::time::Instant::from_std(stream.admission_deadline);
-    let send = |body| async move {
-        stream
-            .local
-            .record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
-        validate_served_read(stream.request)?;
-        stream
-            .local
-            .ensure_peer_serve_open()
-            .map_err(error_to_status)?;
-        tokio::time::timeout_at(
-            deadline,
-            stream
-                .sender
-                .send(Ok(DfsReadRangesFrame { body: Some(body) })),
-        )
-        .await
-        .map_err(|_| Status::resource_exhausted("DFS peer read deadline exceeded"))?
-        .map_err(|_| Status::cancelled("DFS range consumer disconnected"))
-    };
-    send(Body::Header(header)).await?;
-    for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
-        let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
-        let length = data.len() as u64;
-        send(Body::Data(data)).await?;
-        stream.local.record_peer_read_event("data_frame");
-        stream.local.record_peer_read_event("shared_frame");
-        if let Some(metrics) = stream.metrics {
-            metrics.record("grpc", "send", "read", length);
-        }
-    }
-    send(Body::Completion(completion)).await
 }
 
 /// A sidecar-backed object streamed group by group without a body allocation.

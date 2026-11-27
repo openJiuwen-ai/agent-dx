@@ -146,6 +146,8 @@ pub(crate) enum TestPoint {
     SlotQueue,
     /// Inside the slot, every check passed; serving starts next.
     Serve,
+    /// Response polled by the transport after admission.
+    ResponsePoll,
 }
 
 /// The task validating a grant: publishes the outcome and retires the
