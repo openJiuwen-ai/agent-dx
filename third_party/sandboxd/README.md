@@ -1,7 +1,7 @@
 # sandboxd protocol
 
-- Repository: https://github.com/inclusionAI/sandboxd
-- Pinned head: `03ea0a4db807c1d5dac4b11d02f2ec238083a8ae`
+- Repository: https://github.com/openJiuwen-ant/sandboxd
+- Pinned `adx-develop` head: `69e38e113025fd88722c758c70da8d9c6ab5015e`
 - ADX builds this revision without downstream source patches. Rootfs defaults,
   bootstrap mounts and managed-file paths are adapted by the control plane to
   the published sandboxd protocol.
@@ -33,8 +33,8 @@ per-file SHA256 and each executable's ELF machine. It rejects unsafe or duplicat
 tar entries and installs the directory only after verification. Download or
 verification failure stops package assembly.
 
-Both bundles are built from the clean pinned sandboxd revision using
-`build/e2e/build_backend.py`. Updating this dependency requires matching source
+Both bundles use the clean pinned sandboxd revision and the four Make targets in
+`build/e2e/build_backend.py`, with the pinned runc and Redis 7.2.5 CLI. Updating this dependency requires matching source
 and verified archive pins. To include the backend in the ADX release, build with
 `ADX_WITH_SANDBOXD=1 make platform-release`. This adds the backend to
 `runtime/sandboxd/`, includes the complete architecture-pinned AKernel gVisor `release-20261012.0-akernel.4` bundles (runsc, containerd shim, and adjacent `gvisor-bin` helpers),
