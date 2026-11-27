@@ -553,7 +553,7 @@ async fn workspace_http_refuses_unready_outlet_and_recursively_deletes_active_da
             .request(method, "/v1/workspaces/%FF", Value::Null)
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(error["code"], "invalid_request");
+        assert_eq!(error["error"], "invalid_request");
     }
     let gid = fixture.directory.path().metadata().unwrap().gid();
     let create = fixture
@@ -605,7 +605,17 @@ async fn workspace_http_refuses_unready_outlet_and_recursively_deletes_active_da
         .request("DELETE", "/v1/workspaces/alice?force=true", Value::Null)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(deleted, json!({"owner":"alice","data_lost":false}));
+    assert_eq!(
+        deleted,
+        json!({
+            "owner":"alice",
+            "node_id":"entry",
+            "node_ip":"127.0.0.1",
+            "state":"ready",
+            "access_path": fixture.api.public_path("alice"),
+            "data_lost":false,
+        })
+    );
     assert!(!data.exists());
     assert_eq!(std::fs::read(outside.path().join("keep")).unwrap(), b"keep");
     assert_eq!(
@@ -613,7 +623,7 @@ async fn workspace_http_refuses_unready_outlet_and_recursively_deletes_active_da
             .request("DELETE", "/v1/workspaces/alice", Value::Null)
             .await
             .1,
-        json!({"owner":"alice"})
+        json!({"owner":"alice","deleted":false})
     );
     assert_eq!(
         fixture
@@ -622,6 +632,38 @@ async fn workspace_http_refuses_unready_outlet_and_recursively_deletes_active_da
             .0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_response_reports_whether_the_workspace_existed() {
+    let fixture = Fixture::new().await;
+    let (status, missing) = fixture
+        .request("DELETE", "/v1/workspaces/absent", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(missing, json!({"owner":"absent","deleted":false}));
+
+    fixture.prepare_workspace("present").await;
+    let (status, deleted) = fixture
+        .request("DELETE", "/v1/workspaces/present", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        deleted,
+        json!({
+            "owner":"present",
+            "node_id":"entry",
+            "node_ip":"127.0.0.1",
+            "state":"ready",
+            "deleted":true,
+        })
+    );
+
+    let (status, error) = fixture
+        .request("DELETE", "/v1/workspaces/present?force=true", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error["error"], "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -972,7 +1014,16 @@ async fn delete_epoch_is_optional_and_rejects_stale_generations() {
     let uri = "/v1/workspaces/retry";
     let (status, deleted) = fixture.request("DELETE", uri, Value::Null).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(deleted, json!({"owner":"retry"}));
+    assert_eq!(
+        deleted,
+        json!({
+            "owner":"retry",
+            "node_id":"entry",
+            "node_ip":"127.0.0.1",
+            "state":"ready",
+            "deleted":true,
+        })
+    );
     let second = fixture.prepare_workspace("retry").await;
     assert!(second.epoch > first.epoch);
     for query in ["", "&force=true"] {
@@ -1183,7 +1234,7 @@ async fn delete_retries_meta_after_physical_directory_is_gone() {
 async fn remote_delete_retries_cleanup_and_meta_without_directory_lookup() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
-        "https://localhost:{}",
+        "https://127.0.0.1:{}",
         listener.local_addr().unwrap().port()
     );
     let mut fixture = Fixture::with_node_address(&endpoint).await;
@@ -1278,7 +1329,7 @@ async fn remote_delete_retries_cleanup_and_meta_without_directory_lookup() {
                 Ok(result) => result,
                 Err(error) => (
                     error.status,
-                    json!({"code":error.code, "message":error.message}),
+                    json!({"error":error.code, "message":error.message}),
                 ),
             }
         }
@@ -1364,7 +1415,14 @@ async fn remote_delete_retries_cleanup_and_meta_without_directory_lookup() {
         forced,
         (
             StatusCode::OK,
-            json!({"owner":"remote-retry","data_lost":false})
+            json!({
+                "owner":"remote-retry",
+                "node_id":"entry",
+                "node_ip":"127.0.0.1",
+                "state":"ready",
+                "access_path": fixture.api.public_path("remote-retry"),
+                "data_lost":false,
+            })
         )
     );
     assert!(!current.exists());
@@ -1486,7 +1544,7 @@ async fn isolated_workspace_is_not_reopened_before_deactivation() {
         .request("POST", "/v1/workspaces", json!({"owner":"detach"}))
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(error["code"], "claim_conflict");
+    assert_eq!(error["error"], "claim_conflict");
     assert!(!old.exists());
     assert_eq!(
         fixture.request("DELETE", uri, Value::Null).await.0,
