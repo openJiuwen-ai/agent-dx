@@ -39,7 +39,7 @@ Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，
 
 发布文件使用 TemplateDraft，不含 version。不带发布幂等键时每次成功发布生成新数字版本（即使内容相同）。有 `Idempotency-Key` 时沿原键重放返回原版本；没有键的超时应查询权威记录。序列按 tenant/template 隔离，并与快照原子提交；旧数据必须先经运维转换，服务不会自动编号旧字符串版本。
 
-对私有 OCI 镜像，可在共用配置添加 `"image_registry_auth_file": "/registry/.dockerconfigjson"`，并为 Activator 只读挂载 Docker auth 文件。仅在发布时查询文件 `auths` 中匹配的 registry。凭据键可用仓库主机名和端口，也可带 HTTPS scheme 或 `/v1/`、`/v2/` 后缀。registry 和 Bearer 鉴权地址须同源且使用 HTTPS。查询成功时，镜像的 digest 引用作为模板版本记录的内部字段保存，公开模板继续显示原 tag。查询失败或未配置时，模板沿用原引用。Activator 创建 Env 时使用版本已保存的引用，历史模板缺少 digest 时也继续使用原引用。创建和恢复过程沿用运行时自己的镜像拉取与缓存机制。
+对私有 OCI 镜像，可在共用配置添加 `"image_registry_auth_file": "/registry/.dockerconfigjson"`，并为 Activator 只读挂载 Docker auth 文件。仅在发布时查询文件 `auths` 中匹配的 registry。凭据键可用仓库主机名和端口，也可带 HTTPS scheme 或 `/v1/`、`/v2/` 后缀。registry 和 Bearer 鉴权地址须同源且使用 HTTPS。查询成功时，镜像的 digest 引用作为模板版本记录的内部字段保存，公开模板继续显示原 tag。查询失败或未配置时，模板沿用原引用。自动 Golden 制备与恢复使用相同的有效镜像。解析成功时配方记录 `image_digest`，沿用 tag 时省略该字段。新 Binding 遇到与有效镜像不兼容的历史配方时使用冷启动，模板仍可查询。建议为生产 registry 配置认证文件，以固定可变 tag 在发布时指向的内容。Activator 创建 Env 时使用版本已保存的引用，历史模板缺少 digest 时也继续使用原引用。创建和恢复过程沿用运行时自己的镜像拉取与缓存机制。
 
 启用镜像解析前先完成所有 Activator 副本的滚动升级。旧版 Activator 读取带内部字段的新模板会失败。
 
@@ -200,12 +200,11 @@ ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 
 `pause` 能力是 dormant 升级的硬依赖：`Environment::pause` 默认返回 `Unsupported`，部署的 Environment 适配器必须实现 `pause` 才能让休眠沙箱走"立即 checkpoint 再切换"路径。未实现的部署在候选就绪、E1 已休眠时，`checkpoint_candidate` 会返回 `Unsupported`，reconcile 与 `Invalid` 同等处理——记录警告后**停止主动重试**，等待外部变更（alias 改动、成员变化、进程重启）再检查，**不降级为"不 checkpoint 直接切"**。active 升级路径（E1 活跃、E2 保持 Running 切换）不调用 pause，不受此影响。
 
-### pause 超时预算与 reconcile 步骤对齐
+### 候选 Checkpoint 与失败恢复
 
-`checkpoint_candidate` 的 pause 预算取自 reconcile 步骤的剩余 deadline：`pause_timeout_seconds(deadline)` = 剩余秒数 clamp 到 `1..=3600`（与 API Server pause 契约一致）。`pause` 方法在 trait 入口校验 `timeout_seconds ∈ 1..=3600`，越界返回 `Invalid`；HTTP/嵌入式适配器的客户端等待预算就是 `timeout_seconds` 本身，**不再叠加 transport 自身的 `request_timeout_seconds`**。这样 pause 的等待上限恒等于 reconcile 步骤的剩余预算，外层 `tokio::time::timeout(request_timeout_seconds, reconcile_binding(...))` 真正 bound 住整步，不会出现"pause 客户端愿意等的时间 > 步骤剩余预算"导致外层先超时、留误导性 `OutcomeUnknown("reconciliation step timed out")` 的情况。
+别名收敛的单轮预算默认 120 秒，下限 60 秒，后台任务另为 Pause 发布留出 15 秒。旧 Environment 已休眠时，Activator 需要至少 60 秒剩余预算才发送候选 Pause。预算不足时将候选保留为 Running，交给下一轮处理。候选 Pause 的捕获预算固定为 60 秒。HTTP 和进程内适配器在捕获预算之外最多再等 15 秒，以接收 Paused 发布结果。未知结果在其他副本和后续轮次仍可用原操作 ID 和相同请求体重放。确认 Pause 被拒绝且候选仍为 Running 时推进尝试序号，最多四个序号。权威状态已是 Paused 时直接提交切换。
 
-真实 checkpoint 捕获（CRIU dump + 上传共享存储）在大内存沙箱下可能数十秒到数分钟。当 pause 实际耗时超过步骤剩余预算时，pause 返回 `OutcomeUnknown`，`switch_current` 不执行；下一轮 reconcile 查到候选已是 Paused，走 `Paused => ()` 完成切换——升级最终收敛，不会因慢捕获把候选判死。若 Platform 侧捕获失败把候选置为 Failed，下一轮命中 `Failed | Deleted => Conflict`，候选退役、升级失败，需人工排查。现有测试用内存 fake 覆盖了"慢 pause 下一轮收敛"路径，不证明真实 CRIU/共享存储时序。
-
+确认候选进入 Failed 或 Deleted 后，Activator 先提交退役意图，再经 Platform 清理 Environment 和关联。连续四次明确拒绝 Pause 的候选也按此流程退役。同一 Binding generation 和版本变更的重建间隔为 5 秒、15 秒、45 秒、2 分钟和 5 分钟，后续每 5 分钟重试。冷却期间继续使用原 current。进入分钟级冷却时记录 Binding scope、源版本、目标版本和失败次数。切换完成或 Binding 删除时清除这组重试元数据。
 
 ### 创建排队取消与退避
 

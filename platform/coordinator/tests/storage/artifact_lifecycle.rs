@@ -266,6 +266,94 @@ async fn cleanup_candidate(s: &adx_coordinator::storage::Session) -> CheckpointA
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn shared_checkpoint_collection_bounds_each_cycle_without_hgetall() {
+    use object_store::{path::Path as Key, ObjectStoreExt};
+
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "source").await;
+    let remote = std::sync::Arc::new(object_store::memory::InMemory::new());
+    let mut records = Vec::new();
+    let mut keys = Vec::new();
+    for index in 1..=20 {
+        let id = format!("paused-{index}");
+        let assignment = Assignment {
+            environment_id: id.clone(),
+            node_id: "source".into(),
+            shard_id: 0,
+            generation: index,
+            devices: vec![],
+        };
+        session
+            .reserve(spec(&id), assignment.clone())
+            .await
+            .unwrap();
+        let artifact = artifact();
+        let key = Key::from(format!("test/{}/files/memory", artifact.location));
+        remote.put(&key, b"memory".to_vec().into()).await.unwrap();
+        keys.push(key);
+        let mut record = running(spec(&id), assignment);
+        record.state = EnvironmentState::Paused;
+        record.runtime.ip = None;
+        record.resources_held = false;
+        record.checkpoint = Some(RestorePoint {
+            recovery_profile: Default::default(),
+            origin: None,
+            id: "pause".into(),
+            artifact,
+            expires_at_unix_seconds: None,
+            source_runtime_id: record.runtime.id.clone(),
+        });
+        session.commit(record.clone()).await.unwrap();
+        records.push(record);
+    }
+    let reclaimer = std::sync::Arc::new(
+        adx_checkpoint_storage::reclaim::ObjectReclaimer::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+        )
+        .unwrap(),
+    );
+    let coordinator = rpc(session.clone(), reclaimers(reclaimer)).await;
+    assert_eq!(coordinator.collect_shared_artifacts().await.unwrap(), 0);
+    let mut connection = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: String = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    for mut record in records {
+        record.state = EnvironmentState::Deleted;
+        record.checkpoint = None;
+        record.revision += 1;
+        session.commit(record).await.unwrap();
+    }
+    let first = coordinator.collect_shared_artifacts().await.unwrap();
+    let stats: redis::InfoDict = redis::cmd("INFO")
+        .arg("COMMANDSTATS")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        stats.get::<String>("cmdstat_hgetall").is_none(),
+        "shared checkpoint GC must use cached references"
+    );
+    assert_eq!(first, 16);
+    assert_eq!(session.shared_artifacts().await.unwrap().len(), 4);
+    assert_eq!(coordinator.collect_shared_artifacts().await.unwrap(), 4);
+    assert_eq!(coordinator.collect_shared_artifacts().await.unwrap(), 0);
+    for key in keys {
+        assert!(remote.get(&key).await.is_err());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn checkpoint_registry_reclaims_shared_artifacts_once_without_a_source_node() {
     use object_store::{path::Path as Key, ObjectStoreExt};
     let rig = common::Redis::new().await;
@@ -614,4 +702,88 @@ async fn coordinator_collects_shared_snapshot_with_source_node_offline() {
         s.get_snapshot("saved").await.unwrap().state,
         adx_core::snapshots::SnapshotState::Deleted
     );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn redis_restore_to_older_state_retains_rereferenced_shared_artifact() {
+    use object_store::{path::Path as Key, ObjectStoreExt};
+    let mut rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    register(&s, "node").await;
+    let assignment = Assignment {
+        environment_id: "owner".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    s.reserve(spec("owner"), assignment.clone()).await.unwrap();
+    let a = artifact();
+    let mut record = running(spec("owner"), assignment);
+    record.execution_artifacts.push(a.clone());
+    s.commit(record.clone()).await.unwrap();
+
+    let remote = std::sync::Arc::new(object_store::memory::InMemory::new());
+    let key = Key::from(format!("test/{}/files/memory", a.location));
+    remote.put(&key, b"memory".to_vec().into()).await.unwrap();
+    let reclaimer = std::sync::Arc::new(
+        adx_checkpoint_storage::reclaim::ObjectReclaimer::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+        )
+        .unwrap(),
+    );
+    let coordinator = rpc(s.clone(), reclaimers(reclaimer)).await;
+    assert_eq!(coordinator.collect_shared_artifacts().await.unwrap(), 0);
+
+    // Save control:v1 while `owner` still references the shared artifact.
+    let mut client = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let saved_control: Vec<(String, String)> = redis::cmd("HGETALL")
+        .arg("adx:{test}:control:v1")
+        .query_async(&mut client)
+        .await
+        .unwrap();
+    drop(client);
+
+    record.state = EnvironmentState::Deleted;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.execution_artifacts.clear();
+    record.revision += 1;
+    s.commit(record).await.unwrap();
+
+    // Restart Redis and restore the older control:v1 snapshot with the same epoch.
+    rig.crash();
+    rig.start().await;
+    let mut client = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg("adx:{test}:control:v1")
+        .query_async(&mut client)
+        .await
+        .unwrap();
+    let mut hset = redis::cmd("HSET");
+    hset.arg("adx:{test}:control:v1");
+    for (field, value) in &saved_control {
+        hset.arg(field).arg(value);
+    }
+    let _: usize = hset.query_async(&mut client).await.unwrap();
+    drop(client);
+
+    assert!(
+        s.claim_artifact_deletion(&a, None).await.is_err(),
+        "stale publication cache must not allow deletion after Redis reconnect"
+    );
+    assert_eq!(coordinator.collect_shared_artifacts().await.unwrap(), 0);
+    assert!(remote.get(&key).await.is_ok());
+    assert_eq!(s.shared_artifacts().await.unwrap(), vec![a]);
 }

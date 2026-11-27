@@ -95,6 +95,54 @@ async fn permanent_pause_survives_coordinator_epoch_and_can_transfer_after_node_
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn invalidated_pause_can_recover_on_its_healthy_source_with_a_new_generation() {
+    let (_rig, session, record) = paused_fixture().await;
+    session
+        .invalidate_node("source", "source-session")
+        .await
+        .unwrap();
+    let dormant = session.get("sleep").await.unwrap();
+    assert!(dormant.invalidated);
+    assert_eq!(dormant.result.unwrap().state, EnvironmentState::Paused);
+    session.request_resume("sleep", 1).await.unwrap();
+    let replacement = Assignment {
+        generation: 2,
+        ..record.assignment.clone()
+    };
+    assert!(session
+        .reserve_recovery(&record.assignment, replacement.clone(), 1)
+        .await
+        .is_err());
+    maintenance_register(&session, "source", "source-session", 2).await;
+    let recovered = session
+        .reserve_recovery(&record.assignment, replacement, 1)
+        .await
+        .unwrap();
+    assert_eq!(recovered.assignment.node_id, "source");
+    assert!(!recovered.invalidated);
+    let intent = recovered.resume.unwrap();
+    let rejected = session
+        .reject_local_resume(&recovered.assignment, &intent.operation_id, 1)
+        .await
+        .unwrap();
+    assert!(rejected.resume.unwrap().rejected_nodes.contains("source"));
+    let moved = session
+        .reserve_recovery(
+            &recovered.assignment,
+            Assignment {
+                node_id: "target".into(),
+                generation: 3,
+                ..recovered.assignment.clone()
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.assignment.node_id, "target");
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn concurrent_traffic_and_manual_resume_share_durable_intent() {
     let (_rig, session, _) = paused_fixture().await;
     let mut work = Vec::new();

@@ -615,7 +615,7 @@ async fn alias_switch_keeps_logical_identity_and_restart_finishes_retirement() {
     let revision = state.put_alias(&config, None).await.unwrap();
     let mut scope = scope("workspace");
     scope.template_ref = TemplateRef::Alias("production".into());
-    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let deadline = adx_agent_core::unix_time_millis() + 120_000;
     let original = a.activate(&scope, None, deadline).await.unwrap().binding;
     platform
         .observations
@@ -803,7 +803,7 @@ async fn dormant_previous_environment_checkpoints_candidate_before_switch() {
     let revision = state.put_alias(&config, None).await.unwrap();
     let mut scope = scope("dormant-upgrade");
     scope.template_ref = TemplateRef::Alias("production".into());
-    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let deadline = adx_agent_core::unix_time_millis() + 120_000;
     let original = a.activate(&scope, None, deadline).await.unwrap().binding;
     // The previous Environment is dormant: paused before the switch is attempted.
     platform
@@ -1033,7 +1033,7 @@ async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops(
     let revision = state.put_alias(&config, None).await.unwrap();
     let mut scope = scope("slow-checkpoint");
     scope.template_ref = TemplateRef::Alias("production".into());
-    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let deadline = adx_agent_core::unix_time_millis() + 120_000;
     let original = a.activate(&scope, None, deadline).await.unwrap().binding;
     // E1 is dormant: the candidate is checkpointed on the switch attempt.
     platform

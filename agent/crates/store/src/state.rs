@@ -39,11 +39,15 @@ pub struct PublishedTemplate {
     execution_image: Option<String>,
 }
 impl PublishedTemplate {
+    pub fn effective_image(&self) -> &str {
+        self.execution_image
+            .as_deref()
+            .unwrap_or(&self.template.image)
+    }
+
     pub fn execution(&self) -> ExecutionSpec {
         let mut execution = ExecutionSpec::from(&self.template);
-        if let Some(image) = &self.execution_image {
-            execution.image.clone_from(image);
-        }
+        execution.image = self.effective_image().into();
         execution
     }
 }
@@ -127,7 +131,14 @@ impl AgentState {
                 "publication idempotency key was used for another draft".into(),
             ));
         }
-        self.project_preparation(tenant, &version).await.map(Some)
+        if version.auto_prepare_snapshot {
+            self.template(tenant, &version.name, &version.version)
+                .await?
+                .ok_or_else(|| Error::Corrupt("published template version missing".into()))
+                .map(Some)
+        } else {
+            Ok(Some(version))
+        }
     }
     pub async fn publish_with_preparation(
         &self,
@@ -140,6 +151,17 @@ impl AgentState {
             return Err(Error::Invalid(
                 "automatic preparation job is required for this draft".into(),
             ));
+        }
+        if let Some(job) = preparation {
+            let effective_image = execution_image.unwrap_or(&prepared.template.image);
+            if job.seed.execution.image != effective_image {
+                return Err(Error::Invalid(
+                    "Golden seed image differs from its published execution image".into(),
+                ));
+            }
+            job.recipe
+                .validate(effective_image)
+                .map_err(Error::Invalid)?;
         }
         let tenant = prepared.tenant;
         let sequence_key = Key::new("template-sequence", &[tenant, &prepared.template.name])?;
@@ -577,7 +599,12 @@ impl AgentState {
                 writes.push(put(&history, &Option::<Scope>::None)?);
             }
         }
-        let deletes = vec![key];
+        let mut deletes = vec![key];
+        let progress_key = crate::aliases::rollout_key(&binding.scope)?;
+        if let Some(progress) = self.store.get(&progress_key).await? {
+            checks.push(check(&progress_key, &progress));
+            deletes.push(progress_key);
+        }
         if self
             .store
             .commit(&Transaction::with_deletes(checks, writes, deletes)?)

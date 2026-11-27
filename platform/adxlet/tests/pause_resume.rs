@@ -39,6 +39,9 @@ struct Backend {
     prepare_entered: tokio::sync::Notify,
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     checkpoint_entered: tokio::sync::Notify,
+    checkpoint_delay: Mutex<Duration>,
+    checkpoints_active: std::sync::atomic::AtomicUsize,
+    checkpoints_peak: std::sync::atomic::AtomicUsize,
     running_checkpoint_delay: Mutex<Duration>,
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
     committed_records: Mutex<BTreeMap<String, EnvironmentRecord>>,
@@ -169,12 +172,20 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
     async fn checkpoint(&self, id: &str, path: &Path, _: Duration) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let active = self.checkpoints_active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.checkpoints_peak.fetch_max(active, Ordering::SeqCst);
         self.event("checkpoint");
         self.checkpoint_entered.notify_one();
         let gate = self.checkpoint_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             gate.notified().await;
         }
+        let delay = *self.checkpoint_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        self.checkpoints_active.fetch_sub(1, Ordering::SeqCst);
         std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
         if !*self.checkpoint_leaves_running.lock().unwrap() {
             self.running.lock().unwrap().remove(id);
@@ -713,6 +724,116 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
         Error::Conflict
     );
     assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn pause_retries_transient_state_publication_without_recapturing() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    *backend.checkpoint_commit_failures.lock().unwrap() = 2;
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    assert_eq!(paused.record.state, EnvironmentState::Paused);
+    assert_eq!(paused.durability, Durability::Published);
+    let events = backend.events.lock().unwrap();
+    assert_eq!(
+        events.iter().filter(|event| *event == "checkpoint").count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "checkpoint-result-retry")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn six_environments_share_two_checkpoint_slots() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let node = node.with_max_concurrent_checkpoints(2).unwrap();
+    node.update_capacity(
+        Resources {
+            cpu_millis: spec.resources.cpu_millis * 6,
+            memory_bytes: spec.resources.memory_bytes * 6,
+            disk_bytes: spec.resources.disk_bytes * 6,
+        },
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    *backend.checkpoint_delay.lock().unwrap() = Duration::from_millis(50);
+    let mut work = Vec::new();
+    for index in 0..6 {
+        let mut spec = spec.clone();
+        spec.id = format!("env-{index}");
+        let mut assignment = assignment.clone();
+        assignment.environment_id = spec.id.clone();
+        let handle = node.environment(spec, assignment).unwrap();
+        let created = handle.create().await.unwrap();
+        let mut request = pause(created.record.revision);
+        request.operation_id = format!("pause-{index}");
+        work.push((handle, request));
+    }
+    let mut jobs = tokio::task::JoinSet::new();
+    for (handle, request) in work {
+        jobs.spawn(async move { handle.pause(request).await });
+    }
+    while let Some(result) = jobs.join_next().await {
+        assert_eq!(
+            result.unwrap().unwrap().record.state,
+            EnvironmentState::Paused
+        );
+    }
+    assert_eq!(
+        backend
+            .checkpoints_peak
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_queued_pause_can_expire_before_prepare_or_route_retirement() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let node = node.with_max_concurrent_checkpoints(1).unwrap();
+    node.update_capacity(
+        Resources {
+            cpu_millis: spec.resources.cpu_millis * 2,
+            memory_bytes: spec.resources.memory_bytes * 2,
+            disk_bytes: spec.resources.disk_bytes * 2,
+        },
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    let first = node.environment(spec.clone(), assignment.clone()).unwrap();
+    let first_created = first.create().await.unwrap();
+    let mut other_spec = spec;
+    other_spec.id = "queued".into();
+    let mut other_assignment = assignment;
+    other_assignment.environment_id = other_spec.id.clone();
+    let other = node.environment(other_spec, other_assignment).unwrap();
+    let other_created = other.create().await.unwrap();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    *backend.checkpoint_gate.lock().unwrap() = Some(release.clone());
+    let first_pause =
+        tokio::spawn(async move { first.pause(pause(first_created.record.revision)).await });
+    backend.checkpoint_entered.notified().await;
+    let mut request = pause(other_created.record.revision);
+    request.operation_id = "pause-queued".into();
+    request.timeout_seconds = 1;
+    let result = tokio::time::timeout(Duration::from_secs(2), other.pause(request)).await;
+    assert!(matches!(result, Ok(Err(Error::Unavailable(_)))));
+    assert_eq!(
+        other.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    let events = backend.events.lock().unwrap().clone();
+    assert_eq!(events.iter().filter(|event| *event == "retire").count(), 1);
+    assert_eq!(*backend.prepare_ids.lock().unwrap(), vec!["pause-a"]);
+    release.notify_one();
+    first_pause.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -2978,6 +3099,15 @@ async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker
 
 #[tokio::test]
 async fn object_pause_seeds_same_node_resume_without_remote_manifest() {
+    verify_same_node_cache(false).await;
+}
+
+#[tokio::test]
+async fn invalidated_pause_recovers_on_the_same_node_without_downloading() {
+    verify_same_node_cache(true).await;
+}
+
+async fn verify_same_node_cache(reassigned: bool) {
     use adxlet::checkpoint::ObjectCheckpointStore;
     use object_store::{ObjectStore, ObjectStoreExt};
     let (root, backend, _, spec, assignment) = fixture();
@@ -3014,9 +3144,29 @@ async fn object_pause_seeds_same_node_resume_without_remote_manifest() {
         )))
         .await
         .unwrap();
-    let running = h.resume(resume(paused.record.revision)).await.unwrap();
+    let running = if reassigned {
+        let mut recovered = paused.record;
+        let origin = adx_core::runtime::RuntimeIdentity {
+            environment_id: recovered.spec.id.clone(),
+            ownership_generation: recovered.assignment.generation,
+            runtime_id: recovered.runtime.id.clone(),
+        };
+        recovered.checkpoint.as_mut().unwrap().origin = Some(origin);
+        recovered.assignment.generation += 1;
+        recovered.revision = 1;
+        recovered.runtime.id =
+            adx_core::runtime_id(&recovered.spec.id, recovered.assignment.generation);
+        recovered.last_operation = None;
+        node.recover_environment(recovered).await.unwrap()
+    } else {
+        h.resume(resume(paused.record.revision)).await.unwrap()
+    };
     assert_eq!(running.record.state, EnvironmentState::Running);
-    h.delete().await.unwrap();
+    node.environment(running.record.spec, running.record.assignment)
+        .unwrap()
+        .delete()
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]

@@ -43,6 +43,7 @@ impl Controller {
         demand: u64,
         origin: super::PauseOrigin,
     ) -> Result<()> {
+        let admission = self.checkpoint_admission(request.timeout_seconds).await?;
         if !self
             .services
             .routes
@@ -65,7 +66,10 @@ impl Controller {
             });
             let trace = adx_observability::trace::Trace::child("environment.auto_pause");
             trace.attribute("environment.id", self.record.spec.id.clone());
-            trace.run_result(self.pause(request)).await.map(|_| ())
+            trace
+                .run_result(self.pause_with_admission(request, Some(admission)))
+                .await
+                .map(|_| ())
         }
         .await;
         self.auto_pause_guard = None;
@@ -313,10 +317,18 @@ impl Controller {
         }
     }
     pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
+        self.pause_with_admission(request, None).await
+    }
+
+    async fn pause_with_admission(
+        &mut self,
+        request: PauseRequest,
+        admission: Option<(tokio::time::Instant, tokio::sync::OwnedSemaphorePermit)>,
+    ) -> Result<OperationResult> {
         let intent = self.pause_intent();
         let services = self.services.clone();
         let mut attempt = services.metrics.operation_attempt("pause", intent);
-        let result = self.pause_inner(request).await;
+        let result = Box::pin(self.pause_inner(request, admission)).await;
         let cleared = self.clear_operation_intent().await;
         let result = match (result, cleared) {
             (Ok(value), Ok(())) => Ok(value),
@@ -325,7 +337,11 @@ impl Controller {
         attempt.finish(&result);
         result
     }
-    async fn pause_inner(&mut self, request: PauseRequest) -> Result<OperationResult> {
+    async fn pause_inner(
+        &mut self,
+        request: PauseRequest,
+        admission: Option<(tokio::time::Instant, tokio::sync::OwnedSemaphorePermit)>,
+    ) -> Result<OperationResult> {
         if request.operation_id.starts_with("task:") {
             self.services.upgrade.management_grant(
                 &self.record.spec.id,
@@ -346,12 +362,10 @@ impl Controller {
         }
         let execution = self.services.execution(&self.record, "pause").await?;
         request.retention.validate()?;
-        if request.timeout_seconds == 0 || request.timeout_seconds > 3600 {
-            return Err(Error::Invalid(
-                "positive checkpoint TTL and timeout (at most 3600 seconds) required".into(),
-            ));
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(request.timeout_seconds);
+        let (deadline, permit) = match admission {
+            Some(admission) => admission,
+            None => self.checkpoint_admission(request.timeout_seconds).await?,
+        };
         let planned = request.operation_id.starts_with("task:");
         let idle_revision = if planned {
             match self.wait_upgrade_idle(deadline).await {
@@ -364,13 +378,38 @@ impl Controller {
         } else {
             None
         };
-        let result = self
-            .pause_checkpoint(request, &execution, deadline, idle_revision)
-            .await;
+        let result =
+            Box::pin(self.pause_checkpoint(request, &execution, deadline, idle_revision)).await;
+        drop(permit);
+        let result = match result {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => Box::pin(self.publish_paused_checkpoint()).await,
+            Err(error) => Err(error),
+        };
         if planned && self.record.state == EnvironmentState::Running {
             self.services.reopen_route(&self.record).await?;
         }
         result
+    }
+
+    async fn checkpoint_admission(
+        &self,
+        timeout_seconds: u64,
+    ) -> Result<(tokio::time::Instant, tokio::sync::OwnedSemaphorePermit)> {
+        if !(1..=3600).contains(&timeout_seconds) {
+            return Err(Error::Invalid(
+                "positive checkpoint TTL and timeout (at most 3600 seconds) required".into(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+        let permit = tokio::time::timeout_at(
+            deadline,
+            self.services.checkpoint_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Unavailable("pause timed out waiting for a checkpoint slot".into()))?
+        .map_err(|_| Error::Unavailable("checkpoint admission is closed".into()))?;
+        Ok((deadline, permit))
     }
 
     async fn wait_upgrade_idle(&mut self, deadline: tokio::time::Instant) -> Result<u64> {
@@ -407,7 +446,7 @@ impl Controller {
         execution: &ExecutionLease,
         deadline: tokio::time::Instant,
         idle_revision: Option<u64>,
-    ) -> Result<OperationResult> {
+    ) -> Result<Option<OperationResult>> {
         if tokio::time::Instant::now() >= deadline {
             return Err(Error::Unavailable(
                 "pause deadline exceeded before capture".into(),
@@ -471,7 +510,7 @@ impl Controller {
                 services.store.discard_staged(&staged).await?;
                 self.capture_preparation = None;
                 return if self.auto_pause_guard.is_some() {
-                    self.sync().await
+                    self.sync().await.map(Some)
                 } else {
                     Err(error)
                 };
@@ -515,7 +554,7 @@ impl Controller {
                     self.sync().await?;
                     return Err(error);
                 }
-                return self.sync().await;
+                return self.sync().await.map(Some);
             }
         }
         for reference in services
@@ -692,12 +731,34 @@ impl Controller {
             source_runtime_id: self.record.runtime.id.clone(),
         });
         self.transition(Event::Checkpointed)?;
+        self.pause_publication_pending = true;
         self.completed(
             request.operation_id,
             request.expected_revision,
             LifecycleKind::Pause,
         );
-        self.sync().await
+        Ok(None)
+    }
+
+    async fn publish_paused_checkpoint(&mut self) -> Result<OperationResult> {
+        for delay_ms in [200, 500, 1000, 2000] {
+            match self.sync().await {
+                Err(Error::Unavailable(_)) if self.durability != Some(Durability::Published) => {}
+                Ok(result) if result.durability == Durability::Journaled => {}
+                result => {
+                    if matches!(&result, Ok(res) if res.durability == Durability::Published) {
+                        self.pause_publication_pending = false;
+                    }
+                    return result;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        let result = self.sync().await;
+        if matches!(&result, Ok(res) if res.durability == Durability::Published) {
+            self.pause_publication_pending = false;
+        }
+        result
     }
     async fn restore_execution(
         &mut self,
@@ -977,7 +1038,10 @@ impl Controller {
                     "restore interrupted by accepted deletion".into(),
                 ).into());
             }
-            path = services.store.prepare_restore(&cp.artifact) => path?,
+            path = services.store.prepare_restore(&cp.artifact) => path.map_err(|error| ResumeFailure {
+                retry_admission: error == Error::NotFound,
+                error,
+            })?,
         };
         let prepare_restore_ms = prepare_started.elapsed().as_secs_f64() * 1_000.0;
         let input_started = Instant::now();

@@ -38,7 +38,8 @@ curl --fail --silent --show-error \
 All responses use ordinary JSON. Query values must be URL encoded. Unknown
 routes return 404. Invalid, blank or duplicate query parameters return 400;
 unknown Environment-query parameters also return 400. A missing node returns
-404. Unavailable state or Redis returns 503, never a successful empty result.
+404. Unavailable authoritative state returns 503. Scheduling writes also return
+503 when Redis is unavailable.
 Timeouts return 504 when a response can still be delivered. Errors have the form
 `{"error":{"code":"...","message":"..."}}`. A lost write response does not
 prove that the scheduling change failed; query the node again.
@@ -120,6 +121,11 @@ subsequent recovery requiring those bytes can fail.
 
 ## Environment query
 
+Ownership queries use the committed in-memory publication snapshot. The last
+committed view can be served during a Redis outage while the scheduler and
+catalog still consider it authoritative. The query returns 503 while either
+requires recovery.
+
 | Query parameter | Contract |
 | --- | --- |
 | `node_id` | Optional exact authoritative Assignment node ID |
@@ -130,7 +136,7 @@ subsequent recovery requiring those bytes can fail.
 
 Filters are applied before pagination. `tenant_id=system` filters the literal
 `system` tenant. Results are sorted by Environment ID. `count` is the total
-number matching all filters in this request's authoritative storage snapshot;
+number matching all filters in this request's committed publication snapshot;
 `instanceInfos` is the requested page. A page beyond the end is empty while
 `count` remains the matching total. `epoch` and `revision` identify the observed
 Coordinator session and control snapshot. Pages are separate observations, not

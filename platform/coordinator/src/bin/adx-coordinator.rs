@@ -562,6 +562,9 @@ async fn run_primary(
             if let Err(error) = collection_rpc.collect_checkpoint_cleanups().await {
                 adx_observability::warn!("checkpoint cleanup incomplete: {error}");
             }
+            if let Err(error) = collection_rpc.collect_retired_volume_references().await {
+                adx_observability::warn!("retired Volume reference collection incomplete: {error}");
+            }
             if let Err(error) = collection_rpc.collect_failed(collection_retention).await {
                 adx_observability::warn!("failed environment collection incomplete: {error}");
             }

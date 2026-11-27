@@ -13,6 +13,7 @@ struct Application {
     preparations: Mutex<Vec<(String, String, Value)>>,
     pauses: Mutex<Vec<(String, String, Value, String)>>,
     stall: bool,
+    pause_delay: Duration,
     absent: bool,
     state: Option<&'static str>,
 }
@@ -84,6 +85,7 @@ impl EnvironmentApplication for Application {
             .lock()
             .unwrap()
             .push((tenant.into(), id.into(), input, operation_id.into()));
+        tokio::time::sleep(self.pause_delay).await;
         if self.stall {
             std::future::pending().await
         } else {
@@ -276,7 +278,7 @@ async fn local_pause_forwards_prefixed_operation_id_and_budget() {
     assert_eq!(calls[0].3, calls[1].3);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn local_pause_timeout_is_unknown_so_callers_requery() {
     let app = Arc::new(Application {
         stall: true,
@@ -289,6 +291,23 @@ async fn local_pause_timeout_is_unknown_so_callers_requery() {
         environment.pause("tenant", "adx-id", 1).await,
         Err(EnvironmentError::OutcomeUnknown(_))
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_pause_waits_for_publication_after_the_capture_budget() {
+    let app = Arc::new(Application {
+        pause_delay: Duration::from_secs(14),
+        ..Default::default()
+    });
+    let env = LocalEnvironment::new(app.clone(), Duration::from_millis(50), None).unwrap();
+    assert_eq!(
+        env.pause("tenant", "adx-id", 1).await.unwrap().phase,
+        EnvironmentPhase::Paused
+    );
+    assert_eq!(
+        app.pauses.lock().unwrap()[0].2,
+        json!({"timeoutSeconds": 1})
+    );
 }
 
 #[tokio::test]

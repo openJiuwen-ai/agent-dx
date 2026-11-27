@@ -232,7 +232,7 @@ separate EXECD HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
-Public resume and authenticated Ingress demand call Coordinator EnsureRunning. It persists one intent, prefers original-node admission, and transfers a shared checkpoint only after definitive NoCapacity or owner invalidation. An ambiguous RPC retains the owner. Paused objects stay dormant on node loss. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
+Public resume and authenticated Ingress demand call Coordinator EnsureRunning. It persists one intent and prefers original-node admission. After owner invalidation, a healthy compatible source remains preferred for a shared checkpoint under a fresh assignment generation. An unavailable source or a definitive rejection allows another compatible node to restore. An ambiguous RPC retains the assigned owner. Paused objects stay dormant on node loss. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
 
 ## Idle pause and auto resume
 
@@ -270,7 +270,7 @@ snapshot belongs to the verified API Key identity. The service replaces incoming
 
 Raw `timeoutSeconds` is honored for reusable snapshots and pause: it defaults
 to 300 and must be from 1 through 3600 when supplied. API Server encodes it into the Node checkpoint RPC timeout. The RPC context additionally includes the configured transport timeout. Pause accepts optional `retention`; omission inherits the creation policy.
-The capture budget does not bound subsequent OBS publication or the entire pause. Snapshot and Pause are currently the only lifecycle bodies with a
+The capture budget includes waiting for a node checkpoint slot. Expiring in that queue returns unavailable before workload preparation or route retirement. Subsequent OBS and state publication run after capture with their own limits. Snapshot and Pause are currently the only lifecycle bodies with a
 caller-provided logical timeout; SDK HTTP transport waits use that logical
 value plus a 30-second buffer. Reusable Snapshot uses one SDK transport
 attempt, while Pause uses the lifecycle retry policy.
@@ -376,7 +376,7 @@ final event—not a later HTTP status—is the completion boundary.
 
 ## Pause, resume, and publication
 
-Pause requires a complete checkpoint, positive size, matching request/snapshot ID and a published Paused record. Object-storage upload must finish before submission. A local SQLite Journaled result means cluster publication is pending and returns an unavailable error, not pause success.
+Pause requires a complete checkpoint, positive size, matching request/snapshot ID and a published Paused record. Object-storage upload must finish before submission. The node retries a temporarily unavailable Paused commit with bounded backoff. A local SQLite Journaled result means cluster publication is pending and returns an unavailable error.
 
 Resume requires a matching Running record, completed EXECD readiness and Relay binding, followed by Coordinator/Redis submission. `functionProxyId` is a retained HTTP field populated with the node ID; it does not imply a FunctionProxy process. Current `portMappings` is empty. Coordinator route publication and Ingress receiving that update are asynchronous; a successful operation does not guarantee every Ingress already has the new route.
 

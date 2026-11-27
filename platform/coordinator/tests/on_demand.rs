@@ -1019,6 +1019,16 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
             serde_json::from_str(body).unwrap(),
         )
     }
+    let mut redis = redis::Client::open(rig._redis.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: String = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut redis)
+        .await
+        .unwrap();
     let base = "/instance-manager/query-tenant-instances";
     let (code, page) = call(address, "GET", &format!("{base}?node_id=a&page_size=1")).await;
     assert_eq!(code, 200);
@@ -1063,6 +1073,15 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
             .await
             .0,
         404
+    );
+    let stats: redis::InfoDict = redis::cmd("INFO")
+        .arg("COMMANDSTATS")
+        .query_async(&mut redis)
+        .await
+        .unwrap();
+    assert!(
+        stats.get::<String>("cmdstat_hgetall").is_none(),
+        "autoscaling sampling must use committed publication"
     );
     let (code, queue) = call(address, "GET", "/global-scheduler/scheduling_queue").await;
     assert_eq!(code, 200);
@@ -1157,10 +1176,18 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
         404
     );
     rig._redis.crash();
-    let (code, error) = call(address, "GET", &format!("{base}?node_id=a")).await;
+    let (code, page) = call(address, "GET", &format!("{base}?node_id=a")).await;
+    assert_eq!(code, 200);
+    assert_eq!(page["count"], 2);
+    assert_eq!(page["node"]["scheduling_paused"], false);
+    let (code, error) = call(
+        address,
+        "POST",
+        "/global-scheduler/node/localschedulingstatus?node_id=a",
+    )
+    .await;
     assert_eq!(code, 503);
     assert_eq!(error["error"]["code"], "Unavailable");
-    assert!(error.get("count").is_none());
     task.abort();
 }
 

@@ -9,6 +9,7 @@ mod transport;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
 pub use artifacts::ArtifactDeletionGuard;
+pub(crate) use artifacts::{artifact_key, record_artifacts};
 mod collection;
 mod credentials;
 mod failure;
@@ -20,6 +21,7 @@ mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
+pub(crate) use recovery::validate_checkpoint_target;
 pub(crate) use recovery::{checkpoint_requirements, recovery_profile_requirements};
 pub use recovery::{LegacyCheckpointProof, LegacyCheckpointProofs};
 #[cfg(test)]
@@ -86,7 +88,7 @@ if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 
 local facts = cjson.decode(ARGV[7])
 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
 if (redis.call('HGET',KEYS[3],facts[4]) or '') ~= facts[5] then return 0 end
-local cleanup_cursor=13 + 2 * tonumber(ARGV[12])
+local cleanup_cursor=12 + 2 * tonumber(ARGV[11])
 if ARGV[cleanup_cursor] ~= '' and redis.call('HEXISTS',KEYS[6],ARGV[cleanup_cursor]) ~= 0 then return 2 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
 redis.call('HSET',KEYS[3],facts[4],facts[6])
@@ -94,10 +96,10 @@ redis.call('HDEL',KEYS[3],facts[1])
 redis.call('HDEL', KEYS[1], ARGV[3])
 if ARGV[8] ~= '' then
   redis.call('HSET',KEYS[1],'header',ARGV[9])
-  if ARGV[10] ~= '' then redis.call('HSET',KEYS[5],ARGV[10],ARGV[11]) end
+  if ARGV[10] ~= '' then redis.call('HDEL',KEYS[5],ARGV[10]) end
 end
-local cursor=13
-for _=1,tonumber(ARGV[12]) do
+local cursor=12
+for _=1,tonumber(ARGV[11]) do
   local key=ARGV[cursor]; local value=ARGV[cursor+1]
   if value == '' then redis.call('HDEL',KEYS[4],key) else redis.call('HSET',KEYS[4],key,value) end
   cursor=cursor+2
@@ -1018,15 +1020,10 @@ impl RedisStore {
         if let Some(catalog) = catalog {
             cmd.arg(&catalog.header_value)
                 .arg(encode(&catalog.advanced_header()?)?)
-                .arg(&receipt.environment_id)
-                .arg(catalog.reference_value(&receipt.environment_id)?);
+                .arg(&receipt.environment_id);
             catalog.append_writes(&mut cmd)?;
         } else {
-            cmd.arg(expected_header)
-                .arg(encode(header)?)
-                .arg("")
-                .arg("")
-                .arg(0);
+            cmd.arg(expected_header).arg(encode(header)?).arg("").arg(0);
         }
         if let Some(task) = cleanup {
             cmd.arg(task.id()).arg(encode(task)?);
@@ -1880,19 +1877,29 @@ impl Session {
                 .zip(record.session.as_ref())
                 .filter(|(previous, next)| previous.id != next.id)
             {
-                let mut catalog = self.volume_catalog().await?;
-                if Some(&catalog.header_value) != header_value.as_ref() {
+                let raw = self.store.raw().await?;
+                if raw.get(HEADER) != header_value.as_ref()
+                    || raw.get(&field) != node_value.as_ref()
+                {
                     continue;
                 }
-                let environments = snapshot(&catalog.control)?.environments;
-                if catalog.control.get(&field) != node_value.as_ref() {
+                let environments: Vec<_> = snapshot(&raw)?
+                    .environments
+                    .into_values()
+                    .filter(|environment| {
+                        environment.assignment.node_id == record.node.id
+                            && !environment.invalidated
+                            && volumes::has_volumes(&environment.spec)
+                    })
+                    .collect();
+                let mut catalog = self
+                    .volume_slice(environments.iter().map(|environment| &environment.spec), [])
+                    .await?;
+                if raw.get(HEADER) != Some(&catalog.header_value) {
                     continue;
                 }
-                for mut environment in environments.into_values().filter(|environment| {
-                    environment.assignment.node_id == record.node.id
-                        && !environment.invalidated
-                        && volumes::has_volumes(&environment.spec)
-                }) {
+                catalog.control = raw;
+                for mut environment in environments {
                     catalog.rebind_execution_session(&mut environment, &previous.id, &next.id)?;
                     fields.push((
                         format!("environment:{}", environment.spec.id),
@@ -2142,7 +2149,9 @@ impl Session {
                 return Err(Error::Conflict);
             }
             let catalog = if volumes::has_volumes(&record.spec) {
-                let mut catalog = self.volume_catalog().await?;
+                let mut catalog = self
+                    .volume_slice([&record.spec], [record.assignment.node_id.as_str()])
+                    .await?;
                 if Some(&catalog.header_value) != header_value.as_ref() {
                     continue;
                 }
@@ -2219,7 +2228,9 @@ impl Session {
                 return Err(Error::Conflict);
             }
             let mut catalog = if volumes::has_volumes(&stored_environment.spec) {
-                let mut catalog = self.volume_catalog().await?;
+                let mut catalog = self
+                    .volume_slice([&stored_environment.spec], [replacement.node_id.as_str()])
+                    .await?;
                 if Some(&catalog.header_value) != header_value.as_ref() {
                     continue;
                 }
@@ -2411,7 +2422,9 @@ impl Session {
                 });
             }
             let catalog = if volumes::has_volumes(&result.spec) {
-                let mut catalog = self.volume_catalog().await?;
+                let mut catalog = self
+                    .volume_slice([&result.spec], [result.assignment.node_id.as_str()])
+                    .await?;
                 if Some(&catalog.header_value) != header_value.as_ref() {
                     continue;
                 }

@@ -511,6 +511,7 @@ fn spawn_controller(
         record,
         services,
         durability,
+        pause_publication_pending: false,
         retired: false,
         authority_fenced,
         recovery_pending: false,
@@ -1141,6 +1142,7 @@ struct Controller {
     services: Arc<Services>,
     held: bool,
     durability: Option<Durability>,
+    pause_publication_pending: bool,
     retired: bool,
     authority_fenced: bool,
     // Retrying full recovery must not consume a fresh claim fenced only by comparison.

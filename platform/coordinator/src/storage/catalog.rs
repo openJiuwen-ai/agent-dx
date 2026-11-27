@@ -28,6 +28,7 @@ impl PublicationValue {
 #[derive(Default)]
 pub(super) struct Catalog {
     pub(super) epoch: u64,
+    transport_generation: u64,
     revision: u64,
     pub(super) nodes: BTreeMap<String, Arc<StoredNode>>,
     environments: BTreeMap<String, Arc<StoredEnvironment>>,
@@ -253,6 +254,7 @@ impl RedisStore {
             + 1;
         *catalog = Catalog {
             epoch,
+            transport_generation: self.connection.transport_generation.load(Ordering::Acquire),
             revision,
             nodes: saved
                 .nodes
@@ -360,7 +362,55 @@ impl Session {
             .catalog
             .lock()
             .expect("publication catalog invariant");
-        catalog.epoch == self.epoch && catalog.dirty.is_empty()
+        catalog.epoch == self.epoch
+            && catalog.dirty.is_empty()
+            && catalog.transport_generation
+                == self
+                    .store
+                    .connection
+                    .transport_generation
+                    .load(Ordering::Acquire)
+    }
+    pub(crate) fn reseed_disconnected_publication(&self, saved: &StoredSnapshot) {
+        let generation = self
+            .store
+            .connection
+            .transport_generation
+            .load(Ordering::Acquire);
+        let mut catalog = self
+            .store
+            .connection
+            .catalog
+            .lock()
+            .expect("publication catalog invariant");
+        if catalog.epoch != self.epoch || catalog.transport_generation != generation {
+            let revision = self
+                .store
+                .connection
+                .publication_sequence
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
+            *catalog = Catalog {
+                epoch: self.epoch,
+                transport_generation: generation,
+                revision,
+                nodes: saved
+                    .nodes
+                    .iter()
+                    .map(|(id, node)| (id.clone(), Arc::new(node.clone())))
+                    .collect(),
+                environments: saved
+                    .environments
+                    .iter()
+                    .map(|(id, env)| (id.clone(), Arc::new(env.clone())))
+                    .collect(),
+                dirty: BTreeSet::new(),
+                applied_revision: 0,
+                catching_up: true,
+                resets: catalog.resets,
+                skipped: catalog.skipped,
+            };
+        }
     }
     pub(crate) fn publication_snapshot(
         &self,
@@ -371,7 +421,15 @@ impl Session {
             .catalog
             .lock()
             .expect("publication catalog poisoned");
-        if catalog.epoch != self.epoch || !catalog.dirty.is_empty() {
+        if catalog.epoch != self.epoch
+            || !catalog.dirty.is_empty()
+            || catalog.transport_generation
+                != self
+                    .store
+                    .connection
+                    .transport_generation
+                    .load(Ordering::Acquire)
+        {
             return Err(Error::Unavailable(
                 "publication awaiting ambiguous write resolution".into(),
             ));
@@ -387,6 +445,25 @@ impl Session {
         ))
     }
     pub(crate) async fn repair_publication(&self) -> Result<()> {
+        let generation = self
+            .store
+            .connection
+            .transport_generation
+            .load(Ordering::Acquire);
+        let stale_transport = {
+            let catalog = self
+                .store
+                .connection
+                .catalog
+                .lock()
+                .expect("publication catalog poisoned");
+            catalog.epoch != self.epoch || catalog.transport_generation != generation
+        };
+        if stale_transport {
+            let saved = self.snapshot().await?;
+            self.store.seed_publication(self.epoch, saved);
+            return Ok(());
+        }
         // Repair only ambiguous objects, in bounded batches. Successful normal
         // commits never issue these reads and continuous unrelated writes cannot
         // invalidate this object-locked repair.

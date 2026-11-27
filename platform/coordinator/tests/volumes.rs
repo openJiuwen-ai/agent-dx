@@ -1722,6 +1722,13 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
     let mounted = environment("mounted", "workspace");
     let mut plain = environment("plain", "workspace");
     plain.execution.mounts.clear();
+    let client = redis::Client::open(rig.url.clone()).unwrap();
+    let mut redis = client.get_multiplexed_async_connection().await.unwrap();
+    let _: String = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut redis)
+        .await
+        .unwrap();
     let batch = session
         .claim_batch(vec![
             (mounted.clone(), candidate.clone()),
@@ -1729,8 +1736,6 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
         ])
         .await
         .unwrap();
-    let client = redis::Client::open(rig.url.clone()).unwrap();
-    let mut redis = client.get_multiplexed_async_connection().await.unwrap();
     let pending: Vec<String> = redis::cmd("KEYS")
         .arg("adx:{test}:control:v1:create-receipt:*")
         .query_async(&mut redis)
@@ -1813,21 +1818,87 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
                 },
             });
             record.revision += 1;
+            record.state = EnvironmentState::Paused;
+            record.resources_held = false;
+            record.runtime.ip = None;
+            session
+                .commit_releasing(
+                    record.clone(),
+                    &candidate.node_session_id,
+                    std::slice::from_ref(&runtime_id),
+                )
+                .await
+                .unwrap();
+            assert!(session
+                .get_volume("tenant", "workspace")
+                .await
+                .unwrap()
+                .occupancy
+                .is_none());
+
+            let intent = session
+                .request_resume(&record.spec.id, 1)
+                .await
+                .unwrap()
+                .resume
+                .unwrap();
+            let paused_revision = record.revision;
+            record.revision += 1;
+            record.runtime.id = adx_core::runtime_id_for_revision(
+                &record.spec.id,
+                record.assignment.generation,
+                record.revision,
+            );
+            record.state = EnvironmentState::Resuming;
+            record.resources_held = true;
+            session
+                .authorize_volumes(&record, &runtime_id, &candidate.node_session_id)
+                .await
+                .unwrap();
+            record.state = EnvironmentState::Running;
+            record.runtime.ip = Some("127.0.0.1".parse().unwrap());
+            record.revision += 1;
+            record.last_operation = Some(adx_core::CompletedOperation {
+                id: intent.operation_id,
+                expected_revision: paused_revision,
+                kind: adx_core::LifecycleKind::Resume,
+            });
             session.commit(record.clone()).await.unwrap();
         }
         record.runtime.ip = None;
         record.checkpoint = None;
         record.state = EnvironmentState::Deleted;
+        record.last_operation = None;
         record.resources_held = false;
         record.revision += 1;
         session
-            .commit_releasing(record.clone(), &candidate.node_session_id, &[runtime_id])
+            .commit_releasing(
+                record.clone(),
+                &candidate.node_session_id,
+                std::slice::from_ref(&record.runtime.id),
+            )
             .await
             .unwrap();
         let replay = session.commit_with_state(record.clone()).await.unwrap();
         assert_eq!(replay.result, record);
         assert!(replay.stored.is_none());
     }
+    let stats: redis::InfoDict = redis::cmd("INFO")
+        .arg("COMMANDSTATS")
+        .query_async(&mut redis)
+        .await
+        .unwrap();
+    assert!(
+        stats.get::<String>("cmdstat_hgetall").is_none(),
+        "lifecycle hot paths must use point reads"
+    );
+    let references: Option<String> = redis::cmd("HGET")
+        .arg("adx:{test}:control:v1:volume-references")
+        .arg("mounted")
+        .query_async(&mut redis)
+        .await
+        .unwrap();
+    assert!(references.is_none());
     let cleanup = session.checkpoint_cleanups().await.unwrap();
     assert_eq!(cleanup.len(), 1);
     assert_eq!(cleanup[0].artifacts[0].location, "volume-checkpoint");

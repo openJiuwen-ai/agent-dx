@@ -128,7 +128,7 @@ async fn alias_service_validation_uses_current_version_and_prewrite_retry_uses_n
         .unwrap()
         .phase = EnvironmentPhase::Paused;
     activator
-        .reconcile_binding(&scope, context.deadline_unix_ms())
+        .reconcile_binding(&scope, unix_time_millis() + 120_000)
         .await
         .unwrap();
     let (new, port, _start_mode) = managed

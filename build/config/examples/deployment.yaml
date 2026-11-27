@@ -68,6 +68,7 @@ services:
         key_file: /opt/adx/data/runtime-control-key
       execd_env: {}
       checkpoint_dir: /opt/adx/data/checkpoints
+      max_concurrent_checkpoints: 100
       resource_source:
         kind: auto
         disk_path: /opt/adx/data

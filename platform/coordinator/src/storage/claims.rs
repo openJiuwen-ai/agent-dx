@@ -293,7 +293,17 @@ impl Session {
                 .flatten()
                 .unwrap_or_else(|| "0".into());
             let mut catalog = if uses_volumes {
-                let catalog = self.volume_catalog().await?;
+                let catalog = self
+                    .volume_slice(
+                        claims
+                            .iter()
+                            .filter(|(spec, _)| volumes::has_volumes(spec))
+                            .map(|(spec, _)| spec),
+                        claims
+                            .iter()
+                            .map(|(_, candidate)| candidate.node_id.as_str()),
+                    )
+                    .await?;
                 if catalog.header_value != header_value {
                     continue;
                 }

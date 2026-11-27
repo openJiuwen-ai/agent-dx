@@ -293,6 +293,29 @@ impl Environment for LocalEnvironment {
         id: &str,
         timeout_seconds: u64,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.pause_with_attempt(tenant, id, timeout_seconds, None)
+            .await
+    }
+    async fn pause_attempt(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+        attempt: u8,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.pause_with_attempt(tenant, id, timeout_seconds, Some(attempt))
+            .await
+    }
+}
+
+impl LocalEnvironment {
+    async fn pause_with_attempt(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+        attempt: Option<u8>,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         environment_request::validate_identity(tenant)?;
         environment_request::validate_identity(id)?;
         if !(1..=3600).contains(&timeout_seconds) {
@@ -300,10 +323,10 @@ impl Environment for LocalEnvironment {
                 "pause timeout_seconds out of API bounds 1..=3600".into(),
             ));
         }
-        let operation_id = environment_request::pause_operation_id(tenant, id)?;
+        let operation_id = environment_request::pause_attempt_operation_id(tenant, id, attempt)?;
         let input = environment_request::pause_input(timeout_seconds);
         let value = tokio::time::timeout(
-            Duration::from_secs(timeout_seconds),
+            environment_request::pause_response_timeout(timeout_seconds),
             self.application
                 .pause_request(tenant, id, input, &operation_id),
         )

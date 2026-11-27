@@ -166,7 +166,7 @@ finally:
         environment.close()
 ```
 
-先安装包内 `sdk/` 下的 wheel。暂停/恢复需使用支持 checkpoint 的后端并准备制品目录或对象存储，不能用 runc 的基础创建验收替代，见 [快照与存储](../testing/snapshot-storage.md)。组件日志位于部署的 `state_dir/logs/`；就绪失败优先检查证书、Redis、资源源、sandboxd、Execd 与 Relay 绑定。
+先安装包内 `sdk/` 下的 wheel。暂停/恢复需使用支持 checkpoint 的后端并准备制品目录或对象存储，不能用 runc 的基础创建验收替代，见 [快照与存储](../testing/snapshot-storage.md)。每个 `adxlet` 默认同时处理 100 个生命周期 Checkpoint，可在节点配置中按快照大小和磁盘能力通过 `max_concurrent_checkpoints` 限制。组件日志位于部署的 `state_dir/logs/`；就绪失败优先检查证书、Redis、资源源、sandboxd、Execd 与 Relay 绑定。
 
 SDK 中的 runtime 及资源数值应与已准备的 sandboxd 后端匹配。例如 Firecracker 验收使用 `runtime='firecracker', cpu=1000, memory=512`；部署配置的角色、身份和内部调用链无需因此更换。
 

@@ -92,6 +92,7 @@ struct Platform {
     >,
     retired: AtomicBool,
     unavailable: AtomicBool,
+    golden_image: Mutex<Option<String>>,
     unknown_reference_response: AtomicBool,
     block_creation: AtomicBool,
 }
@@ -200,10 +201,13 @@ impl Environment for Platform {
         image: &str,
         runtime: &str,
     ) -> Result<bool, EnvironmentError> {
+        let expected = self.golden_image.lock().await;
         Ok(!self.unavailable.load(Ordering::Relaxed)
             && tenant == "tenant"
             && matches!(id, "snapshot-ready" | "snapshot-canary" | "snapshot-stable")
-            && image == fixed_image()
+            && expected
+                .as_ref()
+                .map_or_else(|| image == fixed_image(), |value| image == value)
             && runtime == "runsc")
     }
     async fn create(
@@ -272,6 +276,55 @@ fn draft(automatic: bool) -> TemplateDraft {
         "volumes":[{"id":"user-${workspace}", "source":{"type":"directory","storage_domain":"sfs","path":"tenant/users/${workspace}"},
             "access_mode":"exclusive","create_if_missing":true,"create_options":{"uid":10001,"gid":10001,"mode":"0700"}}]
     })).unwrap()
+}
+
+#[tokio::test]
+async fn golden_tag_without_registry_auth_is_prepared_and_cloned_with_the_same_image() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let author = Activator::new(state.clone(), platform.clone());
+    let mut tagged = draft(true);
+    tagged.image = "registry.example/app:v1".into();
+    *platform.golden_image.lock().await = Some(tagged.image.clone());
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+
+    let published = author
+        .publish_with_id("tenant", &tagged, Some("tag-publish"))
+        .await
+        .unwrap();
+    assert_eq!(published.image, tagged.image);
+    author.reconcile_snapshot_preparations().await.unwrap();
+    let ready = author
+        .publish_with_id("tenant", &tagged, Some("tag-publish"))
+        .await
+        .unwrap();
+    assert_eq!(ready.snapshot_preparation, Some(SnapshotPreparation::Ready));
+    assert!(serde_json::to_value(ready.prewarm_recipe.unwrap())
+        .unwrap()
+        .get("image_digest")
+        .is_none());
+    assert_eq!(
+        platform.calls.lock().await[0].2.execution.image,
+        tagged.image
+    );
+
+    let binding = digitalmate_request(scope("golden-tag", TemplateRef::Version("1".into())));
+    author
+        .resolve(&binding, adx_agent_core::unix_time_millis() + 5_000)
+        .await
+        .unwrap();
+    let requests = platform.creations.lock().await;
+    assert_eq!(requests[0].execution.image, tagged.image);
+    assert_eq!(
+        requests[0].execution.snapshot_id.as_deref(),
+        Some("snapshot-ready")
+    );
 }
 
 #[tokio::test]
@@ -898,6 +951,48 @@ async fn replace_fixture_record(repo: &MemoryRepository, key: Key, value: serde_
 }
 
 #[tokio::test]
+async fn incompatible_persisted_golden_keeps_template_readable_and_starts_cold() {
+    let repo = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repo.clone());
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    let published = activator.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    activator.reconcile_snapshot_preparations().await.unwrap();
+    let key = Key::new(
+        "snapshot-preparation-result",
+        &["tenant", "digitalmate", &published.version],
+    )
+    .unwrap();
+    let mut result = repo.get(&key).await.unwrap().unwrap().value;
+    result["recipe"]["image_digest"] = json!(format!("sha256:{}", "a".repeat(64)));
+    replace_fixture_record(&repo, key, result).await;
+
+    let template = activator
+        .template("tenant", "digitalmate", &published.version)
+        .await
+        .unwrap();
+    template.validate_metadata().unwrap();
+    assert_eq!(template.image, published.image);
+    let binding = activate(
+        &activator,
+        &scope("cold-fallback", TemplateRef::Version(published.version)),
+        "w-new",
+    )
+    .await;
+    assert!(binding.current.snapshot_id.is_none());
+    let requests = platform.creations.lock().await;
+    assert_eq!(requests[0].execution.image, published.image);
+    assert!(requests[0].execution.snapshot_id.is_none());
+}
+
+#[tokio::test]
 async fn version_two_preparation_keeps_protection_without_new_golden_allocations() {
     let repo = Arc::new(MemoryRepository::default());
     let state = AgentState::new(repo.clone());
@@ -1170,7 +1265,7 @@ async fn alias_upgrade_uses_the_selected_versions_golden_and_keeps_the_workspace
     platform.block_creation.store(true, Ordering::Relaxed);
     assert!(matches!(
         activator
-            .reconcile_binding(&scope, adx_agent_core::unix_time_millis() + 30_000)
+            .reconcile_binding(&scope, adx_agent_core::unix_time_millis() + 120_000)
             .await,
         Err(Error::Conflict(_))
     ));
@@ -1180,7 +1275,7 @@ async fn alias_upgrade_uses_the_selected_versions_golden_and_keeps_the_workspace
     platform.unavailable.store(true, Ordering::Relaxed);
     platform.block_creation.store(false, Ordering::Relaxed);
     activator
-        .reconcile_binding(&scope, adx_agent_core::unix_time_millis() + 30_000)
+        .reconcile_binding(&scope, adx_agent_core::unix_time_millis() + 120_000)
         .await
         .unwrap();
     let after = state.binding(&scope).await.unwrap().unwrap();

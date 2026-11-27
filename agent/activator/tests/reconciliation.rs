@@ -10,15 +10,22 @@ use adx_agent_core::{
     environment::*,
     *,
 };
-use adx_agent_store::{discovery::RedisRegistry, AgentState, RedisRepository};
+use adx_agent_store::{
+    discovery::RedisRegistry, AgentState, Check, Key, Put, Record, RedisRepository, Repository,
+    Transaction,
+};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 #[derive(Default)]
-struct Platform(Mutex<BTreeMap<String, EnvironmentObservation>>);
+struct Platform(
+    Mutex<BTreeMap<String, EnvironmentObservation>>,
+    Mutex<Vec<u8>>,
+    Mutex<VecDeque<EnvironmentError>>,
+);
 #[async_trait::async_trait]
 impl Environment for Platform {
     async fn create(
@@ -68,6 +75,19 @@ impl Environment for Platform {
         record.ready = false;
         Ok(record.clone())
     }
+    async fn pause_attempt(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+        attempt: u8,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.1.lock().unwrap().push(attempt);
+        if let Some(error) = self.2.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.pause(tenant, id, timeout_seconds).await
+    }
 }
 
 fn ready_condition() -> adx_activator::registration::ConditionSource {
@@ -77,7 +97,7 @@ fn ready_condition() -> adx_activator::registration::ConditionSource {
 fn settings() -> ReconcileSettings {
     ReconcileSettings {
         concurrency: 2,
-        request_timeout_seconds: 5,
+        request_timeout_seconds: 120,
         membership_refresh_seconds: 1,
     }
 }
@@ -173,6 +193,202 @@ fn scope(id: &str) -> Scope {
 
 #[tokio::test]
 #[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
+async fn short_round_leaves_a_ready_candidate_running_for_the_next_round() {
+    let (_, _, state, activator, platform, mut config) = fixture().await;
+    let scope = scope("pause-budget");
+    let original = activator
+        .activate(&scope, None, unix_time_millis() + 5_000)
+        .await
+        .unwrap()
+        .binding;
+    pause_current(&platform, &state, &scope).await;
+    select(&state, &mut config, "2").await;
+    let short = activator
+        .reconcile_binding(&scope, unix_time_millis() + 15_000)
+        .await;
+    assert!(matches!(
+        short,
+        Err(adx_activator::Error::OutcomeUnknown(_))
+    ));
+    let binding = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(binding.current, original.current);
+    let candidate = binding.secondary.unwrap().environment.environment_id;
+    assert_eq!(
+        platform.0.lock().unwrap()[&candidate].phase,
+        EnvironmentPhase::Running
+    );
+    activator
+        .reconcile_binding(&scope, unix_time_millis() + 120_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .binding(&scope)
+            .await
+            .unwrap()
+            .unwrap()
+            .current
+            .version,
+        "2"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
+async fn candidate_pause_reuses_unknown_attempt_then_rotates_after_conflict() {
+    let (_, _, state, activator, platform, mut config) = fixture().await;
+    let scope = scope("pause-retry");
+    activator
+        .activate(&scope, None, unix_time_millis() + 5_000)
+        .await
+        .unwrap();
+    pause_current(&platform, &state, &scope).await;
+    select(&state, &mut config, "2").await;
+    platform.2.lock().unwrap().extend([
+        EnvironmentError::OutcomeUnknown("reply lost".into()),
+        EnvironmentError::Conflict("operation definitively rejected".into()),
+    ]);
+    for _ in 0..2 {
+        assert!(activator
+            .reconcile_binding(&scope, unix_time_millis() + 120_000)
+            .await
+            .is_err());
+    }
+    let replacement = Activator::new(state.clone(), platform.clone());
+    replacement
+        .reconcile_binding(&scope, unix_time_millis() + 120_000)
+        .await
+        .unwrap();
+    assert_eq!(*platform.1.lock().unwrap(), vec![0, 0, 1]);
+    assert_eq!(
+        state
+            .binding(&scope)
+            .await
+            .unwrap()
+            .unwrap()
+            .current
+            .version,
+        "2"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
+async fn failed_candidate_rebuilds_wait_through_long_cooldowns_and_recover() {
+    let (store, registry, state, activator, platform, mut config) = fixture().await;
+    let scope = scope("candidate-rebuild");
+    let original = activator
+        .activate(&scope, None, unix_time_millis() + 5_000)
+        .await
+        .unwrap()
+        .binding;
+    pause_current(&platform, &state, &scope).await;
+    select(&state, &mut config, "2").await;
+    let key = Key::new(
+        "binding-rollout",
+        &["tenant", "agent", "alias", "production", &scope.binding_id],
+    )
+    .unwrap();
+    let deadline = unix_time_millis() + 120_000;
+    for (failed, delay) in [5_u64, 15, 45, 120, 300, 300].into_iter().enumerate() {
+        let short = activator
+            .reconcile_binding(&scope, unix_time_millis() + 15_000)
+            .await;
+        assert!(matches!(
+            short,
+            Err(adx_activator::Error::OutcomeUnknown(_))
+        ));
+        let candidate = state
+            .binding(&scope)
+            .await
+            .unwrap()
+            .unwrap()
+            .secondary
+            .unwrap()
+            .environment;
+        platform
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&candidate.environment_id)
+            .unwrap()
+            .phase = EnvironmentPhase::Failed;
+        let before = unix_time_millis();
+        assert!(!activator.reconcile_binding(&scope, deadline).await.unwrap());
+        assert!(!activator.reconcile_binding(&scope, deadline).await.unwrap());
+        assert_eq!(
+            platform.0.lock().unwrap()[&candidate.environment_id].phase,
+            EnvironmentPhase::Deleted
+        );
+
+        let progress = store.get(&key).await.unwrap().unwrap();
+        let retry_at = progress.value["retry_after_unix_ms"].as_u64().unwrap();
+        assert_eq!(progress.value["failed_candidates"], failed + 1);
+        assert!(retry_at >= before + delay * 1_000);
+        assert!(retry_at <= unix_time_millis() + delay * 1_000);
+
+        let restarted = Activator::new(state.clone(), platform.clone());
+        for _ in 0..2 {
+            assert!(matches!(
+                restarted.reconcile_binding(&scope, deadline).await,
+                Err(adx_activator::Error::CreationDeferred { retry_after_unix_ms }) if retry_after_unix_ms == retry_at
+            ));
+        }
+        let binding = state.binding(&scope).await.unwrap().unwrap();
+        assert_eq!(binding.current, original.current);
+        assert!(binding.secondary.is_none());
+        assert_eq!(platform.0.lock().unwrap().len(), failed + 2);
+
+        // Age only the persisted deadline, without waiting five minutes per test.
+        let mut due = progress.value;
+        let next_retry = if failed == 5 {
+            unix_time_millis() + 500
+        } else {
+            0
+        };
+        due["retry_after_unix_ms"] = next_retry.into();
+        assert!(store
+            .commit(
+                &Transaction::new(
+                    vec![Check {
+                        key: key.clone(),
+                        expected: Some(progress.revision)
+                    }],
+                    vec![Put {
+                        key: key.clone(),
+                        record: Record::new(&due).unwrap()
+                    }],
+                )
+                .unwrap()
+            )
+            .await
+            .unwrap());
+    }
+    let restarted = Arc::new(Activator::new(state.clone(), platform));
+    let worker = Reconciliation::start(
+        restarted,
+        store.clone(),
+        registry,
+        registration("cooldown-restart"),
+        settings(),
+        true,
+        ready_condition(),
+    )
+    .await
+    .unwrap();
+    converged(&state, &scope, "2").await;
+    let binding = state.binding(&scope).await.unwrap().unwrap();
+    assert_ne!(
+        binding.current.environment_id,
+        original.current.environment_id
+    );
+    assert_eq!(binding.current.version, "2");
+    assert!(store.get(&key).await.unwrap().is_none());
+    worker.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
 async fn member_removal_transfers_unfinished_bindings_without_an_alias_update() {
     let (store, registry, state, activator, platform, mut config) = fixture().await;
     let members: Vec<_> = ["departing", "survivor"]
@@ -205,7 +421,10 @@ async fn member_removal_transfers_unfinished_bindings_without_an_alias_update() 
         store,
         registry.clone(),
         registration("survivor"),
-        settings(),
+        ReconcileSettings {
+            request_timeout_seconds: 60,
+            ..settings()
+        },
         true,
         ready_condition(),
     )

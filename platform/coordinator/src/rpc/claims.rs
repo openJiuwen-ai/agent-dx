@@ -4,17 +4,61 @@ use crate::storage::{ClaimOutcome, LocalClaim};
 use adx_core::snapshots::Reference;
 use pb::claim_environment_response::Outcome;
 
+#[derive(Default)]
+pub(super) struct RecoveryBackoff {
+    failures: usize,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl RecoveryBackoff {
+    fn check(&self) -> Result<()> {
+        if self
+            .retry_at
+            .is_some_and(|retry_at| tokio::time::Instant::now() < retry_at)
+        {
+            return Err(Error::Unavailable(
+                "scheduler recovery retry is deferred".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Arm before the first await so cancellation also leaves a cooldown.
+    fn start(&mut self) {
+        self.failures = (self.failures + 1).min(4);
+        self.defer();
+    }
+
+    fn defer(&mut self) {
+        let delay = [200, 500, 1000, 2000][self.failures - 1];
+        self.retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(delay));
+    }
+}
+
 impl State {
     pub(super) async fn recover_authoritative_state(&mut self) -> Result<()> {
         if !self.needs_recovery && self.session.inspection_ready().await {
             return Ok(());
         }
         self.needs_recovery = true;
+        self.recovery_backoff.check()?;
+        self.recovery_backoff.start();
+        if let Err(error) = self.load_authoritative_state().await {
+            self.recovery_backoff.defer();
+            return Err(error);
+        }
+        self.recovery_backoff = RecoveryBackoff::default();
+        self.needs_recovery = false;
+        Ok(())
+    }
+
+    async fn load_authoritative_state(&mut self) -> Result<()> {
         // The failed writer has returned. Fence only optional claims before
         // loading their authoritative outcomes; lifecycle objects are independent.
         self.session.claim_barrier().await?;
         let mut saved = self.session.snapshot().await?;
         self.session.refresh_inspection_inventory().await?;
+        self.session.reseed_disconnected_publication(&saved);
         // Both local and central assignments may already be executing before
         // first-result publication. Preserve them during in-process repair;
         // requeuing loses their owner and makes the node's commit NotFound.
@@ -99,7 +143,6 @@ impl State {
         for (id, record) in &self.environments {
             self.specs.insert(id.clone(), record.spec.clone());
         }
-        self.needs_recovery = false;
         self.refresh_volume_waiters().await?;
         Ok(())
     }

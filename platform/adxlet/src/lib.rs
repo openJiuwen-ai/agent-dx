@@ -529,6 +529,9 @@ impl Admission {
     }
 }
 
+/// Default per-adxlet limit for concurrent lifecycle checkpoints.
+pub const DEFAULT_MAX_CONCURRENT_CHECKPOINTS: usize = 100;
+
 pub(crate) struct Services {
     runtime: Arc<dyn RuntimeDriver>,
     runtime_control: Option<runtime_control::RuntimeControlClient>,
@@ -542,6 +545,7 @@ pub(crate) struct Services {
     pressure_pause_ledger: Arc<Mutex<PressurePauseLedger>>,
     operation_timeout: Duration,
     checkpoint: Option<Arc<checkpoint::CheckpointServices>>,
+    checkpoint_slots: Arc<tokio::sync::Semaphore>,
     snapshots: Option<Arc<dyn checkpoint::SnapshotCatalog>>,
     metrics: metrics::Metrics,
     health_failure_threshold: Option<u32>,
@@ -661,6 +665,9 @@ impl Adxlet {
                 pressure_pause_ledger: Arc::new(Mutex::new(PressurePauseLedger::default())),
                 operation_timeout: Duration::from_secs(30),
                 checkpoint: None,
+                checkpoint_slots: Arc::new(tokio::sync::Semaphore::new(
+                    DEFAULT_MAX_CONCURRENT_CHECKPOINTS,
+                )),
                 snapshots: None,
                 metrics: metrics::Metrics::default(),
                 health_failure_threshold: None,
@@ -717,6 +724,20 @@ impl Adxlet {
         Arc::get_mut(&mut self.services)
             .ok_or(Error::Conflict)?
             .snapshots = Some(catalog);
+        Ok(self)
+    }
+
+    /// Limit concurrent lifecycle checkpoints before creating Environment handles.
+    /// Returns Invalid for a zero limit or a value exceeding semaphore capacity.
+    pub fn with_max_concurrent_checkpoints(mut self, limit: usize) -> Result<Self> {
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&limit) {
+            return Err(Error::Invalid(
+                "max_concurrent_checkpoints is out of range".into(),
+            ));
+        }
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .checkpoint_slots = Arc::new(tokio::sync::Semaphore::new(limit));
         Ok(self)
     }
 

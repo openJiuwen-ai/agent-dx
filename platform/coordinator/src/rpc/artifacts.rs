@@ -1,36 +1,40 @@
 //! Shared artifact deletion is performed by Coordinator, without a source-node RPC.
 use super::*;
+use crate::storage::{artifact_key, record_artifacts};
+use adx_core::snapshots::SnapshotState;
+
+const SHARED_ARTIFACTS_PER_SWEEP: usize = 16;
+
 impl CoordinatorRpc {
     pub async fn collect_shared_artifacts(&self) -> Result<usize> {
-        let (session, candidates) = {
-            let state = self.0.state.lock().await;
+        let session = {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await?;
             state.healthy()?;
-            let snapshots = state.session.retained_snapshots().await?;
-            let holds = state.session.execution_holds().await?;
-            let candidates = state
-                .session
-                .shared_artifacts()
-                .await?
-                .into_iter()
-                .filter(|artifact| {
-                    !holds.iter().any(|h| {
-                        h.artifacts.iter().any(|a| {
-                            a.storage == artifact.storage && a.location == artifact.location
-                        })
-                    }) && !snapshots.iter().any(|s| &s.artifact == artifact)
-                        && !state.environments.values().any(|e| {
-                            e.result.as_ref().is_some_and(|r| {
-                                r.checkpoint
-                                    .iter()
-                                    .chain(r.snapshot_source.iter())
-                                    .any(|p| &p.artifact == artifact)
-                                    || r.execution_artifacts.contains(artifact)
-                            })
-                        })
-                })
-                .collect::<Vec<_>>();
-            (state.session.clone(), candidates)
+            state.session.clone()
         };
+        let (publication, _) = session.publication_snapshot()?;
+        let (snapshots, holds) = session.inspection_inventory().await?;
+        let referenced: BTreeSet<_> = publication
+            .environments
+            .values()
+            .filter_map(|environment| environment.result.as_ref())
+            .flat_map(record_artifacts)
+            .chain(
+                snapshots
+                    .into_iter()
+                    .filter(|snapshot| snapshot.state != SnapshotState::Deleted)
+                    .map(|snapshot| snapshot.artifact),
+            )
+            .chain(holds.into_iter().flat_map(|hold| hold.artifacts))
+            .map(|artifact| artifact_key(&artifact))
+            .collect();
+        let candidates = session
+            .shared_artifacts()
+            .await?
+            .into_iter()
+            .filter(|artifact| !referenced.contains(&artifact_key(artifact)))
+            .take(SHARED_ARTIFACTS_PER_SWEEP);
         let stores = self
             .0
             .reclaimers
