@@ -96,10 +96,15 @@ impl AgentApi {
         })
     }
 
-    /// Bind an embedded Activator directly to the API Server's Environment service.
+    /// Bind an embedded Activator directly to the API Server's Environment
+    /// service. `draining` is the host process's shutdown flag; the embedded
+    /// Activator's member lease reports draining from the same instant the
+    /// host begins shutdown, so Gateway-side selection stops routing here
+    /// within one lease heartbeat instead of after lease expiry.
     pub async fn new_embedded(
         config: AgentConfig,
         environment: Arc<dyn Environment>,
+        draining: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if config.activator.is_some() {
             return Err(Error::Invalid("configure exactly one Activator mode".into()).into());
@@ -114,7 +119,7 @@ impl AgentApi {
             );
         }
         let control: Arc<dyn Control> =
-            Arc::new(LocalControl::connect(settings, environment).await?);
+            Arc::new(LocalControl::connect(settings, environment, draining).await?);
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
             request_timeout: timeout,

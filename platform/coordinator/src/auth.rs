@@ -3,7 +3,7 @@ use crate::storage::Session;
 use adx_core::{Error, Result};
 use adx_protocol::{
     auth::{Peers, Principal},
-    control as pb, status,
+    control as pb, not_accepted, status,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,10 +115,40 @@ fn new_api_key() -> String {
 pub struct AuthRpc {
     session: Session,
     peers: Peers,
+    draining: tokio::sync::watch::Receiver<bool>,
 }
 impl AuthRpc {
     pub fn new(session: Session, peers: Peers) -> Self {
-        Self { session, peers }
+        Self {
+            session,
+            peers,
+            draining: tokio::sync::watch::channel(false).1,
+        }
+    }
+    /// Construct with the handover draining flag shared with the RPC
+    /// admission gate (see `CoordinatorRpc::begin_drain` and
+    /// `CoordinatorRpc::draining_receiver`).
+    pub fn with_draining(
+        session: Session,
+        peers: Peers,
+        draining: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            session,
+            peers,
+            draining,
+        }
+    }
+    /// Handover admission gate for credential writes; same contract as
+    /// `CoordinatorRpc::admission`.
+    fn admission(&self) -> std::result::Result<(), Status> {
+        if *self.draining.borrow() {
+            Err(not_accepted(
+                "Coordinator handover in progress; operation not accepted",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 #[tonic::async_trait]
@@ -181,6 +211,7 @@ impl pb::credential_service_server::CredentialService for AuthRpc {
         request: Request<pb::CreateTenantKeyRequest>,
     ) -> std::result::Result<Response<pb::CreateTenantKeyResponse>, Status> {
         self.admin(&request, request.get_ref().caller.as_ref())?;
+        self.admission()?;
         let r = request.into_inner();
         let api_key = new_api_key();
         let metadata = r
@@ -274,6 +305,7 @@ impl pb::credential_service_server::CredentialService for AuthRpc {
         request: Request<pb::RevokeTenantKeyRequest>,
     ) -> std::result::Result<Response<pb::RevokeTenantKeyResponse>, Status> {
         self.admin(&request, request.get_ref().caller.as_ref())?;
+        self.admission()?;
         let r = request.into_inner();
         if ((!r.id.is_empty()) as u8 + (!r.public_id.is_empty()) as u8) != 1 {
             return Err(Status::invalid_argument(

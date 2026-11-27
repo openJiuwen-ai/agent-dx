@@ -1051,6 +1051,14 @@ impl RedisStore {
         );
         Ok(applied == 1)
     }
+    /// Read the full control state without taking an epoch: the standby's
+    /// read-only view. Validates the hash like `begin` would, but never
+    /// writes — the header, and with it the fencing epoch, is untouched.
+    /// An empty hash (no primary has ever run) reports missing metadata.
+    pub async fn read_snapshot(&self) -> Result<StoredSnapshot> {
+        snapshot(&self.raw().await?)
+    }
+
     /// Called once per Coordinator startup, never on a Redis reconnect. A new epoch
     /// rejects old Coordinator writes; this is fencing, not leader election or HA.
     pub async fn begin(&self, shards: usize) -> Result<Session> {
@@ -1521,9 +1529,14 @@ impl Session {
         self.register_session(node, address, proxy_address, None)
             .await
     }
-    /// Re-enable successful publication after a live process completes recovery.
-    /// Ordinary heartbeats never enter this transition or touch Redis.
-    async fn restore_node_publication(&self, id: &str, session_id: &str) -> Result<()> {
+    /// Re-enable successful publication after a live process completes
+    /// recovery: persist the routable session transition — with the current
+    /// report — to Redis, so a later primary change reads the session back
+    /// routable and the node continues serving without a full
+    /// reconciliation. Ordinary heartbeats never enter this transition or
+    /// touch Redis.
+    async fn restore_node_publication(&self, node: &Node, current: &NodeSession) -> Result<()> {
+        let id = node.id.clone();
         let field = format!("node:{id}");
         let token = format!("node-session:{id}");
         for _ in 0..ATTEMPTS {
@@ -1537,19 +1550,22 @@ impl Session {
             if registered
                 .session
                 .as_ref()
-                .is_none_or(|session| session.id != session_id)
+                .is_none_or(|stored| stored.id != current.id)
             {
                 return Err(Error::Conflict);
             }
-            if active.as_deref() == Some(session_id)
+            if active.as_deref() == Some(current.id.as_str())
                 && registered.last_incident_id.is_none()
                 && registered.retirement.is_none()
+                && registered.session.as_ref() == Some(current)
             {
                 return Ok(());
             }
-            if active.as_deref().is_some_and(|s| s != session_id) {
+            if active.as_deref().is_some_and(|s| s != current.id) {
                 return Err(Error::Conflict);
             }
+            registered.session = Some(current.clone());
+            registered.node = node.clone();
             registered.last_incident_id = None;
             registered.retirement = None;
             let mut command = redis::cmd("EVAL");
@@ -1568,7 +1584,7 @@ impl Session {
                 .arg(&field)
                 .arg(raw)
                 .arg(&token)
-                .arg(session_id)
+                .arg(&current.id)
                 .arg(encode(&registered)?)
                 .arg(active.as_deref().unwrap_or(""));
             let write = self
@@ -1579,7 +1595,7 @@ impl Session {
             write.finish(
                 applied,
                 vec![PublicationValue::Node(
-                    id.into(),
+                    id.clone(),
                     Some(Arc::new(registered)),
                 )],
             );
@@ -1638,12 +1654,12 @@ impl Session {
                     &mut node,
                     previous.node.labels.get(NODE_HOST_UUID_LABEL),
                 );
+                node.available &= !previous.scheduling_paused;
                 if let Some(current) = session.as_ref().filter(|current| {
                     current.routable && previous.session.as_ref().is_some_and(|old| !old.routable)
                 }) {
-                    self.restore_node_publication(&node.id, &current.id).await?;
+                    self.restore_node_publication(&node, current).await?;
                 }
-                node.available &= !previous.scheduling_paused;
                 let checkpoint_gc_fenced =
                     previous.checkpoint_gc_fenced && !session.as_ref().is_some_and(|s| s.routable);
                 let record = StoredNode {
@@ -1735,13 +1751,13 @@ impl Session {
                     && previous.proxy_address == proxy_address
                     && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
                 {
+                    node.available &= !previous.scheduling_paused;
                     if let Some(current) = session.as_ref().filter(|current| {
                         current.routable
                             && previous.session.as_ref().is_some_and(|old| !old.routable)
                     }) {
-                        self.restore_node_publication(&node.id, &current.id).await?;
+                        self.restore_node_publication(&node, current).await?;
                     }
-                    node.available &= !previous.scheduling_paused;
                     let checkpoint_gc_fenced = previous.checkpoint_gc_fenced
                         && !session.as_ref().is_some_and(|s| s.routable);
                     let record = StoredNode {

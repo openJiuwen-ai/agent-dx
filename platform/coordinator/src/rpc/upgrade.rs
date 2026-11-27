@@ -329,6 +329,14 @@ impl CoordinatorRpc {
             if method != hyper::Method::POST {
                 return Err(Error::NotFound);
             }
+            // Upgrade-task mutation is new work: the handover drain rejects
+            // it so the operator retries against the next primary (the
+            // persisted task record is the resumption fence).
+            if *self.0.draining.borrow() {
+                return Err(Error::Unavailable(
+                    "Coordinator handover in progress; operation not accepted".into(),
+                ));
+            }
             let _owner = self.0.upgrade_lock.lock().await;
             if suffix == "tasks" {
                 return self.begin_upgrade(parse(body)?).await;
@@ -899,6 +907,7 @@ impl CoordinatorRpc {
                         node_session_id: op.source_session_id.clone(),
                         run_timeout_seconds: None,
                         expected_revision: None,
+                        coordinator_epoch: session.epoch(),
                     })
                     .await
                     .map_err(adx_protocol::dependency_status)?
@@ -1586,6 +1595,7 @@ impl CoordinatorRpc {
                     node_session_id: source.id.clone(),
                     run_timeout_seconds: None,
                     expected_revision: Some(expected_revision),
+                    coordinator_epoch: session.epoch(),
                 })
                 .await
                 .map_err(adx_protocol::dependency_status)?
@@ -2117,6 +2127,7 @@ impl CoordinatorRpc {
                         .and_then(|intent| intent.run_timeout_seconds),
                     Duration::from_secs(600),
                     true,
+                    session.epoch(),
                 )
                 .await?;
                 stored = session.get(&r.environment_id).await?;

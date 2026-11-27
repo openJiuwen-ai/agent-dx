@@ -65,6 +65,8 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
+Coordinator 主切换/排空窗口对新的变更操作返回 `Unavailable` 并附带 gRPC trailer `adx-not-accepted: true`：该操作保证未入队、未产生任何效果，API Server 以同一请求身份对新主重试，对调用方表现为 `UNAVAILABLE / same_operation / not_started`，不进入 `OUTCOME_UNKNOWN`。已接纳操作的在途收尾回调（执行提交、卷初始化）与读路径在排空期继续服务。独立 Activator 的排空拒绝使用同名 HTTP 响应头（503 + `adx-not-accepted: true`），Gateway 客户端据此以同一请求体安全换成员重试。
+
 内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时归一为 504、`DEADLINE_EXCEEDED`；只有等待超时而没有确认终态时，仍使用 `outcome=unknown`、`retry=same_operation`。写请求的结果可能未知，创建重试沿用原 Request ID 和 Environment ID；尚未成功确认的执行可以重新分配 generation，并由对账回收残留。已确认成功和后续生命周期继续校验归属代次；不能因连接失败覆盖已有成功。
 
 认证依赖 Redis Coordinator 发现时，共享发现库仅对瞬态连接故障在同一绝对期限内至多重读一次幂等发现脚本。锁等待、连接建立及两次查询共用发现预算；API Server 的一次未缓存凭据验证还将发现、channel 获取和 `VerifyApiKey` 纳入同一原始 RPC 预算。坏记录、缺失记录、epoch 不匹配、Redis 认证／配置和命令错误不触发传输重读，仍拒绝认证；认证依赖不可用或预算耗尽对原生 HTTP 入口保持 503，无效 API Key 保持 401。此恢复不重放 API 写操作。连接故障阶段、错误类别、尝试次数和耗时在服务端结构化记录，不将 Redis URL、凭据或原始错误文本写入诊断；用例和执行入口见 [发现库](../../crates/discovery/README.md)。

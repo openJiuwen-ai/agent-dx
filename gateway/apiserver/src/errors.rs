@@ -50,6 +50,16 @@ impl<'a> ErrorDetail<'a> {
                 RetryDirective::SameOperation,
                 OperationOutcome::NotStarted,
             )
+        } else if adx_protocol::not_accepted_status(status) {
+            // A coordinator handover rejection carries the guarantee the
+            // operation was not accepted: the same identity may be retried
+            // against the next primary, regardless of what the operation
+            // would have done once started.
+            (
+                ErrorCode::Unavailable,
+                RetryDirective::SameOperation,
+                OperationOutcome::NotStarted,
+            )
         } else if scheduling_failure.is_some() {
             (
                 ErrorCode::DeadlineExceeded,
@@ -266,6 +276,21 @@ mod tests {
         assert!(status
             .message()
             .contains("backend preparation/runtime start"));
+    }
+
+    #[test]
+    fn handover_not_accepted_is_same_operation_not_started() {
+        let status = adx_protocol::not_accepted("Coordinator handover in progress");
+        let detail = ErrorDetail::from_status(
+            &status,
+            "request-a",
+            Some("pause-a"),
+            Some("instance-a"),
+            true,
+        );
+        assert_eq!(detail.code, ErrorCode::Unavailable);
+        assert_eq!(detail.retry, RetryDirective::SameOperation);
+        assert_eq!(detail.outcome, OperationOutcome::NotStarted);
     }
 
     #[test]

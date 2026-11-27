@@ -24,6 +24,37 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+/// Process-wide gauge of in-flight Activator operations that touch the
+/// Environment application or durable bindings (reconciliation jobs,
+/// snapshot preparation scans). Embedded hosts wait on it during shutdown:
+/// this work runs in the Activator's own tasks, invisible to the
+/// management-HTTP connection count.
+static IN_FLIGHT_OPERATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current number of in-flight Activator operations (see
+/// [`IN_FLIGHT_OPERATIONS`]).
+pub fn in_flight_operations() -> usize {
+    IN_FLIGHT_OPERATIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Hold one for the duration of an Activator operation; the count feeds the
+/// embedded host's shutdown completion criterion.
+pub struct OperationScope;
+
+impl OperationScope {
+    pub fn new() -> Self {
+        IN_FLIGHT_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OperationScope
+    }
+}
+
+impl Drop for OperationScope {
+    fn drop(&mut self) {
+        IN_FLIGHT_OPERATIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Process-local AgentBinding cache limits. Zero capacity disables caching.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]

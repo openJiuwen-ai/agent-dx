@@ -245,7 +245,7 @@ impl CoordinatorRpc {
         state.recover_authoritative_state().await?;
         state.healthy()?;
         let node = &record.assignment.node_id;
-        if state.overdue(node, self.0.heartbeat_timeout) {
+        if state.heartbeat_expired(node, self.0.heartbeat_timeout) {
             state.invalidate_node(node).await?;
         }
         if state
@@ -273,6 +273,13 @@ impl pb::volume_execution_service_server::VolumeExecutionService for Coordinator
         let trace = adx_observability::trace::Trace::rpc("coordinator.volume.authorize", &request);
         trace
             .run_result(async {
+                // In-flight tail of an already-admitted create or resume:
+                // the record's assignment exists and the caller is its live
+                // claimant, so this cannot start new work — creates enter
+                // through the gated intakes (see admission()). A drain that
+                // starts between allocation and this call must not fail the
+                // accepted create; the tail completes under the still-held
+                // lease, like begin_initialization and the execution commit.
                 let principal = self.0.peers.authenticate(&request)?;
                 let request = request.into_inner();
                 let record: EnvironmentRecord = request
@@ -379,6 +386,10 @@ impl pb::volume_execution_service_server::VolumeExecutionService for Coordinator
             adx_observability::trace::Trace::rpc("coordinator.volume.initialize.begin", &request);
         trace
             .run_result(async {
+                // In-flight tail of an already-admitted create: the volume
+                // was authorized (itself an ungated tail, see
+                // authorize_execution); initialization completes under the
+                // still-held lease (see admission()).
                 let principal = self.0.peers.authenticate(&request)?;
                 let request = request.into_inner();
                 let record: EnvironmentRecord = request
@@ -432,6 +443,10 @@ impl pb::volume_execution_service_server::VolumeExecutionService for Coordinator
         );
         trace
             .run_result(async {
+                // In-flight tail of an already-admitted create: the volume
+                // was authorized (itself an ungated tail, see
+                // authorize_execution); initialization completes under the
+                // still-held lease (see admission()).
                 let principal = self.0.peers.authenticate(&request)?;
                 let request = request.into_inner();
                 let execution = request
@@ -477,6 +492,7 @@ impl pb::volume_service_server::VolumeService for CoordinatorRpc {
             adx_observability::trace::Trace::rpc("coordinator.volume.release_owner", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("API Server identity required"));
                 }
@@ -537,6 +553,7 @@ impl pb::volume_service_server::VolumeService for CoordinatorRpc {
         let trace = adx_observability::trace::Trace::rpc("coordinator.volume.ensure", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("API Server identity required"));
                 }
@@ -649,6 +666,7 @@ impl pb::volume_service_server::VolumeService for CoordinatorRpc {
         let trace = adx_observability::trace::Trace::rpc("coordinator.volume.delete", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("API Server identity required"));
                 }

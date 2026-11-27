@@ -219,6 +219,11 @@ impl NodeRpc {
                 {
                     return Err(Status::data_loss("claim response identity changed"));
                 }
+                // The node issued this claim itself; a stale-primary answer is
+                // reconciled through the ordinary catalog cycle, so record the
+                // epoch without rejecting the caller's in-flight operation.
+                self.manager
+                    .observe_coordinator_epoch(owned.coordinator_epoch);
                 let handle = self.manager.environment(spec, owner).map_err(status)?;
                 let result = match owned.snapshot {
                     Some(snapshot) => {

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     time::Duration,
@@ -89,11 +89,25 @@ pub trait Control: Send + Sync {
         self.activate_with_cache(ctx, scope, expected_generation, bypass_cache)
             .await
     }
+    /// Admission-readiness signal: true once this control's own startup work
+    /// (e.g. the first membership discovery read) has completed. This is an
+    /// initialization latch only — later transient failures never flip it
+    /// back, so a shared-dependency outage cannot pull every Gateway
+    /// replica out of load balancing at once; callers retry instead.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 pub struct ActivatorClient {
     endpoints: Arc<RwLock<Vec<ActivatorEndpoint>>>,
     discovery_task: Option<tokio::task::JoinHandle<()>>,
+    /// Set once the first membership snapshot has been read (or immediately
+    /// when a static endpoint list is configured). Readiness is therefore
+    /// "discovery works", not "members currently exist" — an empty-but-
+    /// successful read still admits the Gateway, and later refresh failures
+    /// retain the last membership instead of un-readying it.
+    discovery_synced: Arc<AtomicBool>,
     token: String,
     client: reqwest::Client,
     timeout: Duration,
@@ -173,12 +187,21 @@ impl ActivatorClient {
                 .collect(),
             allow_plaintext,
         )?));
+        let discovery_synced = Arc::new(AtomicBool::new(discovery.is_none()));
         let discovery_task = discovery
-            .map(|config| crate::discovery::start(config, endpoints.clone(), allow_plaintext))
+            .map(|config| {
+                crate::discovery::start(
+                    config,
+                    endpoints.clone(),
+                    discovery_synced.clone(),
+                    allow_plaintext,
+                )
+            })
             .transpose()?;
         Ok(Self {
             endpoints,
             discovery_task,
+            discovery_synced,
             token,
             client,
             timeout,
@@ -250,6 +273,13 @@ impl ActivatorClient {
                 Err(_) => return Err(uncertain(writes, "Activator response unavailable")),
             };
             let status = response.status();
+            // A structured not-accepted rejection is guaranteed not applied:
+            // the same request may be retried against the next member.
+            if status.as_u16() == 503 && response.headers().get("adx-not-accepted").is_some() {
+                if offset + 1 < endpoints.len().min(2) {
+                    continue;
+                }
+            }
             let mut bytes = Vec::new();
             while let Some(chunk) = response
                 .chunk()
@@ -383,6 +413,9 @@ impl Control for ActivatorClient {
             parameters,
         )
         .await
+    }
+    fn ready(&self) -> bool {
+        self.discovery_synced.load(Ordering::Acquire)
     }
 }
 pub(crate) fn uncertain(writes: bool, message: &str) -> Error {

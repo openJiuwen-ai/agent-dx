@@ -4,7 +4,7 @@
   "namespace": "adx",
   "scheduler_shards": 1,
   "placement": "pack",
-  "rpc_timeout_seconds": 30,
+  "rpc_timeout_seconds": 5,
   "tls": {
     "ca": "/opt/adx/config/tls/ca.pem",
     "certificate": "/opt/adx/config/tls/coordinator.pem",
@@ -29,6 +29,10 @@
   "node_retention_seconds": 1800,
   "failed_retention_seconds": 600,
   "discovery_ttl_seconds": 15,
+  "lease_seconds": 15,
+  "standby_sync_seconds": 5,
+  "shutdown_timeout_seconds": 15,
+  "readiness_listen": "0.0.0.0:19091",
   "metrics_listen": "127.0.0.1:19090",
   "autoscaling_listen": "127.0.0.1:19092",
   "checkpoint_reclaimers": []

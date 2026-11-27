@@ -136,6 +136,7 @@ fn delete_request() -> Request<pb::DeleteEnvironmentRequest> {
             tenant_id: "tenant".into(),
             administrator: false,
         }),
+        coordinator_epoch: 0,
     });
     request.metadata_mut().insert(
         "adx-component",
@@ -155,6 +156,7 @@ fn coordinator_delete_request(
         node_session_id: node_session_id.into(),
         assignment: Some(assignment().try_into().expect("test assignment is valid")),
         caller: None,
+        coordinator_epoch: 0,
     });
     request.metadata_mut().insert(
         "adx-component",
@@ -544,4 +546,38 @@ async fn preparation_cleanup_uses_exact_revision_and_owner_session() {
             .code(),
         tonic::Code::FailedPrecondition
     );
+}
+
+#[tokio::test]
+async fn coordinator_epoch_below_the_observed_record_rejects_the_command() {
+    use adx_protocol::control::node_service_server::NodeService;
+
+    let (manager, service, revision) = running_service().await;
+    let epoch_request = |epoch: u64| {
+        let mut request = coordinator_delete_request(None, Some(revision), "session");
+        request.get_mut().coordinator_epoch = epoch;
+        request
+    };
+    manager.observe_coordinator_epoch(5);
+    let error = service
+        .delete_environment(epoch_request(4))
+        .await
+        .expect_err("a late command from a deposed primary must be rejected");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("deposed primary"));
+    assert_eq!(manager.observed_coordinator_epoch(), 5);
+    assert!(service
+        .delete_environment(epoch_request(5))
+        .await
+        .expect("the current primary epoch is accepted")
+        .into_inner()
+        .record
+        .is_some());
+    assert!(service
+        .delete_environment(epoch_request(0))
+        .await
+        .expect("an absent epoch cannot fence the command")
+        .into_inner()
+        .record
+        .is_some());
 }
