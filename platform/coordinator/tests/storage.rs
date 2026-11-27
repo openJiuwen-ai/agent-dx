@@ -11,6 +11,8 @@ mod common;
 mod counter_compaction;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/lease.rs"]
+mod lease;
 #[path = "storage/master_upgrade.rs"]
 mod master_upgrade;
 #[path = "storage/node_retirement.rs"]
@@ -29,6 +31,8 @@ mod receipt_expiry;
 mod recovery_profile;
 #[path = "storage/snapshot_preparation.rs"]
 mod snapshot_preparation;
+#[path = "storage/standby.rs"]
+mod standby;
 #[path = "storage/transport_recovery.rs"]
 mod transport_recovery;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};

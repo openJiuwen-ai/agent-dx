@@ -125,6 +125,9 @@ impl Activator {
                 let Some(service) = service.upgrade() else {
                     break;
                 };
+                // Count the scan for the embedded host's shutdown criterion
+                // (see OperationScope).
+                let _operation = crate::OperationScope::new();
                 if let Err(error) = service.reconcile_snapshot_preparations().await {
                     tracing::warn!(%error, "Golden preparation scan incomplete");
                 }

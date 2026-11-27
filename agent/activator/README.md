@@ -67,9 +67,9 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 
 `registration` 为可选配置；配置后同时启用下述别名后台收敛，要求 Redis 通知能力就绪；缺省使用静态地址并按请求处理。示例：[discovery.json](examples/discovery.json)。`instance_id` 在活跃副本之间必须唯一，建议重启后保持稳定；`advertise_url` 必须是 Gateway 可直达的单实例地址，不能使用 `0.0.0.0` 或多实例随机负载均衡地址。地址及认证/TLS 校验沿用 ActivatorClient 的传输策略。
 
-进程绑定监听端口后先注册，再开始服务；注册失败会拒绝启动。默认租约 15 秒，心跳 5 秒；`lease_seconds` 范围 6–300，`heartbeat_seconds` 至少 1 且不超过租约的三分之一。Redis 服务端时间决定租约是否到期，与 AgentBinding 的 5 小时滑动 TTL 独立。正常退出时先停心跳并注销，然后结束 HTTP 服务；异常退出靠租约过期被发现端移除，Gateway 默认最多还需一个刷新周期才看到变更。
+进程绑定监听端口后先注册，再开始服务；注册失败会拒绝启动。默认租约 15 秒，心跳 5 秒；`lease_seconds` 范围 6–300，`heartbeat_seconds` 至少 1 且不超过租约的三分之一。Redis 服务端时间决定租约是否到期，与 AgentBinding 的 5 小时滑动 TTL 独立。成员记录的 `ready` 在请求处理能力就绪（Activator 入槽）后才置位；`draining` 翻转在一个轮询周期（250ms）内被续租写入并 `publish_changed` 通告，Gateway 不必等心跳间隔加刷新周期——嵌入宿主即使在下一次常规续约前退出，成员也已可见为 draining。正常退出时先停心跳并注销，然后结束 HTTP 服务；成员移除始终由显式 shutdown 或租约过期承担（draining 成员保持可观察而非消失），异常退出靠租约过期被发现端移除，Gateway 默认最多还需一个刷新周期才看到变更。
 
-每次进程启动生成新的 incarnation，同一个活跃 ID 的其他 incarnation 无法续租或注销它。异常退出后立即用相同 ID 启动可能在旧租约到期前返回 Conflict，调用方应在租约到期后重试。后续续租失败会产生 tracing 警告；不会修改 AgentBinding 元数据或发起 Environment 恢复。成员 ID 同时用于请求亲和与后台 Binding 分工，任何 Activator 仍可通过 Redis 恢复 AgentBinding 身份。
+incarnation 在进程生命周期内保持稳定：初始化重试复用同一身份，续租对自身未过期租约幂等，重试不再自撞 Conflict。同一个活跃 ID 的其他 incarnation 无法续租或注销它；异常退出后立即用相同 ID 启动仍可能在旧租约到期前返回 Conflict，调用方应在租约到期后重试。后续续租失败会产生 tracing 警告；不会修改 AgentBinding 元数据或发起 Environment 恢复。成员 ID 同时用于请求亲和与后台 Binding 分工，任何 Activator 仍可通过 Redis 恢复 AgentBinding 身份。排空期新请求被拒绝为 HTTP 503 并附带 `adx-not-accepted: true` 响应头，Gateway 客户端据此以同一请求体安全换成员重试。
 
 ## Environment HTTP 适配契约
 

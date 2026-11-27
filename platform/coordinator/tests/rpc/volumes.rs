@@ -478,3 +478,218 @@ async fn release_volume_owner_rejects_foreign_pending_requests_before_cancellati
         "foreign release_owner rejected only after mutating the victim tenant's scheduling queue"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis and TLS; build/ci/run.py control-rpc"]
+async fn drained_coordinator_still_grants_volume_authorization_for_an_admitted_create() {
+    use adx_coordinator::{
+        storage::{LocalClaim, NodeSession},
+        Node,
+    };
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::{AccessMode, StorageDomain, VolumeRef, VolumeSource, VolumeSpec},
+    };
+    use std::collections::BTreeMap;
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let domains = BTreeMap::from([(
+        "sfs".into(),
+        StorageDomain {
+            dynamic_nodes: false,
+            backend_id: "server:/export".into(),
+            node_roots: BTreeMap::from([("node".into(), "/mnt/sfs".into())]),
+            tenant_paths: BTreeMap::from([("tenant".into(), "workspaces".into())]),
+        },
+    )]);
+    session
+        .ensure_volume(
+            VolumeSpec {
+                tenant_id: "tenant".into(),
+                id: "workspace".into(),
+                source: VolumeSource::Directory {
+                    storage_domain: "sfs".into(),
+                    path: "workspaces/user".into(),
+                },
+                access_mode: AccessMode::Exclusive,
+                create_if_missing: false,
+                create_options: None,
+            },
+            &domains,
+        )
+        .await
+        .unwrap();
+    let report = pb::RegisterNodeRequest {
+        pressure: None,
+        pressure_disposition: Default::default(),
+        checkpoint_scopes: Default::default(),
+        storage_mounts: Default::default(),
+        node_id: "node".into(),
+        node_address: "127.0.0.1:9000".into(),
+        proxy_address: "127.0.0.1:9001".into(),
+        session_id: "boot".into(),
+        heartbeat_sequence: 2,
+        // The node is executing the admitted create, so it admits work:
+        // authorize_volumes requires an available owner (available maps
+        // from accepting_allocations).
+        reconciling: false,
+        accepting_allocations: true,
+        runtime_classes: vec!["runc".into()],
+        capacity: Some(
+            Resources {
+                cpu_millis: 1000,
+                memory_bytes: 4096,
+                disk_bytes: 0,
+            }
+            .into(),
+        ),
+        labels: Default::default(),
+        devices: vec![],
+    };
+    session
+        .register_session(
+            Node {
+                id: "node".into(),
+                capacity: Resources {
+                    cpu_millis: 1000,
+                    memory_bytes: 4096,
+                    disk_bytes: 0,
+                },
+                available: true,
+                labels: Default::default(),
+                devices: vec![],
+                runtime_classes: vec!["runc".into()],
+            },
+            report.node_address.clone(),
+            report.proxy_address.clone(),
+            Some(NodeSession {
+                id: "boot".into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut source = spec("source");
+    source.execution.mounts.push(Mount {
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into()],
+        source: MountSource::Volume(VolumeRef {
+            id: "workspace".into(),
+            uid: None,
+        }),
+        create_if_missing: false,
+        create_options: None,
+    });
+    let assignment = session
+        .claim(
+            source.clone(),
+            &LocalClaim {
+                request_id: String::new(),
+                node_id: "node".into(),
+                node_session_id: "boot".into(),
+                devices: vec![],
+            },
+        )
+        .await
+        .unwrap()
+        .record()
+        .assignment
+        .clone();
+    let record = EnvironmentRecord {
+        observation: None,
+        spec: source,
+        runtime: adx_core::Runtime {
+            id: format!("source-{}", assignment.generation),
+            ip: None,
+        },
+        assignment,
+        state: adx_core::EnvironmentState::Starting,
+        revision: 1,
+        resources_held: true,
+        snapshot_source: None,
+        failure: None,
+        checkpoint: None,
+        last_operation: None,
+        restart_attempts: 0,
+        restart_pending: false,
+        execution_artifacts: vec![],
+    };
+    let rpc = CoordinatorRpc::new(
+        session,
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap()
+    .with_volume_domains(domains)
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let control = rpc.clone();
+    let execution = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(control))
+            .add_service(
+                pb::volume_execution_service_server::VolumeExecutionServiceServer::new(execution),
+            )
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    // Two-step registration before the drain: the authorize handler's live
+    // claimant check needs the node session and the inspected marker.
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+    node.register_node(report).await.unwrap();
+    node.inspect_node(pb::InspectNodeRequest {
+        node_id: "node".into(),
+        session_id: "boot".into(),
+    })
+    .await
+    .unwrap();
+    // SIGTERM lands between the create's allocation and the node's volume
+    // authorization: the create was accepted, so its tail must complete.
+    rpc.begin_drain();
+    let mut grants = pb::volume_execution_service_client::VolumeExecutionServiceClient::new(
+        channel(address, "node").await,
+    );
+    let grant = grants
+        .authorize_execution(pb::AuthorizeVolumeExecutionRequest {
+            record: Some(record.clone().try_into().unwrap()),
+            previous_runtime_id: record.runtime.id.clone(),
+            node_session_id: "boot".into(),
+        })
+        .await
+        .expect("draining must not reject an admitted create's volume authorization")
+        .into_inner();
+    assert_eq!(grant.assignment.as_ref().unwrap().node_id, "node");
+    assert_eq!(grant.runtime_id, record.runtime.id);
+    assert_eq!(grant.node_session_id, "boot");
+    assert_eq!(grant.volumes.len(), 1);
+    assert_eq!(grant.volumes[0].backend_id, "server:/export");
+    assert_eq!(grant.volumes[0].root, "/mnt/sfs");
+    let volume: adx_core::volumes::Volume =
+        grant.volumes[0].volume.clone().unwrap().try_into().unwrap();
+    assert_eq!(volume.spec.id, "workspace");
+    // Control: the same drain still rejects new operations as not accepted,
+    // so the exemption above cannot let fresh creates slip in.
+    let mut api = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "apiserver").await,
+    );
+    let error = api
+        .create_environment(create("drained-volume-create"))
+        .await
+        .unwrap_err();
+    assert!(
+        adx_protocol::not_accepted_status(&error),
+        "new creates must stay rejected through the drain: {error:?}"
+    );
+}

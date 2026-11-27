@@ -178,6 +178,18 @@ impl RedisRepository {
     }
 }
 
+impl RedisRepository {
+    /// Dedicated pub/sub connection for membership-change notifications.
+    /// Separate from the multiplexed command connection so subscriptions do
+    /// not block command traffic.
+    pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
+        self.client
+            .get_async_pubsub()
+            .await
+            .map_err(|_| Error::Unavailable("Redis pubsub connect failed".into()))
+    }
+}
+
 #[async_trait]
 impl Repository for RedisRepository {
     async fn get(&self, key: &Key) -> Result<Option<Record>> {
