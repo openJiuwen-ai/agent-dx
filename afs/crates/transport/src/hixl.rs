@@ -26,14 +26,18 @@ use std::time::{Duration, Instant};
 const HIXL_SUCCESS: u32 = 0;
 #[cfg(any(feature = "hixl", test))]
 const HIXL_TIMEOUT: u32 = 103_901;
+/// Mirrors AFS_HIXL_QUARANTINED: native ownership is uncertain and teardown is forbidden.
+#[cfg(any(feature = "hixl", test))]
+const HIXL_QUARANTINED: u32 = u32::MAX;
 const HIXL_UNSUPPORTED: u32 = 103_905;
 const HIXL_RESOURCE_EXHAUSTED: u32 = 203_900;
 const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 /// Relay HBM budget: `buffer_pool_count 脳 buffer_pool_size_mib 脳 2 MiB`.
 const MAX_POOL_BYTES: usize = 512 * 1024 * 1024;
-/// One Host slot pool per device lane: 128 receive + 128 export slots of 4 MiB
-/// windows. The configuration bounds the sum over all lanes.
-const MAX_HOST_POOL_BYTES: usize = 1024 * 1024 * 1024;
+/// Maximum number of slots in either Host pool on a lane. Mirrors the native limit.
+pub const MAX_HOST_SLOTS_PER_POOL: usize = 4096;
+/// Combined receive and export registrations for direct RoCE on one lane.
+pub const MAX_DIRECT_REGISTRATIONS: usize = 4000;
 #[cfg(feature = "hixl")]
 const ERR_BYTES: usize = 512;
 /// Maximum descriptors in one native transfer batch. Mirrors `AFS_HIXL_MAX_BATCH_WINDOWS`.
@@ -42,27 +46,107 @@ pub const MAX_BATCH_WINDOWS: usize = 64;
 /// Default fixed Host-window size.
 pub const DEFAULT_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 /// Default number of local receive slots.
-pub const DEFAULT_RECEIVE_SLOTS: usize = 16;
+pub const DEFAULT_RECEIVE_SLOTS: usize = 256;
 /// Default number of source export slots.
-pub const DEFAULT_EXPORT_SLOTS: usize = 16;
+pub const DEFAULT_EXPORT_SLOTS: usize = 256;
 
 mod group;
 pub use group::{HixlRuntimeGroup, validate_group_options};
 
-/// Link used by the immutable Host-to-Host data path.
+/// Link and window memory mode used by the Host-to-Host data path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadTransport {
     #[default]
     Roce,
     Hccs,
+    /// HCCS direct transfer between Host Fabric windows.
+    HccsFabric,
+}
+
+impl ReadTransport {
+    /// Public link name, independent of the window memory mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Roce => "roce",
+            Self::Hccs | Self::HccsFabric => "hccs",
+        }
+    }
+
+    /// Whether this mode requires a verified HCCS super-pod identity.
+    #[must_use]
+    pub const fn is_hccs(self) -> bool {
+        matches!(self, Self::Hccs | Self::HccsFabric)
+    }
+
+    /// Whether the engine allocates Host Fabric windows.
+    #[must_use]
+    pub const fn is_fabric_mem(self) -> bool {
+        matches!(self, Self::HccsFabric)
+    }
 }
 
 impl fmt::Display for ReadTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Roce => "roce",
-            Self::Hccs => "hccs",
-        })
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Where the SDK expands a FabricMem transfer task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FabricMemUnfold {
+    Aicpu,
+    Host,
+}
+
+/// Explicit local FabricMem overrides. An omitted value delegates to the SDK.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FabricMemOptions {
+    pub unfold: Option<FabricMemUnfold>,
+    pub task_streams: Option<u16>,
+    pub max_capacity_tb: Option<u16>,
+    pub start_address_tb: Option<u16>,
+    pub max_transfer_count_per_batch: Option<u16>,
+}
+
+impl FabricMemOptions {
+    /// Check mode, ranges and the unfold/stream combination before startup.
+    ///
+    /// # Errors
+    /// Returns a configuration diagnostic if an override is invalid.
+    pub fn validate(self, fabric_mem: bool) -> Result<(), &'static str> {
+        if !fabric_mem && self != Self::default() {
+            return Err("hixl.fabric_mem_* SDK overrides require fabric_mem = true");
+        }
+        if self
+            .task_streams
+            .is_some_and(|value| !(1..=8).contains(&value))
+        {
+            return Err("hixl.fabric_mem_task_streams must be in 1..=8");
+        }
+        if self.task_streams.is_some_and(|value| value > 1)
+            && self.unfold != Some(FabricMemUnfold::Host)
+        {
+            return Err(
+                "hixl.fabric_mem_task_streams greater than 1 requires fabric_mem_unfold = 'host'",
+            );
+        }
+        if self
+            .max_capacity_tb
+            .is_some_and(|value| !(1..=1024).contains(&value))
+        {
+            return Err("hixl.fabric_mem_max_capacity_tb must be in 1..=1024");
+        }
+        if self.start_address_tb.is_some_and(|value| value > 1024) {
+            return Err("hixl.fabric_mem_start_address_tb must be in 0..=1024");
+        }
+        if self
+            .max_transfer_count_per_batch
+            .is_some_and(|value| !(1..=1920).contains(&value))
+        {
+            return Err("hixl.fabric_mem_max_transfer_count_per_batch must be in 1..=1920");
+        }
+        Ok(())
     }
 }
 
@@ -77,7 +161,8 @@ pub struct RuntimeOptions {
     pub receive_slots: usize,
     pub export_slots: usize,
     pub transport: ReadTransport,
-    /// Enable the native Device buffer pool. Required for HCCS.
+    pub fabric_mem_options: FabricMemOptions,
+    /// Enable the native Device buffer pool. Required for HCCS relay and forbidden for FabricMem.
     pub buffer_pool: bool,
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
@@ -93,6 +178,7 @@ impl Default for RuntimeOptions {
             receive_slots: DEFAULT_RECEIVE_SLOTS,
             export_slots: DEFAULT_EXPORT_SLOTS,
             transport: ReadTransport::Roce,
+            fabric_mem_options: FabricMemOptions::default(),
             buffer_pool: false,
             buffer_pool_count: 4,
             buffer_pool_size_mib: 8,
@@ -129,7 +215,7 @@ pub struct EngineInfo {
     pub generation: u64,
     pub window_bytes: usize,
     pub transport: ReadTransport,
-    /// Canonical relay dimensions; both are zero for direct RoCE.
+    /// Canonical relay dimensions; both are zero for direct RoCE and FabricMem.
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
     /// SDK-reported super-pod identity, present only on HCCS.
@@ -530,13 +616,13 @@ impl<B: NativeBackend> RuntimeCore<B> {
         generation: u64,
     ) -> Result<Self, HixlError> {
         validate_options(&options)?;
-        let hccs_domain_id = if options.transport == ReadTransport::Hccs {
+        let hccs_domain_id = if options.transport.is_hccs() {
             Some(backend.hccs_domain_id().ok_or_else(|| {
                 HixlError::new(
                     HixlPhase::Initialize,
                     HixlErrorKind::Unsupported,
                     Some(HIXL_UNSUPPORTED),
-                    "HCCS relay requires a verifiable SDK super-pod identity",
+                    "HCCS requires a verifiable SDK super-pod identity",
                 )
             })?)
         } else {
@@ -613,7 +699,10 @@ impl<B: NativeBackend> RuntimeCore<B> {
         }
         let timeout_ms = deadline_timeout_ms(deadline, HixlPhase::Connect)?;
         if let Err(error) = self.backend.connect(peer, timeout_ms) {
-            if error.accepted {
+            if error.accepted || error.status == Some(HIXL_QUARANTINED) {
+                if error.status == Some(HIXL_QUARANTINED) {
+                    self.quarantined_bytes = self.status().allocated_bytes;
+                }
                 self.state = RuntimeState::Quarantined;
                 return Err(HixlError::new(
                     HixlPhase::Connect,
@@ -1091,9 +1180,13 @@ impl<B: NativeBackend> RuntimeCore<B> {
             ));
         }
         if let Err(error) = self.backend.shutdown() {
-            // A failed cleanup is retryable: the native steps are idempotent,
-            // and data-plane entry stays closed until one attempt completes.
-            self.state = RuntimeState::ShutdownFailed;
+            // Only failures with a known outcome can retry the unfinished steps.
+            if error.status == Some(HIXL_QUARANTINED) {
+                self.quarantined_bytes = self.status().allocated_bytes;
+                self.state = RuntimeState::Quarantined;
+            } else {
+                self.state = RuntimeState::ShutdownFailed;
+            }
             return Err(HixlError::new(
                 HixlPhase::Shutdown,
                 HixlErrorKind::ShutdownIncomplete,
@@ -1179,6 +1272,25 @@ impl<B: NativeBackend> RuntimeCore<B> {
 }
 
 fn validate_options(options: &RuntimeOptions) -> Result<(), HixlError> {
+    options
+        .fabric_mem_options
+        .validate(options.transport.is_fabric_mem())
+        .map_err(|message| {
+            HixlError::new(
+                HixlPhase::Initialize,
+                HixlErrorKind::InvalidArgument,
+                None,
+                message,
+            )
+        })?;
+    if options.transport.is_fabric_mem() && options.device_listen_port.is_some() {
+        return Err(HixlError::new(
+            HixlPhase::Initialize,
+            HixlErrorKind::InvalidArgument,
+            None,
+            "HIXL FabricMem does not support device_listen_port",
+        ));
+    }
     if options.device_listen_port == Some(0) {
         return Err(HixlError::new(
             HixlPhase::Initialize,
@@ -1194,8 +1306,8 @@ fn validate_options(options: &RuntimeOptions) -> Result<(), HixlError> {
         || options.window_bytes > MAX_WINDOW_BYTES
         || options.receive_slots == 0
         || options.export_slots == 0
-        || options.receive_slots > 128
-        || options.export_slots > 128
+        || options.receive_slots > MAX_HOST_SLOTS_PER_POOL
+        || options.export_slots > MAX_HOST_SLOTS_PER_POOL
         || (options.buffer_pool
             && (!(1..=64).contains(&options.buffer_pool_count)
                 || !(1..=64).contains(&options.buffer_pool_size_mib)))
@@ -1215,6 +1327,14 @@ fn validate_options(options: &RuntimeOptions) -> Result<(), HixlError> {
             "HIXL HCCS requires the Device buffer pool",
         ));
     }
+    if options.transport.is_fabric_mem() && options.buffer_pool {
+        return Err(HixlError::new(
+            HixlPhase::Initialize,
+            HixlErrorKind::InvalidArgument,
+            None,
+            "HIXL FabricMem cannot use the Device buffer pool",
+        ));
+    }
     let slots = options
         .receive_slots
         .checked_add(options.export_slots)
@@ -1226,7 +1346,7 @@ fn validate_options(options: &RuntimeOptions) -> Result<(), HixlError> {
                 "HIXL pool slot count overflows",
             )
         })?;
-    let bytes = options.window_bytes.checked_mul(slots).ok_or_else(|| {
+    options.window_bytes.checked_mul(slots).ok_or_else(|| {
         HixlError::new(
             HixlPhase::Initialize,
             HixlErrorKind::InvalidArgument,
@@ -1234,12 +1354,15 @@ fn validate_options(options: &RuntimeOptions) -> Result<(), HixlError> {
             "HIXL Host pool byte count overflows",
         )
     })?;
-    if bytes > MAX_HOST_POOL_BYTES {
+    if options.transport == ReadTransport::Roce
+        && !options.buffer_pool
+        && slots > MAX_DIRECT_REGISTRATIONS
+    {
         return Err(HixlError::new(
             HixlPhase::Initialize,
             HixlErrorKind::ResourceExhausted,
             Some(HIXL_RESOURCE_EXHAUSTED),
-            format!("HIXL Host pool exceeds {} bytes", MAX_HOST_POOL_BYTES),
+            format!("HIXL direct Host pool exceeds {MAX_DIRECT_REGISTRATIONS} SDK registrations"),
         ));
     }
     if options.relay_hbm_budget_bytes() > MAX_POOL_BYTES {
@@ -2045,8 +2168,10 @@ impl NativeBackend for RealNative {
         let (buffer_pool_count, buffer_pool_size_mib) = options.buffer_pool_dims();
         let mut handle = std::ptr::null_mut();
         let mut hccs_domain_id = 0;
+        let fabric_options = (options.fabric_mem_options != FabricMemOptions::default())
+            .then(|| ffi::FabricOptions::from(options.fabric_mem_options));
         let mut error = ErrorBuffer::default();
-        // SAFETY: engine_id and error remain live for the synchronous native call;
+        // SAFETY: engine_id, fabric_options, and error remain live for the synchronous native call;
         // options were validated before the owner thread was spawned.
         let status = unsafe {
             (api.afs_hixl_start)(
@@ -2059,9 +2184,13 @@ impl NativeBackend for RealNative {
                 match options.transport {
                     ReadTransport::Roce => 1,
                     ReadTransport::Hccs => 2,
+                    ReadTransport::HccsFabric => 3,
                 },
                 buffer_pool_count,
                 buffer_pool_size_mib,
+                fabric_options
+                    .as_ref()
+                    .map_or(std::ptr::null(), std::ptr::from_ref),
                 &mut hccs_domain_id,
                 &mut handle,
                 error.ptr(),
@@ -2083,7 +2212,7 @@ impl NativeBackend for RealNative {
         Ok(Self {
             api,
             handle: Some(handle),
-            hccs_domain_id: (options.transport == ReadTransport::Hccs).then_some(hccs_domain_id),
+            hccs_domain_id: options.transport.is_hccs().then_some(hccs_domain_id),
         })
     }
 

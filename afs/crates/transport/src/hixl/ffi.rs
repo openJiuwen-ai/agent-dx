@@ -9,7 +9,7 @@ use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 use super::{HIXL_UNSUPPORTED, NativeCallError};
 
 const MODULE_NAME: &str = "libafs_hixl.so";
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,6 +47,30 @@ macro_rules! bridge_api {
     };
 }
 
+#[repr(C)]
+pub(super) struct FabricOptions {
+    enable_aicpu_unfold: u32,
+    task_streams: u32,
+    max_capacity_tb: u32,
+    start_address_tb: u32,
+    max_transfer_count_per_batch: u32,
+}
+
+impl From<super::FabricMemOptions> for FabricOptions {
+    fn from(options: super::FabricMemOptions) -> Self {
+        let encode = |value: Option<u16>| value.map_or(u32::MAX, u32::from);
+        Self {
+            enable_aicpu_unfold: options.unfold.map_or(u32::MAX, |mode| {
+                u32::from(mode == super::FabricMemUnfold::Aicpu)
+            }),
+            task_streams: encode(options.task_streams),
+            max_capacity_tb: encode(options.max_capacity_tb),
+            start_address_tb: encode(options.start_address_tb),
+            max_transfer_count_per_batch: encode(options.max_transfer_count_per_batch),
+        }
+    }
+}
+
 bridge_api! {
     fn afs_hixl_start(
         device_id: i32,
@@ -58,6 +82,7 @@ bridge_api! {
         transport: u32,
         buffer_pool_count: usize,
         buffer_pool_size_mib: usize,
+        fabric_options: *const FabricOptions,
         out_hccs_domain_id: *mut u64,
         out: *mut *mut c_void,
         error: *mut c_char,
@@ -224,6 +249,20 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn fabric_wire_options_preserve_explicit_zero_and_omit_unset_fields() {
+        let options = FabricOptions::from(super::super::FabricMemOptions {
+            unfold: Some(super::super::FabricMemUnfold::Host),
+            start_address_tb: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(options.enable_aicpu_unfold, 0);
+        assert_eq!(options.start_address_tb, 0);
+        assert_eq!(options.task_streams, u32::MAX);
+        assert_eq!(options.max_capacity_tb, u32::MAX);
+        assert_eq!(options.max_transfer_count_per_batch, u32::MAX);
+    }
+
+    #[test]
     fn only_missing_module_or_dependency_is_unsupported() {
         let temp = tempfile::tempdir().unwrap();
         let module = temp.path().join(MODULE_NAME);
@@ -238,13 +277,17 @@ mod tests {
         let wrong_abi = temp.path().join("wrong-abi.so");
         compile(
             &wrong_abi,
-            "unsigned afs_hixl_abi_version(void) { return 999; }",
+            "unsigned afs_hixl_abi_version(void) { return 2; }",
             &[],
         );
         let incompatible = load(wrong_abi).unwrap_or_else(|error| panic!("{}", error.message));
         let error = incompatible.api.err().unwrap();
         assert_eq!(error.status, None);
-        assert!(error.message.contains("ABI version 999"));
+        assert!(
+            error
+                .message
+                .contains("ABI version 2 is incompatible with required version 3")
+        );
 
         let library = temp.path().join("libafs_test_hixl_dependency.so");
         compile(&library, "unsigned dependency(void) { return 1; }", &[]);

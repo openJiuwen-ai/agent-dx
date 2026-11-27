@@ -61,8 +61,12 @@ pub(crate) struct MemoryExports {
 
 impl MemoryExports {
     pub(crate) fn new(window_bytes: usize, slots: usize) -> Self {
+        Self::with_info(engine(HOME_ENGINE, 7, window_bytes), slots)
+    }
+
+    pub(crate) fn with_info(info: EngineInfo, slots: usize) -> Self {
         Self {
-            info: engine(HOME_ENGINE, 7, window_bytes),
+            info,
             slots,
             memory: Mutex::new(Memory::default()),
             exports: AtomicUsize::new(0),

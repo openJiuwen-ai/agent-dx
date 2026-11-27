@@ -1,4 +1,4 @@
-#[cfg(any(feature = "hixl", test))]
+#[cfg(test)]
 use super::ReadTransport;
 use super::{
     EngineInfo, HixlError, HixlErrorKind, HixlPhase, HixlRuntime, RuntimeOptions, RuntimeState,
@@ -138,7 +138,7 @@ impl HixlRuntimeGroup {
                 Err(start_error) => return Err(rollback_start(&lanes, start_error)),
             }
         }
-        if lanes[0].info().transport == ReadTransport::Hccs {
+        if lanes[0].info().transport.is_hccs() {
             let expected_domain = lanes[0].info().hccs_domain_id;
             if expected_domain.is_none()
                 || lanes
@@ -171,8 +171,18 @@ pub fn validate_group_options(options: &[RuntimeOptions]) -> Result<(), HixlErro
     let mut engines = HashSet::with_capacity(options.len());
     let mut listen_ports = HashSet::with_capacity(options.len());
     let first = &options[0];
+    let mut host_bytes = 0_usize;
+    let mut hbm_bytes = 0_usize;
     for lane in options {
         validate_options(lane)?;
+        // Per-lane validation makes each add/multiply here representable.
+        let lane_bytes = lane.window_bytes * (lane.receive_slots + lane.export_slots);
+        host_bytes = host_bytes
+            .checked_add(lane_bytes)
+            .ok_or_else(|| group_option_error("HIXL group Host pool byte count overflows"))?;
+        hbm_bytes = hbm_bytes
+            .checked_add(lane.relay_hbm_budget_bytes())
+            .ok_or_else(|| group_option_error("HIXL group HBM pool byte count overflows"))?;
         if !devices.insert(lane.device_id) {
             return Err(group_option_error(format!(
                 "duplicate HIXL device id {} in runtime group",
@@ -198,7 +208,8 @@ pub fn validate_group_options(options: &[RuntimeOptions]) -> Result<(), HixlErro
                 lane.engine_id
             )));
         }
-        if options.len() > 1 && lane.device_listen_port.is_none() {
+        if options.len() > 1 && !lane.transport.is_fabric_mem() && lane.device_listen_port.is_none()
+        {
             return Err(group_option_error(
                 "multi-device HIXL requires an explicit listener port per lane",
             ));

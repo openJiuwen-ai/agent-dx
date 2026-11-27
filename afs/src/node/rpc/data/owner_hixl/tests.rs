@@ -1,5 +1,6 @@
 use super::test_support::{MemoryExports, MemorySource, OPEN_HANDLE, memory_home};
 use super::*;
+use crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION;
 use afs_protocol::node_data::{HixlSlotChecksumAlgorithm, OwnerHandle, RootAccess};
 use std::sync::atomic::Ordering;
 
@@ -36,6 +37,7 @@ fn negotiate_request(root: &str) -> OwnerNegotiateHixlRequest {
         client_engine_id: "127.0.0.1:7940".to_owned(),
         client_engine_generation: 3,
         protocol_version: HIXL_PROTOCOL_VERSION,
+        memory_kind: afs_protocol::node_data::HixlMemoryKind::ClassicHost as i32,
         transport: afs_protocol::node_data::HixlTransport::Roce as i32,
         buffer_pool_count: 0,
         buffer_pool_size_mib: 0,
@@ -137,11 +139,20 @@ fn session(service: &OwnerHixlService) -> u64 {
 
 #[test]
 fn negotiation_reports_the_full_export_pool() {
-    let (service, _, _) = fixture(SLOT, 128);
-    let reply = service
+    use crate::config::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
+
+    for slots in [256, MAX_OWNERFS_HIXL_SLOTS_PER_POOL] {
+        let (service, _, _) = fixture(SLOT, slots);
+        let reply = service
+            .negotiate_blocking("node-b", negotiate_request("root-a"))
+            .unwrap();
+        assert_eq!(usize::try_from(reply.lanes[0].export_slots).unwrap(), slots);
+    }
+    let (service, _, _) = fixture(SLOT, MAX_OWNERFS_HIXL_SLOTS_PER_POOL + 1);
+    let error = service
         .negotiate_blocking("node-b", negotiate_request("root-a"))
-        .unwrap();
-    assert_eq!(reply.lanes[0].export_slots, 128);
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
 }
 
 #[test]
@@ -258,12 +269,103 @@ fn negotiate_authorizes_the_presented_grant_and_reports_lanes() {
         .negotiate_blocking("node-b", negotiate_request("root-x"))
         .unwrap_err();
     assert!(denied.message().contains("unknown root"));
-    let mut old = negotiate_request("root-a");
-    old.protocol_version += 1;
-    assert!(service.negotiate_blocking("node-b", old).is_err());
+    for version in [0, 2, 3] {
+        let mut unknown = negotiate_request("root-a");
+        unknown.protocol_version = version;
+        let error = service.negotiate_blocking("node-b", unknown).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+    }
+    let mut unspecified = negotiate_request("root-a");
+    unspecified.memory_kind = 0;
+    let error = service
+        .negotiate_blocking("node-b", unspecified)
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
     let mut lanes = negotiate_request("root-a");
     lanes.lane_count = 2;
     assert!(service.negotiate_blocking("node-b", lanes).is_err());
+}
+
+#[test]
+fn fabric_home_admits_only_authorized_v1_hccs_in_its_verified_domain() {
+    use afs_protocol::node_data::{HixlMemoryKind, HixlTransport};
+    use afs_transport::hixl::ReadTransport;
+
+    let mut info = crate::node::rpc::hixl::test_support::engine("127.0.0.1:7930", 7, SLOT);
+    info.transport = ReadTransport::HccsFabric;
+    info.hccs_domain_id = Some(7);
+    let exports = Arc::new(MemoryExports::with_info(info, 4));
+    let service = OwnerHixlService::from_parts(
+        exports.clone(),
+        Arc::new(MemorySource::new(patterned(SLOT, 0), 3000)),
+    );
+    let mut request = negotiate_request("root-a");
+    request.memory_kind = HixlMemoryKind::FabricHost as i32;
+    request.transport = HixlTransport::Hccs as i32;
+    request.hccs_domain_id = Some(7);
+
+    for invalid in [
+        OwnerNegotiateHixlRequest {
+            memory_kind: HixlMemoryKind::ClassicHost as i32,
+            buffer_pool_count: 4,
+            buffer_pool_size_mib: 8,
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            memory_kind: 0,
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            memory_kind: i32::MAX,
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            transport: HixlTransport::Roce as i32,
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            buffer_pool_count: 4,
+            buffer_pool_size_mib: 8,
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            hccs_domain_id: None,
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            hccs_domain_id: Some(8),
+            ..request.clone()
+        },
+        OwnerNegotiateHixlRequest {
+            client_engine_generation: 0,
+            ..request.clone()
+        },
+    ] {
+        let error = service.negotiate_blocking("node-b", invalid).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    let denied = OwnerNegotiateHixlRequest {
+        access: Some(access("root-x")),
+        ..request.clone()
+    };
+    let error = service.negotiate_blocking("node-b", denied).unwrap_err();
+    assert!(error.message().contains("unknown root"));
+    assert!(service.lock_registry().unwrap().sessions.is_empty());
+    assert_eq!(exports.active(), 0);
+
+    let (classic, _, _) = fixture(SLOT, 4);
+    let error = classic
+        .negotiate_blocking("node-b", request.clone())
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let reply = service.negotiate_blocking("node-b", request).unwrap();
+    assert_eq!(reply.protocol_version, 1);
+    assert_eq!(reply.memory_kind, HixlMemoryKind::FabricHost as i32);
+    assert_eq!(reply.transport, HixlTransport::Hccs as i32);
+    assert_eq!(reply.buffer_pool_count, 0);
+    assert_eq!(reply.buffer_pool_size_mib, 0);
+    assert_eq!(reply.hccs_domain_id, Some(7));
+    assert_eq!(reply.lanes[0].engine_generation, 7);
 }
 
 #[test]

@@ -38,9 +38,30 @@ destination=$(dirname "$output")
 mkdir -p "$destination"
 stage=$(mktemp -d "$destination/.hixl-module.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-"${CXX:-c++}" -std=c++17 -fPIC -shared -Wl,-z,defs -Wl,-soname,libafs_hixl.so \
+cxx=${CXX:-c++}
+fabric_flags=()
+# Probe declarations only: linking against newer ACL APIs here would make the
+# module unloadable with otherwise supported runtime/driver combinations.
+if "$cxx" -std=c++17 -isystem "$sdk/include" -fsyntax-only "$native/hixl_fabric_vmm_probe.cc" \
+    >"$stage/acl-fabric-vmm-probe.log" 2>&1
+then
+  fabric_flags+=(-DAFS_HIXL_HAVE_ACL_FABRIC_VMM)
+else
+  echo 'CANN SDK lacks ACL external FabricMem VMM declarations; building with ADXL only' >&2
+fi
+adxl_flags=()
+if [[ -f "$sdk/include/adxl/adxl_engine.h" ]]; then
+  adxl_flags+=(-DAFS_HIXL_HAVE_ADXL_HEADER)
+fi
+
+"$cxx" -std=c++17 -fPIC -shared -Wl,-z,defs -Wl,-soname,libafs_hixl.so \
   -Wl,--version-script,"$native/hixl-module.map" \
-  -Wall -Wextra -O2 -I"$sdk/include" "$native/hixl.cc" "$native/hixl_numa.cc" \
+  -Wall -Wextra -O2 -I"$sdk/include" "${fabric_flags[@]}" "$native/hixl.cc" "$native/hixl_numa.cc" "$native/hixl_fabric.cc" \
   "${link_paths[@]}" -lcann_hixl -lascendcl -lmetadef -lgraph -ldl \
   -o "$stage/libafs_hixl.so"
+"$cxx" -std=c++17 -fPIC -shared -Wl,-z,defs -Wl,-soname,libafs_hixl_fabric.so \
+  -Wl,--version-script,"$native/hixl-fabric-module.map" \
+  -Wall -Wextra -O2 -I"$sdk/include" "${adxl_flags[@]}" "$native/hixl_fabric_adxl.cc" \
+  -ldl -o "$stage/libafs_hixl_fabric.so"
+mv -f "$stage/libafs_hixl_fabric.so" "$destination/libafs_hixl_fabric.so"
 mv -f "$stage/libafs_hixl.so" "$output"

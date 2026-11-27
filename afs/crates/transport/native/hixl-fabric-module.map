@@ -1,0 +1,4 @@
+{
+    global: afs_fabric_adxl_available_v1; afs_fabric_alloc_v1; afs_fabric_free_v1;
+    local: *;
+};

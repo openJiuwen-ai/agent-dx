@@ -154,7 +154,7 @@ afs-native-rdma-test:
 afs-test:
 	$(CARGO) test --locked $(AFS_PACKAGES) --all-targets $(AFS_NATIVE_FEATURES) -j $(JOBS) -- --test-threads=$(JOBS)
 ifeq ($(AFS_WITH_HIXL),1)
-	$(CARGO) test --locked -p afs-transport --features hixl --test hixl_native_bridge -j $(JOBS) -- --ignored
+	$(CARGO) test --locked -p afs-transport --features hixl --test hixl_native_bridge --test hixl_fabric_allocator -j $(JOBS) -- --ignored
 	AFS_HIXL_MODULE="$(abspath $(AFS_HIXL_MODULE))" $(CARGO) test --locked -p afs --features hixl --test hixl_shutdown -j $(JOBS) -- --ignored --test-threads=1
 endif
 scheduler-bench:

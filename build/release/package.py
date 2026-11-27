@@ -2,6 +2,7 @@
 """Assemble explicit build artifacts; never compile or fetch during deployment."""
 
 import argparse
+import logging
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_manifest import (  # noqa: E402
     AFS_BINARIES,
-    AFS_HIXL_MODULE,
+    AFS_HIXL_MODULES,
     BINARIES,
     GVISOR_BINARIES,
     SANDBOXD_BINARIES,
@@ -47,7 +48,7 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *,
     if with_hixl:
         if not with_afs or "linux" not in identity.target:
             raise ValueError("the HIXL module requires an AFS package for Linux")
-        inputs[f"bin/{AFS_HIXL_MODULE}"] = binary_dir / AFS_HIXL_MODULE
+        inputs.update({f"bin/{name}": binary_dir / name for name in AFS_HIXL_MODULES})
     inputs["runtime/adx-execd"] = binary_dir / "adx-execd"
     envd_dir = binary_dir / "envd"
     envd_component = (binary_dir / "envd-manifest.json", binary_dir / "envd-LICENSE")
@@ -185,7 +186,7 @@ def main():
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
     p.add_argument("--with-afs", action="store_true", help="include OwnerFs and DistributedFs binaries")
-    p.add_argument("--with-hixl", action="store_true", help="include the optional AFS HIXL module")
+    p.add_argument("--with-hixl", action="store_true", help="include the optional AFS HIXL modules")
     p.add_argument("--backend-dir", type=Path)
     p.add_argument("--runsc", type=Path)
     v = sub.add_parser("verify")
@@ -217,7 +218,8 @@ def main():
             backend_dir=args.backend_dir,
             runsc=args.runsc,
         )
-    print("package verified")
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
+    logging.info("package verified")
 
 
 if __name__ == "__main__":

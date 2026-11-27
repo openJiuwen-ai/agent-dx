@@ -249,8 +249,10 @@ class PackageTests(unittest.TestCase):
             redis_cli.chmod(0o700)
             wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
-            module_path = f"bin/{pkg.AFS_HIXL_MODULE}"
-            (binaries / pkg.AFS_HIXL_MODULE).write_bytes(b"hixl fixture")
+            module_names = ("libafs_hixl.so", "libafs_hixl_fabric.so")
+            module_paths = {f"bin/{name}" for name in module_names}
+            for name in module_names:
+                (binaries / name).write_bytes(name.encode())
 
             default_output = root / "default-package"
             default_manifest = pkg.assemble(
@@ -260,6 +262,7 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn("with_afs", default_manifest)
             self.assertNotIn("bin/afs-meta", default_manifest["files"])
             self.assertFalse((default_output / "etc/examples/afs").exists())
+            self.assertTrue(module_paths.isdisjoint(default_manifest["files"]))
             pkg.verify(default_output)
 
             afs_output = root / "afs-package"
@@ -275,7 +278,7 @@ class PackageTests(unittest.TestCase):
             self.assertIn("etc/examples/afs/deployment-ownerfs-local.yaml", afs_manifest["files"])
             self.assertIn("third_party/afs-source/LICENSE", afs_manifest["files"])
             self.assertIn("third_party/afs-source/NOTICE", afs_manifest["files"])
-            self.assertNotIn(module_path, afs_manifest["files"])
+            self.assertTrue(module_paths.isdisjoint(afs_manifest["files"]))
             pkg.verify(afs_output)
 
             hixl_output = root / "hixl-package"
@@ -285,12 +288,29 @@ class PackageTests(unittest.TestCase):
                 with_afs=True, with_hixl=True,
             )
             self.assertIs(hixl_manifest["with_hixl"], True)
-            self.assertIn(module_path, hixl_manifest["files"])
+            self.assertTrue(module_paths.issubset(hixl_manifest["files"]))
             pkg.verify(hixl_output)
-            del hixl_manifest["with_hixl"]
-            (hixl_output / "manifest.json").write_text(json.dumps(hixl_manifest))
-            with self.assertRaisesRegex(ValueError, "HIXL module is present without with_hixl"):
-                pkg.verify(hixl_output)
+            for name in module_names:
+                module_path = f"bin/{name}"
+                module_file = hixl_output / module_path
+                self.assertEqual(module_file.read_bytes(), name.encode())
+                with self.subTest(missing_module=name):
+                    manifest = {**hixl_manifest, "files": dict(hixl_manifest["files"])}
+                    del manifest["files"][module_path]
+                    (hixl_output / "manifest.json").write_text(json.dumps(manifest))
+                    module_file.unlink()
+                    with self.assertRaisesRegex(ValueError, "incomplete package"):
+                        pkg.verify(hixl_output)
+                    module_file.write_bytes(name.encode())
+                with self.subTest(unexpected_module=name):
+                    manifest = {**afs_manifest, "files": dict(afs_manifest["files"])}
+                    manifest["files"][module_path] = hixl_manifest["files"][module_path]
+                    (afs_output / "manifest.json").write_text(json.dumps(manifest))
+                    (afs_output / module_path).write_bytes(name.encode())
+                    with self.assertRaisesRegex(ValueError, "HIXL module is present without with_hixl"):
+                        pkg.verify(afs_output)
+                    (afs_output / module_path).unlink()
+            (afs_output / "manifest.json").write_text(json.dumps(afs_manifest))
 
             yaml_path = "etc/examples/afs/deployment-ownerfs-local.yaml"
             manifest_path = afs_output / "manifest.json"

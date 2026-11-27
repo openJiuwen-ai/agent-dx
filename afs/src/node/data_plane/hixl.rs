@@ -1,6 +1,7 @@
 //! HIXL batch transfers, export ownership and slot integrity.
 
 mod export;
+pub(crate) mod group_trace;
 mod metrics;
 
 use afs_transport::hixl::{

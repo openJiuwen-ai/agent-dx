@@ -1,6 +1,7 @@
 //! HIXL backend status rendered for the Node REST endpoints.
 
 use super::{CheckResult, Node};
+use afs_transport::hixl::{ReadTransport, RuntimeStatus};
 use serde_json::json;
 
 #[cfg(feature = "ownerfs")]
@@ -42,14 +43,33 @@ pub(super) fn health(node: &Node) -> CheckResult {
     )
 }
 
+fn actual_mode(status: &RuntimeStatus) -> &'static str {
+    match status.transport {
+        ReadTransport::Roce if status.relay_hbm_budget_bytes != 0 => "roce_relay",
+        ReadTransport::Roce => "roce_direct",
+        ReadTransport::Hccs => "hccs_relay",
+        ReadTransport::HccsFabric => "hccs_fabric",
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+fn protocol_version(status: Option<&RuntimeStatus>) -> Option<u32> {
+    status.map(|_| crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION)
+}
+
+#[cfg(not(feature = "ownerfs"))]
+fn protocol_version(_: Option<&RuntimeStatus>) -> Option<u32> {
+    None
+}
+
 fn hixl_check(
     config: &crate::config::HixlConfig,
     data_mode: crate::config::DataMode,
     ownerfs: bool,
-    status: Option<&afs_transport::hixl::RuntimeStatus>,
+    status: Option<&RuntimeStatus>,
     lane_count: usize,
     infos: &[afs_transport::hixl::EngineInfo],
-    lane_statuses: &[afs_transport::hixl::RuntimeStatus],
+    lane_statuses: &[RuntimeStatus],
 ) -> CheckResult {
     use crate::config::DataMode;
     use afs_transport::hixl::RuntimeState;
@@ -58,10 +78,7 @@ fn hixl_check(
     let startup_fallback = configured && data_mode == DataMode::Auto && status.is_none();
     let ready = !configured || running || startup_fallback;
     let devices = config.device_configs();
-    #[cfg(feature = "ownerfs")]
-    let protocol_version = status.map(|_| crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION);
-    #[cfg(not(feature = "ownerfs"))]
-    let protocol_version = Option::<u32>::None;
+
     let lanes = (0..lane_count)
         .map(|index| {
             let device = devices.get(index);
@@ -83,6 +100,9 @@ fn hixl_check(
                 "engine_id": engine_id,
                 "engine_generation": info.map(|info| info.generation),
                 "state": state,
+                "actual_mode": lane_status.map(actual_mode),
+                "fabric_mem": lane_status.is_some_and(|status| status.transport.is_fabric_mem()),
+                "internal_protocol_version": protocol_version(lane_status),
                 "allocated_bytes": lane_status.map_or(0, |status| status.allocated_bytes),
                 "relay_hbm_budget_bytes": lane_status
                     .map_or(0, |status| status.relay_hbm_budget_bytes),
@@ -102,7 +122,9 @@ fn hixl_check(
             "relay_hbm_budget_bytes": status.map_or(0, |status| status.relay_hbm_budget_bytes),
             "hccs_domain_id": status.and_then(|status| status.hccs_domain_id),
             "lane_count": lane_count,
-            "internal_protocol_version": protocol_version,
+            "actual_mode": status.map(actual_mode),
+            "fabric_mem": status.is_some_and(|status| status.transport.is_fabric_mem()),
+            "internal_protocol_version": protocol_version(status),
             "lanes": lanes,
             "state": status
                 .map(|status| status.state.to_string())
@@ -270,8 +292,8 @@ mod hixl_health_tests {
 
         assert!(check.ready);
         assert_eq!(check.body["lane_count"], 2);
-        #[cfg(feature = "dfs")]
-        assert_eq!(check.body["internal_protocol_version"], 2);
+        #[cfg(feature = "ownerfs")]
+        assert_eq!(check.body["internal_protocol_version"], 1);
         assert_eq!(check.body["relay_hbm_budget_bytes"], 128 * MIB);
         assert_eq!(check.body["receive_slots_in_use"], 3);
         assert_eq!(check.body["export_slots_in_use"], 2);
@@ -288,9 +310,41 @@ mod hixl_health_tests {
         assert_eq!(check.body["lanes"][1]["engine_generation"], 11);
         assert_eq!(check.body["lanes"][1]["allocated_bytes"], 32 * MIB);
         assert_eq!(check.body["lanes"][1]["hccs_domain_id"], 7);
+        assert_eq!(check.body["lanes"][1]["actual_mode"], "hccs_relay");
+        assert_eq!(check.body["lanes"][1]["fabric_mem"], false);
         assert!(!check.body.to_string().contains("\"address\""));
         assert!(!check.body.to_string().contains("virtual_address"));
         assert!(!check.body.to_string().contains("token"));
+    }
+
+    #[cfg(feature = "ownerfs")]
+    #[test]
+    fn health_reports_fabric_from_the_runtime_even_when_requested_mode_differs() {
+        let status = RuntimeStatus {
+            transport: ReadTransport::HccsFabric,
+            relay_hbm_budget_bytes: 0,
+            ..hccs_status()
+        };
+        let config = HixlConfig {
+            engine_id: "127.0.0.1:7920".into(),
+            ..Default::default()
+        };
+        let check = hixl_check(
+            &config,
+            DataMode::Hixl,
+            true,
+            Some(&status),
+            1,
+            &[],
+            std::slice::from_ref(&status),
+        );
+        assert_eq!(check.body["transport"], "roce");
+        assert_eq!(check.body["actual_mode"], "hccs_fabric");
+        assert_eq!(check.body["internal_protocol_version"], 1);
+        assert_eq!(check.body["lanes"][0]["fabric_mem"], true);
+        assert_eq!(check.body["lanes"][0]["actual_mode"], "hccs_fabric");
+        assert_eq!(check.body["lanes"][0]["internal_protocol_version"], 1);
+        assert_eq!(check.body["lanes"][0]["relay_hbm_budget_bytes"], 0);
     }
 
     #[test]
@@ -309,6 +363,8 @@ mod hixl_health_tests {
         assert_eq!(check.body["lane_count"], 0);
         assert!(check.body["internal_protocol_version"].is_null());
         assert_eq!(check.body["lanes"].as_array().unwrap().len(), 0);
+        assert!(check.body["actual_mode"].is_null());
+        assert_eq!(check.body["fabric_mem"], false);
         assert_eq!(check.body["data_mode"], "grpc");
     }
 }

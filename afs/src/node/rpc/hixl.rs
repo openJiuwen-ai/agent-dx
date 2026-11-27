@@ -1,12 +1,8 @@
 //! Wire negotiation shared by the HIXL RPC adapters.
 
-#[cfg(feature = "ownerfs")]
-use afs_protocol::node_data::HixlTransport;
-#[cfg(feature = "ownerfs")]
-use afs_transport::hixl::{EngineInfo, ReadTransport};
-
 use crate::node::data_plane::hixl::SlotChecksum;
-use afs_protocol::node_data::HixlSlotChecksumAlgorithm;
+use afs_protocol::node_data::{HixlMemoryKind, HixlSlotChecksumAlgorithm, HixlTransport};
+use afs_transport::hixl::{EngineInfo, ReadTransport};
 
 impl SlotChecksum {
     /// The reader's offer in preference order: hardware CRC32C first.
@@ -40,12 +36,37 @@ impl SlotChecksum {
     }
 }
 
-pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 1;
 
-#[cfg(feature = "ownerfs")]
-pub(super) type TransportParameters = (HixlTransport, u32, u32, Option<u64>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TransportParameters {
+    pub(super) protocol_version: u32,
+    pub(super) transport: HixlTransport,
+    pub(super) memory_kind: HixlMemoryKind,
+    pub(super) buffer_pool_count: u32,
+    pub(super) buffer_pool_size_mib: u32,
+    pub(super) hccs_domain_id: Option<u64>,
+}
 
-#[cfg(feature = "ownerfs")]
+impl TransportParameters {
+    pub(super) fn matches_wire(
+        self,
+        protocol_version: u32,
+        transport: i32,
+        memory_kind: i32,
+        buffer_pool_count: u32,
+        buffer_pool_size_mib: u32,
+        hccs_domain_id: Option<u64>,
+    ) -> bool {
+        protocol_version == self.protocol_version
+            && transport == self.transport as i32
+            && memory_kind == self.memory_kind as i32
+            && buffer_pool_count == self.buffer_pool_count
+            && buffer_pool_size_mib == self.buffer_pool_size_mib
+            && hccs_domain_id == self.hccs_domain_id
+    }
+}
+
 pub(super) fn transport_parameters(info: &EngineInfo) -> Result<TransportParameters, &'static str> {
     let count = u32::try_from(info.buffer_pool_count)
         .map_err(|_| "HIXL buffer-pool count exceeds protocol range")?;
@@ -54,14 +75,31 @@ pub(super) fn transport_parameters(info: &EngineInfo) -> Result<TransportParamet
     if (count == 0) != (size == 0) {
         return Err("HIXL buffer-pool dimensions must both be zero or positive");
     }
-    match (info.transport, info.hccs_domain_id) {
-        (ReadTransport::Roce, None) => Ok((HixlTransport::Roce, count, size, None)),
-        (ReadTransport::Hccs, Some(domain)) if count > 0 => {
-            Ok((HixlTransport::Hccs, count, size, Some(domain)))
+    use HixlMemoryKind::{ClassicHost, FabricHost};
+    let (transport, memory_kind) = match (info.transport, info.hccs_domain_id) {
+        (ReadTransport::Roce, None) => (HixlTransport::Roce, ClassicHost),
+        (ReadTransport::Hccs, Some(_)) if count > 0 => (HixlTransport::Hccs, ClassicHost),
+        // The native runtime obtained the domain from the device. Zero is
+        // a valid domain; absence is not.
+        (ReadTransport::HccsFabric, Some(_)) if count == 0 => (HixlTransport::Hccs, FabricHost),
+        (ReadTransport::Roce, Some(_)) => {
+            return Err("HIXL RoCE must not advertise an HCCS domain");
         }
-        (ReadTransport::Roce, Some(_)) => Err("HIXL RoCE must not advertise an HCCS domain"),
-        (ReadTransport::Hccs, _) => Err("HIXL HCCS requires a buffer pool and a super-pod domain"),
-    }
+        (ReadTransport::Hccs, _) => {
+            return Err("HIXL HCCS requires a buffer pool and a super-pod domain");
+        }
+        (ReadTransport::HccsFabric, _) => {
+            return Err("HIXL Fabric requires zero buffer-pool dimensions and a super-pod domain");
+        }
+    };
+    Ok(TransportParameters {
+        protocol_version: HIXL_PROTOCOL_VERSION,
+        transport,
+        memory_kind,
+        buffer_pool_count: count,
+        buffer_pool_size_mib: size,
+        hccs_domain_id: info.hccs_domain_id,
+    })
 }
 
 /// The source refused the typed capability before any data submission.
@@ -86,13 +124,71 @@ mod tests {
         assert!(super::transport_parameters(&info).is_err());
         info.buffer_pool_size_mib = 8;
         let relay = super::transport_parameters(&info).unwrap();
-        assert_eq!(
-            relay,
-            (afs_protocol::node_data::HixlTransport::Roce, 4, 8, None)
-        );
+        assert!(relay.matches_wire(
+            1,
+            afs_protocol::node_data::HixlTransport::Roce as i32,
+            afs_protocol::node_data::HixlMemoryKind::ClassicHost as i32,
+            4,
+            8,
+            None,
+        ));
         assert_ne!(direct, relay);
         info.hccs_domain_id = Some(7);
         assert!(super::transport_parameters(&info).is_err());
+    }
+
+    #[cfg(feature = "ownerfs")]
+    #[test]
+    fn v1_encodes_explicit_classic_memory_kind() {
+        use afs_protocol::node_data::{
+            HixlMemoryKind, HixlTransport, OwnerNegotiateHixlReply, OwnerNegotiateHixlRequest,
+        };
+        use prost::Message;
+
+        for (transport, count, size, domain, request_bytes, reply_bytes) in [
+            (
+                HixlTransport::Roce,
+                0,
+                0,
+                None,
+                &[0x20, 1, 0x28, 1, 0x58, 1][..],
+                &[0x18, 1, 0x20, 1, 0x68, 1][..],
+            ),
+            (
+                HixlTransport::Hccs,
+                4,
+                8,
+                Some(7),
+                &[0x20, 1, 0x28, 2, 0x30, 4, 0x38, 8, 0x40, 7, 0x58, 1][..],
+                &[0x18, 1, 0x20, 2, 0x28, 4, 0x30, 8, 0x38, 7, 0x68, 1][..],
+            ),
+        ] {
+            let request = OwnerNegotiateHixlRequest {
+                protocol_version: 1,
+                transport: transport as i32,
+                buffer_pool_count: count,
+                buffer_pool_size_mib: size,
+                hccs_domain_id: domain,
+                memory_kind: HixlMemoryKind::ClassicHost as i32,
+                ..Default::default()
+            };
+            let reply = OwnerNegotiateHixlReply {
+                protocol_version: 1,
+                transport: transport as i32,
+                buffer_pool_count: count,
+                buffer_pool_size_mib: size,
+                hccs_domain_id: domain,
+                memory_kind: HixlMemoryKind::ClassicHost as i32,
+                ..Default::default()
+            };
+            assert_eq!(request.encode_to_vec().as_slice(), request_bytes);
+            assert_eq!(reply.encode_to_vec().as_slice(), reply_bytes);
+            assert_eq!(
+                OwnerNegotiateHixlRequest::decode(request_bytes).unwrap(),
+                request
+            );
+            assert_eq!(OwnerNegotiateHixlReply::decode(reply_bytes).unwrap(), reply);
+        }
     }
 
     #[test]

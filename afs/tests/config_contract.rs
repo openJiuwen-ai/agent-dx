@@ -611,6 +611,10 @@ fn hixl_defaults_off_with_roce_transport_without_changing_existing_data_mode() {
     assert_eq!(printed["hixl"]["buffer_pool_count"], 4);
     assert_eq!(printed["hixl"]["buffer_pool_size_mib"], 8);
     assert_eq!(printed["hixl"]["session_idle_ms"], 20000);
+    assert_eq!(printed["hixl"]["fabric_mem"], false);
+    assert_eq!(printed["hixl"]["export_slots_per_session"], 32);
+    assert_eq!(printed["hixl"]["ownerfs_sessions_per_home"], 8);
+    assert!(printed["hixl"].get("export_slots").is_none());
     assert!(printed["hixl"].get("device_listen_port").is_some());
     assert!(printed["hixl"]["device_listen_port"].is_null());
     let options = cfg.hixl.runtime_options_per_device().remove(0);
@@ -624,12 +628,13 @@ fn hixl_defaults_off_with_roce_transport_without_changing_existing_data_mode() {
 fn disabled_hixl_table_is_accepted_without_native_dependencies() {
     let cfg = resolve_hixl_table(
         "data_mode='grpc'",
-        "window_bytes=4194304\nreceive_slots=2\nexport_slots=2",
+        "window_bytes=4194304\nreceive_slots=2\nexport_slots_per_session=2\nownerfs_sessions_per_home=3",
     )
     .unwrap();
     assert_eq!(cfg.data_mode, DataMode::Grpc);
     let printed = serde_json::to_value(&cfg).unwrap();
     assert_eq!(printed["hixl"]["receive_slots"], 2);
+    assert_eq!(cfg.hixl.runtime_options_per_device()[0].export_slots, 6);
 }
 
 fn resolve_hixl_table(prefix: &str, table: &str) -> afs_error::Result<Config> {
@@ -667,23 +672,153 @@ device_listen_port=27666",
 }
 
 #[test]
-fn hixl_link_and_buffer_pool_are_independent() {
-    for (table, link, pool) in [
-        ("", "roce", false),
-        ("transport='roce'\nbuffer_pool=true", "roce", true),
-        (HCCS_BUFFER_POOL, "hccs", true),
+fn hixl_valid_link_and_memory_modes_use_the_same_capacity_defaults() {
+    use afs_transport::hixl::ReadTransport;
+
+    for (table, transport, pool) in [
+        ("", ReadTransport::Roce, false),
+        (
+            "transport='roce'\nbuffer_pool=true",
+            ReadTransport::Roce,
+            true,
+        ),
+        (HCCS_BUFFER_POOL, ReadTransport::Hccs, true),
+        (
+            "transport='hccs'\nfabric_mem=true\nbuffer_pool=false",
+            ReadTransport::HccsFabric,
+            false,
+        ),
     ] {
         let cfg = resolve_hixl_table("", table).unwrap();
         let options = cfg.hixl.runtime_options_per_device().remove(0);
-        assert_eq!(options.transport.to_string(), link);
+        let printed = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(printed["hixl"]["transport"], transport.as_str());
+        assert_eq!(printed["hixl"]["fabric_mem"], transport.is_fabric_mem());
+        assert_eq!(options.transport, transport);
         assert_eq!(options.buffer_pool, pool);
+        assert_eq!(options.window_bytes, 4 * 1024 * 1024);
+        assert_eq!(options.receive_slots, 256);
+        assert_eq!(options.export_slots, 256);
     }
-    assert!(
-        resolve_hixl_table("", "transport='hccs'\nbuffer_pool=false")
-            .unwrap_err()
-            .message()
-            .contains("buffer_pool")
+}
+
+#[test]
+fn hixl_rejects_conflicting_link_and_memory_modes_even_when_disabled() {
+    for table in [
+        "transport='hccs'\nbuffer_pool=false",
+        "transport='hccs'\nfabric_mem=true\nbuffer_pool=true",
+        "transport='roce'\nfabric_mem=true\nbuffer_pool=false",
+        "transport='roce'\nfabric_mem=true\nbuffer_pool=true",
+    ] {
+        let error = resolve_hixl_table("", table).unwrap_err();
+        assert!(error.message().contains("fabric_mem"), "{table}: {error}");
+    }
+}
+
+#[test]
+fn hixl_fabric_sdk_options_are_optional_and_propagate_to_every_lane() {
+    use afs_transport::hixl::{FabricMemOptions, FabricMemUnfold};
+
+    let mode = "transport='hccs'\nfabric_mem=true\nengine_id='192.0.2.10:7920'";
+    let cfg = resolve_hixl_table("", mode).unwrap();
+    let defaults = cfg.hixl.runtime_options_per_device().remove(0);
+    assert_eq!(defaults.fabric_mem_options, FabricMemOptions::default());
+
+    let table = format!(
+        "{mode}\nfabric_mem_unfold='host'\nfabric_mem_task_streams=8\n\
+         fabric_mem_max_capacity_tb=1024\nfabric_mem_start_address_tb=0\n\
+         fabric_mem_max_transfer_count_per_batch=1920\n\
+         [[hixl.additional_devices]]\ndevice_id=1\nengine_id='192.0.2.10:7921'"
     );
+    let cfg = resolve_hixl_table("", &table).unwrap();
+    let options = cfg.hixl.runtime_options_per_device();
+    assert_eq!(options.len(), 2);
+    for lane in options {
+        assert_eq!(
+            lane.fabric_mem_options,
+            FabricMemOptions {
+                unfold: Some(FabricMemUnfold::Host),
+                task_streams: Some(8),
+                max_capacity_tb: Some(1024),
+                start_address_tb: Some(0),
+                max_transfer_count_per_batch: Some(1920),
+            }
+        );
+    }
+}
+
+#[test]
+fn hixl_fabric_sdk_options_reject_off_mode_and_invalid_values() {
+    let mode = "transport='hccs'\nfabric_mem=true";
+    for (key, value) in [
+        ("fabric_mem_unfold", "'host'"),
+        ("fabric_mem_task_streams", "1"),
+        ("fabric_mem_max_capacity_tb", "1"),
+        ("fabric_mem_start_address_tb", "0"),
+        ("fabric_mem_max_transfer_count_per_batch", "1"),
+    ] {
+        let setting = format!("{key}={value}");
+        assert!(resolve_hixl_table("", &setting).is_err(), "{key}");
+        assert!(
+            resolve_hixl_table("", &format!("{mode}\n{setting}")).is_ok(),
+            "{key}"
+        );
+    }
+    for value in [
+        "fabric_mem_unfold='unknown'",
+        "fabric_mem_task_streams=0",
+        "fabric_mem_task_streams=2",
+        "fabric_mem_unfold='aicpu'\nfabric_mem_task_streams=2",
+        "fabric_mem_unfold='host'\nfabric_mem_task_streams=9",
+        "fabric_mem_max_capacity_tb=0",
+        "fabric_mem_max_capacity_tb=1025",
+        "fabric_mem_start_address_tb=-1",
+        "fabric_mem_start_address_tb=1025",
+        "fabric_mem_max_transfer_count_per_batch=0",
+        "fabric_mem_unfold='host'\nfabric_mem_max_transfer_count_per_batch=1921",
+    ] {
+        assert!(
+            resolve_hixl_table("", &format!("{mode}\n{value}")).is_err(),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn hixl_fabric_lanes_require_distinct_engines_without_listener_overrides() {
+    let table = "transport='hccs'\nfabric_mem=true\nengine_id='192.0.2.10:7920'";
+    let extra = "[[hixl.additional_devices]]\ndevice_id=1\nengine_id='192.0.2.10:7921'";
+    let cfg = resolve_hixl_table("", &format!("{table}\n{extra}")).unwrap();
+    let options = cfg.hixl.runtime_options_per_device();
+    assert_eq!(options.len(), 2);
+    assert!(options.iter().all(|lane| lane.device_listen_port.is_none()));
+    assert_ne!(options[0].engine_id, options[1].engine_id);
+    assert!(
+        resolve_hixl_table("", &format!("transport='hccs'\nfabric_mem=true\n{extra}")).is_err()
+    );
+    let duplicate = extra.replace(":7921", ":7920");
+    assert!(resolve_hixl_table("", &format!("{table}\n{duplicate}")).is_err());
+    for config in [
+        format!("{table}\ndevice_listen_port=17920"),
+        format!("{table}\n{extra}\ndevice_listen_port=17921"),
+    ] {
+        let error = resolve_hixl_table("", &config).unwrap_err();
+        assert!(error.message().contains("device_listen_port"));
+    }
+}
+
+#[test]
+fn hixl_host_slot_limits_depend_on_registration_mode() {
+    let cap = "receive_slots=4096\nexport_slots_per_session=512";
+    for mode in [HCCS_BUFFER_POOL, "transport='hccs'\nfabric_mem=true"] {
+        let cfg = resolve_hixl_table("", &format!("{mode}\n{cap}")).unwrap();
+        let options = &cfg.hixl.runtime_options_per_device()[0];
+        assert_eq!(options.receive_slots, 4096);
+        assert_eq!(options.export_slots, 4096);
+    }
+    assert!(resolve_hixl_table("", "receive_slots=3744").is_ok());
+    let error = resolve_hixl_table("", "receive_slots=3745").unwrap_err();
+    assert!(error.message().contains("4000"));
 }
 
 const HCCS_BUFFER_POOL: &str = "transport='hccs'\nbuffer_pool=true";
@@ -750,7 +885,13 @@ fn hixl_rejects_unbounded_pools_and_unknown_options() {
         "window_bytes=0",
         "window_bytes=4194305",
         "receive_slots=0",
-        "export_slots=129",
+        "receive_slots=4097",
+        "export_slots=32",
+        "export_slots_per_session=0",
+        "export_slots_per_session=513",
+        "export_slots_per_session=9223372036854775807",
+        "ownerfs_sessions_per_home=9",
+        "transport='hccs-fabric'",
         "device_id=-1",
         "window_byets=1024",
         // Renamed to ownerfs_read_group_*; no alias is kept.

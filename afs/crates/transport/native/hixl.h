@@ -2,9 +2,8 @@
  * AFS HIXL rH2H thin C ABI.
  *
  * Rust owns the lifecycle state machine and invokes this ABI only from its
- * dedicated ACL owner thread.  The native side owns aclrtMallocHost buffers,
- * optional HIXL registrations.  No C++ object or STL
- * type crosses the boundary.
+ * dedicated ACL owner thread. The native side owns Host buffers and their
+ * optional HIXL registrations. No C++ object or STL type crosses the boundary.
  */
 #ifndef AFS_HIXL_H
 #define AFS_HIXL_H
@@ -33,15 +32,32 @@ typedef struct afs_hixl_batch_window {
 
 #define AFS_HIXL_MAX_BATCH_WINDOWS 64U
 
+/* Bridge status for a permanently retained Fabric generation. No operation,
+ * including shutdown, may retry SDK work on this generation. */
+#define AFS_HIXL_QUARANTINED UINT32_MAX
+
 #define AFS_HIXL_TRANSPORT_ROCE 1U
 #define AFS_HIXL_TRANSPORT_HCCS 2U
+#define AFS_HIXL_TRANSPORT_HCCS_FABRIC 3U
 
-/* Increment when changing any exported signature or shared layout. */
-#define AFS_HIXL_ABI_VERSION 1U
+/* Increment when changing an exported signature, shared layout or mode contract. */
+#define AFS_HIXL_ABI_VERSION 3U
 uint32_t afs_hixl_abi_version(void);
 
-/* Pool dimensions are both zero for direct RoCE, or both positive for relay.
- * HCCS requires relay. RoCE relay requires HCCL_INTRA_ROCE_ENABLE=1,
+/* All fields use UNSET for omission. Unfold is 0 for Host, 1 for AICPU. */
+#define AFS_HIXL_FABRIC_OPTION_UNSET UINT32_MAX
+typedef struct afs_hixl_fabric_options {
+    uint32_t enable_aicpu_unfold;
+    uint32_t task_streams;
+    uint32_t max_capacity_tb;
+    uint32_t start_address_tb;
+    uint32_t max_transfer_count_per_batch;
+} afs_hixl_fabric_options_t;
+
+/* Pool dimensions are both zero for direct RoCE and HCCS FabricMem, or both
+ * positive for relay. HCCS FabricMem requires device_listen_port = 0.
+ * fabric_options must be NULL outside FabricMem. NULL keeps all SDK defaults.
+ * RoCE relay requires HCCL_INTRA_ROCE_ENABLE=1,
  * HCCL_INTRA_PCIE_ENABLE=0 and HCCL_INTER_HCCS_DISABLE=TRUE before SDK startup.
  * On failure, a non-null out_runtime marks retained resources after incomplete
  * cleanup. It is quarantined and must never permit an unsupported fallback. */
@@ -54,11 +70,15 @@ uint32_t afs_hixl_start(int32_t device_id,
                         uint32_t transport,
                         size_t buffer_pool_count,
                         size_t buffer_pool_size_mib,
+                        const afs_hixl_fabric_options_t *fabric_options,
                         uint64_t *out_hccs_domain_id,
                         void **out_runtime,
                         char *error,
                         size_t error_len);
 
+/* AFS_HIXL_QUARANTINED means the Fabric connection outcome was uncertain or
+ * the generation was already quarantined. Other failures do not carry this
+ * meaning. */
 uint32_t afs_hixl_connect(void *runtime,
                           const char *peer,
                           uint32_t timeout_ms,
@@ -121,6 +141,8 @@ uint32_t afs_hixl_release_receives(void *runtime,
                                    char *error,
                                    size_t error_len);
 
+/* AFS_HIXL_QUARANTINED permanently blocks Fabric cleanup. Other failures may
+ * be retried after pending work drains or a retryable cleanup error clears. */
 uint32_t afs_hixl_shutdown(void *runtime, char *error, size_t error_len);
 
 /* Only call after afs_hixl_shutdown succeeds.  An uncertain runtime must be

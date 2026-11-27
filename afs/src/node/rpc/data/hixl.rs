@@ -5,8 +5,8 @@
 
 use crate::config::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
 use crate::node::data_plane::hixl::{ExportProvider, runtime_error};
-use crate::node::rpc::hixl::{TransportParameters, transport_parameters};
-use afs_protocol::node_data::{HixlLane, HixlTransport};
+use crate::node::rpc::hixl::{HIXL_PROTOCOL_VERSION, TransportParameters, transport_parameters};
+use afs_protocol::node_data::HixlLane;
 use afs_transport::grpc::error_status::{coded_status, error_to_status};
 use afs_transport::hixl::{EngineInfo, HixlError};
 use tonic::Status;
@@ -59,34 +59,6 @@ pub(super) fn negotiated_lanes(
     Ok((parameters, lanes))
 }
 
-pub(super) fn validate_transport_request(
-    transport: i32,
-    buffer_pool_count: u32,
-    buffer_pool_size_mib: u32,
-    hccs_domain_id: Option<u64>,
-    expected: TransportParameters,
-) -> Result<(), Status> {
-    let requested = HixlTransport::try_from(transport).map_err(|_| {
-        coded_status(
-            afs_error::NODE_TRANSFER_INVALID,
-            "HIXL transport is unknown",
-        )
-    })?;
-    if (
-        requested,
-        buffer_pool_count,
-        buffer_pool_size_mib,
-        hccs_domain_id,
-    ) != expected
-    {
-        return Err(coded_status(
-            afs_error::NODE_TRANSFER_INVALID,
-            "HIXL transport or buffer-pool parameters do not match",
-        ));
-    }
-    Ok(())
-}
-
 fn export_slot_count(slots: usize) -> Result<u32, Status> {
     if !(1..=MAX_OWNERFS_HIXL_SLOTS_PER_POOL).contains(&slots) {
         return Err(coded_status(
@@ -107,7 +79,7 @@ pub(super) fn validate_client_engine(
     engine_id: &str,
     generation: u64,
 ) -> Result<(), Status> {
-    if protocol_version != crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION {
+    if protocol_version != HIXL_PROTOCOL_VERSION {
         return Err(coded_status(
             afs_error::NODE_TRANSFER_UNSUPPORTED,
             "HIXL protocol version is unsupported",

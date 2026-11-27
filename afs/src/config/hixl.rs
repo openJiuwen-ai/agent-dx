@@ -4,9 +4,12 @@
 //! other setting is merged, because its checks need the role, the enabled
 //! filesystems, the data mode and the TLS material.
 
-use super::{DataMode, MAX_OWNERFS_HIXL_READ_GROUP_BYTES, Role, invalid};
+use super::{
+    DataMode, MAX_OWNERFS_HIXL_READ_GROUP_BYTES, MAX_OWNERFS_HIXL_SESSIONS_PER_HOME, Role, invalid,
+};
 use crate::node::storage::MAX_TRANSFER_BYTES;
 use afs_error::Result;
+use afs_transport::hixl::{FabricMemOptions, FabricMemUnfold, MAX_DIRECT_REGISTRATIONS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -26,7 +29,15 @@ pub enum HixlTransport {
 pub struct HixlDeviceConfig {
     pub device_id: i32,
     pub engine_id: String,
+    /// Optional listener override for classic HIXL; unsupported for FabricMem.
     pub device_listen_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HixlFabricMemUnfold {
+    Aicpu,
+    Host,
 }
 
 /// Fixed Host-memory pools and the administrator-managed HIXL device set.
@@ -36,17 +47,26 @@ pub struct HixlConfig {
     pub transport: HixlTransport,
     pub device_id: i32,
     pub engine_id: String,
+    /// Optional listener override for classic HIXL; unsupported for FabricMem.
     pub device_listen_port: Option<u16>,
     pub additional_devices: Vec<HixlDeviceConfig>,
     pub window_bytes: usize,
     pub receive_slots: usize,
-    pub export_slots: usize,
+    /// Export slots reserved in the lane budget for each configured Home session.
+    pub export_slots_per_session: usize,
     /// Idle peer control-session reuse limit, 1..=20000 ms. Sources close a
     /// session after 30 s without activity, so a reader never reuses one past
     /// 20 s.
     pub session_idle_ms: u64,
     /// Relay through device memory instead of registering Host slots directly.
     pub buffer_pool: bool,
+    /// Use Host Fabric windows over HCCS, without a Device relay pool.
+    pub fabric_mem: bool,
+    pub fabric_mem_unfold: Option<HixlFabricMemUnfold>,
+    pub fabric_mem_task_streams: Option<u16>,
+    pub fabric_mem_max_capacity_tb: Option<u16>,
+    pub fabric_mem_start_address_tb: Option<u16>,
+    pub fabric_mem_max_transfer_count_per_batch: Option<u16>,
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
     /// Target upper bound for one OwnerFs read-ahead window. The negotiated
@@ -91,12 +111,9 @@ pub struct HixlConfig {
 /// deployment.
 const MAX_OWNERFS_HIXL_READ_GROUP_HOST_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_OWNERFS_HIXL_MIN_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
-const MAX_OWNERFS_HIXL_SESSIONS_PER_HOME: usize = 4;
-/// One Host slot pool bound; both pools of every device lane together may
-/// reserve 1 GiB, so a node that serves and reads sizes each pool from the
-/// same budget.
-pub(crate) const MAX_OWNERFS_HIXL_SLOTS_PER_POOL: usize = 128;
-const MAX_OWNERFS_HIXL_HOST_SLOT_BYTES: usize = 1024 * 1024 * 1024;
+/// Maximum number of receive or total export slots on a lane.
+pub(crate) const MAX_OWNERFS_HIXL_SLOTS_PER_POOL: usize =
+    afs_transport::hixl::MAX_HOST_SLOTS_PER_POOL;
 /// Files up to the OwnerFs OPEN prefetch limit arrive inside the OPEN reply.
 const MIN_OWNERFS_HIXL_BATCH_FILE_BYTES: u64 = 4096 + 1;
 const MAX_OWNERFS_HIXL_BATCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -109,11 +126,17 @@ impl Default for HixlConfig {
             engine_id: String::new(),
             device_listen_port: None,
             additional_devices: Vec::new(),
-            window_bytes: 4 * 1024 * 1024,
-            receive_slots: 16,
-            export_slots: 16,
+            window_bytes: afs_transport::hixl::DEFAULT_WINDOW_BYTES,
+            receive_slots: afs_transport::hixl::DEFAULT_RECEIVE_SLOTS,
+            export_slots_per_session: 32,
             session_idle_ms: 20_000,
             buffer_pool: false,
+            fabric_mem: false,
+            fabric_mem_unfold: None,
+            fabric_mem_task_streams: None,
+            fabric_mem_max_capacity_tb: None,
+            fabric_mem_start_address_tb: None,
+            fabric_mem_max_transfer_count_per_batch: None,
             buffer_pool_count: 4,
             buffer_pool_size_mib: 8,
             ownerfs_read_group_bytes: 32 * 1024 * 1024,
@@ -124,7 +147,7 @@ impl Default for HixlConfig {
             ownerfs_buffered_writes: false,
             ownerfs_snapshot_reads: false,
             trusted_peers: Vec::new(),
-            ownerfs_sessions_per_home: 2,
+            ownerfs_sessions_per_home: 8,
             ownerfs_batch_read: true,
             ownerfs_batch_max_file_bytes: MAX_OWNERFS_HIXL_BATCH_FILE_BYTES,
         }
@@ -147,6 +170,9 @@ impl HixlConfig {
     }
 
     fn validate(&self, role: Role, deployment: HixlDeployment) -> Result<()> {
+        self.fabric_mem_options()
+            .validate(self.fabric_mem)
+            .map_err(invalid)?;
         let HixlDeployment {
             ownerfs,
             dfs,
@@ -154,20 +180,46 @@ impl HixlConfig {
             mutual_tls,
             bound_peers,
         } = deployment;
-        if self.transport == HixlTransport::Hccs && !self.buffer_pool {
-            return Err(invalid("HIXL transport hccs requires buffer_pool = true"));
+        if self.fabric_mem && (self.transport != HixlTransport::Hccs || self.buffer_pool) {
+            return Err(invalid(
+                "hixl.fabric_mem requires transport = hccs and buffer_pool = false",
+            ));
+        }
+        if self.transport == HixlTransport::Hccs && !self.fabric_mem && !self.buffer_pool {
+            return Err(invalid(
+                "HIXL transport hccs requires either fabric_mem or buffer_pool",
+            ));
         }
         if self.ownerfs_min_write_bytes > MAX_TRANSFER_BYTES {
             return Err(invalid(format!(
                 "hixl.ownerfs_min_write_bytes must be in 0..={MAX_TRANSFER_BYTES}"
             )));
         }
-        let lanes = self.additional_devices.len() + 1;
-        let pool_bytes = self
+        if !(1..=MAX_OWNERFS_HIXL_SESSIONS_PER_HOME).contains(&self.ownerfs_sessions_per_home) {
+            return Err(invalid("hixl.ownerfs_sessions_per_home must be 1..=8"));
+        }
+        let export_slots = self
+            .checked_total_export_slots()
+            .filter(|slots| (1..=MAX_OWNERFS_HIXL_SLOTS_PER_POOL).contains(slots))
+            .ok_or_else(|| invalid(format!(
+                "hixl.export_slots_per_session * ownerfs_sessions_per_home must be in 1..={MAX_OWNERFS_HIXL_SLOTS_PER_POOL} per lane"
+            )))?;
+        let slots = self
             .receive_slots
-            .checked_add(self.export_slots)
-            .and_then(|slots| slots.checked_mul(self.window_bytes))
+            .checked_add(export_slots)
+            .ok_or_else(|| invalid("hixl total Host slot count overflows"))?;
+        let lanes = self.additional_devices.len() + 1;
+        let pool_bytes = slots
+            .checked_mul(self.window_bytes)
             .and_then(|bytes| bytes.checked_mul(lanes));
+        if self.transport == HixlTransport::Roce
+            && !self.buffer_pool
+            && slots > MAX_DIRECT_REGISTRATIONS
+        {
+            return Err(invalid(format!(
+                "HIXL direct Host pool exceeds {MAX_DIRECT_REGISTRATIONS} SDK registrations per lane"
+            )));
+        }
         let buffer_pool_bytes = self
             .buffer_pool_count
             .checked_mul(self.buffer_pool_size_mib)
@@ -176,11 +228,9 @@ impl HixlConfig {
         if self.window_bytes == 0
             || self.window_bytes > 4 * 1024 * 1024
             || self.receive_slots == 0
-            || self.export_slots == 0
             || self.receive_slots > MAX_OWNERFS_HIXL_SLOTS_PER_POOL
-            || self.export_slots > MAX_OWNERFS_HIXL_SLOTS_PER_POOL
+            || pool_bytes.is_none()
             || !(1..=20_000).contains(&self.session_idle_ms)
-            || pool_bytes.is_none_or(|bytes| bytes > MAX_OWNERFS_HIXL_HOST_SLOT_BYTES)
             || self.buffer_pool_count == 0
             || self.buffer_pool_count > 64
             || self.buffer_pool_size_mib == 0
@@ -188,7 +238,7 @@ impl HixlConfig {
             || buffer_pool_bytes.is_none_or(|bytes| bytes > 512 * 1024 * 1024)
         {
             return Err(invalid(
-                "HIXL requires 1..4 MiB windows, 1..128 Host slots per pool, <=1 GiB Host slot memory across all device lanes, 1..64 HBM buffer-pool count and size, <=512 MiB HBM budget, and session_idle_ms in 1..=20000",
+                "HIXL requires nonzero windows up to 4 MiB, 1..=4096 receive slots per lane, representable total Host slot bytes, 1..=64 HBM buffer-pool count and size, <=512 MiB HBM per lane, and session_idle_ms in 1..=20000",
             ));
         }
         let enabled = self.enabled(data_mode, ownerfs);
@@ -222,10 +272,9 @@ impl HixlConfig {
     /// READ occupies one receive slot per window. Pooled sessions of one Home
     /// can each hold a window at once, so they split the export pool.
     fn validate_ownerfs(&self) -> Result<()> {
-        let sessions = self.ownerfs_sessions_per_home;
         let slot_capacity = self
             .receive_slots
-            .min(self.export_slots / sessions.max(1))
+            .min(self.export_slots_per_session)
             .checked_mul(self.window_bytes);
         let inflight_bytes = u64::try_from(self.ownerfs_read_group_bytes)
             .ok()
@@ -241,14 +290,13 @@ impl HixlConfig {
                 .is_multiple_of(self.window_bytes)
             || slot_capacity.is_none_or(|capacity| self.ownerfs_read_group_bytes > capacity)
             || !(1..=2).contains(&self.ownerfs_read_group_max_inflight)
-            || !(1..=MAX_OWNERFS_HIXL_SESSIONS_PER_HOME).contains(&sessions)
             || inflight_bytes.is_none_or(|bytes| self.ownerfs_read_group_host_budget_bytes < bytes)
             || self.ownerfs_read_group_host_budget_bytes
                 > MAX_OWNERFS_HIXL_READ_GROUP_HOST_BUDGET_BYTES
             || self.ownerfs_min_file_bytes > MAX_OWNERFS_HIXL_MIN_FILE_BYTES
         {
             return Err(invalid(
-                "hixl.ownerfs_read_group_bytes must be a multiple of window_bytes up to 128 MiB and min(receive_slots, export_slots / ownerfs_sessions_per_home) windows, ownerfs_sessions_per_home must be 1..=4, ownerfs_read_group_max_inflight must be 1 or 2, ownerfs_read_group_host_budget_bytes must cover every in-flight window up to 4 GiB, and ownerfs_min_file_bytes must be <= 1 TiB",
+                "hixl.ownerfs_read_group_bytes must be a multiple of window_bytes up to 128 MiB and min(receive_slots, export_slots_per_session) windows, ownerfs_read_group_max_inflight must be 1 or 2, ownerfs_read_group_host_budget_bytes must cover every in-flight window up to 4 GiB, and ownerfs_min_file_bytes must be <= 1 TiB",
             ));
         }
         if !(MIN_OWNERFS_HIXL_BATCH_FILE_BYTES..=MAX_OWNERFS_HIXL_BATCH_FILE_BYTES)
@@ -300,7 +348,12 @@ impl HixlConfig {
                     "hixl device at index {index} listener port must be in 1..=65535"
                 )));
             }
-            if multiple_devices && device.device_listen_port.is_none() {
+            if self.fabric_mem && device.device_listen_port.is_some() {
+                return Err(invalid(
+                    "HIXL FabricMem does not support device_listen_port",
+                ));
+            }
+            if multiple_devices && !self.fabric_mem && device.device_listen_port.is_none() {
                 return Err(invalid(
                     "hixl.device_listen_port must be set for every device in a multi-device config",
                 ));
@@ -314,7 +367,7 @@ impl HixlConfig {
             }
 
             if device.engine_id.is_empty() {
-                if index == 0 && !enabled {
+                if index == 0 && !enabled && (!self.fabric_mem || !multiple_devices) {
                     continue;
                 }
                 return Err(invalid(format!(
@@ -345,6 +398,24 @@ impl HixlConfig {
         Ok(())
     }
 
+    fn checked_total_export_slots(&self) -> Option<usize> {
+        self.export_slots_per_session
+            .checked_mul(self.ownerfs_sessions_per_home)
+    }
+
+    fn fabric_mem_options(&self) -> FabricMemOptions {
+        FabricMemOptions {
+            unfold: self.fabric_mem_unfold.map(|unfold| match unfold {
+                HixlFabricMemUnfold::Aicpu => FabricMemUnfold::Aicpu,
+                HixlFabricMemUnfold::Host => FabricMemUnfold::Host,
+            }),
+            task_streams: self.fabric_mem_task_streams,
+            max_capacity_tb: self.fabric_mem_max_capacity_tb,
+            start_address_tb: self.fabric_mem_start_address_tb,
+            max_transfer_count_per_batch: self.fabric_mem_max_transfer_count_per_batch,
+        }
+    }
+
     fn runtime_options_for_device(
         &self,
         device: &HixlDeviceConfig,
@@ -355,11 +426,17 @@ impl HixlConfig {
             device_listen_port: device.device_listen_port,
             window_bytes: self.window_bytes,
             receive_slots: self.receive_slots,
-            export_slots: self.export_slots,
+            // Resolved config has already checked this product. An unresolved
+            // overflowing value must still fail runtime slot validation.
+            export_slots: self.checked_total_export_slots().unwrap_or(usize::MAX),
             transport: match self.transport {
                 HixlTransport::Roce => afs_transport::hixl::ReadTransport::Roce,
+                HixlTransport::Hccs if self.fabric_mem => {
+                    afs_transport::hixl::ReadTransport::HccsFabric
+                }
                 HixlTransport::Hccs => afs_transport::hixl::ReadTransport::Hccs,
             },
+            fabric_mem_options: self.fabric_mem_options(),
             buffer_pool: self.buffer_pool,
             buffer_pool_count: self.buffer_pool_count,
             buffer_pool_size_mib: self.buffer_pool_size_mib,
@@ -544,7 +621,7 @@ mod hixl_config_tests {
                 ..auto.clone()
             },
             HixlConfig {
-                ownerfs_read_group_bytes: 128 * 1024 * 1024,
+                ownerfs_read_group_bytes: 132 * 1024 * 1024,
                 ..auto.clone()
             },
             HixlConfig {
@@ -584,29 +661,29 @@ mod hixl_config_tests {
     }
 
     #[test]
-    fn pooled_sessions_split_the_export_slots_of_one_window() {
+    fn per_session_export_slots_bound_one_read_group() {
         let ownerfs = ownerfs_deployment();
         // 32 MiB windows need eight 4 MiB slots per session.
-        for (sessions, export_slots, valid) in [
-            (4, 32, true),
-            (4, 24, false),
-            (2, 16, true),
-            (2, 8, false),
-            (0, 16, false),
-            (5, 64, false),
+        for (sessions, export_slots_per_session, valid) in [
+            (8, 8, true),
+            (8, 7, false),
+            (2, 8, true),
+            (2, 4, false),
+            (0, 8, false),
+            (9, 8, false),
         ] {
             let config = HixlConfig {
                 ownerfs_sessions_per_home: sessions,
-                export_slots,
+                export_slots_per_session,
                 ..ownerfs_config()
             };
             assert_eq!(
                 config.validate(Role::Node, ownerfs).is_ok(),
                 valid,
-                "sessions={sessions}, export_slots={export_slots}"
+                "sessions={sessions}, export_slots_per_session={export_slots_per_session}"
             );
         }
-        assert_eq!(HixlConfig::default().ownerfs_sessions_per_home, 2);
+        assert_eq!(HixlConfig::default().ownerfs_sessions_per_home, 8);
         assert_eq!(
             HixlConfig::default().ownerfs_read_group_bytes,
             32 * 1024 * 1024
@@ -614,82 +691,35 @@ mod hixl_config_tests {
     }
 
     #[test]
-    fn host_slot_pools_reserve_one_gib_and_cap_the_group() {
-        let ownerfs = ownerfs_deployment();
-        let reserved = HixlConfig {
-            receive_slots: 128,
-            export_slots: 128,
-            ownerfs_read_group_bytes: 128 * 1024 * 1024,
+    fn eight_lanes_can_use_the_default_host_pools() {
+        let config = HixlConfig {
+            device_listen_port: Some(30650),
+            additional_devices: (1..8)
+                .map(|id| HixlDeviceConfig {
+                    device_id: id,
+                    engine_id: format!("127.0.0.1:{}", 7920 + id),
+                    device_listen_port: Some(30650 + id as u16),
+                })
+                .collect(),
             ..ownerfs_config()
         };
-        // 128 + 128 slots of 4 MiB is exactly the 1 GiB Host slot budget.
-        assert!(reserved.validate(Role::Node, ownerfs).is_ok());
-        assert!(
-            HixlConfig {
-                receive_slots: 129,
-                ..reserved.clone()
-            }
-            .validate(Role::Node, ownerfs)
-            .is_err()
-        );
-        assert!(
-            HixlConfig {
-                export_slots: 129,
-                ..reserved.clone()
-            }
-            .validate(Role::Node, ownerfs)
-            .is_err()
-        );
-        // The group cap stays at 128 MiB even though the pools could hold more.
-        assert!(
-            HixlConfig {
-                ownerfs_read_group_bytes: 132 * 1024 * 1024,
-                ..reserved.clone()
-            }
-            .validate(Role::Node, ownerfs)
-            .is_err()
-        );
-        // Every device lane allocates its own pool, so the 1 GiB budget is the
-        // sum over lanes: two lanes take 64/64 each, four lanes 32/32.
-        let extra = |id: i32| HixlDeviceConfig {
-            device_id: id,
-            engine_id: format!("127.0.0.1:{}", 7920 + id as u16),
-            device_listen_port: Some(30650 + id as u16),
-        };
-        let two_lanes = HixlConfig {
-            device_listen_port: Some(30650),
-            additional_devices: vec![extra(1)],
-            ..reserved.clone()
-        };
-        assert!(two_lanes.validate(Role::Node, ownerfs).is_err());
-        assert!(
-            HixlConfig {
-                receive_slots: 64,
-                export_slots: 64,
-                ..two_lanes
-            }
-            .validate(Role::Node, ownerfs)
-            .is_ok()
-        );
-        assert!(
-            HixlConfig {
-                device_listen_port: Some(30650),
-                additional_devices: vec![extra(1), extra(2), extra(3)],
-                receive_slots: 32,
-                export_slots: 32,
-                ownerfs_read_group_bytes: 32 * 1024 * 1024,
-                ..ownerfs_config()
-            }
-            .validate(Role::Node, ownerfs)
-            .is_ok()
-        );
+        assert!(config.validate(Role::Node, ownerfs_deployment()).is_ok());
+        let lanes = config.runtime_options_per_device();
+        assert_eq!(lanes.len(), 8);
+        let capacity: u64 = lanes
+            .iter()
+            .map(|lane| {
+                (lane.window_bytes as u64) * ((lane.receive_slots + lane.export_slots) as u64)
+            })
+            .sum();
+        assert_eq!(capacity, 16 * 1024 * 1024 * 1024);
     }
 
     #[test]
     fn ownerfs_bounds_do_not_apply_while_ownerfs_mode_is_off() {
         let config = HixlConfig {
             receive_slots: 2,
-            export_slots: 2,
+            export_slots_per_session: 2,
             ..Default::default()
         };
         assert!(validate_hixl_disabled(&config).is_ok());
@@ -847,10 +877,6 @@ mod hixl_config_tests {
     #[test]
     fn device_set_is_limited_to_sixteen_devices_including_primary() {
         let mut config = valid_multi_device_config();
-        // Sixteen lanes of two 8-slot pools fit the 1 GiB Host slot budget.
-        config.receive_slots = 8;
-        config.export_slots = 8;
-        config.window_bytes = 4 * 1024 * 1024;
         let primary_device_id = config.device_id;
         config.additional_devices = (0..16)
             .filter(|device_id| *device_id != primary_device_id)
