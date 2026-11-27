@@ -2240,7 +2240,6 @@ async fn owner_prefetch_cache_hits_do_not_count_as_client_rpc_or_payload() {
     client.prefetched_reads.lock().unwrap().entries.insert(
         file.handle.clone(),
         super::PrefetchedOwnerRead {
-            #[cfg(feature = "dfs")]
             identity: file.identity.0.clone(),
             bytes: b"cached".to_vec(),
         },

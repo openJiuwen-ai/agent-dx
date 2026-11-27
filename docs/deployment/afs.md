@@ -644,7 +644,10 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 共享读的请求在途范围已消失、部分体被回收或指定持有者还未开始取该块时，
 读者收到 `NODE_TRANSFER_NOT_READY` 并继续用其余副本。一次读跨多个块时
 仍可使用已可供的持有者范围，等待预算为 0。没有配置变更或协议升级。
-CRC 片段由发送方核验覆盖段，只发送请求授权的字节。
+CRC 片段由发送方核验覆盖段，只发送请求授权的字节。节点选取持有者时排除已降级的候选，再从其余候选和自己中选排名最高者。
+
+读者的 `afs_dfs_read_cache_events_total` 中，`designated_self` 和 `designated_remote` 按每次选源所处理的块计数。同一块分多段读或重新选源可计多次。
+持有者从拼装中或等待安装的内存体成功发送一个授权范围后，`holder_served_partial` 事件加一，`afs_dfs_holder_served_partial_bytes_total` 累加该范围的字节数。已安装副本走磁盘供数路径，两项部分体计数都保持原值。
 
 Linux DFS挂载完成后仅设置自身FUSE设备的BDI `read_ahead_kb`，默认16384KiB；显式0禁用。
 INIT协商值与BDI有效值分别记录在`dfs.fuse_cache_init`和`dfs.fuse_readahead`。

@@ -29,7 +29,10 @@ fn p2_w2_native_last_slice_keeps_actual_charge_and_freeze_address() {
     assert_eq!(slow_transport.as_ref(), &[7]);
     assert!(matches!(
         budget.try_reserve(1).unwrap(),
-        DirtyAdmission::Wait { .. }
+        DirtyAdmission::Wait {
+            node_budget_short: true,
+            ..
+        }
     ));
     drop(slow_transport);
     assert_eq!(budget.snapshot().live_bytes, 0);
@@ -295,6 +298,7 @@ fn p2_w2_native_inode_charge_follows_last_shared_slice_and_actual_capacity() {
     .unwrap();
     builder.write_at(0, b"shared-owner").unwrap();
     assert_eq!(owner.snapshot().live_bytes, 4096);
+    assert!(owner.held_since().is_some());
     assert_eq!(owner.snapshot().live_peak_bytes, 4096);
     assert_eq!(budget.snapshot().live_bytes, 4096);
     let frozen = builder.freeze();
@@ -306,6 +310,7 @@ fn p2_w2_native_inode_charge_follows_last_shared_slice_and_actual_capacity() {
         DirtyAdmission::Wait { .. }
     ));
     drop(last);
+    assert!(owner.held_since().is_none());
     assert_eq!(owner.snapshot().live_bytes, 0);
     assert_eq!(budget.snapshot().live_bytes, 0);
     assert_eq!(pool.snapshot().idle_bytes, 4096);

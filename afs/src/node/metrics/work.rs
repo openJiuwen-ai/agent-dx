@@ -310,6 +310,7 @@ pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
     "denied_reauthorized",
     // H2 step 2: what this Node answered as a version holder.
     "holder_served",
+    "holder_served_partial",
     "holder_waited",
     "holder_wait_timeout",
     "holder_wait_rejected",
@@ -447,6 +448,8 @@ struct ReadCoreMetrics {
     #[cfg(feature = "dfs")]
     read_cache_events: afs_metrics::IntCounterVec,
     #[cfg(feature = "dfs")]
+    holder_partial_bytes: afs_metrics::IntCounter,
+    #[cfg(feature = "dfs")]
     read_source_bytes: afs_metrics::IntCounterVec,
     #[cfg(feature = "dfs")]
     read_cache_resources: afs_metrics::IntGaugeVec,
@@ -575,9 +578,15 @@ impl ReadCoreMetrics {
             read_cache_events: counter_vec(
                 registry,
                 "afs_dfs_read_cache_events_total",
-                "Native read cache Chunks by stage: staged, dropped, installed, published or retired; one count per Chunk event.",
+                "Native read cache and holder events. Designations count Chunk selections; partial serves count completed range operations.",
                 &["event"],
                 READ_CACHE_EVENTS,
+            )?,
+            #[cfg(feature = "dfs")]
+            holder_partial_bytes: counter(
+                registry,
+                "afs_dfs_holder_served_partial_bytes_total",
+                "Authorized bytes served from in-memory holder ranges with a completed response.",
             )?,
             #[cfg(feature = "dfs")]
             read_source_bytes: counter_vec(
@@ -1250,6 +1259,12 @@ impl ReadWorkMetrics {
                 .with_label_values(&[event])
                 .inc();
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn holder_served_partial(&self, bytes: u64) {
+        self.read_cache_event("holder_served_partial");
+        self.core.holder_partial_bytes.inc_by(bytes);
     }
 
     #[cfg(feature = "dfs")]
@@ -1974,6 +1989,7 @@ mod tests {
     const DFS_REGISTERED_FAMILIES: &[&str] = &[
         "afs_dfs_fetch_events_total",
         "afs_dfs_fetch_resources",
+        "afs_dfs_holder_served_partial_bytes_total",
         "afs_dfs_native_write_resources",
         "afs_dfs_native_writeback_errors_total",
         "afs_dfs_peer_disk_cache_events_total",

@@ -492,9 +492,14 @@ impl StageBudget {
     }
 }
 
+#[cfg(test)]
+type AfterFreeze = Box<dyn FnOnce() + Send>;
+
 /// One byte-budgeted queue and one supervised installer per node. Cache
 /// persistence and metadata publication never gate foreground delivery.
 pub(super) struct ReadCacheRuntime {
+    #[cfg(test)]
+    after_freeze: Mutex<Option<AfterFreeze>>,
     session: String,
     capacity: u64,
     send: tokio::sync::mpsc::UnboundedSender<CacheJob>,
@@ -663,6 +668,8 @@ impl ReadCacheRuntime {
         let (send, receive) = tokio::sync::mpsc::unbounded_channel();
         let (segment_send, segment_receive) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            #[cfg(test)]
+            after_freeze: Mutex::new(None),
             session,
             capacity,
             send,
@@ -1005,6 +1012,10 @@ impl ReadCacheRuntime {
             (complete, bytes.coverage.len(), frozen)
         });
         if complete {
+            #[cfg(test)]
+            if let Some(hook) = self.after_freeze.lock().unwrap().take() {
+                hook();
+            }
             let PartialCopy {
                 mut job,
                 body,
@@ -1469,6 +1480,66 @@ impl CacheJob {
             queued_at: Instant::now(),
             table: None,
             in_flight: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl DfsReadEngine {
+    pub(crate) fn checkpoint_stage(
+        &self,
+        chunk: &ChunkObject,
+        version: &FileVersionId,
+        layout: &LayoutRootId,
+        data: &[u8],
+        offset: usize,
+        length: usize,
+    ) {
+        self.remember_trusted_crc_table(
+            chunk,
+            crate::node::chunk_crc32c::CrcTable::build(data).unwrap(),
+        );
+        let batch = ReadBatch {
+            file_version_id: Some(version.clone()),
+            layout_root_id: layout.clone(),
+            ops: vec![ChunkReadOp {
+                chunk_id: chunk.id.clone(),
+                chunk_offset: offset as u64,
+                length: length as u64,
+                output_offset: 0,
+            }],
+            lookahead: Vec::new(),
+        };
+        let sources = [ChunkSources {
+            chunk_id: chunk.id.clone(),
+            chunk: Some(chunk.clone()),
+            sources: Vec::new(),
+            allowed_ranges: vec![(0, chunk.length)],
+        }];
+        self.cache_completed_ranges(&batch, &sources, &data[offset..offset + length]);
+    }
+
+    pub(crate) fn checkpoint_assemble(&self) {
+        self.distributed_cache
+            .as_ref()
+            .unwrap()
+            .assemble_pending(&self.local);
+    }
+
+    pub(crate) fn checkpoint_after_freeze(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .distributed_cache
+            .as_ref()
+            .unwrap()
+            .after_freeze
+            .lock()
+            .unwrap() = Some(Box::new(hook));
+    }
+
+    pub(crate) async fn checkpoint_install(self: &Arc<Self>) {
+        let cache = self.distributed_cache.as_ref().unwrap();
+        for job in cache.queued_jobs_for_test() {
+            self.run_install_job(job, cache.capacity()).await;
         }
     }
 }

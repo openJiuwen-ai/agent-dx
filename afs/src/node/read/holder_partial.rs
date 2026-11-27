@@ -24,10 +24,18 @@ pub(crate) struct PartialBytes {
 }
 
 impl PartialBytes {
-    fn bytes(&self) -> &[u8] {
-        self.complete.as_deref().unwrap_or(&self.data)
+    fn covers(&self, bounds: &Range<usize>) -> bool {
+        self.coverage
+            .iter()
+            .any(|range| range.start <= bounds.start && range.end >= bounds.end)
     }
 }
+
+#[cfg(test)]
+pub(crate) type VerifyGate = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// An assembler-owned body with one immutable descriptor. Completion moves
 /// the same allocation into shared ownership for the installer.
@@ -35,6 +43,8 @@ impl PartialBytes {
 pub(crate) struct HolderPartial {
     pub(crate) table: Arc<CrcTable>,
     bytes: Mutex<PartialBytes>,
+    #[cfg(test)]
+    pub(crate) verify_gate: Mutex<Option<VerifyGate>>,
 }
 
 impl HolderPartial {
@@ -59,10 +69,7 @@ impl HolderPartial {
         let Ok(bytes) = self.bytes.lock() else {
             return false;
         };
-        bytes
-            .coverage
-            .iter()
-            .any(|range| range.start <= bounds.start && range.end >= bounds.end)
+        bytes.covers(&bounds)
     }
 
     /// Copy only the exact grant range while the caller holds a read slot.
@@ -76,19 +83,34 @@ impl HolderPartial {
         let Some(bounds) = self.crc_bounds(offset, length) else {
             return Ok(None);
         };
-        let Ok(bytes) = self.bytes.lock() else {
-            return Ok(None);
+        // Snapshot the covered CRC segments atomically with the coverage check.
+        // A frozen allocation can be shared; an assembling one may still change.
+        let cover = {
+            let Ok(bytes) = self.bytes.lock() else {
+                return Ok(None);
+            };
+            if !bytes.covers(&bounds) {
+                return Ok(None);
+            }
+            if let Some(frozen) = &bytes.complete {
+                if bounds.end > frozen.len() {
+                    return Ok(None);
+                }
+                frozen.slice(bounds.clone())
+            } else {
+                let Some(range) = bytes.data.get(bounds.clone()) else {
+                    return Ok(None);
+                };
+                SharedChunkBytes::from_vec(range.to_vec())
+            }
         };
-        if !bytes
-            .coverage
-            .iter()
-            .any(|range| range.start <= bounds.start && range.end >= bounds.end)
-        {
-            return Ok(None);
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.verify_gate.lock().unwrap().take() {
+            let _ = entered.send(());
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
         }
-        let Some(cover) = bytes.bytes().get(bounds.clone()) else {
-            return Ok(None);
-        };
         let first = bounds.start / SEGMENT;
         if cover
             .chunks(SEGMENT)
@@ -100,9 +122,8 @@ impl HolderPartial {
                 "DFS holder buffer differs from its trusted CRC table",
             ));
         }
-        let start = offset as usize;
-        let end = start + length as usize;
-        copy(&bytes.bytes()[start..end]).map(Some)
+        let start = offset as usize - bounds.start;
+        copy(&cover[start..start + length as usize]).map(Some)
     }
 }
 
@@ -127,6 +148,16 @@ impl HolderPartials {
     }
 
     #[cfg(test)]
+    pub(crate) fn registered_epochs(&self, chunk: &ChunkId) -> Vec<u64> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|(id, epoch)| (id == chunk).then_some(*epoch))
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn queries_for_test(&self) -> usize {
         self.queries.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -142,6 +173,8 @@ impl HolderPartials {
         let body = Arc::new(HolderPartial {
             table,
             bytes: Mutex::new(bytes),
+            #[cfg(test)]
+            verify_gate: Mutex::new(None),
         });
         self.bodies
             .lock()

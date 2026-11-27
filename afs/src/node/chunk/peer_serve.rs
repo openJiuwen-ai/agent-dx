@@ -1077,6 +1077,11 @@ impl LocalChunkStore {
         })
     }
 
+    #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn occupy_peer_payload_budget(&self) -> Result<PeerReadReservation> {
+        self.reserve_peer_read_payload(self.peer_read_budget.limit as usize)
+    }
+
     /// RDMA packed and object payloads share one configured actual-capacity ledger.
     #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {

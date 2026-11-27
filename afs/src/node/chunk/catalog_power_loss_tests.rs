@@ -339,7 +339,7 @@ fn read_cache_intent_uses_the_same_durable_wal_name() {
         .receipt
         .unwrap();
     ack(&payload);
-    let intent = ReadCacheIntent {
+    let intent = super::read_cache::ReadCacheIntent {
         namespace_id: crate::dfs::NamespaceId::new("default"),
         file_version_id: crate::dfs::FileVersionId::new("version"),
         layout_root_id: crate::dfs::LayoutRootId::new("layout"),

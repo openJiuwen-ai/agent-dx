@@ -54,7 +54,7 @@ impl StagedChunk {
     /// verified against on receive (CPU fix 2): the table is accepted only if
     /// its descriptor digest is `expected`'s trusted identity, and then no
     /// CRC is recomputed. Any other case falls back to `from_replica`.
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(feature = "dfs")]
     pub(crate) fn from_replica_with_table(
         operation_id: OperationId,
         expected: &ChunkObject,

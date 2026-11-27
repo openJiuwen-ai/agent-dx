@@ -1241,6 +1241,12 @@ async fn h2_2c1_two_grpc_readers_share_eight_chunks_by_segment() {
         pair.writer_bytes
     );
     assert_eq!(pair.timeouts, 0);
+    eprintln!(
+        "holder_served_partial={} partial_bytes={}",
+        pair.partial_ops, pair.partial_bytes
+    );
+    assert!(pair.partial_ops > 0, "no holder served from a partial body");
+    assert!(pair.partial_bytes > 0, "no verified partial bytes sent");
 }
 
 /// review/18 a5: with no holder wait (`dfs_holder_wait_ms = 0`, also a bare
@@ -1305,22 +1311,27 @@ struct PairOutcome {
     waited_at_lower: u64,
     not_ready_at_lower: u64,
     timeouts: u64,
+    partial_ops: u64,
+    partial_bytes: u64,
     writer_reads: usize,
     writer_bytes: u64,
 }
 
 fn cache_event_count(registry: &afs_metrics::Registry, event: &str) -> u64 {
     let sample = format!("afs_dfs_read_cache_events_total{{event=\"{event}\"}} ");
+    metric_value(registry, &sample)
+}
+
+fn partial_bytes_count(registry: &afs_metrics::Registry) -> u64 {
+    metric_value(registry, "afs_dfs_holder_served_partial_bytes_total ")
+}
+
+fn metric_value(registry: &afs_metrics::Registry, sample: &str) -> u64 {
     afs_metrics::encode_text(registry)
         .unwrap()
         .lines()
-        .find_map(|line| {
-            line.strip_prefix(sample.as_str())?
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
-        .unwrap_or(0)
+        .find_map(|line| line.strip_prefix(sample))
+        .map_or(0, |value| value.trim().parse().unwrap())
 }
 
 /// CRC Chunks for the pair test: one, or two ranked oppositely for r1 and
@@ -1784,6 +1795,14 @@ async fn pair_read(
     let lower_metrics = &nodes[1 - higher].registry;
     let waited_at_lower = cache_event_count(lower_metrics, "holder_waited");
     let not_ready_at_lower = cache_event_count(lower_metrics, "holder_not_ready");
+    let partial_ops = nodes
+        .iter()
+        .map(|node| cache_event_count(&node.registry, "holder_served_partial"))
+        .sum();
+    let partial_bytes = nodes
+        .iter()
+        .map(|node| partial_bytes_count(&node.registry))
+        .sum();
     for node in nodes {
         node.server.abort();
     }
@@ -1795,6 +1814,8 @@ async fn pair_read(
         waited_at_higher,
         waited_at_lower,
         not_ready_at_lower,
+        partial_ops,
+        partial_bytes,
         timeouts,
         writer_reads: writer_reads.reads(),
         writer_bytes: writer_metrics
@@ -2646,4 +2667,342 @@ async fn h2_2c1_partial_reclaimed_before_serve_preserves_holder_for_next_chunk()
     );
     assert_eq!(cache_event_count(&reader.metrics, "holder_demoted"), 0);
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_2c1_holder_requests_at_every_handoff() {
+    const PART: usize = crate::node::chunk_crc32c::SEGMENT;
+    let data: Vec<_> = (0..PART * 4).map(|i| (i % 247) as u8).collect();
+    let chunk = crc_chunk_designating_holder("checkpoint", data.clone(), &["holder"]);
+    let (h, engine) = checkpoint_holder(&chunk);
+
+    let wait_for = |offset: usize| {
+        let (reached, entered) = tokio::sync::oneshot::channel();
+        holder_serve(&h).on(
+            crate::node::rpc::data::HolderTestPoint::Waiting,
+            move || {
+                let _ = reached.send(());
+            },
+        );
+        (entered, request_checkpoint(&h, &chunk, offset))
+    };
+    let stage = |offset| {
+        engine.checkpoint_stage(&chunk.chunk, &h.version, &h.layout.id, &data, offset, PART)
+    };
+    let request = |offset| request_checkpoint(&h, &chunk, offset);
+    let check = |name: &'static str,
+                 offset: usize,
+                 request: tokio::task::JoinHandle<Result<Vec<u8>, Status>>| {
+        let expected = data[offset..offset + PART].to_vec();
+        async move {
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(bytes, expected, "{name}");
+            eprintln!("checkpoint {name}: served {} B", bytes.len());
+        }
+    };
+
+    let in_read = h.in_flight.begin_range(&chunk.chunk.id, 9, 0, PART as u64);
+    let (entered, waiting) = wait_for(0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    stage(0);
+    drop(in_read);
+    engine.checkpoint_assemble();
+    check("fetch-complete", 0, waiting).await;
+
+    stage(PART);
+    let (entered, waiting) = wait_for(PART);
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    engine.checkpoint_assemble();
+    check("segment-queued", PART, waiting).await;
+    check("segment-assembled", PART, request(PART)).await;
+
+    stage(2 * PART);
+    engine.checkpoint_assemble();
+    let (frozen, reached) = tokio::sync::oneshot::channel();
+    let (resume, hold) = std::sync::mpsc::channel();
+    engine.checkpoint_after_freeze(move || {
+        let _ = frozen.send(());
+        hold.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+    });
+    stage(3 * PART);
+    let assemble = tokio::task::spawn_blocking({
+        let engine = engine.clone();
+        move || engine.checkpoint_assemble()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!h.local.has_servable_record(&chunk.chunk.id));
+    check("body-frozen-not-yet-queued", 3 * PART, request(3 * PART)).await;
+    resume.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), assemble)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!h.local.has_servable_record(&chunk.chunk.id));
+    check("install-queued", 3 * PART, request(3 * PART)).await;
+    let timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(timeout, engine.checkpoint_install())
+        .await
+        .unwrap();
+    assert!(h.local.has_servable_record(&chunk.chunk.id));
+    let partial_ops = cache_event_count(&h.metrics, "holder_served_partial");
+    let partial_bytes = partial_bytes_count(&h.metrics);
+    assert_eq!((partial_ops, partial_bytes), (5, 5 * PART as u64));
+    check("installed", 3 * PART, request(3 * PART)).await;
+    assert_eq!(
+        cache_event_count(&h.metrics, "holder_served_partial"),
+        partial_ops
+    );
+    assert_eq!(partial_bytes_count(&h.metrics), partial_bytes);
+    assert!(!h.in_flight.contains(&chunk.chunk.id));
+    assert_eq!(cache_event_count(&h.metrics, "holder_not_ready"), 0);
+    assert_eq!(cache_event_count(&h.metrics, "holder_wait_timeout"), 0);
+}
+
+fn request_checkpoint(
+    h: &Holder,
+    chunk: &StagedChunk,
+    offset: usize,
+) -> tokio::task::JoinHandle<Result<Vec<u8>, Status>> {
+    let mut op = holder_op(
+        0,
+        &chunk.chunk.id.0,
+        offset as u64,
+        crate::node::chunk_crc32c::SEGMENT as u64,
+        &grant("v", "l"),
+    );
+    op.wait_ms = 400;
+    let service = h.service.clone();
+    tokio::spawn(async move { read(&service, holder_request(vec![op])).await })
+}
+
+fn checkpoint_engine(
+    local: Arc<LocalChunkStore>,
+    namespace: NamespaceId,
+    name: &str,
+    epoch: u64,
+) -> Arc<crate::node::read::engine::DfsReadEngine> {
+    use crate::node::read::engine::{DfsReadConfig, DfsReadEngine, LocalReadAuthority};
+    let meta = Arc::new(PairMeta {
+        reply: Default::default(),
+        holder: None,
+    });
+    let pool = crate::node::rpc::peer::PeerConnectionPool::new(
+        afs_transport::GrpcConfig::default(),
+        afs_transport::TlsConfig::Disabled,
+        2,
+    )
+    .unwrap();
+    let transfer = crate::node::rpc::peer::GrpcChunkTransfer::new(
+        Arc::new(pool),
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap();
+    Arc::new(
+        DfsReadEngine::new(
+            namespace,
+            name.into(),
+            local,
+            meta,
+            Arc::new(transfer),
+            DfsReadConfig::default(),
+        )
+        .with_read_authority(Arc::new(LocalReadAuthority::new(
+            epoch,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )))
+        .with_distributed_cache("checkpoints".into(), 64 << 20)
+        .with_holder_lists(std::time::Duration::from_secs(1)),
+    )
+}
+
+fn checkpoint_holder(
+    chunk: &StagedChunk,
+) -> (Holder, Arc<crate::node::read::engine::DfsReadEngine>) {
+    let mut h = partial_holder(std::slice::from_ref(chunk), chunk.chunk.length);
+    let engine = checkpoint_engine(h.local.clone(), NamespaceId::new("namespace"), "holder", 9);
+    h.in_flight = engine.holder_in_flight().unwrap();
+    h.service.holders = Some(crate::node::rpc::data::HolderServe::new(
+        h.meta.clone(),
+        h.registry.clone(),
+        h.in_flight.clone(),
+        "holder".into(),
+        9,
+    ));
+    (h, engine)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_2c1_busy_partial_preserves_holder_for_next_chunk() {
+    let temp = tempfile::tempdir().unwrap();
+    let chunks = [review_chunk(40), review_chunk(41)];
+    let h = partial_holder(&chunks, chunks.iter().map(|chunk| chunk.chunk.length).sum());
+    let _partials = chunks
+        .each_ref()
+        .map(|chunk| partial_body(&h, chunk, chunk.bytes().len()));
+    let (endpoint, server) = serve(h.service.clone()).await;
+    let reader = review_reader(temp.path(), &chunks, &endpoint, 0).await;
+    let held = h.local.occupy_peer_payload_budget().unwrap();
+    let budget = std::time::Duration::from_secs(2);
+    assert_eq!(
+        read_within(&reader, &chunks[0], budget).await.unwrap(),
+        chunks[0].bytes()
+    );
+    assert_eq!(reader.writer.reads(), 1);
+    let event = |name| cache_event_count(&reader.metrics, name);
+    assert_eq!(
+        event("holder_answered_not_ready") + event("holder_answered_busy"),
+        1,
+        "temporary payload pressure must reach the reader as not ready or busy"
+    );
+    assert_eq!(event("holder_demoted"), 0);
+    drop(held);
+    assert_eq!(
+        read_within(&reader, &chunks[1], budget).await.unwrap(),
+        chunks[1].bytes()
+    );
+    assert_eq!(
+        reader.writer.reads(),
+        1,
+        "the next Chunk must come from the holder"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_2c1_partial_verification_allows_the_next_segment_to_assemble() {
+    const PART: usize = crate::node::chunk_crc32c::SEGMENT;
+    let data = vec![123; 4 * PART];
+    let chunk = crc_chunk_designating_holder("verify-concurrently", data.clone(), &["holder"]);
+    let (h, engine) = checkpoint_holder(&chunk);
+    let stage = |offset| {
+        engine.checkpoint_stage(&chunk.chunk, &h.version, &h.layout.id, &data, offset, PART)
+    };
+    stage(0);
+    engine.checkpoint_assemble();
+    let view = h
+        .in_flight
+        .partials
+        .covering(&chunk.chunk.id, 9, 0, PART as u64)
+        .unwrap();
+    let (entered, at_verify) = tokio::sync::oneshot::channel();
+    let (resume, paused) = std::sync::mpsc::channel();
+    *view.verify_gate.lock().unwrap() = Some((entered, paused));
+    let request = request_checkpoint(&h, &chunk, 0);
+    let timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(timeout, at_verify)
+        .await
+        .unwrap()
+        .unwrap();
+    stage(PART);
+    let assemble = tokio::task::spawn_blocking(move || {
+        engine.checkpoint_assemble();
+        view.covers(PART as u64, PART as u64)
+    });
+    let progress = tokio::time::timeout(timeout, assemble).await;
+    resume.send(()).unwrap();
+    assert!(
+        progress
+            .expect("assembler blocked behind range verification")
+            .unwrap()
+    );
+    assert_eq!(
+        tokio::time::timeout(timeout, request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        data[..PART]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_2c1_open_reader_grant_matches_the_assembled_partial_epoch() {
+    struct MetaValidator(crate::meta::dfs::DfsService, tokio::runtime::Handle);
+    impl DfsHolderGrantValidator for MetaValidator {
+        fn validate(
+            &self,
+            request: ValidateDfsHolderGrant,
+        ) -> afs_error::Result<DfsAuthorizedHolderRead> {
+            self.1.block_on(self.0.validate_holder_grant(request))
+        }
+    }
+
+    const PART: usize = crate::node::chunk_crc32c::SEGMENT;
+    let chunk = review_chunk(42);
+    let timeout = std::time::Duration::from_secs(5);
+    let (meta, epoch, lookup) = tokio::time::timeout(
+        timeout,
+        crate::meta::dfs::open_partial_readers(chunk.clone()),
+    )
+    .await
+    .expect("open shared readers");
+    let (version, layout_id) = (
+        lookup.file_version_id.clone(),
+        lookup.layout_root_id.clone(),
+    );
+    let h = holder(30_000);
+    let engine = checkpoint_engine(
+        h.local.clone(),
+        lookup.namespace_id.clone(),
+        "holder",
+        epoch,
+    );
+    engine.checkpoint_stage(&chunk.chunk, &version, &layout_id, chunk.bytes(), 0, PART);
+    engine.checkpoint_assemble();
+    let flight = engine.holder_in_flight().unwrap();
+    assert!(!h.local.has_servable_record(&chunk.chunk.id));
+    let mut holders = tokio::time::timeout(timeout, meta.version_holders(lookup))
+        .await
+        .expect("issue holder grant")
+        .unwrap();
+    assert_eq!(holders.len(), 1);
+    let grant = holders.pop().unwrap().grant;
+    let registered = flight.partials.registered_epochs(&chunk.chunk.id);
+    eprintln!(
+        "registered_epochs={registered:?} holder_node_epoch={}",
+        grant.holder_node_epoch
+    );
+    assert_eq!(registered, [grant.holder_node_epoch]);
+    let registry = HolderRegistry::new();
+    registry.retain(&version, 1);
+    let mut layout = review_layout(std::slice::from_ref(&chunk));
+    layout.id = layout_id.clone();
+    registry.attach(&version, &layout);
+    let mut service = h.service;
+    service.holders = Some(crate::node::rpc::data::HolderServe::new(
+        Arc::new(MetaValidator(meta, tokio::runtime::Handle::current())),
+        registry,
+        flight,
+        "holder".into(),
+        epoch,
+    ));
+    let mut op = holder_op(0, &chunk.chunk.id.0, 0, PART as u64, &grant);
+    op.source_copy_id = format!(
+        "holder:{}:{}",
+        grant.holder_node_id, grant.holder_node_epoch
+    );
+    let mut request = holder_request(vec![op]);
+    request.file_version_id = version.0;
+    request.layout_root_id = layout_id.0;
+    let received = tokio::time::timeout(timeout, read(&service, request))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, chunk.bytes()[..PART]);
+    assert_eq!(cache_event_count(&h.metrics, "holder_served_partial"), 1);
 }

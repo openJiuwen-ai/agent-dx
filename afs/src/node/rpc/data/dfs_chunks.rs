@@ -1136,11 +1136,19 @@ async fn stream_holder_data(
                     .read(op.chunk_offset, op.length, |range| {
                         local.copy_verified_peer_range(range)
                     })
-                    .map_err(error_to_status)?
+                    .map_err(|error| {
+                        if error.code() == afs_error::IO_CAPACITY {
+                            local.record_read_cache_event("holder_not_ready");
+                            holder_not_ready()
+                        } else {
+                            error_to_status(error)
+                        }
+                    })?
             {
                 let table = view.table.clone();
                 drop(view);
                 stream_holder_memory_range(stream, op, &table, body.into_shared_bytes()).await?;
+                local.record_holder_served_partial(op.length);
                 continue;
             }
             // Installation may have moved the range into the catalog.

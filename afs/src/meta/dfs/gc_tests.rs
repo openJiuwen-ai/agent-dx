@@ -3104,6 +3104,7 @@ async fn create_registers_its_handle_in_memory_and_writes_no_reference() {
 
 /// Cross the actual Node reporting path with a reopened Meta store. A transport
 /// delay keeps one low-numbered open reply in flight while a second is delivered.
+#[cfg(feature = "dfs")]
 #[tokio::test]
 async fn a_restart_preserves_a_live_reader_above_the_report_watermark() {
     use crate::node::gc::{GcControl, GcReferences, SoftReader};

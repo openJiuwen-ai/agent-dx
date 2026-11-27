@@ -1349,6 +1349,7 @@ pub enum SourceGrant {
     Holder(DfsHolderGrant),
 }
 
+#[cfg(feature = "dfs")]
 pub(crate) struct SourceGrantContext<'a> {
     pub(crate) namespace_id: &'a NamespaceId,
     pub(crate) file_version_id: &'a FileVersionId,
@@ -1359,6 +1360,7 @@ pub(crate) struct SourceGrantContext<'a> {
     pub(crate) token: &'a String,
 }
 
+#[cfg(feature = "dfs")]
 impl SourceGrant {
     pub(crate) fn context(&self) -> SourceGrantContext<'_> {
         match self {
@@ -1695,7 +1697,7 @@ pub(crate) fn count_interval_extent_visit() {
 }
 
 /// Extents examined on this thread since the last call (tests).
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 pub(crate) fn take_interval_extent_visits() -> u64 {
     INTERVAL_EXTENT_VISITS.with(|visits| visits.replace(0))
 }

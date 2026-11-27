@@ -1,6 +1,7 @@
 use super::*;
 use crate::dfs::{
-    DfsReadValidation, Extent, LayoutRootId, StorageDeviceDescriptor, ValidateDfsReadGrants,
+    DfsReadValidation, DfsVersionHoldersRequest, Extent, LayoutRootId, StorageDeviceDescriptor,
+    ValidateDfsReadGrants,
 };
 use crate::meta::store::{NodeSessionLease, Store, journal::MemoryLog};
 use crate::node::chunk::{ChunkSink, LocalChunkStore, StagedChunk};
@@ -60,7 +61,12 @@ impl Fixture {
     }
 }
 
-async fn register(store: &Store, id: &str, session: &str, devices: Vec<StorageDeviceDescriptor>) {
+async fn register(
+    store: &Store,
+    id: &str,
+    session: &str,
+    devices: Vec<StorageDeviceDescriptor>,
+) -> TxnOutcome {
     store
         .register_node_session(
             RequestKey::new(id, format!("register-{session}")),
@@ -77,7 +83,7 @@ async fn register(store: &Store, id: &str, session: &str, devices: Vec<StorageDe
             },
         )
         .await
-        .unwrap();
+        .unwrap()
 }
 
 async fn legacy_direct_commit_fixture() -> (
@@ -167,6 +173,14 @@ async fn fixture() -> Fixture {
 }
 
 async fn fixture_with_bytes(bytes: &[u8]) -> Fixture {
+    fixture_with_chunk(StagedChunk::new(
+        OperationId::new("durable-r1"),
+        bytes.to_vec(),
+    ))
+    .await
+}
+
+async fn fixture_with_chunk(staged: StagedChunk) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let local = LocalChunkStore::open(temp.path(), "receiver").unwrap();
     let store = Arc::new(
@@ -183,7 +197,6 @@ async fn fixture_with_bytes(bytes: &[u8]) -> Fixture {
         vec![local.device_descriptor().unwrap()],
     )
     .await;
-    let staged = StagedChunk::new(OperationId::new("durable-r1"), bytes.to_vec());
     let receipt = local.put(staged.clone()).unwrap();
     let ack = &receipt.durable_acks[0];
     let copy = CopyRecord {
@@ -262,6 +275,55 @@ async fn fixture_with_bytes(bytes: &[u8]) -> Fixture {
         },
         copy,
     }
+}
+
+/// A committed layout and two reported readers opened through Meta. Return
+/// the holder's registration epoch independently of the later grant lookup.
+pub(crate) async fn open_partial_readers(
+    staged: StagedChunk,
+) -> (DfsService, u64, DfsVersionHoldersRequest) {
+    let f = fixture_with_chunk(staged).await;
+    register(&f.store, "holder", "holder-old", Vec::new()).await;
+    let registration = register(&f.store, "holder", "holder-current", Vec::new()).await;
+    let TxnOutcome::Committed { outcome, .. } = registration else {
+        panic!("holder session was not registered");
+    };
+    let OperationResult::NodeSession(holder) = outcome.result else {
+        panic!("registration did not return a node session");
+    };
+    for (node_id, session_id, share_read_cache) in [
+        ("holder", holder.session_id.as_str(), true),
+        ("reader", "reader-original", false),
+    ] {
+        f.service
+            .report_readers(node_id, session_id, f.store.writer_term(), 0, Vec::new())
+            .await
+            .unwrap();
+        let opened = f
+            .service
+            .open_file_read(OpenFileRead {
+                node_id: node_id.into(),
+                session_id: session_id.into(),
+                reader: 1,
+                inode_id: InodeId::new("file"),
+                name: None,
+                share_read_cache,
+            })
+            .await
+            .unwrap();
+        assert!(opened.registered);
+        assert_eq!(
+            opened.inode.unwrap().head_version.as_ref(),
+            Some(&f.request.file_version_id)
+        );
+    }
+    let request = DfsVersionHoldersRequest {
+        caller_id: f.request.caller_id,
+        namespace_id: f.request.namespace_id,
+        file_version_id: f.request.file_version_id,
+        layout_root_id: f.request.layout_root_id,
+    };
+    (f.service, holder.lease_epoch, request)
 }
 
 async fn replace_source_layout(f: &Fixture, extents: Vec<Extent>) {
