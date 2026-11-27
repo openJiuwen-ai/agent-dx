@@ -617,17 +617,29 @@ async fn model_registration_preserves_template_injection_and_lazy_reconnect() {
     check_model_injection(true).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires isolated DIGITALMATE_PRIVACY_TEST_DATABASE_URL and ADX_CREDENTIAL_KEY_FILE"]
+async fn digitalmate_model_registration_preserves_template_injection_and_lazy_reconnect() {
+    check_application_model_injection("digitalmate", true).await;
+}
+
 async fn check_model_injection(registration: bool) {
+    check_application_model_injection("orbit", registration).await;
+}
+
+async fn check_application_model_injection(application: &str, registration: bool) {
     for reference in [
         adx_agent_core::TemplateRef::Version("1".into()),
         adx_agent_core::TemplateRef::Alias("production".into()),
     ] {
         let (gateway, backend) = fixture().await;
         let state = AgentState::new(Arc::new(MemoryRepository::default()));
-        let draft: adx_agent_core::TemplateDraft = serde_json::from_str(include_str!(
+        let mut draft: adx_agent_core::TemplateDraft = serde_json::from_str(include_str!(
             "../../../agent/activator/examples/orbit-sfs-template.json"
         ))
         .unwrap();
+        draft.name = application.into();
         let template = draft.with_version("1".into());
         state
             .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
@@ -636,7 +648,7 @@ async fn check_model_injection(registration: bool) {
         state
             .put_alias(
                 &serde_json::from_value(json!({
-                    "tenant":"tenant", "template":"orbit", "alias":"production", "seed":"stable",
+                    "tenant":"tenant", "template":application, "alias":"production", "seed":"stable",
                     "versions":[{"version":"1", "weight":1}]
                 }))
                 .unwrap(),
@@ -670,11 +682,18 @@ async fn check_model_injection(registration: bool) {
                     DigitalMateGatewayApi::new(
                         {
                             let mut config = orbit_settings(18092);
-                            config.orbit.as_mut().unwrap().template_ref = reference.name().into();
+                            let mut target = config.orbit.take().unwrap();
+                            target.template = application.into();
+                            target.template_ref = reference.name().into();
+                            if application == "digitalmate" {
+                                config.digitalmate = Some(target);
+                            } else {
+                                config.orbit = Some(target);
+                            }
                             #[cfg(unix)]
                             if registration {
                                 config.privacy = Some(serde_json::from_value(json!({
-                                    "listen":"127.0.0.1:0", "template":"orbit",
+                                    "listen":"127.0.0.1:0", "template":application,
                                     "tls_certificate":concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ingress-cert.pem"),
                                     "tls_private_key":concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ingress-key.pem"),
                                     "model_config_name":"DIGITALMATE_MODEL_CONFIG"
@@ -690,10 +709,11 @@ async fn check_model_injection(registration: bool) {
         );
         let scope = adx_agent_core::Scope {
             tenant: "tenant".into(),
-            template: "orbit".into(),
+            template: application.into(),
             template_ref: reference,
             binding_id: format!(
-                "orbit-{}",
+                "{}-{}",
+                application,
                 hex::encode(Sha256::digest(
                     serde_json::to_vec(&["tenant", "alice"]).unwrap()
                 ))
@@ -704,6 +724,9 @@ async fn check_model_injection(registration: bool) {
             let (mut sender, server, client) =
                 connection(gateway.clone(), IngressSecurity::Plaintext).await;
             let mut request = orbit_request("");
+            if application == "digitalmate" {
+                *request.uri_mut() = "/digitalmate/ws".parse().unwrap();
+            }
             request.headers_mut().insert(
                 adx_agent_core::parameters::HEADER,
                 "workspace=forged".parse().unwrap(),
@@ -721,7 +744,7 @@ async fn check_model_injection(registration: bool) {
                 format!(
                     "w-{}",
                     hex::encode(Sha256::digest(
-                        serde_json::to_vec(&["tenant", "orbit", "alice"]).unwrap()
+                        serde_json::to_vec(&["tenant", application, "alice"]).unwrap()
                     ))
                 )
             );

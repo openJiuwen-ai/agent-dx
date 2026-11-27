@@ -132,6 +132,16 @@ Gateway 在 `DigitalMateGatewayConfig::validate()` 阶段校验此字段，早�
 切换到配置中心读取的 DigitalMate 模板使用同名 `DIGITALMATE_MODEL_CONFIG_NAME`、privacy 存储和 Gateway 认证。迁移期间旧模板继续使用注入的 Key，不要求同时切换读取方式。
 
 Gateway 在新建 Binding 的初始化中继续提供 `workspace` 和 `model_api_key/model_api_base`，与登录注册同时生效。已有 Binding 的普通重连跳过该初始化，不重新查询模型服务或修改实例启动参数。
+
+迁移回归同时覆盖 DigitalMate 和 Orbit 的固定版本、`production` 别名及重连复用。测试使用隔离 PostgreSQL，先载入 `gateway/src/ingress/accounts/schema.sql`，设置 `DIGITALMATE_PRIVACY_TEST_DATABASE_URL` 和仅供测试的合成密钥文件 `ADX_CREDENTIAL_KEY_FILE`，再运行：
+
+```bash
+cargo test --locked -p data-plane-gateway --features agent-api,mock-e2e --lib \
+  model_registration_preserves_template_injection_and_lazy_reconnect -- --ignored --test-threads=1
+```
+
+该命令验证模板参数注入及重连复用；运行时连接和真实模型回复由部署验收验证。
+
 Huawei 和 AGC 登录在身份认证成功后、返回登录响应前，由 Gateway 沿用账号模型服务取得并确认当前模型凭据，
 调用注册接口写入 `API_KEY/API_BASE` 字符串字典。租户、模板及工作区由 Gateway 配置和已认证用户推导，不依赖沙箱启动。
 注册成功且业务会话仍有效后才返回登录 Token；每次重新登录都会注册当前值。
