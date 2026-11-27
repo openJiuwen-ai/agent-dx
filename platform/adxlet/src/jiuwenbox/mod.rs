@@ -489,6 +489,11 @@ impl Jiuwenbox {
         devices: &[DeviceAllocation],
         root: &Path,
     ) -> Result<(Value, Value)> {
+        if spec.execution.prefer_image_path == Some(true) || spec.execution.process_user.is_some() {
+            return Err(Error::Invalid(
+                "preferImagePath and processUser require sandboxd".into(),
+            ));
+        }
         if !spec.execution.protected_ingress.is_empty() {
             return Err(Error::Invalid(
                 "protected ingress requires an ACL-capable runtime".into(),

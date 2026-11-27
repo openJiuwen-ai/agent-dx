@@ -20,6 +20,37 @@ from adx_environment import (
 
 
 class CreateRequestTests(unittest.TestCase):
+    def test_sandboxd_start_options_reach_http_without_changing_defaults(self):
+        import adx_environment as sdk
+        default_body = self.capture_create()
+        self.assertNotIn("preferImagePath", default_body)
+        self.assertNotIn("processUser", default_body)
+        for prefer, uid, gid in ((True, 1001, 1002), (False, 0, 0)):
+            body = self.capture_create(
+                prefer_image_path=prefer, process_user=sdk.ProcessUser(uid=uid, gid=gid),
+                env={"PATH": "/caller/bin"},
+            )
+            self.assertEqual(body["preferImagePath"], prefer)
+            self.assertEqual(body["processUser"], {"uid": uid, "gid": gid})
+            self.assertEqual(body["env"]["PATH"], "/caller/bin")
+            self.assertNotIn("user", body)
+            self.assertNotIn("group", body)
+
+    def test_invalid_sandboxd_start_options_never_open_transport(self):
+        import adx_environment as sdk
+        for value in (1, "true", []):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                Environment(image="image", prefer_image_path=value, connection=self.connection)
+        with self.assertRaises(TypeError):
+            Environment(image="image", process_user={"uid": 0, "gid": 0}, connection=self.connection)
+        with self.assertRaises(ValueError):
+            Environment(image="image", user="1001", group="1002",
+                        process_user=sdk.ProcessUser(uid=0, gid=0), connection=self.connection)
+        for uid, gid in ((-1, 0), (0, 4294967295), (True, 0), (0, "1")):
+            with self.subTest(uid=uid, gid=gid), self.assertRaises(ValueError):
+                sdk.ProcessUser(uid=uid, gid=gid)
+        self.assert_no_transport_setup()
+
     def test_local_rootfs_sends_node_path_and_preserves_environment(self):
         with Environment(
             rootfs=LocalRootfs(path="/var/lib/agentos/images/tools/rootfs"),
@@ -119,8 +150,9 @@ class CreateRequestTests(unittest.TestCase):
         self.assertEqual(self.exchanges, [])
 
     def test_tool_identity_reaches_create_and_is_optional(self):
-        body = self.capture_create(runtime="conch", user="1001", group="1002")
-        self.assertEqual((body["user"], body["group"]), ("1001", "1002"))
+        for runtime in ("conch", "runsc"):
+            body = self.capture_create(runtime=runtime, user="1001", group="1002")
+            self.assertEqual((body["user"], body["group"]), ("1001", "1002"))
         body = self.capture_create()
         self.assertNotIn("user", body)
         self.assertNotIn("group", body)

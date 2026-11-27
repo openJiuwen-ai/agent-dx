@@ -179,6 +179,10 @@ message WorkloadProcess {
   optional string user = 3;
   optional string cwd = 4;
 }
+message ProcessUser {
+  uint32 uid = 1;
+  uint32 gid = 2;
+}
 message ExecutionOptions {
   RootfsSpec rootfs = 1;
   repeated MountSpec mounts = 2;
@@ -201,6 +205,10 @@ message ExecutionOptions {
   WorkloadProcess process = 17;
   repeated NetworkRule protected_ingress = 18;
   repeated uint32 private_service_ports = 19;
+  // Presence distinguishes the fresh-start default from an explicit restore override.
+  optional bool prefer_image_path = 20;
+  // Missing preserves the OCI user; a present zero-valued message selects root.
+  ProcessUser process_user = 21;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }

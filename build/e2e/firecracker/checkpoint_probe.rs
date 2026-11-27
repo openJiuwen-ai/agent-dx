@@ -7,7 +7,7 @@ use std::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = std::env::args()
         .nth(1)
-        .unwrap_or("/run/adx/execd.sock".into());
+        .unwrap_or("/tmp/adx/execd.sock".into());
     let mut connection = UnixStream::connect(socket)?;
     connection.set_read_timeout(Some(Duration::from_secs(180)))?;
     let body = "{\"timeoutSeconds\":120}";

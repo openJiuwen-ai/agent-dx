@@ -38,7 +38,7 @@ async fn unsupported_runtime_create_options_return_not_started_without_submissio
         json!({"image":"tools:1", "runtime":"supervisor", "extra_config":{"x":1}}),
         json!({"image":"tools:1", "runtime":"conch", "extra_config":{"x":1}}),
         json!({"image":"tools:1", "runtime":"supervisor", "user":"1001", "group":"1002"}),
-        json!({"image":"tools:1", "runtime":"runsc", "user":"1001", "group":"1002"}),
+        json!({"image":"tools:1", "runtime":"runsc", "user":"alice", "group":"staff"}),
     ] {
         let response = http::request(
             fixture.api.clone(),

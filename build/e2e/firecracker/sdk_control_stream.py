@@ -3,13 +3,17 @@
 
 import argparse
 import json
+import logging
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
 
 
 def _executable(name, environment=None, cwd=None):
@@ -53,7 +57,7 @@ out = a.run / 'evidence/sdk-control-stream.json'
 
 def passed(name, **fields):
     result['cases'].append({'name': name, 'passed': True, **fields})
-    print('PASS', name, fields, flush=True)
+    logging.info('PASS %s %s', name, fields)
 
 
 def command(script):
@@ -101,7 +105,7 @@ def egress_probe():
 
 
 def checkpoint():
-    r = s.commands.run('/tmp/checkpoint-probe /run/adx/execd.sock', timeout=180)
+    r = s.commands.run('/tmp/checkpoint-probe /tmp/adx/execd.sock', timeout=180)
     if not (r.exit_code == 0):
         raise AssertionError((r.stdout, r.stderr))
     if not (r.stdout.startswith('HTTP/1.1 200')):
@@ -249,5 +253,5 @@ finally:
             result['cleanup_error'] = repr(error)
         s.close()
     out.write_text(json.dumps(result, indent=2) + '\n')
-print(json.dumps(result), flush=True)
+logging.info('%s', json.dumps(result))
 raise SystemExit(result['status'] != 'passed')

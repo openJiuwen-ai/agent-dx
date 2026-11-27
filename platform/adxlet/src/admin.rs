@@ -41,7 +41,30 @@ impl Adxlet {
             .collect();
         let count = handles.len();
         for handle in handles {
-            let r = handle.delete().await?;
+            let r = match handle.delete().await {
+                Ok(result) => result,
+                Err(Error::NotFound) => {
+                    let record = handle.view().0;
+                    if record.state != EnvironmentState::Deleted || record.resources_held {
+                        return Err(Error::NotFound);
+                    }
+                    // Failed creates can leave no Coordinator record. Cleanup has
+                    // completed, so retire the local controller and continue drain.
+                    self.remember_retired(&record.assignment, None);
+                    let mut environments = self
+                        .environments
+                        .lock()
+                        .expect("shared state lock poisoned");
+                    if environments
+                        .get(&record.spec.id)
+                        .is_some_and(|(_, _, current)| current.same_controller(&handle))
+                    {
+                        environments.remove(&record.spec.id);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if r.record.state != EnvironmentState::Deleted
                 || r.record.resources_held
                 || r.durability != Durability::Published

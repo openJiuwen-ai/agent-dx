@@ -370,9 +370,32 @@ impl TryFrom<pb::WorkloadProcess> for core::WorkloadProcess {
     }
 }
 
+impl From<core::ProcessUser> for pb::ProcessUser {
+    fn from(value: core::ProcessUser) -> Self {
+        Self {
+            uid: value.uid,
+            gid: value.gid,
+        }
+    }
+}
+
+impl TryFrom<pb::ProcessUser> for core::ProcessUser {
+    type Error = Error;
+    fn try_from(value: pb::ProcessUser) -> Result<Self> {
+        let user = Self {
+            uid: value.uid,
+            gid: value.gid,
+        };
+        user.validate()?;
+        Ok(user)
+    }
+}
+
 impl From<core::ExecutionOptions> for pb::ExecutionOptions {
     fn from(value: core::ExecutionOptions) -> Self {
         Self {
+            prefer_image_path: value.prefer_image_path,
+            process_user: value.process_user.map(Into::into),
             user: value.user,
             group: value.group,
             process: value.process.map(Into::into),
@@ -416,6 +439,8 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
         let data_plane = value.data_plane.unwrap_or_default();
         let limits = value.limits.unwrap_or_default();
         Ok(Self {
+            prefer_image_path: value.prefer_image_path,
+            process_user: value.process_user.map(TryInto::try_into).transpose()?,
             user: value.user,
             group: value.group,
             process: value.process.map(TryInto::try_into).transpose()?,

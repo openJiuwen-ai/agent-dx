@@ -1735,6 +1735,42 @@ async fn conch_environment_identity_reaches_native_policy() {
 }
 
 #[tokio::test]
+async fn jiuwenbox_rejects_sandboxd_start_overrides_before_submission() {
+    for class in ["supervisor", "conch"] {
+        for (prefer_image_path, process_user) in [
+            (Some(true), None),
+            (
+                None,
+                Some(adx_core::execution::ProcessUser { uid: 0, gid: 0 }),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let driver = fixture.driver().await;
+            let mut wanted = spec(class);
+            wanted.execution.prefer_image_path = prefer_image_path;
+            wanted.execution.process_user = process_user;
+            assert!(driver
+                .start_with_deadline(
+                    &wanted,
+                    "tenant-agent-1",
+                    1,
+                    &[],
+                    Instant::now() + Duration::from_secs(3)
+                )
+                .await
+                .is_err());
+            assert!(!fixture
+                .backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, path, _)| method == "POST" && path == "/api/v1/sandboxes"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn identity_override_is_not_silently_ignored_by_supervisor() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;

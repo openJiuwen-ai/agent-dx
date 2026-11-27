@@ -13,6 +13,7 @@ struct Dependencies {
     records: Mutex<Vec<EnvironmentRecord>>,
     traces: Mutex<Vec<(String, Option<String>)>>,
     fail_at: Mutex<Option<String>>,
+    missing_at: Mutex<Option<String>>,
     durability: Mutex<Durability>,
     start_entered: Semaphore,
     start_release: Semaphore,
@@ -32,6 +33,7 @@ impl Dependencies {
             records: Mutex::default(),
             traces: Mutex::default(),
             fail_at: Mutex::default(),
+            missing_at: Mutex::default(),
             durability: Mutex::new(Durability::Published),
             start_entered: Semaphore::new(0),
             start_release: Semaphore::new(0),
@@ -49,6 +51,9 @@ impl Dependencies {
             .lock()
             .unwrap()
             .push((name.into(), adx_observability::trace::traceparent()));
+        if self.missing_at.lock().unwrap().as_deref() == Some(name) {
+            return Err(Error::NotFound);
+        }
         if self.fail_at.lock().unwrap().as_deref() == Some(name)
             || (name == "remove" && self.fail_cleanup.load(std::sync::atomic::Ordering::SeqCst))
         {
@@ -1324,6 +1329,64 @@ async fn explicit_drain_requires_published_deletion_and_closes_admission() {
     assert_eq!(node.drain().await.unwrap(), 0);
     let events = deps.events.lock().unwrap();
     assert_eq!(events.iter().filter(|e| *e == "remove").count(), 1);
+}
+
+#[tokio::test]
+async fn drain_continues_when_deleted_environments_are_already_absent() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    *deps.fail_at.lock().unwrap() = Some("start".into());
+    for id in ["failed-a", "failed-b"] {
+        assert!(node
+            .environment(spec(id), assignment(id))
+            .unwrap()
+            .create()
+            .await
+            .is_err());
+    }
+    *deps.fail_at.lock().unwrap() = None;
+    node.environment(spec("running"), assignment("running"))
+        .unwrap()
+        .create()
+        .await
+        .unwrap();
+    *deps.missing_at.lock().unwrap() = Some("commit:Deleted".into());
+
+    assert_eq!(node.drain().await.unwrap(), 3);
+    assert_eq!(node.used(), Resources::default());
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(node.drain().await.unwrap(), 0);
+    assert!(node.environment(spec("new"), assignment("new")).is_err());
+    assert_eq!(
+        deps.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "commit:Deleted")
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn drain_does_not_ignore_not_found_before_resource_cleanup_completes() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    node.environment(spec("running"), assignment("running"))
+        .unwrap()
+        .create()
+        .await
+        .unwrap();
+    *deps.missing_at.lock().unwrap() = Some("remove".into());
+
+    assert_eq!(node.drain().await.unwrap_err(), Error::NotFound);
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(node.used(), resources());
+
+    *deps.missing_at.lock().unwrap() = None;
+    assert_eq!(node.drain().await.unwrap(), 1);
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(node.drain().await.unwrap(), 0);
 }
 
 #[tokio::test]

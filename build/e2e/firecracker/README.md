@@ -26,7 +26,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
 
 对支持主动控制流的当前 Execd 镜像，可设置 `ADX_E2E_RUNTIME_CONTROL=1`。驱动为 adxlet 配置网桥网关 `10.231.16.1:19003` 上的 gRPC 监听及节点私有凭据文件；FC guest 默认回连 `http://10.231.16.1:19003`，可通过 `ADX_E2E_RUNTIME_CONTROL_ADDRESS` 与 `ADX_E2E_RUNTIME_CONTROL_LISTEN` 分别指定回连和监听地址。使用同一版本的 ADX 发布包、静态 Execd 与 SDK，不能用旧镜像验证该模式。
 
-另外在基目录准备静态 `checkpoint-probe`。它由本目录的 `checkpoint_probe.rs` 为 guest 架构编译，是通过 SDK 上传到运行环境内的 Unix HTTP 客户端，实际调用 `/run/adx/execd.sock`，不是模拟 checkpoint 后端。ARM64 musl 构建示例：
+另外在基目录准备静态 `checkpoint-probe`。它由本目录的 `checkpoint_probe.rs` 为 guest 架构编译，是通过 SDK 上传到运行环境内的 Unix HTTP 客户端，实际调用 `/tmp/adx/execd.sock`，不是模拟 checkpoint 后端。ARM64 musl 构建示例：
 
 ```sh
 rustc --edition=2024 --target aarch64-unknown-linux-musl \

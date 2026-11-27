@@ -1,11 +1,11 @@
 {
-  "repository": "https://github.com/inclusionAI/sandboxd.git",
-  "revision": "03ea0a4db807c1d5dac4b11d02f2ec238083a8ae",
+  "repository": "https://github.com/openJiuwen-ant/sandboxd.git",
+  "revision": "69e38e113025fd88722c758c70da8d9c6ab5015e",
   "files": [
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
+      "sha256": "a016457afd13dc159a5e01dd9098f389af62acb740455679792152ef6db653ba"
     },
     {
       "source": "LICENSE",

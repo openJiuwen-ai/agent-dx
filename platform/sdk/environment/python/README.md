@@ -900,12 +900,39 @@ filesystem must already grant that UID/GID access; ADX does not recursively chow
 mounted data. Omitted fields preserve the runtime deployment's identity.
 
 Conch requires `python3` in the guest template's PATH for its native privilege-drop
-wrapper. For sandboxd, adxlet logs that it ignored the pair and proceeds with the
-identity configured by the sandboxd runtime template. The pair cannot be combined
-with `inherit_entrypoint=True` or a snapshot identity override;
-image entrypoint `process.user` retains its separate meaning. Use matching API
-Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved
-across the complete create path. Unknown account resolution fails creation.
+wrapper. Sandboxd accepts decimal UID/GID through the same pair, for example
+`Environment(image="tools:v1", runtime="runsc", user="1001", group="1002")`.
+It configures the initial OCI process without looking up names. Supervisor rejects
+the pair. The pair cannot be combined with `process_user`,
+`inherit_entrypoint=True`, or a snapshot identity override. Image entrypoint
+`process.user` retains its separate meaning. Use matching API Server,
+Coordinator, adxlet, and SDK versions so identity is preserved across the complete
+create path. Unknown Conch account resolution fails creation.
+
+Sandboxd also supports a typed initial-process identity and image PATH selection:
+
+```python
+from adx_environment import Environment, ProcessUser
+
+environment = Environment(
+    image="tools:v1",
+    runtime="runsc",
+    process_user=ProcessUser(uid=1001, gid=1002),
+    prefer_image_path=True,
+)
+```
+
+Both IDs are required integers from 0 to 4294967294. `ProcessUser(uid=0, gid=0)`
+explicitly selects root; omitting `process_user` preserves the base OCI identity.
+The selected identity needs access to the bootstrap and mounted paths; ADX does
+not change existing ownership. `prefer_image_path=True` lets the OCI image's
+PATH override the request PATH; absent image PATH still falls back to the request.
+False or omission on fresh creation preserves existing PATH precedence, including
+omission of the built-in profile PATH for a custom rootfs. On snapshot creation,
+omitted options inherit the source settings; explicit `False` and explicit
+`ProcessUser` configure the target. The runtime owns restored credentials and
+compatibility checks. Conch and Supervisor reject `process_user` and
+`prefer_image_path=True`.
 
 ## Managed Volumes
 

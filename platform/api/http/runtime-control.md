@@ -80,12 +80,14 @@ Prepared 仅证明实例内的 handoff 准备完成，不代表 checkpoint 制�
 ## Workload-local checkpoint
 
 When Adxlet has checkpoint storage configured it supplies
-`ADX_EXECD_CONTROL_SOCKET_PATH=/run/adx`. The operator may override the directory
-through `execd_env`; AKernel uses `/run/akernel`. EXECD binds `execd.sock` there. The
-socket belongs to the Environment filesystem and is not mounted from the host.
+`ADX_EXECD_CONTROL_SOCKET_PATH=/tmp/adx`, allowing non-root initial processes to
+create the directory. The operator may override it through `execd_env`; AKernel
+uses `/run/akernel`. An override must be writable by the initial process user.
+EXECD binds `execd.sock` there. The socket belongs to the Environment filesystem
+and is not mounted from the host.
 
 ```sh
-curl --fail-with-body --unix-socket /run/adx/execd.sock \
+curl --fail-with-body --unix-socket /tmp/adx/execd.sock \
   -H 'Content-Type: application/json' \
   -d '{"timeoutSeconds":120}' \
   http://localhost/checkpoint

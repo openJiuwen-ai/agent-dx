@@ -982,7 +982,7 @@ contracts are assigned to the Firecracker profile. Resource observations read th
 limits and filesystem with infrastructure reservations; this fixture is not
 the production sandboxd collector.
 
-sandboxd is locked to PR #56 through `third_party/sandboxd/source.json`. A
+sandboxd source and OBS bundles are locked through `third_party/sandboxd/source.json` and `third_party/sandboxd/artifacts.json`. A
 single-platform EXECD manifest is published within the test network (the pinned
 backend's image-index lookup defaults to AMD64). OCI storage is a child of a
 tmpfs mount to avoid nested OverlayFS depth and allow sandboxd to reset its

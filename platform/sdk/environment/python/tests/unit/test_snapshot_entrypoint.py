@@ -2,10 +2,22 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from adx_environment import Environment, EnvironmentError as SDKEnvironmentError
+from adx_environment import Environment, EnvironmentError as SDKEnvironmentError, ProcessUser
 
 
 class SnapshotEntrypointTests(unittest.TestCase):
+    def test_snapshot_start_options_distinguish_inheritance_from_explicit_root(self):
+        for options in ({}, {"prefer_image_path": False, "process_user": ProcessUser(uid=0, gid=0)}):
+            environment = Environment.create(snapshot_id="saved", **options)
+            self.addCleanup(environment.close)
+            body = self.client.create_info.call_args.args[0]
+            if options:
+                self.assertIs(body["preferImagePath"], False)
+                self.assertEqual(body["processUser"], {"uid": 0, "gid": 0})
+            else:
+                self.assertNotIn("preferImagePath", body)
+                self.assertNotIn("processUser", body)
+
     def setUp(self):
         self.client = MagicMock()
         self.client.create_info.return_value = {"environmentId": "clone", "newlyCreated": True}

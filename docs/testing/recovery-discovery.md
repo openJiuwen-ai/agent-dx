@@ -121,7 +121,9 @@ adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，不删除 Environment，也�
 RPC/Relay 地址保持一致的新进程，可在心跳期限内通过 GetSession 身份复核接续会话。
 preserve 不延长心跳期限；超时或复核失败仍沿既有失效对账路径处理。
 
-显式 `adxctl stop --mode drain` 先通过 Drain 删除并确认本地 Environment 已发布退役。
+显式 `adxctl stop --mode drain` 先通过 Drain 删除本地 Environment。
+资源清理完成后，提交删除结果成功或 Coordinator 返回 `NotFound` 均继续清理其余实例；
+`NotFound` 表示对应记录已不存在。资源清理失败或其他提交错误仍会使 drain 失败。
 清理成功后向 adxlet 发送 SIGTERM；完成 Relay 排水，再通过当前 Coordinator 连接
 发送注销。直接给 adxlet 的 SIGTERM/SIGINT 同样保留 planned departure 语义。通知最多等待 `min(rpc_timeout_seconds, 5)` 秒，失败记录一次 WARN
 并继续退出，由心跳失效与超时退役兜底。

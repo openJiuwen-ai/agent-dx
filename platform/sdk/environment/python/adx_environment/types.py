@@ -731,6 +731,22 @@ class S3Config:
 
 
 @dataclass(frozen=True)
+class ProcessUser:
+    """Numeric user of sandboxd's initial process; omitted preserves the OCI default."""
+
+    uid: int
+    gid: int
+
+    def __post_init__(self) -> None:
+        for label, value in (("uid", self.uid), ("gid", self.gid)):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 4294967295:
+                raise ValueError(f"process_user {label} must be an integer from 0 to 4294967294")
+
+    def to_dict(self) -> Dict[str, int]:
+        return {"uid": self.uid, "gid": self.gid}
+
+
+@dataclass(frozen=True)
 class CreateOptions:
     """Ownership and permissions for a newly created Local bind directory only."""
 

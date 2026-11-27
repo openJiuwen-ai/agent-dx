@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
-  "sandboxd_revision": "03ea0a4db807c1d5dac4b11d02f2ec238083a8ae",
+  "sandboxd_revision": "69e38e113025fd88722c758c70da8d9c6ab5015e",
   "artifacts": {
     "x86_64-unknown-linux-gnu": {
-      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/sandboxd-03ea0a4db807c1d5dac4b11d02f2ec238083a8ae/linux/amd64/bcb76454721cd006afd402e98b2c68b9d4b6e9ab69e869937b279cb150ad6e70/backend-03ea0a4db807-linux-amd64.tar.gz",
-      "bytes": 57255524,
-      "sha256": "bcb76454721cd006afd402e98b2c68b9d4b6e9ab69e869937b279cb150ad6e70"
+      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/sandboxd-69e38e113025fd88722c758c70da8d9c6ab5015e/linux/amd64/cd19fb9dd1863d0e49f34ee91b73b29b9921dabf749f5f7c818534eae803a461/backend-69e38e113025-linux-amd64.tar.gz",
+      "sha256": "cd19fb9dd1863d0e49f34ee91b73b29b9921dabf749f5f7c818534eae803a461",
+      "bytes": 57428541
     },
     "aarch64-unknown-linux-gnu": {
-      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/sandboxd-03ea0a4db807c1d5dac4b11d02f2ec238083a8ae/linux/arm64/0b19a32b01b456799bf4aa0110d016ba1474793e25214a9fb25bed2746deffad/backend-03ea0a4db807-linux-arm64.tar.gz",
-      "bytes": 52564955,
-      "sha256": "0b19a32b01b456799bf4aa0110d016ba1474793e25214a9fb25bed2746deffad"
+      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/sandboxd-69e38e113025fd88722c758c70da8d9c6ab5015e/linux/arm64/b5304ba1fe7b44fcaa41ab6d9df9cda85b8bd8b64cce169a84a3e9867de13e2f/backend-69e38e113025-linux-arm64.tar.gz",
+      "sha256": "b5304ba1fe7b44fcaa41ab6d9df9cda85b8bd8b64cce169a84a3e9867de13e2f",
+      "bytes": 52703669
     }
   }
 }
