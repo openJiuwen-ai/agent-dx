@@ -192,7 +192,7 @@ struct HttpsClients {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("failed to load control plane CA file {path:?}: {source}")]
+#[error("failed to load control plane CA file {}: {source}", .path.display())]
 struct ControlPlaneCaError {
     path: PathBuf,
     source: BoxError,
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn control_plane_ca_errors_identify_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing.pem");
+        let missing = dir.path().join("missing CA.pem");
         let invalid_pem = dir.path().join("invalid-pem.pem");
         let invalid_der = dir.path().join("invalid-der.pem");
         let empty = dir.path().join("empty.pem");
@@ -543,7 +543,10 @@ mod tests {
                 .err()
                 .unwrap();
             assert_eq!(&error.path, path);
-            assert!(error.to_string().contains(&format!("{path:?}")));
+            assert!(error.to_string().starts_with(&format!(
+                "failed to load control plane CA file {}: ",
+                path.display()
+            )));
             assert!(error.source().is_some());
         }
     }

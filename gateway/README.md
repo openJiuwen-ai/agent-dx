@@ -343,7 +343,8 @@ rather than deleting log data. When a dedicated access file exists, enabled acce
 Ingress also replaces Traefik for the existing public control-plane
 surface. Only a fixed set of paths such as `/api/environment`, `/functions`,
 `/serverless`, `/terminal`, `/invocations`, and `/global-scheduler` is proxied to the configured
-`ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS`. For a separate HTTPS API Server,
+`ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS` (leading and trailing whitespace
+is ignored). For a separate HTTPS API Server,
 set the address to an HTTPS origin (for example `https://apiserver:8888`) and set
 `ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_CA_FILE` to the deployment's PEM CA bundle.
 Ingress verifies the certificate chain against that bundle and verifies the

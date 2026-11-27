@@ -241,8 +241,10 @@ impl IngressConfig {
                 )))
             }
         };
-        let control_plane_ca_file =
-            parse_control_plane_ca_file(&frontend_address, env::var_os(CONTROL_PLANE_CA_FILE_ENV))?;
+        let (frontend_address, control_plane_ca_file) = parse_control_plane_upstream(
+            &frontend_address,
+            env::var_os(CONTROL_PLANE_CA_FILE_ENV),
+        )?;
         let control_plane_routes = crate::ingress::parse_static_routes(
             &env::var("ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES")
                 .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_ROUTES.into()),
@@ -728,11 +730,12 @@ fn transfer_policy() -> Result<TransferPolicy, ConfigError> {
     })
 }
 
-fn parse_control_plane_ca_file(
+fn parse_control_plane_upstream(
     address: &str,
-    value: Option<OsString>,
-) -> Result<Option<PathBuf>, ConfigError> {
-    let ca_file = value.filter(|path| !path.is_empty()).map(PathBuf::from);
+    ca_file: Option<OsString>,
+) -> Result<(String, Option<PathBuf>), ConfigError> {
+    let address = address.trim();
+    let ca_file = ca_file.filter(|path| !path.is_empty()).map(PathBuf::from);
     crate::ingress::reverse_proxy::control_plane_origin(address, ca_file.as_deref()).map_err(
         |error| {
             ConfigError::Invalid(format!(
@@ -740,7 +743,7 @@ fn parse_control_plane_ca_file(
             ))
         },
     )?;
-    Ok(ca_file)
+    Ok((address.to_owned(), ca_file))
 }
 
 #[cfg(test)]
@@ -748,26 +751,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_plane_address_trims_only_surrounding_whitespace() {
+        let ca = PathBuf::from("/secrets/ca.pem");
+        assert_eq!(
+            parse_control_plane_upstream(
+                " \thttps://apiserver:8888 \n",
+                Some(ca.clone().into_os_string())
+            ),
+            Ok(("https://apiserver:8888".into(), Some(ca)))
+        );
+        assert_eq!(
+            parse_control_plane_upstream(" 127.0.0.1:8888 ", None),
+            Ok(("127.0.0.1:8888".into(), None))
+        );
+        for address in [" \t ", "127.0. 0.1:8888"] {
+            assert!(parse_control_plane_upstream(address, None).is_err());
+        }
+    }
+
+    #[test]
     fn control_plane_ca_file_treats_empty_as_unset() {
         for value in [None, Some(std::ffi::OsString::new())] {
             assert_eq!(
-                parse_control_plane_ca_file("127.0.0.1:8888", value.clone()),
-                Ok(None)
+                parse_control_plane_upstream("127.0.0.1:8888", value.clone()),
+                Ok(("127.0.0.1:8888".into(), None))
             );
-            let error = parse_control_plane_ca_file("https://apiserver:8888", value).unwrap_err();
+            let error = parse_control_plane_upstream("https://apiserver:8888", value).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("HTTPS control plane upstream requires a CA file"));
         }
         let ca = PathBuf::from("/secrets/ca.pem");
         assert_eq!(
-            parse_control_plane_ca_file(
+            parse_control_plane_upstream(
                 "https://apiserver:8888",
                 Some(ca.clone().into_os_string())
             ),
-            Ok(Some(ca.clone()))
+            Ok(("https://apiserver:8888".into(), Some(ca.clone())))
         );
-        assert!(parse_control_plane_ca_file("127.0.0.1:8888", Some(ca.into_os_string())).is_err());
+        assert!(parse_control_plane_upstream("127.0.0.1:8888", Some(ca.into_os_string())).is_err());
     }
 
     #[test]
