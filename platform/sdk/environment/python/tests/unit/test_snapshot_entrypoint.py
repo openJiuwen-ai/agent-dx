@@ -12,7 +12,7 @@ class SnapshotEntrypointTests(unittest.TestCase):
             self.addCleanup(environment.close)
             body = self.client.create_info.call_args.args[0]
             if options:
-                self.assertEqual(body["preferImagePath"], False)
+                self.assertIs(body["preferImagePath"], False)
                 self.assertEqual(body["processUser"], {"uid": 0, "gid": 0})
             else:
                 self.assertNotIn("preferImagePath", body)

@@ -21,6 +21,8 @@ make python-check PYTHON_CHECK_BASE=github/master
 CodeCheck 的平台规则另行检查。处理 Python 代码时尤其注意：
 
 - 类型校验使用 `isinstance`，字典分隔符保留空格；新增或修改的条件语句最多包含 3 个布尔表达式。
+- unittest 使用对应的断言方法，避免 `assertEqual(value, True/False)` 触发 G.TES.02。
+  检查真假使用 `assertTrue`/`assertFalse`；需要确认值是布尔对象时使用 `assertIs(value, True/False)`。
 - 嵌套函数或类定义前保留一个空行；平台会检查本地默认规则未启用的 E306。
 - 跨模块测试调用明确的公共校验入口，避免访问其他模块的下划线成员；平台会检查受保护成员访问。
   例如通过 `Commands.get()` 验证能力查询失败及重试，通过请求记录验证路由，不读取内部标志；
