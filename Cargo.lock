@@ -1662,6 +1662,7 @@ dependencies = [
  "http-body-util",
  "httparse",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "ipnet",
  "jsonwebtoken",

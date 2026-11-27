@@ -3,6 +3,7 @@ use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -26,6 +27,7 @@ pub struct IngressConfig {
     pub tls_cert: String,
     pub tls_key: String,
     pub frontend_address: String,
+    pub control_plane_ca_file: Option<PathBuf>,
     pub reverse_proxy: crate::ingress::ReverseProxyConfig,
     pub proxy_routes: Vec<crate::ingress::ProxyRoute>,
     pub control_plane_routes: Vec<crate::ingress::StaticRoute>,
@@ -227,13 +229,19 @@ impl IngressConfig {
                 "Ingress TLS listener requires a certificate and key".into(),
             ));
         }
-        let frontend_address = env::var("ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS")
-            .unwrap_or_else(|_| "127.0.0.1:8888".into());
-        if frontend_address.trim().is_empty() {
-            return Err(ConfigError::Invalid(
-                "Ingress upstream address is required".into(),
-            ));
-        }
+        let address = "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS";
+        let ca_file = "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_CA_FILE";
+        let frontend_address = match env::var(address) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => "127.0.0.1:8888".into(),
+            Err(error) => return Err(ConfigError::Invalid(format!("{address}: {error}"))),
+        };
+        let control_plane_ca_file = env::var_os(ca_file).map(PathBuf::from);
+        crate::ingress::reverse_proxy::control_plane_origin(
+            &frontend_address,
+            control_plane_ca_file.as_deref(),
+        )
+        .map_err(|error| ConfigError::Invalid(format!("{address} / {ca_file}: {error}")))?;
         let control_plane_routes = crate::ingress::parse_static_routes(
             &env::var("ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES")
                 .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_ROUTES.into()),
@@ -428,6 +436,7 @@ impl IngressConfig {
             tls_cert,
             tls_key,
             frontend_address,
+            control_plane_ca_file,
             reverse_proxy,
             proxy_routes,
             control_plane_routes,

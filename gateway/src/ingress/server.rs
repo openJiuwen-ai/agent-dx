@@ -489,6 +489,17 @@ impl Ingress {
         self
     }
 
+    pub(super) fn with_control_plane_tls(
+        mut self,
+        config: &ReverseProxyConfig,
+        ca_file: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        super::reverse_proxy::control_plane_origin(&self.frontend_address, Some(ca_file))?;
+        self.reverse_proxy
+            .enable_control_plane_https(config, ca_file)?;
+        Ok(self)
+    }
+
     pub fn with_proxy_routes(mut self, routes: Vec<ProxyRoute>) -> Self {
         self.proxy_routes = Arc::new(routes);
         self
@@ -1626,12 +1637,16 @@ impl Ingress {
         let route = ProxyRoute {
             name: "apiserver".into(),
             path_prefix: "/".into(),
-            upstream: format!("http://{}", self.frontend_address),
+            upstream: if self.frontend_address.contains("://") {
+                self.frontend_address.clone()
+            } else {
+                format!("http://{}", self.frontend_address)
+            },
             strip_prefix: false,
             host: None,
         };
         self.reverse_proxy
-            .proxy_with_tls(
+            .proxy_control_plane(
                 request,
                 &route,
                 peer,

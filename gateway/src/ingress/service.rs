@@ -198,6 +198,11 @@ impl IngressService {
             config.allowed_client_networks.clone(),
             config.allow_any_client,
         );
+        let gateway = if let Some(ca_file) = &config.control_plane_ca_file {
+            gateway.with_control_plane_tls(&config.reverse_proxy, ca_file)?
+        } else {
+            gateway
+        };
         #[cfg(feature = "agent-api")]
         let gateway = match file_access {
             Some(access) => gateway.with_execd_access(access),
@@ -473,6 +478,7 @@ mod tests {
             tls_cert: certificate.display().to_string(),
             tls_key: private_key.display().to_string(),
             frontend_address: "127.0.0.1:8888".into(),
+            control_plane_ca_file: None,
             reverse_proxy: ReverseProxyConfig {
                 max_idle_connections: 8,
                 idle_timeout: Duration::from_secs(1),

@@ -2,12 +2,16 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::body::Incoming;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::error::Error;
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -138,32 +142,101 @@ pub fn parse_proxy_routes(input: &str) -> Result<Vec<ProxyRoute>, String> {
     Ok(routes)
 }
 
+pub(crate) fn control_plane_origin(address: &str, ca_file: Option<&Path>) -> Result<Uri, BoxError> {
+    let origin: Uri = if address.contains("://") {
+        address.parse()?
+    } else {
+        let authority: http::uri::Authority = address.parse()?;
+        Uri::builder()
+            .scheme("http")
+            .authority(authority)
+            .path_and_query("/")
+            .build()?
+    };
+    if origin
+        .authority()
+        .is_none_or(|authority| authority.as_str().contains('@'))
+        || origin
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+        || address.contains('#')
+    {
+        return Err("control plane upstream must be an HTTP or HTTPS origin".into());
+    }
+    match (origin.scheme_str(), ca_file) {
+        (Some("https"), Some(path)) if !path.as_os_str().is_empty() => {
+            // The URI hostname is used for SNI and certificate verification, independently of Host.
+            let _ = rustls::pki_types::ServerName::try_from(
+                origin.host().unwrap_or_default().trim_matches(['[', ']']),
+            )?;
+            Ok(origin)
+        }
+        (Some("https"), _) => Err("HTTPS control plane upstream requires a CA file".into()),
+        (Some("http"), None) => Ok(origin),
+        (Some("http"), Some(_)) => Err("control plane CA file requires an HTTPS upstream".into()),
+        _ => Err("control plane upstream must use HTTP or HTTPS".into()),
+    }
+}
+
 #[derive(Clone)]
 pub struct ReverseProxy {
     client: Client<HttpConnector, ProxyBody>,
     upgrade_client: Client<HttpConnector, ProxyBody>,
+    control_plane_https: Option<HttpsClients>,
+}
+
+#[derive(Clone)]
+struct HttpsClients {
+    normal: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    upgrade: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
 
 impl ReverseProxy {
     pub fn new(config: ReverseProxyConfig) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.set_connect_timeout(Some(config.connect_timeout));
+        let connector = http_connector(&config);
         Self {
-            client: Client::builder(TokioExecutor::new())
-                .pool_timer(TokioTimer::new())
-                .pool_idle_timeout(config.idle_timeout)
-                .pool_max_idle_per_host(config.max_idle_connections)
-                .retry_canceled_requests(false)
-                .build(connector.clone()),
+            client: client_builder(&config).build(connector.clone()),
             // Execd's tunnel port selects HTTP or WebSocket on the first
             // request. A WebSocket must start on a fresh upstream connection,
             // even when its downstream HTTP connection is being reused.
-            upgrade_client: Client::builder(TokioExecutor::new())
+            upgrade_client: client_builder(&config)
                 .pool_max_idle_per_host(0)
-                .retry_canceled_requests(false)
                 .build(connector),
+            control_plane_https: None,
         }
+    }
+
+    pub(super) fn enable_control_plane_https(
+        &mut self,
+        config: &ReverseProxyConfig,
+        ca_file: &Path,
+    ) -> Result<(), BoxError> {
+        adx_transport::install_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        let mut reader = BufReader::new(File::open(ca_file)?);
+        for cert in rustls_pemfile::certs(&mut reader) {
+            roots.add(cert?)?;
+        }
+        if roots.is_empty() {
+            return Err("control plane CA file contains no certificates".into());
+        }
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut connector = http_connector(config);
+        connector.enforce_http(false);
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_only()
+            .enable_http1()
+            .wrap_connector(connector);
+        self.control_plane_https = Some(HttpsClients {
+            normal: client_builder(config).build(connector.clone()),
+            upgrade: client_builder(config)
+                .pool_max_idle_per_host(0)
+                .build(connector),
+        });
+        Ok(())
     }
 
     pub async fn proxy(
@@ -177,10 +250,31 @@ impl ReverseProxy {
 
     pub async fn proxy_with_tls(
         &self,
+        request: Request<Incoming>,
+        route: &ProxyRoute,
+        peer: SocketAddr,
+        tls: bool,
+    ) -> Response<ProxyBody> {
+        self.forward(request, route, peer, tls, false).await
+    }
+
+    pub(super) async fn proxy_control_plane(
+        &self,
+        request: Request<Incoming>,
+        route: &ProxyRoute,
+        peer: SocketAddr,
+        tls: bool,
+    ) -> Response<ProxyBody> {
+        self.forward(request, route, peer, tls, true).await
+    }
+
+    async fn forward(
+        &self,
         mut request: Request<Incoming>,
         route: &ProxyRoute,
         peer: SocketAddr,
         tls: bool,
+        control_plane: bool,
     ) -> Response<ProxyBody> {
         // Hyper represents HTTP/2 :authority in the URI rather than a Host
         // field. Preserve that client authority before rewriting the URI to
@@ -221,8 +315,23 @@ impl ReverseProxy {
             Ok(uri) => uri,
             Err(error) => return bad_gateway(error),
         };
+        let (scheme, https_client) = match upstream.scheme_str() {
+            Some("http") => ("http", None),
+            Some("https") if control_plane => match &self.control_plane_https {
+                Some(clients) => (
+                    "https",
+                    Some(if upgrade.is_some() {
+                        &clients.upgrade
+                    } else {
+                        &clients.normal
+                    }),
+                ),
+                None => return bad_gateway("control plane HTTPS is not configured"),
+            },
+            _ => return bad_gateway("unsupported proxy upstream scheme"),
+        };
         let uri = Uri::builder()
-            .scheme("http")
+            .scheme(scheme)
             .authority(
                 upstream
                     .authority()
@@ -240,15 +349,13 @@ impl ReverseProxy {
         {
             processing.forwarded();
         }
-        let client = if upgrade.is_some() {
-            &self.upgrade_client
-        } else {
-            &self.client
+        let request = super::processing::forwarding_request(request);
+        let response = match https_client {
+            Some(client) => client.request(request).await,
+            None if upgrade.is_some() => self.upgrade_client.request(request).await,
+            None => self.client.request(request).await,
         };
-        let mut response = match client
-            .request(super::processing::forwarding_request(request))
-            .await
-        {
+        let mut response = match response {
             Ok(response) => response,
             Err(error) => return bad_gateway(error),
         };
@@ -297,6 +404,23 @@ impl ReverseProxy {
                 .boxed_unsync()
         })
     }
+}
+
+fn http_connector(config: &ReverseProxyConfig) -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    connector.set_connect_timeout(Some(config.connect_timeout));
+    connector
+}
+
+fn client_builder(config: &ReverseProxyConfig) -> hyper_util::client::legacy::Builder {
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(config.idle_timeout)
+        .pool_max_idle_per_host(config.max_idle_connections)
+        .retry_canceled_requests(false);
+    builder
 }
 
 fn requested_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {

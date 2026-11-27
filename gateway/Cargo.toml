@@ -56,6 +56,7 @@ bytes = "1"
 percent-encoding = "2"
 h2 = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-auto"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
 etcd-client = { version = "0.14", optional = true, features = ["tls"] }
 futures-util = "0.3"
 http = "1"
