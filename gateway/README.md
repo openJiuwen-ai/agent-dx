@@ -349,7 +349,8 @@ set the address to an HTTPS origin (for example `https://apiserver:8888`) and se
 Ingress verifies the certificate chain against that bundle and verifies the
 hostname in the origin against the certificate. A TLS failure returns 502; the
 request is not retried over plaintext. A bare `host:port` (for example the
-loopback default `127.0.0.1:8888`) still selects HTTP without a CA file. Native
+loopback default `127.0.0.1:8888`) still selects HTTP when the CA file variable is
+unset or empty. HTTPS always requires a CA file. Native
 control paths require a TLS listener. The API Server still authenticates each
 request using the original Authorization headers.
 

@@ -1,5 +1,6 @@
 pub use crate::common::transfer::TransferPolicy;
 use std::env;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -9,6 +10,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const INGRESS_ETCD_ENDPOINTS_ENV: &str = "ADX_DATA_PLANE_INGRESS_ETCD_ENDPOINTS";
+const CONTROL_PLANE_ADDRESS_ENV: &str = "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS";
+const CONTROL_PLANE_CA_FILE_ENV: &str = "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_CA_FILE";
 pub const DEFAULT_CONTROL_PLANE_ROUTES: &str = "exact:/,exact:/healthz,prefix:/terminal,prefix:/api/instances,prefix:/api/admin/v1/keys,prefix:/api/jobs,prefix:/api/environment,prefix:/functions,prefix:/api-docs,prefix:/admin/v1/functions,prefix:/serverless/v1/functions,prefix:/serverless/v1/stream,prefix:/serverless/v1/componentshealth,prefix:/serverless/v1/posix,prefix:/frontend/v1/instance,prefix:/datasystem/v1,prefix:/serverless/v2,prefix:/app/v1,prefix:/client/v1/lease,prefix:/invocations,prefix:/global-scheduler";
 
 /// Strongly typed process configuration for the Ingress.
@@ -229,19 +232,17 @@ impl IngressConfig {
                 "Ingress TLS listener requires a certificate and key".into(),
             ));
         }
-        let address = "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS";
-        let ca_file = "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_CA_FILE";
-        let frontend_address = match env::var(address) {
+        let frontend_address = match env::var(CONTROL_PLANE_ADDRESS_ENV) {
             Ok(value) => value,
             Err(env::VarError::NotPresent) => "127.0.0.1:8888".into(),
-            Err(error) => return Err(ConfigError::Invalid(format!("{address}: {error}"))),
+            Err(error) => {
+                return Err(ConfigError::Invalid(format!(
+                    "{CONTROL_PLANE_ADDRESS_ENV}: {error}"
+                )))
+            }
         };
-        let control_plane_ca_file = env::var_os(ca_file).map(PathBuf::from);
-        crate::ingress::reverse_proxy::control_plane_origin(
-            &frontend_address,
-            control_plane_ca_file.as_deref(),
-        )
-        .map_err(|error| ConfigError::Invalid(format!("{address} / {ca_file}: {error}")))?;
+        let control_plane_ca_file =
+            parse_control_plane_ca_file(&frontend_address, env::var_os(CONTROL_PLANE_CA_FILE_ENV))?;
         let control_plane_routes = crate::ingress::parse_static_routes(
             &env::var("ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES")
                 .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_ROUTES.into()),
@@ -727,9 +728,47 @@ fn transfer_policy() -> Result<TransferPolicy, ConfigError> {
     })
 }
 
+fn parse_control_plane_ca_file(
+    address: &str,
+    value: Option<OsString>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let ca_file = value.filter(|path| !path.is_empty()).map(PathBuf::from);
+    crate::ingress::reverse_proxy::control_plane_origin(address, ca_file.as_deref()).map_err(
+        |error| {
+            ConfigError::Invalid(format!(
+                "{CONTROL_PLANE_ADDRESS_ENV} / {CONTROL_PLANE_CA_FILE_ENV}: {error}"
+            ))
+        },
+    )?;
+    Ok(ca_file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_plane_ca_file_treats_empty_as_unset() {
+        for value in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                parse_control_plane_ca_file("127.0.0.1:8888", value.clone()),
+                Ok(None)
+            );
+            let error = parse_control_plane_ca_file("https://apiserver:8888", value).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("HTTPS control plane upstream requires a CA file"));
+        }
+        let ca = PathBuf::from("/secrets/ca.pem");
+        assert_eq!(
+            parse_control_plane_ca_file(
+                "https://apiserver:8888",
+                Some(ca.clone().into_os_string())
+            ),
+            Ok(Some(ca.clone()))
+        );
+        assert!(parse_control_plane_ca_file("127.0.0.1:8888", Some(ca.into_os_string())).is_err());
+    }
 
     #[test]
     fn explicit_http_listener_limits_methods_and_route_boundaries() {

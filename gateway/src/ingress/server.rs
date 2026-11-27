@@ -484,19 +484,13 @@ impl Ingress {
         self
     }
 
-    pub fn with_reverse_proxy_config(mut self, config: ReverseProxyConfig) -> Self {
-        self.reverse_proxy = ReverseProxy::new(config);
-        self
-    }
-
-    pub(super) fn with_control_plane_tls(
+    pub(super) fn with_reverse_proxy_config(
         mut self,
-        config: &ReverseProxyConfig,
-        ca_file: &std::path::Path,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        super::reverse_proxy::control_plane_origin(&self.frontend_address, Some(ca_file))?;
-        self.reverse_proxy
-            .enable_control_plane_https(config, ca_file)?;
+        config: ReverseProxyConfig,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self, BoxError> {
+        super::reverse_proxy::control_plane_origin(&self.frontend_address, ca_file)?;
+        self.reverse_proxy = ReverseProxy::with_control_plane_config(config, ca_file)?;
         Ok(self)
     }
 

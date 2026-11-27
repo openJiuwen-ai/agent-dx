@@ -1,7 +1,7 @@
 use super::*;
 use crate::ingress::{H2PoolConfig, RouteStore};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -269,7 +269,8 @@ impl Fixture {
             upstream,
             crate::ingress::parse_static_routes("prefix:/api").unwrap(),
         )
-        .with_reverse_proxy_config(config.clone())
+        .with_reverse_proxy_config(config, upstream_tls.as_ref().map(|(_, ca, _)| ca.as_path()))
+        .unwrap()
         .with_proxy_routes(
             mount
                 .map(|prefix| {
@@ -283,10 +284,7 @@ impl Fixture {
                 })
                 .unwrap_or_default(),
         );
-        let ingress = Arc::new(match upstream_tls {
-            Some((_, ca, _)) => ingress.with_control_plane_tls(&config, &ca).unwrap(),
-            None => ingress,
-        });
+        let ingress = Arc::new(ingress);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let ingress_task = tokio::spawn(async move {
@@ -327,86 +325,29 @@ impl Fixture {
     }
 }
 
-fn openssl(dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new("openssl")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 #[tokio::test]
 async fn control_plane_https_verifies_ca_and_name_and_preserves_environment_requests() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
-    for name in ["ca", "other"] {
-        openssl(
-            dir,
-            &[
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:P-256",
-                "-nodes",
-                "-days",
-                "1",
-                "-subj",
-                &format!("/CN={name}"),
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-keyout",
-                &format!("{name}.key"),
-                "-out",
-                &format!("{name}.pem"),
-            ],
-        );
+    let mut ca = CertificateParams::default();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let ca_key = KeyPair::generate().unwrap();
+    for (name, key) in [
+        ("ca.pem", &ca_key),
+        ("other.pem", &KeyPair::generate().unwrap()),
+    ] {
+        std::fs::write(dir.join(name), ca.self_signed(key).unwrap().pem()).unwrap();
     }
-    openssl(
-        dir,
-        &[
-            "req",
-            "-new",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-subj",
-            "/CN=localhost",
-            "-keyout",
-            "server.key",
-            "-out",
-            "server.csr",
-        ],
-    );
-    std::fs::write(dir.join("server.ext"), "subjectAltName=DNS:localhost\n").unwrap();
-    openssl(
-        dir,
-        &[
-            "x509",
-            "-req",
-            "-in",
-            "server.csr",
-            "-CA",
-            "ca.pem",
-            "-CAkey",
-            "ca.key",
-            "-CAcreateserial",
-            "-days",
-            "1",
-            "-extfile",
-            "server.ext",
-            "-out",
-            "server.pem",
-        ],
-    );
+    let server_key = KeyPair::generate().unwrap();
+    let certificate = CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .signed_by(&server_key, &Issuer::new(ca, ca_key))
+        .unwrap();
+    std::fs::write(dir.join("server.pem"), certificate.pem()).unwrap();
+    std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
     let acceptor = adx_transport::tls::http_server_acceptor(
         dir.join("server.pem"),
         dir.join("server.key"),

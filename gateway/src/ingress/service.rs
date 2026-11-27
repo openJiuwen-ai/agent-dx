@@ -186,7 +186,10 @@ impl IngressService {
         .with_e2b_enabled(config.e2b_enabled)
         .with_e2b_allow_http(config.e2b_allow_http)
         .with_backend_http_pool_config(config.backend_http_pool_config())
-        .with_reverse_proxy_config(config.reverse_proxy.clone())
+        .with_reverse_proxy_config(
+            config.reverse_proxy.clone(),
+            config.control_plane_ca_file.as_deref(),
+        )?
         .with_proxy_routes(config.proxy_routes.clone())
         .with_command_watch_config(CommandWatchConfig {
             max_subscriptions_per_connection: config.command_watch_max_subscriptions,
@@ -198,11 +201,6 @@ impl IngressService {
             config.allowed_client_networks.clone(),
             config.allow_any_client,
         );
-        let gateway = if let Some(ca_file) = &config.control_plane_ca_file {
-            gateway.with_control_plane_tls(&config.reverse_proxy, ca_file)?
-        } else {
-            gateway
-        };
         #[cfg(feature = "agent-api")]
         let gateway = match file_access {
             Some(access) => gateway.with_execd_access(access),

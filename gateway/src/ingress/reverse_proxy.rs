@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -191,6 +191,25 @@ struct HttpsClients {
     upgrade: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("failed to load control plane CA file {path:?}: {source}")]
+struct ControlPlaneCaError {
+    path: PathBuf,
+    source: BoxError,
+}
+
+fn load_control_plane_ca(ca_file: &Path) -> Result<rustls::RootCertStore, BoxError> {
+    let mut roots = rustls::RootCertStore::empty();
+    let mut reader = BufReader::new(File::open(ca_file)?);
+    for cert in rustls_pemfile::certs(&mut reader) {
+        roots.add(cert?)?;
+    }
+    if roots.is_empty() {
+        return Err("file contains no certificates".into());
+    }
+    Ok(roots)
+}
+
 impl ReverseProxy {
     pub fn new(config: ReverseProxyConfig) -> Self {
         let connector = http_connector(&config);
@@ -206,20 +225,28 @@ impl ReverseProxy {
         }
     }
 
-    pub(super) fn enable_control_plane_https(
-        &mut self,
-        config: &ReverseProxyConfig,
-        ca_file: &Path,
-    ) -> Result<(), BoxError> {
+    pub(super) fn with_control_plane_config(
+        config: ReverseProxyConfig,
+        ca_file: Option<&Path>,
+    ) -> Result<Self, BoxError> {
+        let control_plane_https = match ca_file {
+            Some(path) => Some(HttpsClients::new(&config, path)?),
+            None => None,
+        };
+        Ok(Self {
+            control_plane_https,
+            ..Self::new(config)
+        })
+    }
+}
+
+impl HttpsClients {
+    fn new(config: &ReverseProxyConfig, ca_file: &Path) -> Result<Self, ControlPlaneCaError> {
+        let roots = load_control_plane_ca(ca_file).map_err(|source| ControlPlaneCaError {
+            path: ca_file.to_path_buf(),
+            source,
+        })?;
         adx_transport::install_crypto_provider();
-        let mut roots = rustls::RootCertStore::empty();
-        let mut reader = BufReader::new(File::open(ca_file)?);
-        for cert in rustls_pemfile::certs(&mut reader) {
-            roots.add(cert?)?;
-        }
-        if roots.is_empty() {
-            return Err("control plane CA file contains no certificates".into());
-        }
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -230,15 +257,16 @@ impl ReverseProxy {
             .https_only()
             .enable_http1()
             .wrap_connector(connector);
-        self.control_plane_https = Some(HttpsClients {
+        Ok(Self {
             normal: client_builder(config).build(connector.clone()),
             upgrade: client_builder(config)
                 .pool_max_idle_per_host(0)
                 .build(connector),
-        });
-        Ok(())
+        })
     }
+}
 
+impl ReverseProxy {
     pub async fn proxy(
         &self,
         request: Request<Incoming>,
@@ -490,6 +518,35 @@ fn bad_gateway(error: impl std::fmt::Display) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_plane_ca_errors_identify_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.pem");
+        let invalid_pem = dir.path().join("invalid-pem.pem");
+        let invalid_der = dir.path().join("invalid-der.pem");
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(
+            &invalid_pem,
+            "-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &invalid_der,
+            "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(&empty, "").unwrap();
+
+        for path in [&missing, &invalid_pem, &invalid_der, &empty] {
+            let error = HttpsClients::new(&ReverseProxyConfig::default(), path)
+                .err()
+                .unwrap();
+            assert_eq!(&error.path, path);
+            assert!(error.to_string().contains(&format!("{path:?}")));
+            assert!(error.source().is_some());
+        }
+    }
 
     #[test]
     fn routes_match_segment_boundaries_and_optional_host() {
