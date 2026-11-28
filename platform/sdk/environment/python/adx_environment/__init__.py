@@ -42,6 +42,7 @@ SDK_CAPABILITIES = frozenset(
         "tunnel-proxy-port",
         "recoverable-commands",
         "multiplexed-command-watch",
+        "attach-paused-environment",
     }
 )
 

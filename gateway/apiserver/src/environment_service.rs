@@ -729,6 +729,15 @@ fn existing_running_response(
                 adx_error::CREATE_TERMINAL_MESSAGE,
             ));
         }
+        if record.state == pb::EnvironmentState::Paused as i32 {
+            // The environment exists with a retained checkpoint. Create is not
+            // a resume: report a non-retryable conflict so the caller can attach
+            // to this environment ID and resume it explicitly.
+            return Err(Status::aborted(format!(
+                "environment {} is paused; resume it explicitly",
+                confirmed_spec.id
+            )));
+        }
         return Err(Status::unavailable("environment create is not yet running"));
     }
     if record.creation_request_id.is_empty() {
@@ -1073,6 +1082,22 @@ mod tests {
                 .code(),
             Code::Unavailable
         );
+    }
+
+    #[test]
+    fn paused_create_reports_a_resumable_conflict() {
+        let record = pb::EnvironmentRecord {
+            spec: Some(pb::EnvironmentSpec {
+                id: "worker".into(),
+                ..Default::default()
+            }),
+            creation_request_id: "create-a".into(),
+            state: pb::EnvironmentState::Paused as i32,
+            ..Default::default()
+        };
+        let error = existing_running_response(&json!({}), &record).unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert!(error.message().contains("worker"));
     }
 
     #[test]
