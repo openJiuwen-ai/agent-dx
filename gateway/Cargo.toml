@@ -30,7 +30,7 @@ path = "src/bin/data_plane_forward.rs"
 
 [features]
 default = ["activity-client"]
-activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
+activity-client = ["dep:prost", "dep:tonic"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
 agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken", "dep:zeroize", "dep:time"]
@@ -56,6 +56,7 @@ bytes = "1"
 percent-encoding = "2"
 h2 = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-auto"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
 etcd-client = { version = "0.14", optional = true, features = ["tls"] }
 futures-util = "0.3"
 http = "1"
@@ -75,7 +76,7 @@ serde_json = "1"
 thiserror = "1"
 tonic = { version = "0.12", optional = true, features = ["transport"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "io-util", "io-std", "time", "signal", "sync", "fs"] }
-tower = { version = "0.5", optional = true }
+tower = { version = "0.5", features = ["timeout", "util"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 url = "2"

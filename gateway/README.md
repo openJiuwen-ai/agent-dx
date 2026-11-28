@@ -231,9 +231,9 @@ The command-watch endpoint and CONNECT handling remain reserved. A `/` route is
 therefore a catch-all for other HTTP requests on its matching host.
 
 Application routes require the TLS ingress and use its existing client ACL.
-Applications handle their own login/authorization, as Frontend does. The current
-upstream transport is HTTP/1.1 over plaintext HTTP, suitable for internal HTTP
-services behind Ingress's TLS termination. Upstream HTTPS is rejected at startup.
+Applications handle their own login/authorization, as the API Server does.
+Application routes use plaintext HTTP/1.1; the control-plane upstream can use
+verified HTTPS separately.
 
 The proxy preserves the public Host, Authorization, Location, and separate
 Set-Cookie headers. It replaces forwarding metadata with the client peer address,
@@ -299,8 +299,10 @@ ADX_DATA_PLANE_INGRESS_PROXY_CONNECT_TIMEOUT_SEC=5
 
 The idle limit is per origin and controls retained connections, not concurrent
 requests. Set it to 0 to disable keep-alive reuse for comparisons. Busy responses
-can open additional connections. Idle and TCP connect timeouts must be non-zero;
-they do not impose a response deadline on long-running create or SSE requests.
+can open additional connections. Idle and connect timeouts must be non-zero.
+The connect timeout covers DNS resolution, TCP connect, and any upstream TLS
+handshake. It does not impose a response deadline on long-running create or SSE
+requests.
 A response connection is reused only after the HTTP message completes; canceling
 an incomplete response discards that connection.
 
@@ -343,9 +345,18 @@ rather than deleting log data. When a dedicated access file exists, enabled acce
 Ingress also replaces Traefik for the existing public control-plane
 surface. Only a fixed set of paths such as `/api/environment`, `/functions`,
 `/serverless`, `/terminal`, `/invocations`, and `/global-scheduler` is proxied to the configured
-`ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS`. These paths are accepted
-only on the TLS listener. Their authentication remains owned by Frontend and
-the original Authorization headers are preserved on that hop.
+`ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS` (leading and trailing whitespace
+is ignored). For a separate HTTPS API Server,
+set the address to an HTTPS origin (for example `https://apiserver:8888`) and set
+`ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_CA_FILE` to the deployment's PEM CA bundle.
+Ingress verifies the certificate chain against that bundle and verifies the
+hostname in the origin against the certificate. A TLS failure returns 502 without
+retrying over plaintext. Ingress logs the upstream origin and connection error
+chain. An explicit port must be a decimal number from 1 to 65535. A bare
+`host:port` (for example the loopback default `127.0.0.1:8888`) still selects HTTP
+when the CA file variable is unset or empty. HTTPS always requires a CA file. Native
+control paths require a TLS listener. The API Server still authenticates each
+request using the original Authorization headers.
 
 The Ingress directly exposes HTTP/direct and standard HTTP CONNECT ingress; it is
 not placed behind Traefik. Native clients such as SSH use the included local adapter, which opens

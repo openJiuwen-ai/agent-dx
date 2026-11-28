@@ -186,7 +186,10 @@ impl IngressService {
         .with_e2b_enabled(config.e2b_enabled)
         .with_e2b_allow_http(config.e2b_allow_http)
         .with_backend_http_pool_config(config.backend_http_pool_config())
-        .with_reverse_proxy_config(config.reverse_proxy.clone())
+        .with_reverse_proxy_config(
+            config.reverse_proxy.clone(),
+            config.control_plane_ca_file.as_deref(),
+        )?
         .with_proxy_routes(config.proxy_routes.clone())
         .with_command_watch_config(CommandWatchConfig {
             max_subscriptions_per_connection: config.command_watch_max_subscriptions,
@@ -473,6 +476,7 @@ mod tests {
             tls_cert: certificate.display().to_string(),
             tls_key: private_key.display().to_string(),
             frontend_address: "127.0.0.1:8888".into(),
+            control_plane_ca_file: None,
             reverse_proxy: ReverseProxyConfig {
                 max_idle_connections: 8,
                 idle_timeout: Duration::from_secs(1),

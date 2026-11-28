@@ -2,13 +2,18 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::body::Incoming;
+use hyper_rustls::{DefaultServerNameResolver, HttpsConnector, ResolveServerName};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::error::Error;
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tower::{timeout::Timeout, util::BoxCloneSyncService, Service};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -138,17 +143,113 @@ pub fn parse_proxy_routes(input: &str) -> Result<Vec<ProxyRoute>, String> {
     Ok(routes)
 }
 
+pub(crate) fn validate_control_plane_origin(
+    address: &str,
+    ca_file: Option<&Path>,
+) -> Result<(), BoxError> {
+    let origin: Uri = control_plane_url(address).parse()?;
+    let authority = origin
+        .authority()
+        .ok_or("control plane upstream must be an HTTP or HTTPS origin")?;
+    if authority.as_str().contains('@')
+        || authority.host().is_empty()
+        || origin
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+        || address.contains('#')
+    {
+        return Err("control plane upstream must be an HTTP or HTTPS origin".into());
+    }
+    // port() treats invalid ports as absent. Check the suffix after the host,
+    // which includes the brackets for IPv6 literals.
+    let suffix = &authority.as_str()[authority.host().len()..];
+    if !suffix.is_empty() {
+        let valid_port = suffix.strip_prefix(':').is_some_and(|port| {
+            port.bytes().all(|b| b.is_ascii_digit()) && matches!(port.parse::<u16>(), Ok(1..))
+        });
+        if !valid_port {
+            return Err("control plane upstream has an invalid port; expected 1 to 65535".into());
+        }
+    }
+    match (
+        origin.scheme_str(),
+        ca_file.filter(|path| !path.as_os_str().is_empty()),
+    ) {
+        (Some("https"), Some(_)) => {
+            DefaultServerNameResolver::default().resolve(&origin)?;
+            Ok(())
+        }
+        (Some("https"), _) => Err("HTTPS control plane upstream requires a CA file".into()),
+        (Some("http"), None) => Ok(()),
+        (Some("http"), Some(_)) => Err("control plane CA file requires an HTTPS upstream".into()),
+        _ => Err("control plane upstream must use HTTP or HTTPS".into()),
+    }
+}
+
+pub(super) fn control_plane_url(address: &str) -> std::borrow::Cow<'_, str> {
+    if address.contains("://") {
+        address.into()
+    } else {
+        format!("http://{address}").into()
+    }
+}
+
+type UpstreamConnector = HttpsConnector<HttpConnector>;
+type ProxyConnector =
+    BoxCloneSyncService<Uri, <UpstreamConnector as Service<Uri>>::Response, BoxError>;
+type ProxyClient = Client<ProxyConnector, ProxyBody>;
+
 #[derive(Clone)]
 pub struct ReverseProxy {
-    client: Client<HttpConnector, ProxyBody>,
-    upgrade_client: Client<HttpConnector, ProxyBody>,
+    client: ProxyClient,
+    upgrade_client: ProxyClient,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to load control plane CA file {}: {source}", .path.display())]
+struct ControlPlaneCaError {
+    path: PathBuf,
+    source: BoxError,
 }
 
 impl ReverseProxy {
     pub fn new(config: ReverseProxyConfig) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.set_connect_timeout(Some(config.connect_timeout));
+        Self::with_roots(config, rustls::RootCertStore::empty())
+    }
+
+    pub(super) fn with_control_plane_config(
+        config: ReverseProxyConfig,
+        ca_file: Option<&Path>,
+    ) -> Result<Self, BoxError> {
+        let roots = match ca_file {
+            Some(path) => load_control_plane_ca(path).map_err(|source| ControlPlaneCaError {
+                path: path.to_path_buf(),
+                source,
+            })?,
+            None => rustls::RootCertStore::empty(),
+        };
+        Ok(Self::with_roots(config, roots))
+    }
+
+    fn with_roots(config: ReverseProxyConfig, roots: rustls::RootCertStore) -> Self {
+        adx_transport::install_crypto_provider();
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut tcp = HttpConnector::new();
+        tcp.set_nodelay(true);
+        // Preserve the TCP connector's budget across multiple resolved addresses.
+        tcp.set_connect_timeout(Some(config.connect_timeout));
+        tcp.enforce_http(false);
+        // The connector follows the configured URI scheme and never retries TLS as HTTP.
+        let connector = UpstreamConnector::builder()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(tcp);
+        // Bound DNS, TCP and TLS together, leaving request and body streaming alone.
+        // Boxing the timeout future satisfies Hyper's Unpin bound for connectors.
+        let connector = ProxyConnector::new(Timeout::new(connector, config.connect_timeout));
         Self {
             client: Client::builder(TokioExecutor::new())
                 .pool_timer(TokioTimer::new())
@@ -221,8 +322,11 @@ impl ReverseProxy {
             Ok(uri) => uri,
             Err(error) => return bad_gateway(error),
         };
+        let Some(scheme) = upstream.scheme() else {
+            return bad_gateway("proxy upstream is missing a scheme");
+        };
         let uri = Uri::builder()
-            .scheme("http")
+            .scheme(scheme.clone())
             .authority(
                 upstream
                     .authority()
@@ -250,7 +354,18 @@ impl ReverseProxy {
             .await
         {
             Ok(response) => response,
-            Err(error) => return bad_gateway(error),
+            Err(error) => {
+                if error.is_connect() {
+                    let mut error_chain = vec![error.to_string()];
+                    let mut source = error.source();
+                    while let Some(cause) = source {
+                        error_chain.push(cause.to_string());
+                        source = cause.source();
+                    }
+                    tracing::warn!(%upstream, ?error_chain, "Ingress reverse proxy connection failed");
+                }
+                return bad_gateway(error);
+            }
         };
         response.headers_mut().remove("x-adx-error-code");
         let response_upgrade = requested_upgrade(response.headers());
@@ -297,6 +412,18 @@ impl ReverseProxy {
                 .boxed_unsync()
         })
     }
+}
+
+fn load_control_plane_ca(ca_file: &Path) -> Result<rustls::RootCertStore, BoxError> {
+    let mut roots = rustls::RootCertStore::empty();
+    let mut reader = BufReader::new(File::open(ca_file)?);
+    for cert in rustls_pemfile::certs(&mut reader) {
+        roots.add(cert?)?;
+    }
+    if roots.is_empty() {
+        return Err("file contains no certificates".into());
+    }
+    Ok(roots)
 }
 
 fn requested_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
@@ -366,6 +493,38 @@ fn bad_gateway(error: impl std::fmt::Display) -> Response<ProxyBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_plane_ca_errors_identify_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing CA.pem");
+        let invalid_pem = dir.path().join("invalid-pem.pem");
+        let invalid_der = dir.path().join("invalid-der.pem");
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(
+            &invalid_pem,
+            "-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &invalid_der,
+            "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(&empty, "").unwrap();
+
+        for path in [&missing, &invalid_pem, &invalid_der, &empty] {
+            let error =
+                ReverseProxy::with_control_plane_config(ReverseProxyConfig::default(), Some(path))
+                    .err()
+                    .unwrap();
+            assert!(error.to_string().starts_with(&format!(
+                "failed to load control plane CA file {}: ",
+                path.display()
+            )));
+            assert!(error.source().is_some());
+        }
+    }
 
     #[test]
     fn routes_match_segment_boundaries_and_optional_host() {

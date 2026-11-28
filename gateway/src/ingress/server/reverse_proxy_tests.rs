@@ -1,6 +1,7 @@
 use super::*;
 use crate::ingress::{H2PoolConfig, RouteStore};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -8,6 +9,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+
+#[derive(Clone)]
+enum UpstreamTls {
+    Accept(tokio_rustls::TlsAcceptor),
+    Stall,
+}
 
 struct Fixture {
     address: SocketAddr,
@@ -34,7 +41,7 @@ impl Drop for ActiveConnection {
 }
 
 async fn backend_connection(
-    mut stream: TcpStream,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     requests: Arc<AtomicUsize>,
     release: Arc<Notify>,
 ) {
@@ -129,7 +136,7 @@ async fn backend_connection(
             }
             "/api/upgrade" => {
                 if stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.is_err() { return; }
-                let (mut reader, mut writer) = stream.split();
+                let (mut reader, mut writer) = tokio::io::split(stream);
                 let _ = tokio::io::copy(&mut reader, &mut writer).await;
                 return;
             }
@@ -172,7 +179,11 @@ async fn backend_connection(
 
 #[tokio::test]
 async fn transfer_reverse_proxy_sse_survives_processing_deadline() {
-    let mut fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut fixture = Fixture::new(ReverseProxyConfig {
+        connect_timeout: Duration::from_millis(250),
+        ..ReverseProxyConfig::default()
+    })
+    .await;
     let mut sender = fixture.sender().await;
     let mut req = request("/api/progress");
     req.headers_mut().insert(
@@ -203,12 +214,22 @@ impl Fixture {
         mount: Option<&str>,
         security: IngressSecurity,
     ) -> Self {
+        Self::start(config, mount, security, None).await
+    }
+
+    async fn start(
+        config: ReverseProxyConfig,
+        mount: Option<&str>,
+        security: IngressSecurity,
+        upstream_tls: Option<(UpstreamTls, PathBuf, &str)>,
+    ) -> Self {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(Notify::new());
+        let backend_tls = upstream_tls.as_ref().map(|(tls, _, _)| tls.clone());
         let backend_task = {
             let (accepted, active, requests, release) = (
                 accepted.clone(),
@@ -226,9 +247,24 @@ impl Fixture {
                             active.fetch_add(1, Ordering::SeqCst);
                             let guard = ActiveConnection(active.clone());
                             let (requests, release) = (requests.clone(), release.clone());
+                            let backend_tls = backend_tls.clone();
                             tasks.spawn(async move {
                                 let _guard = guard;
-                                backend_connection(stream, requests, release).await;
+                                match backend_tls {
+                                    Some(UpstreamTls::Accept(acceptor)) => {
+                                        if let Ok(stream) = acceptor.accept(stream).await {
+                                            backend_connection(stream, requests, release).await;
+                                        }
+                                    }
+                                    Some(UpstreamTls::Stall) => {
+                                        // Read without sending a TLS handshake response.
+                                        let mut stream = stream;
+                                        let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
+                                    }
+                                    None => {
+                                        backend_connection(stream, requests, release).await;
+                                    }
+                                }
                             });
                         }
                         _ = tasks.join_next(), if !tasks.is_empty() => {},
@@ -236,31 +272,35 @@ impl Fixture {
                 }
             })
         };
-        let ingress = Arc::new(
-            Ingress::new(
-                Arc::new(IngressRouteResolver::new(Arc::new(RouteStore::new()))),
-                DataPlaneL4Connector::new(H2PoolConfig::default()),
-                IngressAuthenticator::new(true, false, "", Duration::from_secs(30)).unwrap(),
-                8888,
-                8765,
-                backend_address.to_string(),
-                crate::ingress::parse_static_routes("prefix:/api").unwrap(),
-            )
-            .with_reverse_proxy_config(config)
-            .with_proxy_routes(
-                mount
-                    .map(|prefix| {
-                        vec![ProxyRoute {
-                            name: "grafana".into(),
-                            path_prefix: prefix.into(),
-                            upstream: format!("http://{backend_address}"),
-                            strip_prefix: true,
-                            host: None,
-                        }]
-                    })
-                    .unwrap_or_default(),
-            ),
+        let upstream = match &upstream_tls {
+            Some((_, _, host)) => format!("https://{host}:{}", backend_address.port()),
+            None => backend_address.to_string(),
+        };
+        let ingress = Ingress::new(
+            Arc::new(IngressRouteResolver::new(Arc::new(RouteStore::new()))),
+            DataPlaneL4Connector::new(H2PoolConfig::default()),
+            IngressAuthenticator::new(true, false, "", Duration::from_secs(30)).unwrap(),
+            8888,
+            8765,
+            upstream,
+            crate::ingress::parse_static_routes("prefix:/api").unwrap(),
+        )
+        .with_reverse_proxy_config(config, upstream_tls.as_ref().map(|(_, ca, _)| ca.as_path()))
+        .unwrap()
+        .with_proxy_routes(
+            mount
+                .map(|prefix| {
+                    vec![ProxyRoute {
+                        name: "grafana".into(),
+                        path_prefix: prefix.into(),
+                        upstream: format!("http://{backend_address}"),
+                        strip_prefix: true,
+                        host: None,
+                    }]
+                })
+                .unwrap_or_default(),
         );
+        let ingress = Arc::new(ingress);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let ingress_task = tokio::spawn(async move {
@@ -299,6 +339,90 @@ impl Fixture {
         }));
         sender
     }
+}
+
+fn tls_fixture(name: &str) -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+const TEST_CA: &str = "control-plane-test-ca.pem";
+
+#[tokio::test]
+async fn control_plane_https_verifies_ca_and_name_and_preserves_environment_requests() {
+    let acceptor = adx_transport::tls::http_server_acceptor(
+        tls_fixture("control-plane-test-server.pem"),
+        tls_fixture("ingress-key.pem"),
+        None,
+        vec![b"http/1.1".to_vec()],
+    )
+    .unwrap();
+    for (ca, host, trusted) in [
+        (TEST_CA, "localhost", true),
+        ("ingress-cert.pem", "localhost", false),
+        (TEST_CA, "127.0.0.1", false),
+    ] {
+        let mut fixture = Fixture::start(
+            ReverseProxyConfig::default(),
+            None,
+            IngressSecurity::Tls,
+            Some((UpstreamTls::Accept(acceptor.clone()), tls_fixture(ca), host)),
+        )
+        .await;
+        let mut sender = fixture.sender().await;
+        let get = Request::builder()
+            .uri("/api/environment/v1/resources?label=a%2Fb")
+            .header("host", "public.example:8443")
+            .header("authorization", "Bearer test-tenant")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = timeout(Duration::from_secs(3), sender.send_request(get))
+            .await
+            .unwrap()
+            .unwrap();
+        if trusted {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.starts_with("GET /api/environment/v1/resources?label=a%2Fb HTTP/1.1\r\n"));
+            assert!(body.contains("authorization: Bearer test-tenant\r\n"));
+            let body = complete(&mut sender, "/api/environment/v1/environments").await;
+            assert!(body.starts_with(b"POST /api/environment/v1/environments HTTP/1.1\r\n"));
+            assert!(body.ends_with(b"hello"));
+            assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.accepted.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{ca} {host}");
+            assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn control_plane_https_times_out_when_tls_handshake_stalls() {
+    let mut fixture = Fixture::start(
+        ReverseProxyConfig {
+            connect_timeout: Duration::from_millis(250),
+            ..ReverseProxyConfig::default()
+        },
+        None,
+        IngressSecurity::Tls,
+        Some((UpstreamTls::Stall, tls_fixture(TEST_CA), "127.0.0.1")),
+    )
+    .await;
+    let mut sender = fixture.sender().await;
+    let response = timeout(
+        Duration::from_secs(3),
+        sender.send_request(request("/api/environment/v1/environments")),
+    )
+    .await
+    .expect("Ingress should time out the stalled TLS handshake")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(fixture.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+    wait_active(&fixture, 0).await;
 }
 
 fn request(path: &str) -> Request<Full<Bytes>> {
