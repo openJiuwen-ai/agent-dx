@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -187,11 +188,12 @@ def main():
         'runtime_actions': len(runtime_actions()),
         'errors': audit(control, data),
     }
-    rendered = json.dumps(result, indent=2) + '\n'
+    rendered = json.dumps(result, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered)
-    sys.stdout.write(rendered)
+        args.output.write_text(rendered + '\n')
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(message)s', force=True)
+    logging.info('%s', rendered)
     return bool(result['errors'])
 
 
