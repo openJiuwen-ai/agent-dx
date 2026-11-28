@@ -150,8 +150,6 @@ impl ApplicationWsConfig {
         let uses_privacy_model = privacy.as_ref().is_some_and(|access| {
             access.identity.targets(&self.template) && access.model_configuration.is_some()
         });
-        #[cfg(not(unix))]
-        let uses_privacy_model = false;
         let access = AgentV2Access::new(managed);
         let admission = async {
             let selection = access
@@ -172,11 +170,7 @@ impl ApplicationWsConfig {
                         .map_err(|_| crate::ingress::accounts::Error::Invalid)?;
                         // Login registration and template injection coexist during migration.
                         // Existing bindings still skip this lazy initializer on reconnect.
-                        let mut parameters = if uses_privacy_model {
-                            Default::default()
-                        } else {
-                            auth.model_parameters(&principal).await?
-                        };
+                        let mut parameters = auth.model_parameters(&principal).await?;
                         parameters.extend(workspace);
                         Ok(parameters)
                     },
