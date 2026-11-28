@@ -1,5 +1,8 @@
 //! SSH terminal entrypoint shared by inline instances and managed AgentBindings.
-use super::{server::IngressStream, AccessKind, Ingress};
+use super::{
+    server::{FrontendGuard, IngressStream},
+    AccessKind, Ingress,
+};
 use adx_agent_api::managed::ManagedService;
 use adx_agent_core::{
     target::{SshRoute, Target},
@@ -208,8 +211,15 @@ impl SshListener {
                     let config = self.server_config.clone();
                     let mut stop = shutdown.clone();
                     let deadline = tokio::time::Instant::now() + self.settings.auth_timeout;
+                    let frontend_work = self.gateway.frontend_work_handle();
+                    let gateway = self.gateway.clone();
                     connections.spawn(async move {
                         let _permit = permit;
+                        // Count the SSH frontend against the drain gauge:
+                        // graceful exit waits for (and observes) open SSH
+                        // sessions instead of cutting them with the
+                        // listeners.
+                        let _frontend = FrontendGuard::new(frontend_work);
                         let session = tokio::select! {
                             _ = stop.changed() => return,
                             result = tokio::time::timeout_at(deadline, server::run_stream(config, stream, handler)) => match result {
@@ -220,15 +230,47 @@ impl SshListener {
                         let handle = session.handle();
                         tokio::pin!(session);
                         let mut accepted = false;
-                        loop {
+                        // How the connection answers the shutdown signal:
+                        // unauthenticated connections are new logins drain
+                        // rejects under either mode, and CloseImmediate cuts
+                        // everything at the signal. ContinueUntilDeadline
+                        // keeps an authenticated interactive terminal
+                        // relaying until the recorded drain budget expires,
+                        // mirroring the WS/CONNECT tunnel policy; a missing
+                        // deadline (shutdown without a drain budget)
+                        // degrades to cutting at the signal.
+                        let drain_cut = loop {
                             tokio::select! {
                                 result = &mut session => {
                                     if let Err(error) = result { tracing::debug!(%error, "SSH connection closed"); }
                                     return;
                                 }
                                 _ = auth_rx.changed(), if !accepted => { accepted = *auth_rx.borrow(); }
-                                _ = tokio::time::sleep_until(deadline), if !accepted => break,
-                                _ = stop.changed() => break,
+                                _ = tokio::time::sleep_until(deadline), if !accepted => break None,
+                                _ = stop.changed() => {
+                                    break if !accepted
+                                        || gateway.ws_drain_mode == crate::config::WsDrainMode::CloseImmediate
+                                    {
+                                        None
+                                    } else {
+                                        Some(gateway.drain_deadline().unwrap_or_else(tokio::time::Instant::now))
+                                    };
+                                }
+                            }
+                        };
+                        if let Some(cut) = drain_cut {
+                            // ContinueUntilDeadline: keep relaying inside the
+                            // drain budget. The hard cut at the deadline is
+                            // load-bearing — serve() joins this task before
+                            // returning, so an armed deadline bounds the
+                            // process exit; without it an idle terminal
+                            // would hang the shutdown indefinitely.
+                            tokio::select! {
+                                result = &mut session => {
+                                    if let Err(error) = result { tracing::debug!(%error, "SSH connection closed"); }
+                                    return;
+                                }
+                                _ = tokio::time::sleep_until(cut) => {}
                             }
                         }
                         let _ = handle.disconnect(russh::Disconnect::ByApplication, "SSH connection closing".into(), "".into()).await;

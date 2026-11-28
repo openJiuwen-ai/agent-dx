@@ -420,6 +420,12 @@ services and covers readiness, tenant admission, direct HTTP, WebSocket,
 CONNECT tunnel, port-forwarding, SSH/raw TCP, route retirement, status errors,
 drain, H2 reuse, and activity-count convergence.
 
+## Graceful shutdown and drain
+
+SIGTERM starts the drain: new business work on the public listeners is rejected with HTTP 503 (HTTP/1.x rejections carry `Connection: close` so L4-pinned retries move to a healthy replica; h2 omits the forbidden header), `/readyz` reports not ready, and existing work is bounded by `ADX_DATA_PLANE_INGRESS_DRAIN_TIMEOUT_SEC` (default 15 seconds). `ADX_DATA_PLANE_INGRESS_WS_DRAIN_MODE` selects how existing long-lived connections are handled — WebSocket/command-watch/CONNECT tunnels and built-in SSH terminals: `continue_until_deadline` (default) keeps tunnels running to the budget and lets an established SSH terminal relay until the budget expires, then disconnects it in-protocol; `close_immediate` cancels backend streams and pushes a RECONNECT state to command-watch clients at drain start, and cuts established SSH terminals at the signal — a saturated outbound queue drops the frame with a warning and still closes the connection via its per-connection cancel signal, and a connection whose upgrade raced the drain start closes immediately after registering. An SSH connection that has not finished authenticating is a new login and closes at the signal under either mode. The health listener serves `/readyz`, `/healthz` and `/metrics` through the whole drain window and retires only after the drain completes, so the withdrawal stays observable while it happens.
+
+Drain observability on the health listener's `/metrics`: `data_plane_ingress_draining`, `data_plane_ingress_frontend_connections` (active frontend connection/relay tasks the drain waits on; SSH terminal sessions are included), and `data_plane_ingress_frontend_connections_opened_total` (monotonic; a relay pump that outlives its admission task counts once, on admission — upgrade pumps adopted by a spawned task do not tick it again).
+
 The historical `gateway/tests/real_process_mock.sh` and Lima harness below target the previous etcd/IAM bootstrap; they need adaptation before use with the managed Ingress entrypoint. For the new Redis/mTLS route and real H2/TCP collaboration check, run `python3 build/ci/run.py control-rpc` with `ADX_TEST_REDIS_SERVER` set. This fixture does not launch sandboxd or EXECD.
 
 The reusable Lima topology has a separate project harness:

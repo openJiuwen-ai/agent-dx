@@ -596,3 +596,210 @@ async fn terminal_case(native: bool) {
     .await
     .unwrap();
 }
+
+async fn closed_within(channel: &mut russh::Channel<client::Msg>, limit: Duration) -> bool {
+    tokio::time::timeout(limit, async {
+        loop {
+            match channel.wait().await {
+                None | Some(ChannelMsg::Close) => break,
+                Some(_) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn established_terminal_relays_until_drain_deadline_by_default() {
+    drain_case(crate::config::WsDrainMode::ContinueUntilDeadline).await;
+}
+
+#[tokio::test]
+async fn established_terminal_disconnects_at_drain_start_under_close_immediate() {
+    drain_case(crate::config::WsDrainMode::CloseImmediate).await;
+}
+
+/// The built-in SSH entrypoint follows the long-connection drain policy:
+/// ContinueUntilDeadline keeps an established interactive terminal
+/// relaying until the recorded drain budget expires, CloseImmediate cuts
+/// it at the shutdown signal. Both cuts are protocol-level disconnects,
+/// and the drain gauges must retire with the connection.
+async fn drain_case(mode: crate::config::WsDrainMode) {
+    let host = key();
+    let backend_host = key();
+    let backend_key = key();
+    let inline_user = key();
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = backend_listener.local_addr().unwrap().port();
+    let mut echo = Echo {
+        credential: backend_key.public_key().clone(),
+    };
+    let backend_server = echo.run_on_socket(
+        Arc::new(server::Config {
+            keys: vec![backend_host.clone()],
+            ..Default::default()
+        }),
+        &backend_listener,
+    );
+    let backend_shutdown = backend_server.handle();
+    let node = Arc::new(
+        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+            .parse()
+            .unwrap()]))
+        .with_route_enforcement(),
+    );
+    let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_address = node_listener.local_addr().unwrap();
+    let node_server = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = node_listener.accept().await.unwrap();
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let _ = node.serve_h2(stream).await;
+                });
+            }
+        })
+    };
+    let (gateway, _, routes) = fixture_with_routes().await;
+    let environment = Arc::new(RoutingBackend {
+        inner: Backend::default(),
+        routes,
+        node,
+        node_address,
+    });
+    environment.install("tenant", "inline-instance").await;
+    let gateway = Arc::new(
+        Arc::try_unwrap(gateway)
+            .ok()
+            .unwrap()
+            .with_ws_drain_mode(mode)
+            .with_client_acl(vec!["127.0.0.0/8".parse().unwrap()], false),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let host_path = directory.path().join("host");
+    let backend_path = directory.path().join("backend");
+    std::fs::write(
+        &host_path,
+        host.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(
+        &backend_path,
+        backend_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let listener = SshListener::bind(
+        SshConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            host_key: host_path,
+            backend_key: backend_path,
+            backend_user: "harness".into(),
+            backend_host_keys: vec![backend_host.public_key().to_openssh().unwrap()],
+            inline_authorized_keys: vec![KeyGrant {
+                public_key: inline_user.public_key().to_openssh().unwrap(),
+                tenant_id: "tenant".into(),
+            }],
+            agent_authorized_keys: vec![],
+            connect_timeout_seconds: 5,
+            auth_timeout_seconds: 5,
+            max_connections: 8,
+        },
+        gateway.clone(),
+    )
+    .await
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let ingress = tokio::spawn(listener.serve(stopped));
+    let checks = async {
+        let mut client = client::connect(
+            Arc::new(client::Config::default()),
+            address,
+            Verify(host.public_key().clone()),
+        )
+        .await
+        .unwrap();
+        assert!(client
+            .authenticate_publickey(
+                format!("yr:instance:inline-instance:port={port}"),
+                PrivateKeyWithHashAlg::new(Arc::new(inline_user), None)
+            )
+            .await
+            .unwrap()
+            .success());
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+        channel.request_shell(true).await.unwrap();
+        read_until(&mut channel, "backend-ready").await;
+        channel.data(&b"hello\r"[..]).await.unwrap();
+        assert_eq!(read_until(&mut channel, "hello\r").await, "hello\r");
+        // Drain starts in the production order — the budget deadline is
+        // recorded before the shutdown broadcast, so the terminal reads
+        // a cut instant before the stop signal.
+        let budget = match mode {
+            crate::config::WsDrainMode::ContinueUntilDeadline => Duration::from_secs(3),
+            crate::config::WsDrainMode::CloseImmediate => Duration::from_secs(10),
+        };
+        let drained_at = std::time::Instant::now();
+        gateway.start_drain_at(tokio::time::Instant::now() + budget);
+        stop.send(true).unwrap();
+        match mode {
+            crate::config::WsDrainMode::ContinueUntilDeadline => {
+                // The window still relays: an established terminal keeps
+                // its backend stream under ContinueUntilDeadline.
+                channel.data(&b"still-here\r"[..]).await.unwrap();
+                assert_eq!(
+                    read_until(&mut channel, "still-here\r").await,
+                    "still-here\r"
+                );
+                // The cut lands at the recorded deadline, not at the signal.
+                assert!(
+                    closed_within(&mut channel, Duration::from_secs(5)).await,
+                    "ContinueUntilDeadline must cut the terminal at the drain deadline"
+                );
+                assert!(
+                    drained_at.elapsed() >= Duration::from_secs(2),
+                    "terminal cut before the drain deadline: {:?}",
+                    drained_at.elapsed()
+                );
+            }
+            crate::config::WsDrainMode::CloseImmediate => {
+                // The cut lands at the signal, long before the budget.
+                assert!(
+                    closed_within(&mut channel, Duration::from_secs(2)).await,
+                    "CloseImmediate must cut the terminal at the shutdown signal"
+                );
+                assert!(
+                    drained_at.elapsed() < Duration::from_secs(5),
+                    "terminal outlived the signal under CloseImmediate: {:?}",
+                    drained_at.elapsed()
+                );
+            }
+        }
+    };
+    tokio::pin!(backend_server);
+    tokio::select! { result = tokio::time::timeout(Duration::from_secs(30), checks) => { result.unwrap(); }, result = &mut backend_server => panic!("backend stopped: {result:?}") }
+    ingress.await.unwrap().unwrap();
+    backend_shutdown.shutdown("done".into());
+    backend_server.await.unwrap();
+    node_server.abort();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while gateway.frontend_connections() != 0 || gateway.active_sessions() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}

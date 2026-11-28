@@ -200,7 +200,8 @@ impl IngressService {
         .with_client_acl(
             config.allowed_client_networks.clone(),
             config.allow_any_client,
-        );
+        )
+        .with_ws_drain_mode(config.ws_drain_mode);
         #[cfg(feature = "agent-api")]
         let gateway = match file_access {
             Some(access) => gateway.with_execd_access(access),
@@ -353,9 +354,14 @@ impl IngressService {
             });
         }
         let gateway_for_health = gateway.clone();
+        // The health listener has its own shutdown signal: it must keep
+        // serving /readyz and the drain metrics through the whole drain
+        // window (start_drain → wait_drained), so the release side can
+        // observe that the withdrawal took effect.
+        let (health_shutdown_tx, health_shutdown_rx) = watch::channel(false);
         listeners.spawn(async move {
             gateway_for_health
-                .serve_health(health_listener, shutdown_rx)
+                .serve_health(health_listener, health_shutdown_rx)
                 .await
                 .map_err(service_error)
         });
@@ -371,12 +377,17 @@ impl IngressService {
             _ = &mut shutdown => None,
             result = listeners.join_next() => Some(listener_failure(result)),
         };
-        gateway.start_drain();
+        // Record the drain budget before the shutdown broadcast so every
+        // drain-aware path (built-in SSH terminals under
+        // ContinueUntilDeadline) reads a cut instant, not just the signal.
+        let drain_deadline = tokio::time::Instant::now() + config.drain_timeout;
+        gateway.start_drain_at(drain_deadline);
         let _ = shutdown_tx.send(true);
-        let deadline = tokio::time::Instant::now() + config.drain_timeout;
-        while gateway.active_sessions() > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        gateway.wait_drained(drain_deadline).await;
+        // The drain finished: the health listener retires last, after having
+        // served /readyz (reporting draining) and the drain metrics
+        // throughout the window above.
+        let _ = health_shutdown_tx.send(true);
         watcher_task.abort();
         route_reconciler_task.abort();
         if failure.is_some() {
@@ -424,8 +435,8 @@ pub struct IngressReadiness {
 }
 
 impl IngressReadiness {
-    /// The Ingress's own admission readiness: route store synchronized and
-    /// not draining.
+    /// The Ingress's own admission readiness: route store synchronized,
+    /// enabled entry paths initialized, and not draining.
     pub fn ready(&self) -> bool {
         self.gateway.ready()
     }
@@ -505,6 +516,7 @@ mod tests {
             backend_http_idle_timeout: Duration::from_secs(1),
             backend_http_acquire_timeout: Duration::from_secs(1),
             drain_timeout: Duration::from_millis(10),
+            ws_drain_mode: crate::config::WsDrainMode::ContinueUntilDeadline,
             allowed_client_networks: vec!["127.0.0.1/32".parse().unwrap()],
             allow_any_client: false,
             command_watch_max_subscriptions: 1,
