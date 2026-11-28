@@ -1419,9 +1419,13 @@ impl Session {
         Ok(header)
     }
     pub async fn snapshot(&self) -> Result<StoredSnapshot> {
+        self.snapshot_with_transport().await.map(|(saved, _)| saved)
+    }
+    pub(crate) async fn snapshot_with_transport(&self) -> Result<(StoredSnapshot, u64)> {
         // Never label an older snapshot with a later event sequence: consumers
         // would otherwise skip the event needed to repair that snapshot.
         for _ in 0..ATTEMPTS {
+            let transport = self.transport_generation();
             let before = self
                 .store
                 .connection
@@ -1450,8 +1454,9 @@ impl Session {
                     .connection
                     .publication_sequence
                     .load(Ordering::Acquire)
+                && transport == self.transport_generation()
             {
-                return Ok(saved);
+                return Ok((saved, transport));
             }
         }
         Err(Error::Unavailable(

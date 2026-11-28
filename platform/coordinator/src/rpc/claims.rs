@@ -56,9 +56,10 @@ impl State {
         // The failed writer has returned. Fence only optional claims before
         // loading their authoritative outcomes; lifecycle objects are independent.
         self.session.claim_barrier().await?;
-        let mut saved = self.session.snapshot().await?;
+        let (mut saved, transport) = self.session.snapshot_with_transport().await?;
         self.session.refresh_inspection_inventory().await?;
-        self.session.reseed_disconnected_publication(&saved);
+        self.session
+            .reseed_disconnected_publication(&saved, transport)?;
         // Both local and central assignments may already be executing before
         // first-result publication. Preserve them during in-process repair;
         // requeuing loses their owner and makes the node's commit NotFound.

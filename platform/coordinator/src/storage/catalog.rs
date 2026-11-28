@@ -355,6 +355,13 @@ impl Session {
         Ok(output)
     }
 
+    pub(super) fn transport_generation(&self) -> u64 {
+        self.store
+            .connection
+            .transport_generation
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn publication_ready(&self) -> bool {
         let catalog = self
             .store
@@ -364,53 +371,53 @@ impl Session {
             .expect("publication catalog invariant");
         catalog.epoch == self.epoch
             && catalog.dirty.is_empty()
-            && catalog.transport_generation
-                == self
-                    .store
-                    .connection
-                    .transport_generation
-                    .load(Ordering::Acquire)
+            && catalog.transport_generation == self.transport_generation()
     }
-    pub(crate) fn reseed_disconnected_publication(&self, saved: &StoredSnapshot) {
-        let generation = self
-            .store
-            .connection
-            .transport_generation
-            .load(Ordering::Acquire);
+    pub(crate) fn reseed_disconnected_publication(
+        &self,
+        saved: &StoredSnapshot,
+        transport: u64,
+    ) -> Result<()> {
         let mut catalog = self
             .store
             .connection
             .catalog
             .lock()
             .expect("publication catalog invariant");
-        if catalog.epoch != self.epoch || catalog.transport_generation != generation {
-            let revision = self
-                .store
-                .connection
-                .publication_sequence
-                .fetch_add(1, Ordering::AcqRel)
-                + 1;
-            *catalog = Catalog {
-                epoch: self.epoch,
-                transport_generation: generation,
-                revision,
-                nodes: saved
-                    .nodes
-                    .iter()
-                    .map(|(id, node)| (id.clone(), Arc::new(node.clone())))
-                    .collect(),
-                environments: saved
-                    .environments
-                    .iter()
-                    .map(|(id, env)| (id.clone(), Arc::new(env.clone())))
-                    .collect(),
-                dirty: BTreeSet::new(),
-                applied_revision: 0,
-                catching_up: true,
-                resets: catalog.resets,
-                skipped: catalog.skipped,
-            };
+        if catalog.epoch != self.epoch
+            || self.store.connection.active_epoch.load(Ordering::Acquire) != self.epoch
+        {
+            return Err(Error::Conflict);
         }
+        // A lifecycle write or ambiguous outcome can be published while Redis
+        // is being read. Compare the read's revision under the publication lock
+        // before replacing records or discarding any unresolved writes.
+        if catalog.revision != saved.revision || transport != self.transport_generation() {
+            return Err(Error::Unavailable(
+                "publication snapshot changed during recovery; retry".into(),
+            ));
+        }
+        if catalog.transport_generation == transport {
+            return Ok(());
+        }
+        catalog.transport_generation = transport;
+        catalog.nodes = saved
+            .nodes
+            .iter()
+            .map(|(id, node)| (id.clone(), Arc::new(node.clone())))
+            .collect();
+        catalog.environments = saved
+            .environments
+            .iter()
+            .map(|(id, env)| (id.clone(), Arc::new(env.clone())))
+            .collect();
+        catalog.dirty.clear();
+        catalog.catching_up = true;
+        // Existing subscribers need a full reset because Redis can restore an
+        // older state after a restart, even if no further object events arrive.
+        self.store
+            .send_publication(&mut catalog, vec![], true, vec![]);
+        Ok(())
     }
     pub(crate) fn publication_snapshot(
         &self,
@@ -423,12 +430,7 @@ impl Session {
             .expect("publication catalog poisoned");
         if catalog.epoch != self.epoch
             || !catalog.dirty.is_empty()
-            || catalog.transport_generation
-                != self
-                    .store
-                    .connection
-                    .transport_generation
-                    .load(Ordering::Acquire)
+            || catalog.transport_generation != self.transport_generation()
         {
             return Err(Error::Unavailable(
                 "publication awaiting ambiguous write resolution".into(),
@@ -445,50 +447,44 @@ impl Session {
         ))
     }
     pub(crate) async fn repair_publication(&self) -> Result<()> {
-        let generation = self
-            .store
-            .connection
-            .transport_generation
-            .load(Ordering::Acquire);
-        let stale_transport = {
+        let (transport, fields) = {
             let catalog = self
                 .store
                 .connection
                 .catalog
                 .lock()
                 .expect("publication catalog poisoned");
-            catalog.epoch != self.epoch || catalog.transport_generation != generation
+            if catalog.epoch != self.epoch {
+                return Err(Error::Conflict);
+            }
+            (
+                catalog.transport_generation,
+                catalog.dirty.iter().take(128).cloned().collect::<Vec<_>>(),
+            )
         };
-        if stale_transport {
-            let saved = self.snapshot().await?;
-            self.store.seed_publication(self.epoch, saved);
-            return Ok(());
+        if transport != self.transport_generation() {
+            return self.reload_publication().await;
         }
         // Repair only ambiguous objects, in bounded batches. Successful normal
         // commits never issue these reads and continuous unrelated writes cannot
         // invalidate this object-locked repair.
-        let fields: Vec<_> = self
-            .store
-            .connection
-            .catalog
-            .lock()
-            .expect("publication catalog poisoned")
-            .dirty
-            .iter()
-            .take(128)
-            .cloned()
-            .collect();
         if fields.is_empty() {
             return Ok(());
         }
         let write = self
             .store
-            .publication_write(self.epoch, fields.clone())
+            .publication_prepare(self.epoch, fields.clone())
             .await;
         let mut requested = vec![HEADER.to_owned()];
         requested.extend(fields.clone());
         let raw = self.store.fields_vec(&requested).await?;
         self.header(&raw[0])?;
+        if transport != self.transport_generation() {
+            // HMGET may have fenced the failed connection itself. Release the
+            // object locks before the full recovery on the replacement.
+            drop(write);
+            return self.reload_publication().await;
+        }
         let values = RedisStore::publication_values(
             fields
                 .iter()
@@ -496,13 +492,117 @@ impl Session {
                 .map(|(f, v)| (f.as_str(), v.as_deref())),
         )?;
         write.finish(true, values);
+        if transport != self.transport_generation() {
+            return self.reload_publication().await;
+        }
         Ok(())
+    }
+
+    async fn reload_publication(&self) -> Result<()> {
+        let (saved, transport) = self.snapshot_with_transport().await?;
+        self.reseed_disconnected_publication(&saved, transport)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires dedicated real Redis"]
+    async fn reconnect_recovery_preserves_a_checkpoint_reference_committed_after_the_read() {
+        use adx_checkpoint_storage::reclaim::{ObjectReclaimer, Reclaimers};
+        use adx_core::CheckpointArtifact;
+        use adx_protocol::auth::{Peers, Principal};
+        use adx_scheduling::Placement;
+        use adx_transport::rpc::RpcClient;
+        use object_store::{path::Path, ObjectStoreExt};
+
+        let mut redis = transport_test_redis::Redis::new().await;
+        let session = redis.store().await.begin(1).await.unwrap();
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id":"owner", "tenant_id":"tenant", "image":"image", "runtime_class":"runsc",
+            "priority":0, "resources":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0}
+        }))
+        .unwrap();
+        session
+            .register(
+                Node {
+                    id: "node".into(),
+                    capacity: spec.resources,
+                    available: true,
+                    labels: Default::default(),
+                    devices: vec![],
+                    runtime_classes: vec!["runsc".into()],
+                },
+                "127.0.0.1:1".into(),
+                "127.0.0.1:2".into(),
+            )
+            .await
+            .unwrap();
+        let assignment = Assignment {
+            environment_id: spec.id.clone(),
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        };
+        session
+            .reserve(spec.clone(), assignment.clone())
+            .await
+            .unwrap();
+        let artifact = CheckpointArtifact {
+            storage: "shared".into(),
+            scope: String::new(),
+            location: uuid::Uuid::new_v4().to_string(),
+            size_bytes: 6,
+        };
+        let remote = Arc::new(object_store::memory::InMemory::new());
+        let key = Path::from(format!("test/{}/files/memory", artifact.location));
+        remote.put(&key, b"memory".to_vec().into()).await.unwrap();
+        let mut reclaimers = Reclaimers::default();
+        reclaimers
+            .insert(Arc::new(
+                ObjectReclaimer::new("shared".into(), remote.clone(), "test".into()).unwrap(),
+            ))
+            .unwrap();
+        let coordinator = crate::rpc::CoordinatorRpc::new(
+            session.clone(),
+            Placement::Pack,
+            Peers::network(),
+            RpcClient::network(Principal::Coordinator),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .with_reclaimers(reclaimers);
+
+        redis.crash();
+        redis.start().await;
+        let (saved, transport) = session.snapshot_with_transport().await.unwrap();
+        assert!(!session.publication_ready());
+        assert!(saved.environments[&spec.id].result.is_none());
+        let record: EnvironmentRecord = serde_json::from_value(serde_json::json!({
+            "spec":spec, "assignment":assignment, "state":"Running", "revision":2,
+            "runtime":{"id":"owner-1","ip":"10.0.0.2"}, "resources_held":true,
+            "restart_attempts":0,"restart_pending":false,"execution_artifacts":[artifact]
+        }))
+        .unwrap();
+        session.commit(record).await.unwrap();
+        session.refresh_inspection_inventory().await.unwrap();
+        assert!(matches!(
+            session.reseed_disconnected_publication(&saved, transport),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(!session.publication_ready());
+        session.repair_publication().await.unwrap();
+
+        assert_eq!(coordinator.collect_shared_artifacts().await.unwrap(), 0);
+        assert!(remote.get(&key).await.is_ok());
+        let stored = session.get("owner").await.unwrap().result.unwrap();
+        assert_eq!(stored.execution_artifacts, vec![artifact]);
+    }
+
     fn session() -> Session {
         let (changes, _) = broadcast::channel(1024);
         let store = RedisStore {
