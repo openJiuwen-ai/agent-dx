@@ -12,6 +12,7 @@ pub mod driver;
 pub mod entrypoint;
 pub(crate) mod experience;
 pub mod foreground_admission;
+mod frame_observation;
 pub mod frontend;
 pub mod ingestion;
 pub(crate) mod observability;
@@ -21,6 +22,7 @@ mod privacy_cipher;
 mod privacy_grants;
 mod privacy_http;
 mod privacy_runtime;
+mod profiling;
 pub mod protocol;
 #[cfg(unix)]
 pub mod push;

@@ -130,6 +130,9 @@ impl ApplicationWsConfig {
             Ok(value) => value,
             Err(e) => return agent_error(e),
         };
+        let observation =
+            super::profiling::ConnectionObservation::from_environment(application.name());
+        let setup_stage = observation.stage("gateway.connection_setup");
         let mut handshake = Request::new(());
         *handshake.method_mut() = request.method().clone();
         *handshake.uri_mut() = request.uri().clone();
@@ -154,6 +157,7 @@ impl ApplicationWsConfig {
         let uses_privacy_model = false;
         let access = AgentV2Access::new(managed);
         let admission = async {
+            let selection_stage = observation.stage("gateway.selection");
             let selection = access
                 .select_initialized(
                     context,
@@ -186,6 +190,7 @@ impl ApplicationWsConfig {
                     InitializationError::Agent(e) => agent_error(e),
                     InitializationError::Source(e) => auth_error(e),
                 })?;
+            selection_stage.finish("ok");
             let binding_scope = selection.binding_scope().clone();
             #[cfg(unix)]
             if let Some(rejection) =
@@ -198,6 +203,7 @@ impl ApplicationWsConfig {
                 return Err(rejection);
             }
             let workspace = selection.workspace().map(str::to_owned);
+            let ready_stage = observation.stage("gateway.service_ready");
             let stream = access
                 .connect_service_when_ready(&ingress, selection)
                 .await
@@ -208,6 +214,7 @@ impl ApplicationWsConfig {
                         error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE")
                     }
                 })?;
+            ready_stage.finish("ok");
             Ok((stream, binding_scope, workspace))
         };
         let (stream, privacy_scope, workspace) = tokio::select! {
@@ -239,6 +246,9 @@ impl ApplicationWsConfig {
             ended.send_replace(true);
         });
         *request.uri_mut() = destination;
+        if let Some(upgrade) = observation.upgrade_observation() {
+            request.extensions_mut().insert(upgrade);
+        }
         let names: Vec<_> = request
             .headers()
             .keys()
@@ -290,15 +300,27 @@ impl ApplicationWsConfig {
                 .headers_mut()
                 .insert(http::header::AUTHORIZATION, header);
         }
-        let response = tokio::select! {
+        let handshake_stage = observation.stage("gateway.proxy_handshake");
+        let mut response = tokio::select! {
             biased;
             why = wait_for_end(reason.clone()) => end_response(why),
             _ = tokio::time::sleep_until(deadline) => error(StatusCode::GATEWAY_TIMEOUT, "AGENT_SERVER_UNAVAILABLE"),
             response = proxy_http(request, stream, "environment", Some(cancelled)) => response,
         };
+        handshake_stage.finish(if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            "upgraded"
+        } else {
+            "not_upgraded"
+        });
         if *reason.borrow() != End::Active {
             return end_response(*reason.borrow());
         }
+        observation.annotate_response(&mut response);
+        setup_stage.finish(if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            "upgraded"
+        } else {
+            "not_upgraded"
+        });
         response
     }
 }

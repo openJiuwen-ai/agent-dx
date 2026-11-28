@@ -3021,6 +3021,10 @@ pub(super) async fn proxy_http<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let observation = request
+        .extensions()
+        .get::<super::upgrade_observation::UpgradeObservation>()
+        .cloned();
     let upgrade_requested = request.headers().contains_key(header::UPGRADE);
     let downstream_upgrade = upgrade_requested.then(|| hyper::upgrade::on(&mut request));
     let (mut sender, connection) =
@@ -3065,13 +3069,33 @@ where
                         .map_err(|error| io::Error::other(error.to_string()))?;
                     let mut downstream = TokioIo::new(downstream);
                     let mut upstream = TokioIo::new(upstream);
-                    tokio::io::copy_bidirectional_with_sizes(
-                        &mut downstream,
-                        &mut upstream,
-                        L4_COPY_BUFFER_SIZE,
-                        L4_COPY_BUFFER_SIZE,
-                    )
-                    .await
+                    if let Some(observation) = observation {
+                        let mut downstream = super::upgrade_observation::ObservedIo::new(
+                            downstream,
+                            observation.downstream_read,
+                            observation.downstream_write,
+                        );
+                        let mut upstream = super::upgrade_observation::ObservedIo::new(
+                            upstream,
+                            observation.upstream_read,
+                            observation.upstream_write,
+                        );
+                        tokio::io::copy_bidirectional_with_sizes(
+                            &mut downstream,
+                            &mut upstream,
+                            L4_COPY_BUFFER_SIZE,
+                            L4_COPY_BUFFER_SIZE,
+                        )
+                        .await
+                    } else {
+                        tokio::io::copy_bidirectional_with_sizes(
+                            &mut downstream,
+                            &mut upstream,
+                            L4_COPY_BUFFER_SIZE,
+                            L4_COPY_BUFFER_SIZE,
+                        )
+                        .await
+                    }
                 };
                 let _ = relay_until_cancelled(relay, cancelled).await;
             });

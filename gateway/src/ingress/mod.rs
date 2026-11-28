@@ -18,6 +18,7 @@ pub mod route_watch;
 pub mod server;
 #[cfg(feature = "activity-client")]
 pub mod service;
+mod upgrade_observation;
 
 pub use auth::{AuthError, IngressAuthenticator};
 pub use connector::DataPlaneL4Connector;
