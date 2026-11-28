@@ -13,6 +13,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tower::{timeout::Timeout, util::BoxCloneSyncService, Service};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -147,15 +148,28 @@ pub(crate) fn validate_control_plane_origin(
     ca_file: Option<&Path>,
 ) -> Result<(), BoxError> {
     let origin: Uri = control_plane_url(address).parse()?;
-    if origin
+    let authority = origin
         .authority()
-        .is_none_or(|authority| authority.as_str().contains('@'))
+        .ok_or("control plane upstream must be an HTTP or HTTPS origin")?;
+    if authority.as_str().contains('@')
+        || authority.host().is_empty()
         || origin
             .path_and_query()
             .is_some_and(|path| path.as_str() != "/")
         || address.contains('#')
     {
         return Err("control plane upstream must be an HTTP or HTTPS origin".into());
+    }
+    // port() treats invalid ports as absent. Check the suffix after the host,
+    // which includes the brackets for IPv6 literals.
+    let suffix = &authority.as_str()[authority.host().len()..];
+    if !suffix.is_empty() {
+        let valid_port = suffix.strip_prefix(':').is_some_and(|port| {
+            port.bytes().all(|b| b.is_ascii_digit()) && matches!(port.parse::<u16>(), Ok(1..))
+        });
+        if !valid_port {
+            return Err("control plane upstream has an invalid port; expected 1 to 65535".into());
+        }
     }
     match (
         origin.scheme_str(),
@@ -180,7 +194,10 @@ pub(super) fn control_plane_url(address: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-type ProxyClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
+type UpstreamConnector = HttpsConnector<HttpConnector>;
+type ProxyConnector =
+    BoxCloneSyncService<Uri, <UpstreamConnector as Service<Uri>>::Response, BoxError>;
+type ProxyClient = Client<ProxyConnector, ProxyBody>;
 
 #[derive(Clone)]
 pub struct ReverseProxy {
@@ -221,14 +238,18 @@ impl ReverseProxy {
             .with_no_client_auth();
         let mut tcp = HttpConnector::new();
         tcp.set_nodelay(true);
+        // Preserve the TCP connector's budget across multiple resolved addresses.
         tcp.set_connect_timeout(Some(config.connect_timeout));
         tcp.enforce_http(false);
         // The connector follows the configured URI scheme and never retries TLS as HTTP.
-        let connector = HttpsConnector::<HttpConnector>::builder()
+        let connector = UpstreamConnector::builder()
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
             .wrap_connector(tcp);
+        // Bound DNS, TCP and TLS together, leaving request and body streaming alone.
+        // Boxing the timeout future satisfies Hyper's Unpin bound for connectors.
+        let connector = ProxyConnector::new(Timeout::new(connector, config.connect_timeout));
         Self {
             client: Client::builder(TokioExecutor::new())
                 .pool_timer(TokioTimer::new())
@@ -333,7 +354,18 @@ impl ReverseProxy {
             .await
         {
             Ok(response) => response,
-            Err(error) => return bad_gateway(error),
+            Err(error) => {
+                if error.is_connect() {
+                    let mut error_chain = vec![error.to_string()];
+                    let mut source = error.source();
+                    while let Some(cause) = source {
+                        error_chain.push(cause.to_string());
+                        source = cause.source();
+                    }
+                    tracing::warn!(%upstream, ?error_chain, "Ingress reverse proxy connection failed");
+                }
+                return bad_gateway(error);
+            }
         };
         response.headers_mut().remove("x-adx-error-code");
         let response_upgrade = requested_upgrade(response.headers());

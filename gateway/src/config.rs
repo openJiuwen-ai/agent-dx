@@ -792,6 +792,26 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_address_rejects_invalid_explicit_ports() {
+        let ca = PathBuf::from("/secrets/ca.pem").into_os_string();
+        for host in ["apiserver", "[::1]"] {
+            for port in ["", "abc", "99999", "0", "+443"] {
+                let address = format!("https://{host}:{port}");
+                let error = parse_control_plane_upstream(&address, Some(ca.clone())).unwrap_err();
+                assert!(
+                    error.to_string().contains("invalid port"),
+                    "{address}: {error}"
+                );
+            }
+            for suffix in ["", ":8888", ":65535"] {
+                let address = format!("https://{host}{suffix}");
+                assert!(parse_control_plane_upstream(&address, Some(ca.clone())).is_ok());
+            }
+        }
+        assert!(parse_control_plane_upstream("127.0.0.1:99999", None).is_err());
+    }
+
+    #[test]
     fn explicit_http_listener_limits_methods_and_route_boundaries() {
         let listener: crate::ingress::ListenerConfig = serde_json::from_value(serde_json::json!({
             "listen": "10.88.0.1:8080",

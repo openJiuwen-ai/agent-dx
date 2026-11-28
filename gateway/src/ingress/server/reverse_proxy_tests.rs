@@ -10,6 +10,12 @@ use tokio::time::{sleep, timeout};
 
 type Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 
+#[derive(Clone)]
+enum UpstreamTls {
+    Accept(tokio_rustls::TlsAcceptor),
+    Stall,
+}
+
 struct Fixture {
     address: SocketAddr,
     accepted: Arc<AtomicUsize>,
@@ -173,7 +179,11 @@ async fn backend_connection(
 
 #[tokio::test]
 async fn transfer_reverse_proxy_sse_survives_processing_deadline() {
-    let mut fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut fixture = Fixture::new(ReverseProxyConfig {
+        connect_timeout: Duration::from_millis(250),
+        ..ReverseProxyConfig::default()
+    })
+    .await;
     let mut sender = fixture.sender().await;
     let mut req = request("/api/progress");
     req.headers_mut().insert(
@@ -211,7 +221,7 @@ impl Fixture {
         config: ReverseProxyConfig,
         mount: Option<&str>,
         security: IngressSecurity,
-        upstream_tls: Option<(tokio_rustls::TlsAcceptor, PathBuf, &str)>,
+        upstream_tls: Option<(UpstreamTls, PathBuf, &str)>,
     ) -> Self {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend.local_addr().unwrap();
@@ -219,9 +229,7 @@ impl Fixture {
         let active = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(Notify::new());
-        let upstream_acceptor = upstream_tls
-            .as_ref()
-            .map(|(acceptor, _, _)| acceptor.clone());
+        let backend_tls = upstream_tls.as_ref().map(|(tls, _, _)| tls.clone());
         let backend_task = {
             let (accepted, active, requests, release) = (
                 accepted.clone(),
@@ -239,15 +247,23 @@ impl Fixture {
                             active.fetch_add(1, Ordering::SeqCst);
                             let guard = ActiveConnection(active.clone());
                             let (requests, release) = (requests.clone(), release.clone());
-                            let upstream_acceptor = upstream_acceptor.clone();
+                            let backend_tls = backend_tls.clone();
                             tasks.spawn(async move {
                                 let _guard = guard;
-                                if let Some(acceptor) = upstream_acceptor {
-                                    if let Ok(stream) = acceptor.accept(stream).await {
+                                match backend_tls {
+                                    Some(UpstreamTls::Accept(acceptor)) => {
+                                        if let Ok(stream) = acceptor.accept(stream).await {
+                                            backend_connection(stream, requests, release).await;
+                                        }
+                                    }
+                                    Some(UpstreamTls::Stall) => {
+                                        // Read without sending a TLS handshake response.
+                                        let mut stream = stream;
+                                        let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
+                                    }
+                                    None => {
                                         backend_connection(stream, requests, release).await;
                                     }
-                                } else {
-                                    backend_connection(stream, requests, release).await;
                                 }
                             });
                         }
@@ -325,47 +341,33 @@ impl Fixture {
     }
 }
 
+fn tls_fixture(name: &str) -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+const TEST_CA: &str = "control-plane-test-ca.pem";
+
 #[tokio::test]
 async fn control_plane_https_verifies_ca_and_name_and_preserves_environment_requests() {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
-
-    let dir = tempfile::tempdir().unwrap();
-    let dir = dir.path();
-    let mut ca = CertificateParams::default();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    let ca_key = KeyPair::generate().unwrap();
-    for (name, key) in [
-        ("ca.pem", &ca_key),
-        ("other.pem", &KeyPair::generate().unwrap()),
-    ] {
-        std::fs::write(dir.join(name), ca.self_signed(key).unwrap().pem()).unwrap();
-    }
-    let server_key = KeyPair::generate().unwrap();
-    let certificate = CertificateParams::new(vec!["localhost".into()])
-        .unwrap()
-        .signed_by(&server_key, &Issuer::new(ca, ca_key))
-        .unwrap();
-    std::fs::write(dir.join("server.pem"), certificate.pem()).unwrap();
-    std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
-
     let acceptor = adx_transport::tls::http_server_acceptor(
-        dir.join("server.pem"),
-        dir.join("server.key"),
+        tls_fixture("control-plane-test-server.pem"),
+        tls_fixture("ingress-key.pem"),
         None,
         vec![b"http/1.1".to_vec()],
     )
     .unwrap();
     for (ca, host, trusted) in [
-        ("ca.pem", "localhost", true),
-        ("other.pem", "localhost", false),
-        ("ca.pem", "127.0.0.1", false),
+        (TEST_CA, "localhost", true),
+        ("ingress-cert.pem", "localhost", false),
+        (TEST_CA, "127.0.0.1", false),
     ] {
         let mut fixture = Fixture::start(
             ReverseProxyConfig::default(),
             None,
             IngressSecurity::Tls,
-            Some((acceptor.clone(), dir.join(ca), host)),
+            Some((UpstreamTls::Accept(acceptor.clone()), tls_fixture(ca), host)),
         )
         .await;
         let mut sender = fixture.sender().await;
@@ -395,6 +397,32 @@ async fn control_plane_https_verifies_ca_and_name_and_preserves_environment_requ
             assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
         }
     }
+}
+
+#[tokio::test]
+async fn control_plane_https_times_out_when_tls_handshake_stalls() {
+    let mut fixture = Fixture::start(
+        ReverseProxyConfig {
+            connect_timeout: Duration::from_millis(250),
+            ..ReverseProxyConfig::default()
+        },
+        None,
+        IngressSecurity::Tls,
+        Some((UpstreamTls::Stall, tls_fixture(TEST_CA), "127.0.0.1")),
+    )
+    .await;
+    let mut sender = fixture.sender().await;
+    let response = timeout(
+        Duration::from_secs(3),
+        sender.send_request(request("/api/environment/v1/environments")),
+    )
+    .await
+    .expect("Ingress should time out the stalled TLS handshake")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(fixture.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+    wait_active(&fixture, 0).await;
 }
 
 fn request(path: &str) -> Request<Full<Bytes>> {
