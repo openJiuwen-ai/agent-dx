@@ -552,6 +552,50 @@ fn ownerfs_adopt_on_startup_is_opt_in_and_node_only() {
     assert!(error.to_string().contains("requires Node with fs=ownerfs"));
 }
 
+/// A damaged WAL tail rolls back instead of refusing to start, and the switch
+/// is the only thing that changes that default. Only the local log can do it:
+/// the other backends have no WAL file to cut.
+#[test]
+fn meta_log_tail_rollback_defaults_on_and_follows_the_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta.toml");
+    let resolve = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
+        )
+    };
+
+    let default = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+    assert!(
+        default.meta_log_tail_rollback,
+        "the local log rolls a damaged tail back by default"
+    );
+    assert!(
+        resolve("meta_store='local-file'\n")
+            .unwrap()
+            .meta_log_tail_rollback
+    );
+    assert!(
+        !resolve("meta_store='local-file'\nmeta_log_tail_rollback=false\n")
+            .unwrap()
+            .meta_log_tail_rollback,
+        "an explicit false restores the fail-closed behaviour"
+    );
+    assert!(
+        !resolve("meta_store='memory'\n")
+            .unwrap()
+            .meta_log_tail_rollback,
+        "a backend without a WAL file does not default to rolling one back"
+    );
+    assert!(
+        !Cli::parse_from(["afs-meta", "--meta-log-tail-rollback", "false"])
+            .meta_log_tail_rollback
+            .unwrap_or(true)
+    );
+}
+
 /// The storage root used to be hardcoded to `<data_dir>/ownerfs`, which made it
 /// impossible to point adoption at an existing data parent.
 #[test]

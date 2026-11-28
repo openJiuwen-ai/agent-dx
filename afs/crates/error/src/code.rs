@@ -103,6 +103,12 @@ catalog! {
     META_STORE_UNIMPLEMENTED = 0x03020001 => Unimplemented;
     META_LOG_FENCED = 0x03020002 => FailedPrecondition;
     META_STORE_BUSY = 0x03020003 => ResourceExhausted;
+    // Stored log content contradicts what the log itself declared durable: a
+    // shortened active tail, a missing or changed segment, an unreadable
+    // checkpoint. Callers may act on this code; identity, format-version and
+    // configuration failures keep their own codes so they are never mistaken
+    // for damaged content that automatic recovery could repair.
+    META_LOG_CORRUPT = 0x03020004 => DataLoss;
     META_NODE_PROTOCOL_VERSION = 0x03050001 => FailedPrecondition;
     CONFIG_INVALID = 0x04010001 => InvalidArgument;
     RUNTIME_INTERNAL = 0x04020001 => Internal;

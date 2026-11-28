@@ -399,6 +399,7 @@ async fn p3_recovery_rolled_current_refuses_unlisted_nonempty_segment() {
         wal_max_bytes: 128 * 1024,
         segment_bytes: 4608,
         segments_max: 32,
+        ..Default::default()
     };
     let log = LocalLog::open(dir.path(), limits).unwrap();
     let initial = fs::read(dir.path().join(CURRENT)).unwrap();
@@ -473,6 +474,7 @@ async fn p3_segments_capacity_rejects_before_mutation_and_missing_seal_refuses()
         wal_max_bytes: 128 * 1024,
         segment_bytes: 4608,
         segments_max: 2,
+        ..Default::default()
     };
     let log = LocalLog::open(dir.path(), limits).unwrap();
     let snapshot = || {
@@ -568,6 +570,7 @@ async fn p3_segments_rotate_reclaim_and_keep_previous_recovery_suffix() {
         wal_max_bytes: 128 * 1024,
         segment_bytes: 4608,
         segments_max: 32,
+        ..Default::default()
     };
     let log = LocalLog::open(dir.path(), limits).unwrap();
     let identity = log.identity();

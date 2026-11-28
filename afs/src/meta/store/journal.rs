@@ -305,17 +305,65 @@ pub(super) fn invalid_log(message: impl Into<String>) -> Error {
         format!("Meta operation log: {}", message.into()),
     )
 }
-/// Adds `context` (file, offset) to a log error. A format incompatibility
-/// keeps `STORAGE_FORMAT_INCOMPATIBLE` so operators can tell a binary/data
-/// mismatch from corruption; every other error stays an invalid log, as before.
+/// The stored log contradicts its own durable declaration: a frame whose CRC
+/// or record hash does not match, a segment header whose hash no longer
+/// matches, a segment shorter than its own header, a rollback point below the
+/// installed checkpoint, or exhausted evidence slots.
+///
+/// Kept apart from `invalid_log` (configuration and caller mistakes) and from
+/// `STORAGE_FORMAT_INCOMPATIBLE` (this binary cannot read the format at all).
+/// A format mismatch may be the right data for another build, and a
+/// configuration mistake is never repaired by touching the directory, so only
+/// this code describes damage to the bytes on disk.
+///
+/// Fields that identify the data are deliberately *not* reported under this
+/// code: `CURRENT`, `IDENTITY`, unreadable checkpoints, ambiguous tail slots,
+/// and mismatched chain fields (`sequence`, `base`, `previous_hash`). They
+/// answer "whose data is this and where should replay start"; a mismatch there
+/// is equally consistent with another build or another store's disk, so it is
+/// not the certainty a CRC failure is. Cutting on that guess destroys someone
+/// else's data, so those stay `CONFIG_INVALID` and the operator checks the
+/// mount before anything is written.
+pub(super) fn corrupt_log(message: impl Into<String>) -> Error {
+    let message: String = message.into();
+    // Accept a message that already carries the prefix, so wrapping a log error
+    // in `corrupt_log` cannot produce two copies of it.
+    let detail = message
+        .strip_prefix(LOG_ERROR_PREFIX)
+        .unwrap_or(message.as_str());
+    Error::coded(
+        afs_error::META_LOG_CORRUPT,
+        format!("{LOG_ERROR_PREFIX}{detail}"),
+    )
+}
+/// Adds `context` (file, offset) to a log error, keeping the code so a caller
+/// can tell a format mismatch from damage.
+///
+/// The detail is taken with `message()` and the shared prefix stripped first:
+/// every log error already carries `Meta operation log: `, so appending the
+/// detail to a fresh copy would nest the prefix twice.
 pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Error {
-    if error.code() == afs_error::STORAGE_FORMAT_INCOMPATIBLE {
-        Error::coded(
-            afs_error::STORAGE_FORMAT_INCOMPATIBLE,
-            format!("Meta operation log: {context}: {}", error.message()),
-        )
+    let code = error.code();
+    let detail = log_detail(&error);
+    if code == afs_error::STORAGE_FORMAT_INCOMPATIBLE || code == afs_error::META_LOG_CORRUPT {
+        Error::coded(code, format!("{LOG_ERROR_PREFIX}{context}: {detail}"))
     } else {
-        invalid_log(format!("{context}: {error}"))
+        invalid_log(format!("{context}: {detail}"))
+    }
+}
+/// The prefix every `Meta operation log` error carries, so a wrapped message
+/// can be rebuilt around one new context instead of nesting another copy.
+const LOG_ERROR_PREFIX: &str = "Meta operation log: ";
+
+/// The bare detail of a log error, with the shared prefix removed.
+///
+/// Use this when the detail is going to be embedded in another log message:
+/// `Display` would contribute the prefix a second time plus the `0x… Kind:`
+/// decoration, and `message()` alone still carries the prefix.
+pub(super) fn log_detail(error: &Error) -> String {
+    match error.message().strip_prefix(LOG_ERROR_PREFIX) {
+        Some(detail) => detail.to_owned(),
+        None => error.message().to_owned(),
     }
 }
 pub(super) fn unavailable(message: impl Into<String>) -> Error {
@@ -437,7 +485,7 @@ pub(super) fn decode_frame(
     if u32::from_be_bytes(crc_bytes)
         != crc32c::crc32c_append(crc32c::crc32c(&frame[..4]), &frame[8..])
     {
-        return Err(invalid_log("frame CRC mismatch"));
+        return Err(corrupt_log("frame CRC mismatch"));
     }
     let body_end = frame.len() - 32;
     let payload = &frame[8..body_end];
@@ -446,13 +494,15 @@ pub(super) fn decode_frame(
     hasher.update(payload);
     let hash = *hasher.finalize().as_bytes();
     if frame[body_end..] != hash {
-        return Err(invalid_log("record hash mismatch"));
+        return Err(corrupt_log("record hash mismatch"));
     }
     // Inner layer: after the frame's integrity, before the full decode.
     if let Ok((_, record)) = postcard::take_from_bytes::<EnvelopeHead>(payload) {
         Record::check_schema(record)?;
     }
     let (envelope, tail): (Envelope, _) = postcard::take_from_bytes(payload)
+        // `{e}` is safe here: a postcard error has no `Meta operation log: `
+        // prefix. A log error in this position would need `log_detail`.
         .map_err(|e| invalid_log(format!("decode envelope: {e}")))?;
     if !tail.is_empty()
         || envelope.version != VERSION
@@ -894,7 +944,12 @@ mod tests {
             frame[4..8].copy_from_slice(&crc.to_be_bytes());
             frame
         }
-        async fn refused(dir: &Path, file: &str, markers: &[&str]) {
+        /// Asserts startup refuses and leaves the bytes alone.
+        ///
+        /// `expected` separates damage to the bytes (`META_LOG_CORRUPT`) from
+        /// records that belong to another store identity or format, which say
+        /// the data may well be intact for a different build.
+        async fn refused(dir: &Path, file: &str, markers: &[&str], expected: afs_error::ErrorCode) {
             let root = dir.join("meta-store");
             let before = inventory(&root);
             let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
@@ -918,7 +973,19 @@ mod tests {
             let message = error.to_string();
             assert_eq!(
                 error.downcast_ref::<Error>().unwrap().code(),
-                afs_error::CONFIG_INVALID
+                expected,
+                "refusal code must match the kind of damage"
+            );
+            // Wrapping an error in a context must not restate the shared
+            // prefix: `{error}` formatting once produced
+            // "Meta operation log: <ctx>: 0x… DataLoss: Meta operation log: …".
+            // Every case here goes through that wrapper, so one assertion
+            // guards all of them. (`Display` adds the code/kind decoration for
+            // every error in the workspace; that is not what this checks.)
+            assert_eq!(
+                message.matches("Meta operation log: ").count(),
+                1,
+                "the log prefix must appear exactly once: {message}"
             );
             assert!(message.contains(file), "{message}");
             for marker in markers {
@@ -1026,10 +1093,17 @@ mod tests {
                 "revision-backward" | "key-value" => "canonical",
                 _ => "format/identity",
             };
+            // Damage to the stored bytes; the rest rewrite identity, version or
+            // chain fields, which describe data that another build may read.
+            let expected = match case {
+                "business-base" | "crc" | "hash" => afs_error::META_LOG_CORRUPT,
+                _ => afs_error::CONFIG_INVALID,
+            };
             refused(
                 &dir,
                 "wal-00000000000000000001.log",
                 &["offset 4096", "sequence 0", item],
+                expected,
             )
             .await;
             fs::remove_dir_all(dir).unwrap();
@@ -1048,6 +1122,7 @@ mod tests {
                 wal_max_bytes: 128 * 1024,
                 segment_bytes: 4608,
                 segments_max: 16,
+                ..Default::default()
             };
             let log = LocalLog::open(&root, limits).unwrap();
             let mut tip = LogTip::EMPTY;
@@ -1074,7 +1149,14 @@ mod tests {
                 bytes[6] ^= 1;
                 fs::write(&wal, bytes).unwrap();
             }
-            refused(&dir, name, &["offset 0", "sequence"]).await;
+            // A missing segment is damage to the stored set. A rewritten segment
+            // header changes the format tag, which may be valid for another
+            // build, so it keeps the configuration-level code.
+            let expected = match case {
+                "missing-middle" => afs_error::META_LOG_CORRUPT,
+                _ => afs_error::CONFIG_INVALID,
+            };
+            refused(&dir, name, &["offset 0", "sequence"], expected).await;
             fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -1124,6 +1206,93 @@ mod tests {
                 .to_string()
                 .contains("hash mismatch")
         );
+    }
+
+    /// A damaged checkpoint image is not a tail problem: recovery refuses, and
+    /// the collected per-image detail must not restate the shared prefix. This
+    /// path collects each failure as text before wrapping them in one message,
+    /// which is a shape that doubles the prefix if the text comes from
+    /// `Display` rather than from `log_detail`.
+    #[tokio::test]
+    async fn a_damaged_checkpoint_refuses_with_a_single_log_prefix() {
+        use super::super::local_log::{LocalLog, LocalLogOptions};
+        use std::fs;
+        let dir = tempfile::Builder::new()
+            .prefix("p3-checkpoint-damaged-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        // Recovery refuses, so this error is what an operator would read.
+        let root = dir.join("meta-store");
+        let limits = LocalLogOptions {
+            record_max_bytes: 1024,
+            batch_max_bytes: 4096,
+            wal_max_bytes: 128 * 1024,
+            segment_bytes: 4608,
+            segments_max: 16,
+            ..Default::default()
+        };
+        let log = LocalLog::open(&root, limits).unwrap();
+        let records = test_records(2);
+        let first = super::super::state::State::default()
+            .replay_record(&records[0])
+            .unwrap();
+        let (_, covered) = encode_frame(
+            log.identity(),
+            LogTip::EMPTY.at(log.term()),
+            records[0].clone(),
+            1024 * 1024,
+        )
+        .unwrap();
+        log.append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
+        log.install_checkpoint(
+            covered,
+            super::super::log::StateImage::encode(&first, 1024 * 1024).unwrap(),
+        )
+        .await
+        .unwrap();
+        drop(log);
+
+        // Damage every listed image so no fallback is left.
+        let images = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("checkpoint-"))
+            })
+            .collect::<Vec<_>>();
+        assert!(!images.is_empty(), "fixture needs an installed image");
+        for image in &images {
+            let mut bytes = fs::read(image).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF;
+            fs::write(image, bytes).unwrap();
+        }
+
+        let error = match LocalLog::open(&root, limits) {
+            Ok(_) => panic!("a damaged checkpoint must refuse"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert_eq!(
+            error.code(),
+            afs_error::CONFIG_INVALID,
+            "an unreadable image is a configuration-level refusal"
+        );
+        assert!(
+            message.contains("CURRENT has no valid checkpoint"),
+            "{message}"
+        );
+        assert_eq!(
+            message.matches("Meta operation log: ").count(),
+            1,
+            "collected image details must not restate the prefix: {message}"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1357,5 +1526,45 @@ mod tests {
                 (result, _) => panic!("terms {terms:?}: {:?}", result.map(|r| r.tip)),
             }
         }
+    }
+
+    /// `log_detail` is the only correct way to embed one log error in another.
+    ///
+    /// Wrapping with `Display` emits the prefix plus a `0x… Kind:` decoration,
+    /// and `message()` also keeps the prefix, so both double it. Every wrapper
+    /// the store has — `log_context`, `corrupt_log`, `select_checkpoint`'s
+    /// collected details and `group_failure` — must go through this function.
+    /// Checking them together stops the pattern from being fixed one call site
+    /// at a time and reappearing at the next one.
+    #[test]
+    fn embedding_a_log_error_never_repeats_its_prefix() {
+        let inner = invalid_log("frame length outside record bound");
+        assert_eq!(inner.message().matches(LOG_ERROR_PREFIX).count(), 1);
+
+        // The two shapes that used to double the prefix.
+        assert_eq!(log_detail(&inner), "frame length outside record bound");
+        let wrapped = log_context(invalid_log("inner detail"), "wal-1.log offset 8");
+        assert_eq!(wrapped.message().matches(LOG_ERROR_PREFIX).count(), 1);
+        assert_eq!(wrapped.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
+
+        // Damage rebranding keeps the code and one prefix.
+        let rebranded = corrupt_log(format!("wal-1.log offset 8: {}", log_detail(&inner)));
+        assert_eq!(rebranded.code(), afs_error::META_LOG_CORRUPT);
+        assert_eq!(rebranded.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
+        assert!(
+            rebranded
+                .to_string()
+                .contains("frame length outside record bound")
+        );
+
+        // `corrupt_log` also tolerates a message that already carries it.
+        let tolerant = corrupt_log(inner.message().to_owned());
+        assert_eq!(tolerant.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
+
+        // An error from another layer has no prefix, so it must pass through.
+        let foreign = unavailable("task join failed");
+        assert_eq!(log_detail(&foreign), "task join failed");
+        let mixed = invalid_log(format!("WAL health: {}", log_detail(&foreign)));
+        assert_eq!(mixed.to_string().matches(LOG_ERROR_PREFIX).count(), 1);
     }
 }

@@ -159,10 +159,104 @@ pub(super) fn write_tail(file: &mut File, tail: Tail) -> Result<()> {
     Ok(())
 }
 
+/// Reads both tail slots and returns the declared position, without any
+/// tolerance: the newest generation wins and a slot pointing past the file end
+/// is the caller's problem. Verified comparison (a sealed segment's tail, a
+/// cleanup seal check) must use this so damage can never be read as progress.
 pub(super) fn header(file: &mut File, identity: StoreIdentity, base: LogTip) -> Result<Tail> {
+    let (a, b) = read_tail_slots(file, identity, base)?;
+    let tail = match (a, b) {
+        (Some(a), Some(b)) if a.generation == b.generation && a != b => {
+            Err(invalid_log("WAL conflicting equal tail generations"))
+        }
+        (Some(a), Some(b)) => Ok(if a.generation >= b.generation { a } else { b }),
+        (Some(tail), None) | (None, Some(tail)) => Ok(tail),
+        (None, None) => Err(invalid_log("WAL missing declared tail")),
+    }?;
+    check_tail_against_base(tail, base)?;
+    Ok(tail)
+}
+
+/// The newest declared tail that the file can hold, when one exists.
+///
+/// A tail slot is a progress note, not the authority: it is written after the
+/// frames it declares, and one `sync_data` makes both durable, but the two
+/// writes are separate. A power loss can therefore leave a slot past the file
+/// end, and a deep loss can leave every slot past it. Both are answered by the
+/// frame chain, which carries its own `previous_hash` and sequence, so this
+/// returns `None` rather than an error when no slot describes a reachable
+/// position. The caller then cuts where the chain itself ends.
+///
+/// A slot that still fits remains useful: replay can stop its scan at the
+/// declared position instead of reading past it.
+pub(super) fn reachable_tail(
+    file: &mut File,
+    identity: StoreIdentity,
+    base: LogTip,
+    length: u64,
+) -> Result<Option<Tail>> {
+    let (a, b) = read_tail_slots(file, identity, base)?;
+    let candidates = match (a, b) {
+        (Some(a), Some(b)) if a.generation == b.generation && a != b => {
+            return Err(invalid_log("WAL conflicting equal tail generations"));
+        }
+        (Some(a), Some(b)) => vec![a, b],
+        (Some(tail), None) | (None, Some(tail)) => vec![tail],
+        (None, None) => return Err(invalid_log("WAL missing declared tail")),
+    };
+    let tail = candidates
+        .into_iter()
+        .filter(|tail| tail.end <= length)
+        .max_by_key(|tail| tail.generation);
+    match tail {
+        Some(tail) => {
+            check_tail_against_base(tail, base)?;
+            Ok(Some(tail))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The newest slot on disk, reachable or not.
+///
+/// `reachable_tail` answers "where may replay stop"; this answers "where did
+/// the writer say it had got to", which is what a rollback must report. When
+/// the file stops short of that position — a `truncate`, or a power loss that
+/// let the slot reach the disk after its frames — the difference is exactly
+/// the acknowledged history the rollback drops, so it has to be visible in
+/// the log rather than inferred.
+pub(super) fn newest_tail(
+    file: &mut File,
+    identity: StoreIdentity,
+    base: LogTip,
+) -> Result<Option<Tail>> {
+    let (a, b) = read_tail_slots(file, identity, base)?;
+    Ok(match (a, b) {
+        (Some(a), Some(b)) if a.generation == b.generation && a != b => {
+            return Err(invalid_log("WAL conflicting equal tail generations"));
+        }
+        (Some(a), Some(b)) => Some(if a.generation >= b.generation { a } else { b }),
+        (Some(tail), None) | (None, Some(tail)) => Some(tail),
+        (None, None) => None,
+    })
+}
+
+pub(super) fn read_tail_slots(
+    file: &mut File,
+    identity: StoreIdentity,
+    base: LogTip,
+) -> Result<(Option<Tail>, Option<Tail>)> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = [0; LOG_HEADER_BYTES as usize];
-    file.read_exact(&mut bytes)?;
+    if let Err(error) = file.read_exact(&mut bytes) {
+        // A segment too short to hold its own fixed header is damaged content,
+        // not an I/O failure: the length and the format are what disagree.
+        return Err(corrupt_log(format!(
+            "{} shorter than its {} byte header: {error}",
+            wal_name(base)?,
+            LOG_HEADER_BYTES
+        )));
+    }
     // Version first: before the byte-exact header, identity, hash and CRC.
     format::check_tagged_header(
         FormatKind::MetaWalSegment,
@@ -175,23 +269,29 @@ pub(super) fn header(file: &mut File, identity: StoreIdentity, base: LogTip) -> 
             .iter()
             .any(|b| *b != 0)
     {
-        return Err(invalid_log(format!(
+        let message = format!(
             "{} offset 0 at base sequence {} header format/identity/base/hash/CRC; expected identity {identity:?}, stored identity bytes {:?}",
             wal_name(base)?,
             base.sequence,
             &bytes[6..54]
-        )));
+        );
+        // The identity bytes themselves decide the meaning: a different store,
+        // cluster or incarnation is a foreign directory (the operator may have
+        // mounted the wrong disk), while matching identity with a failed hash
+        // or CRC is damage to these very bytes.
+        let stored_matches = bytes[6..54] == static_header(identity, base)[6..54];
+        return Err(if stored_matches {
+            corrupt_log(message)
+        } else {
+            invalid_log(message)
+        });
     }
     let a = parse_tail(&bytes[STATIC_BYTES..STATIC_BYTES + SLOT_BYTES])?;
     let b = parse_tail(&bytes[STATIC_BYTES + SLOT_BYTES..STATIC_BYTES + 2 * SLOT_BYTES])?;
-    let tail = match (a, b) {
-        (Some(a), Some(b)) if a.generation == b.generation && a != b => {
-            Err(invalid_log("WAL conflicting equal tail generations"))
-        }
-        (Some(a), Some(b)) => Ok(if a.generation >= b.generation { a } else { b }),
-        (Some(tail), None) | (None, Some(tail)) => Ok(tail),
-        (None, None) => Err(invalid_log("WAL missing declared tail")),
-    }?;
+    Ok((a, b))
+}
+
+fn check_tail_against_base(tail: Tail, base: LogTip) -> Result<()> {
     if tail.tip.sequence < base.sequence
         || (tail.tip.sequence == base.sequence
             && (tail.tip != base || tail.end != LOG_HEADER_BYTES))
@@ -200,17 +300,23 @@ pub(super) fn header(file: &mut File, identity: StoreIdentity, base: LogTip) -> 
             "WAL declared tail precedes/mismatches segment base",
         ));
     }
-    Ok(tail)
+    Ok(())
 }
 
 pub(super) fn preserve_tail(dir: &Path, file: &mut File, start: u64, end: u64) -> Result<()> {
     let length = end
         .checked_sub(start)
         .ok_or_else(|| invalid_log("tail evidence position"))?;
+    // A capacity limit, not damage: the tail is too large to preserve whole.
+    // Reported as ResourceExhausted so it is not confused with the count limit
+    // below, which does mean repeated damage. Both limits are compile-time
+    // constants, so the message says what an operator can actually do —
+    // inspect the retained WAL — rather than offering a setting that does not
+    // exist.
     if length > 128 * 1024 * 1024 {
-        return Err(full(
-            "incomplete tail exceeds evidence budget; original WAL retained",
-        ));
+        return Err(full(format!(
+            "incomplete tail of {length} bytes exceeds the 134217728 byte evidence budget; original WAL retained and unmodified — inspect it before deciding whether to truncate by hand"
+        )));
     }
     let mut bytes = Vec::new();
     bytes
@@ -237,7 +343,12 @@ pub(super) fn preserve_tail(dir: &Path, file: &mut File, start: u64, end: u64) -
         }
     }
     if count >= EVIDENCE_LIMIT {
-        return Err(full("tail evidence slots exhausted; original WAL retained"));
+        // Not a space problem: the directory is accumulating one preserved tail
+        // per failed start, which means recovery is not converging. Report it
+        // as damage so the operator looks at the data, not at free space.
+        return Err(corrupt_log(format!(
+            "tail evidence slots exhausted after {count} preserved tails; the segment keeps being re-damaged, original WAL retained — inspect the incomplete-tail-* files before deleting any"
+        )));
     }
     let mut evidence = open_file(&path, true)?;
     evidence.write_all(&bytes)?;

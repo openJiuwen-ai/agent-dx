@@ -30,8 +30,9 @@ use super::{
     BackendPersistence, MetaFuture, StoreRevision,
     journal::{
         AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogCursor, LogStatus, LogTip, MetaLog,
-        RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, decode_frame, encode_batch,
-        fenced, frame_length, full, invalid_log, log_context, unavailable,
+        RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, corrupt_log, decode_frame,
+        encode_batch, fenced, frame_length, full, invalid_log, log_context, log_detail,
+        unavailable,
     },
     log::Record,
 };
@@ -68,6 +69,20 @@ pub struct LocalLogOptions {
     /// Soft rotation target; an atomic batch is never split between segments.
     pub segment_bytes: u64,
     pub segments_max: usize,
+    /// Roll a damaged active segment's tail back to the last frame the chain
+    /// verifies, then cut the file there, instead of refusing to open.
+    ///
+    /// The frame chain is the anchor, not the tail slots: each frame carries
+    /// `base_sequence`, the previous frame's hash and its own CRC, so the chain
+    /// locates the durable prefix even when every slot points past the file end
+    /// (a deep `truncate`) or when the cut lands on a frame boundary. The slots
+    /// only bound the scan when one of them still fits.
+    ///
+    /// Damage the chain cannot place at the tail is still refused: a complete
+    /// frame that fails verification with readable records behind it, an
+    /// unreadable length prefix, a changed sealed segment, a damaged CURRENT or
+    /// IDENTITY, or a rollback point below the installed checkpoint.
+    pub tolerate_tail_rollback: bool,
 }
 impl Default for LocalLogOptions {
     fn default() -> Self {
@@ -77,6 +92,7 @@ impl Default for LocalLogOptions {
             wal_max_bytes: 1024 * 1024 * 1024,
             segment_bytes: 64 * 1024 * 1024,
             segments_max: 64,
+            tolerate_tail_rollback: false,
         }
     }
 }
@@ -200,6 +216,10 @@ struct LocalState {
     manifest: Current,
     revision: StoreRevision,
     wal_bytes: u64,
+    /// What this handle's opening dropped, kept so a test can assert the
+    /// decision rather than the log line that reports it.
+    #[cfg(test)]
+    rollback: Option<TailRollback>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct Tail {
@@ -287,7 +307,12 @@ impl LocalLog {
             "next writer term durable in CURRENT; handle not returned",
         );
         replay.recovered.term = manifest.term;
+        // Budget first: a failed open returns no handle, so reporting after it
+        // would announce a rollback for a store this process never served. The
+        // rollback did happen either way, which is why a stale line is not
+        // wrong — only misleading about whether the process came up.
         let wal_bytes = wal_budget(&dir, limits, 0, 0, &manifest.retired_segments)?;
+        report_tail_rollback(replay.rollback.as_ref());
         Ok(Self {
             inner: Arc::new(Inner {
                 owner_pid: std::process::id(),
@@ -307,6 +332,8 @@ impl LocalLog {
                     manifest,
                     revision: replay.revision,
                     wal_bytes,
+                    #[cfg(test)]
+                    rollback: replay.rollback,
                 }),
             }),
         })
@@ -321,6 +348,15 @@ impl LocalLog {
             .state
             .lock()
             .map_or(0, |state| state.manifest.term)
+    }
+    /// Test-only: what this handle's opening dropped, if anything.
+    #[cfg(test)]
+    pub(super) fn rollback(&self) -> Option<TailRollback> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.rollback.clone())
     }
     /// Test-only: drop this handle's directory lock while keeping the handle,
     /// modelling a writer that lost its local exclusivity so a newer writer
@@ -383,6 +419,9 @@ impl LocalLog {
         {
             return Err(invalid_log("live WAL identity/length changed"));
         }
+        // A rolled-back handle cut the file and rewrote the tail slot, so the
+        // newest slot describes a reachable position again and the strict read
+        // applies exactly as it does without the rollback.
         let declared = header(&mut state.file, inner.identity, active.base)?;
         if declared.tip != state.tip
             || declared.end != state.end
@@ -992,7 +1031,32 @@ impl MetaLog for LocalLog {
 mod tests;
 
 #[cfg(test)]
+mod tail_rollback_tests;
+
+#[cfg(test)]
 mod format_golden_tests;
 
 #[cfg(test)]
 mod format_version_tests;
+
+/// Announce what recovery dropped. The decision itself lives in
+/// `TailRollback`, which the tests assert; this only reports it, and reports
+/// every case including one where the file boundary already expressed the
+/// loss, because that is the signal an external `truncate` leaves behind.
+fn report_tail_rollback(rollback: Option<&TailRollback>) {
+    let Some(rollback) = rollback else {
+        return;
+    };
+    afs_logging::warn!("meta.log.tail_rolled_back";
+        "action" => "tail_rolled_back",
+        "segment" => %rollback.segment,
+        "anchor" => rollback.anchor,
+        "declared_end" => rollback.declared_end,
+        "declared_sequence" => rollback.declared_sequence,
+        "actual_len" => rollback.actual_len,
+        "rolled_back_to" => rollback.rolled_back_to,
+        "dropped_undeclared_bytes" => rollback.dropped_bytes,
+        "dropped_declared_records" => rollback.dropped_declared_records,
+        "recovered_sequence" => rollback.recovered_sequence,
+        "preserved" => if rollback.preserved { "incomplete-tail" } else { "none" });
+}

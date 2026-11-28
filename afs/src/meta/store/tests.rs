@@ -4645,6 +4645,7 @@ async fn p3_operational_real_wal_pressure_reclaims_and_continues() {
         wal_max_bytes: 128 * 1024,
         segment_bytes: 4608,
         segments_max: 4,
+        ..Default::default()
     };
     let log = Arc::new(PressureLocalLog {
         inner: local_log::LocalLog::open(&directory, limits).unwrap(),

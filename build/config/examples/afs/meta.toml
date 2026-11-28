@@ -11,6 +11,10 @@ meta_record_max_bytes = 67108864
 meta_batch_max_bytes = 134217728
 meta_wal_max_bytes = 1073741824
 meta_wal_segment_bytes = 67108864
+# Roll a damaged WAL tail back to the last frame that verifies, instead of
+# refusing to start. Only the local-file backend has a WAL to cut; other
+# backends ignore this key and never roll anything back.
+meta_log_tail_rollback = true
 meta_checkpoint_wal_bytes = 134217728
 meta_checkpoint_wal_records = 1000000
 meta_checkpoint_interval_ms = 60000

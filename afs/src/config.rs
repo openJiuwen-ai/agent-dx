@@ -367,6 +367,11 @@ pub struct Cli {
     /// Soft segment rotation size, no greater than the WAL limit.
     #[arg(long)]
     pub meta_wal_segment_bytes: Option<u64>,
+    /// Roll a damaged WAL tail back to the last position that actually exists
+    /// on disk instead of refusing to start. Defaults to on; `--meta-log-tail-rollback false`
+    /// restores the previous fail-closed behaviour.
+    #[arg(long)]
+    pub meta_log_tail_rollback: Option<bool>,
     /// Idempotent outcome retention in milliseconds.
     #[arg(long)]
     pub meta_request_retention_ms: Option<u64>,
@@ -665,6 +670,7 @@ struct FileConfig {
     meta_checkpoint_wal_records: Option<u64>,
     meta_checkpoint_interval_ms: Option<u64>,
     meta_wal_segment_bytes: Option<u64>,
+    meta_log_tail_rollback: Option<bool>,
     meta_request_retention_ms: Option<u64>,
     meta_request_outcomes_max: Option<usize>,
     meta_request_bytes_max: Option<u64>,
@@ -828,6 +834,11 @@ pub struct Config {
     pub meta_checkpoint_wal_records: u64,
     pub meta_checkpoint_interval_ms: u64,
     pub meta_wal_segment_bytes: u64,
+    /// Roll a damaged WAL tail back to the last position present on disk
+    /// instead of refusing to start. On by default: a tail that a power loss
+    /// left short holds no acknowledged record, so rolling it back keeps every
+    /// stored byte and lets the cluster serve again.
+    pub meta_log_tail_rollback: bool,
     pub meta_request_retention_ms: u64,
     pub meta_request_outcomes_max: usize,
     pub meta_request_bytes_max: u64,
@@ -1037,6 +1048,7 @@ impl Config {
             meta_checkpoint_wal_records: meta.meta_checkpoint_wal_records,
             meta_checkpoint_interval_ms: meta.meta_checkpoint_interval_ms,
             meta_wal_segment_bytes: meta.meta_wal_segment_bytes,
+            meta_log_tail_rollback: meta.meta_log_tail_rollback,
             meta_request_retention_ms: meta.meta_request_retention_ms,
             meta_request_outcomes_max: meta.meta_request_outcomes_max,
             meta_request_bytes_max: meta.meta_request_bytes_max,
