@@ -29,6 +29,7 @@ mod checkpoint_socket;
 pub(crate) mod child_env;
 mod cmd;
 mod codec;
+mod command_output;
 mod constructor_cwd;
 pub mod control;
 pub mod control_stream;
