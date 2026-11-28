@@ -27,17 +27,14 @@ use afs_transport::grpc::error_status::{coded_status, error_to_status};
 use afs_transport::hixl::{EngineInfo, HixlRuntimeGroup, MAX_BATCH_WINDOWS};
 use tonic::{Response, Status};
 
-use super::hixl::{
-    negotiated_lanes, next_session_id, runtime_status, validate_client_engine,
-    validate_transport_request,
-};
+use super::hixl::{negotiated_lanes, next_session_id, runtime_status, validate_client_engine};
 use super::{presented_access, remote_file_for_handle, time_ns};
 use crate::config::MAX_OWNERFS_HIXL_READ_GROUP_BYTES;
+use crate::node::data_plane::hixl::group_trace::GroupTrace;
 use crate::node::data_plane::hixl::{
     ExportProvider, HixlMetrics, Operation, PendingExport, SlotChecksum, runtime_export_provider,
 };
 use crate::node::rpc::OwnerRpcMetrics;
-use crate::node::rpc::hixl::HIXL_PROTOCOL_VERSION;
 use crate::node::vfs::ownerfs::files::RemoteFile;
 use crate::node::vfs::ownerfs::root::{PresentedRootAccess, RootId};
 use crate::node::vfs::ownerfs::{
@@ -496,11 +493,22 @@ impl OwnerHixlService {
     ) -> Result<Response<OwnerPrepareReadHixlReply>, Status> {
         let service = self.clone();
         let started = Instant::now();
+        let trace = GroupTrace::home(request.offset, request.length);
+        let prepare_len = request.length;
         let result = self
             .spawn_phase(Operation::Prepare, move || {
                 service.prepare_blocking(&peer, request)
             })
             .await;
+        if let (Some(trace), Ok(reply)) = (trace, &result) {
+            trace.emit(
+                "home_ready",
+                &reply.read_id,
+                prepare_len,
+                reply.read,
+                "ready",
+            );
+        }
         if let Some(metrics) = &self.owner_metrics {
             metrics.observe("server", "OwnerFiles.PrepareReadHixl", started.elapsed());
             if let Ok(reply) = &result {
@@ -590,14 +598,19 @@ impl OwnerHixlService {
         authorized.map_err(error_to_status)?;
 
         let (parameters, lanes) = negotiated_lanes(self.provider.as_ref(), request.lane_count)?;
-        let (transport, buffer_pool_count, buffer_pool_size_mib, hccs_domain_id) = parameters;
-        validate_transport_request(
+        if !parameters.matches_wire(
+            request.protocol_version,
             request.transport,
+            request.memory_kind,
             request.buffer_pool_count,
             request.buffer_pool_size_mib,
             request.hccs_domain_id,
-            parameters,
-        )?;
+        ) {
+            return Err(coded_status(
+                afs_error::NODE_TRANSFER_INVALID,
+                "HIXL version, memory, transport, pool or domain does not match the local mode",
+            ));
+        }
         let checksum = SlotChecksum::negotiate(&request.slot_checksum_algorithms);
         #[cfg(test)]
         if let Ok(mut offer) = self.offered_checksums.lock() {
@@ -656,11 +669,12 @@ impl OwnerHixlService {
         Ok(OwnerNegotiateHixlReply {
             session_id,
             home_session_id: access.home_session_id,
-            protocol_version: HIXL_PROTOCOL_VERSION,
-            transport: transport as i32,
-            buffer_pool_count,
-            buffer_pool_size_mib,
-            hccs_domain_id,
+            protocol_version: parameters.protocol_version,
+            transport: parameters.transport as i32,
+            memory_kind: parameters.memory_kind as i32,
+            buffer_pool_count: parameters.buffer_pool_count,
+            buffer_pool_size_mib: parameters.buffer_pool_size_mib,
+            hccs_domain_id: parameters.hccs_domain_id,
             lanes,
             slot_checksum_algorithm: checksum.wire() as i32,
             buffered_write_supported: self.buffered_writes,
@@ -850,6 +864,16 @@ impl OwnerHixlService {
             .map(|index| (length - index * window_bytes).min(window_bytes));
         let mut pending = self.reserve_exports(lane_id, capacities, rollback_failed)?;
 
+        let trace = GroupTrace::home(request.offset, request.length);
+        if let Some(trace) = trace {
+            trace.emit(
+                "home_source_begin",
+                &request.read_id,
+                request.length,
+                0,
+                "begin",
+            );
+        }
         let started = Instant::now();
         let filled = self.read_source(
             peer,
@@ -864,6 +888,19 @@ impl OwnerHixlService {
             checksum,
         );
         self.observe(Operation::SourceRead, started, filled.is_ok());
+        if let Some(trace) = trace {
+            let (bytes, outcome) = match &filled {
+                Ok((read, _)) => (*read as u64, "ok"),
+                Err(_) => (0, "error"),
+            };
+            trace.emit(
+                "home_source_end",
+                &request.read_id,
+                request.length,
+                bytes,
+                outcome,
+            );
+        }
         let (read, checksums) = filled?;
         let eof = read < length;
         if read == 0 {

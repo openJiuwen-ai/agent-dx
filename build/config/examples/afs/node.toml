@@ -178,12 +178,17 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # ownerfs_snapshot_reads = false
 # Buffered HIXL writes require opt-in on both sides.
 # ownerfs_buffered_writes = false
-# The two Host slot pools across all device lanes may reserve 1 GiB together;
-# one lane can take 128 + 128 slots of 4 MiB windows (the largest reservation).
+# Shared defaults for all HIXL modes: 2 GiB of window memory per lane,
+# calculated as window_bytes * (receive_slots + export_slots_per_session *
+# ownerfs_sessions_per_home). Budget all configured lanes before enabling HIXL.
 # window_bytes = 4194304
-# receive_slots = 128
-# export_slots = 128
+# receive_slots = 256
+# export_slots_per_session = 32
+# ownerfs_sessions_per_home = 8
 # ownerfs_read_group_bytes = 33554432 # default; up to 128 MiB
+# Sequential snapshot reads of large immutable files: try 67108864 (64 MiB)
+# with ownerfs_read_group_max_inflight = 2. Allow 128 MiB per active open
+# for two full groups in the shared reader budget.
 # ownerfs_min_file_bytes = 1048576 # Auto read-window threshold: file size at Open.
 # Auto write threshold: payload bytes in each request, checked before Prepare
 # or write slot reuse. Smaller writes use the existing RDMA/gRPC policy.
@@ -191,17 +196,26 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # Explicit data_mode = "hixl" ignores this write threshold.
 # ownerfs_min_write_bytes = 524288 # default (512 KiB)
 # session_idle_ms = 20000 # reader session reuse limit, 1..=20000
-# Match transport, pool enablement, and enabled pool sizing on both nodes.
-# Restart both nodes after switching.
-# transport = "roce" # default; "hccs" requires an A3 pair in the same super-pod
-# buffer_pool = false # default; RoCE may use true, HCCS requires true
+# Match transport, memory mode, pool enablement, and enabled pool sizing on
+# both nodes. Drain and restart both nodes when switching.
+# transport = "roce" # default; "hccs" requires supported A3s in one super-pod
+# buffer_pool = false # default; required true for non-Fabric HCCS
+# fabric_mem = false # true requires HCCS and buffer_pool = false
+# For Fabric, place libafs_hixl_fabric.so beside libafs_hixl.so. Minimum software baseline:
+# CANN 9.0.0 and HDK 25.5; verify capabilities with the paired runtime.
+# Optional Fabric SDK overrides (omit to use the installed SDK defaults):
+# fabric_mem_unfold = "host" # host or aicpu; host is the measured A3 candidate
+# fabric_mem_task_streams = 1 # 1..8; above 1 requires host
+# fabric_mem_max_transfer_count_per_batch = 1920 # 1..1920; AICPU internal grouping
+# fabric_mem_max_capacity_tb = 32 # virtual address capacity, NOT physical allocation
+# fabric_mem_start_address_tb = 40 # virtual address base; zero is explicit
 # With the relay enabled, each lane has two device pools. Defaults per pool:
 # buffer_pool_count = 4     # blocks per pool
 # buffer_pool_size_mib = 8  # MiB per block
 # The default uses 64 MiB of HBM per lane; Host slots are budgeted separately.
 # For RoCE with buffer_pool = true, set HCCL_INTRA_ROCE_ENABLE=1,
 # HCCL_INTRA_PCIE_ENABLE=0, and HCCL_INTER_HCCS_DISABLE=TRUE in both Node environments.
-# Host slots prefer the NPU PCI NUMA node. If unavailable, sched_getaffinity
+# Ordinary Host slots prefer the NPU PCI NUMA node. If unavailable, sched_getaffinity
 # reads the allocating owner thread's allowed CPUs; all must map to one NUMA node.
 # No candidate or an existing non-default policy means the original policy is inherited.
 # AFS_HIXL_NUMA reports source=pci|worker_cpu|unknown and policy=preferred|inherited.

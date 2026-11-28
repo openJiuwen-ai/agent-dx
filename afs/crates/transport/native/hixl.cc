@@ -3,6 +3,7 @@
  * plane owns authorization and this layer owns only ACL/HIXL resources.
  */
 #include "hixl.h"
+#include "hixl_fabric.h"
 #include "hixl_numa.h"
 
 #include <acl/acl_rt.h>
@@ -38,7 +39,52 @@ constexpr uint32_t kUnsupported = hixl::UNSUPPORTED;
 constexpr uint32_t kResourceExhausted = hixl::RESOURCE_EXHAUSTED;
 constexpr size_t kMaxWindowBytes = 4U * 1024U * 1024U;
 constexpr size_t kMaxPoolBytes = 512U * 1024U * 1024U;
-constexpr size_t kMaxSlotPoolBytes = 1024U * 1024U * 1024U;
+constexpr size_t kMaxHostSlotsPerPool = 4096;
+// Only ordinary direct RoCE registers each individual Host slot.
+constexpr size_t kMaxDirectRegistrations = 4000;
+
+constexpr uint32_t kUnset = AFS_HIXL_FABRIC_OPTION_UNSET;
+
+bool valid_fabric_options(const afs_hixl_fabric_options_t &options) {
+    const auto in_range = [](uint32_t value, uint32_t min, uint32_t max) {
+        return value == kUnset || (value >= min && value <= max);
+    };
+    return in_range(options.enable_aicpu_unfold, 0, 1) &&
+           in_range(options.task_streams, 1, 8) &&
+           (options.task_streams == kUnset || options.task_streams == 1 || options.enable_aicpu_unfold == 0) &&
+           in_range(options.max_capacity_tb, 1, 1024) &&
+           in_range(options.start_address_tb, 0, 1024) &&
+           in_range(options.max_transfer_count_per_batch, 1, 1920);
+}
+
+std::string fabric_config_json(const afs_hixl_fabric_options_t &options) {
+    std::string json = "{";
+    const auto append = [&](const char *key, uint32_t value, bool boolean = false) {
+        if (value == kUnset) {
+            return;
+        }
+        if (json.size() > 1) {
+            json += ',';
+        }
+        json += '"';
+        json += key;
+        json += "\":";
+        json += boolean ? (value == 0 ? "false" : "true") : std::to_string(value);
+    };
+    append("fabric_memory.enable_aicpu_unfold", options.enable_aicpu_unfold, true);
+    append("fabric_memory.task_stream_num", options.task_streams);
+    append("fabric_memory.max_capacity", options.max_capacity_tb);
+    append("fabric_memory.start_address", options.start_address_tb);
+    append("transfer_config.max_transfer_count_per_batch", options.max_transfer_count_per_batch);
+    return json.size() == 1 ? std::string{} : json + '}';
+}
+
+struct FabricSlab {
+    void *base = nullptr;
+    size_t extent = 0;
+    hixl::MemHandle handle = nullptr;
+    bool registered = false;
+};
 
 struct HostSlot {
     void *address = nullptr;
@@ -55,6 +101,8 @@ struct BatchPlan {
 };
 
 struct Runtime {
+    // Keep the provider loaded until after the engine object is destroyed.
+    afs_hixl_fabric::Provider fabric_provider;
     hixl::Hixl engine;
     int32_t device_id = -1;
     aclrtContext context = nullptr;
@@ -65,6 +113,11 @@ struct Runtime {
     bool poisoned = false;
     bool clean = false;
     bool relay = false;
+    bool fabric = false;
+    bool trace_sdk = false;
+    bool shutting_down = false;
+    FabricSlab fabric_receive;
+    FabricSlab fabric_export;
     uint64_t hccs_domain_id = 0;
     size_t window_bytes = 0;
     std::vector<HostSlot> receive;
@@ -109,6 +162,15 @@ uint64_t elapsed_nanoseconds(std::chrono::steady_clock::time_point start,
                              std::chrono::steady_clock::time_point end) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
     return elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0;
+}
+
+// Opt-in per-batch evidence for isolated benchmark runs; do not include addresses.
+void trace_sdk(const Runtime &runtime, const char *op, const BatchPlan &plan, uint64_t ns, uint32_t status) {
+    uint64_t bytes = 0;
+    for (const auto &descriptor : plan.descriptors) { bytes += descriptor.len; }
+    std::fprintf(stderr, "AFS_HIXL_SDK device=%d op=%s windows=%zu bytes=%llu sdk_ns=%llu status=%u\n",
+                 runtime.device_id, op, plan.descriptors.size(), static_cast<unsigned long long>(bytes),
+                 static_cast<unsigned long long>(ns), static_cast<unsigned>(status));
 }
 
 uint32_t acquire_acl_leases(Runtime *runtime, char *error, size_t error_len) {
@@ -204,6 +266,44 @@ uint32_t check_runtime(Runtime *runtime, char *error, size_t error_len) {
         write_error(error, error_len, "HIXL runtime generation is quarantined");
         return kFailed;
     }
+    if (runtime->shutting_down) {
+        write_error(error, error_len, "HIXL runtime shutdown has started");
+        return kFailed;
+    }
+    return kSuccess;
+}
+
+uint32_t cleanup_fabric_slabs(Runtime *runtime, char *error, size_t error_len) {
+    const auto slabs = {&runtime->fabric_receive, &runtime->fabric_export};
+    for (auto *slab : slabs) {
+        if (slab->registered) {
+            const auto status = runtime->engine.DeregisterMem(slab->handle);
+            if (status != kSuccess) {
+                if (status == kTimeout) {
+                    runtime->poisoned = true;
+                    write_error(error, error_len, "HIXL FabricMem slab deregistration timed out; outcome unknown");
+                    return AFS_HIXL_QUARANTINED;
+                }
+                write_error(error, error_len, "HIXL FabricMem slab deregistration failed");
+                return status;
+            }
+            slab->registered = false;
+            slab->handle = nullptr;
+        }
+    }
+    for (auto *slab : slabs) {
+        if (slab->base != nullptr) {
+            const auto status = runtime->fabric_provider.free(slab->base, error, error_len);
+            if (status != kSuccess) {
+                if (status == afs_hixl_fabric::kOwnershipUnknown || status == kTimeout) {
+                    runtime->poisoned = true;
+                    return AFS_HIXL_QUARANTINED;
+                }
+                return status;
+            }
+            slab->base = nullptr;
+        }
+    }
     return kSuccess;
 }
 
@@ -211,30 +311,40 @@ bool startup_cleanup(Runtime *runtime) noexcept try {
     if (runtime == nullptr) {
         return true;
     }
-    bool clean = true;
-    for (auto *pool : {&runtime->receive, &runtime->exports}) {
-        for (HostSlot &slot : *pool) {
-            if (slot.registered && runtime->engine_initialized) {
-                const hixl::Status status = runtime->engine.DeregisterMem(slot.handle);
-                if (status != kSuccess) {
-                    clean = false;
-                    continue;
+    if (runtime->poisoned) {
+        return false;
+    }
+    if (runtime->fabric) {
+        // Fabric slots borrow addresses; only the slab owns the allocation.
+        if (cleanup_fabric_slabs(runtime, nullptr, 0) != kSuccess) {
+            return false;
+        }
+    } else {
+        bool clean = true;
+        for (auto *pool : {&runtime->receive, &runtime->exports}) {
+            for (HostSlot &slot : *pool) {
+                if (slot.registered && runtime->engine_initialized) {
+                    const hixl::Status status = runtime->engine.DeregisterMem(slot.handle);
+                    if (status != kSuccess) {
+                        clean = false;
+                        continue;
+                    }
+                    slot.registered = false;
+                    slot.handle = nullptr;
                 }
-                slot.registered = false;
-                slot.handle = nullptr;
-            }
-            if (!slot.registered && slot.address != nullptr) {
-                const aclError status = aclrtFreeHost(slot.address);
-                if (status != ACL_SUCCESS) {
-                    clean = false;
-                    continue;
+                if (!slot.registered && slot.address != nullptr) {
+                    const aclError status = aclrtFreeHost(slot.address);
+                    if (status != ACL_SUCCESS) {
+                        clean = false;
+                        continue;
+                    }
+                    slot.address = nullptr;
                 }
-                slot.address = nullptr;
             }
         }
-    }
-    if (!clean) {
-        return false;
+        if (!clean) {
+            return false;
+        }
     }
     if (runtime->engine_initialized) {
         runtime->engine.Finalize();
@@ -274,6 +384,62 @@ uint32_t initialize_acl(Runtime *runtime, char *error, size_t error_len) {
     runtime->context_created = true;
     const aclError current_status = aclrtSetCurrentContext(runtime->context);
     return acl_status(current_status, error, error_len, "aclrtSetCurrentContext");
+}
+
+uint32_t register_fabric_slab(Runtime *runtime,
+                              FabricSlab &slab,
+                              std::vector<HostSlot> &slots,
+                              char *error,
+                              size_t error_len) try {
+    // Start has already checked the combined logical size before resizing the pools.
+    const size_t logical_bytes = slots.size() * runtime->window_bytes;
+    constexpr size_t alignment = afs_hixl_fabric::kAllocationAlignment;
+    const size_t remainder = logical_bytes % alignment;
+    const size_t padding = remainder == 0 ? 0 : alignment - remainder;
+    if (logical_bytes > std::numeric_limits<size_t>::max() - padding) {
+        write_error(error, error_len, "HIXL FabricMem slab size overflows after alignment");
+        return kParamInvalid;
+    }
+    slab.extent = logical_bytes + padding;
+    auto status = runtime->fabric_provider.allocate(slab.extent, &slab.base, error, error_len);
+    if (status != kSuccess) {
+        // A failed call leaving an output does not prove it owns a valid allocation.
+        runtime->poisoned = slab.base != nullptr || status == afs_hixl_fabric::kOwnershipUnknown ||
+                            status == kTimeout;
+        return status;
+    }
+    const auto base = reinterpret_cast<uintptr_t>(slab.base);
+    if (base == 0 || slab.extent > std::numeric_limits<uintptr_t>::max() - base) {
+        runtime->poisoned = true;
+        write_error(error, error_len, "HIXL FabricMem allocation did not return a valid address range");
+        return kFailed;
+    }
+    std::memset(slab.base, 0, slab.extent);
+    // ADXL tracks the allocation by its original base. Registering individual
+    // slots can require an external-memory API absent from older drivers.
+    const hixl::MemDesc descriptor{base, slab.extent};
+    status = runtime->engine.RegisterMem(descriptor, hixl::MEM_HOST, slab.handle);
+    if (status != kSuccess) {
+        runtime->poisoned = slab.handle != nullptr || status == kTimeout;
+        write_error(error, error_len, "HIXL RegisterMem(MEM_HOST) for FabricMem slab failed");
+        return status;
+    }
+    if (slab.handle == nullptr) {
+        runtime->poisoned = true;
+        write_error(error, error_len, "HIXL FabricMem slab registration did not return a handle");
+        return kFailed;
+    }
+    slab.registered = true;
+    for (size_t index = 0; index < slots.size(); ++index) {
+        slots[index].address = static_cast<unsigned char *>(slab.base) + index * runtime->window_bytes;
+        slots[index].length = runtime->window_bytes;
+    }
+    return kSuccess;
+} catch (...) {
+    // An exception at either SDK entry point can leave hidden allocator or
+    // registration state. Do not touch either slab in startup rollback.
+    runtime->poisoned = true;
+    throw;
 }
 
 uint32_t register_pool(Runtime *runtime,
@@ -420,14 +586,20 @@ void pinned_addresses(const Runtime *runtime, const std::vector<size_t> &slot_id
 }
 
 uint32_t disconnect_peers(Runtime *runtime, char *error, size_t error_len) {
-    for (const std::string &peer : runtime->peers) {
-        const hixl::Status status = runtime->engine.Disconnect(hixl::AscendString(peer.c_str()), 1000);
+    while (!runtime->peers.empty()) {
+        const auto peer = runtime->peers.begin();
+        const hixl::Status status = runtime->engine.Disconnect(hixl::AscendString(peer->c_str()), 1000);
         if (status != kSuccess) {
+            if (runtime->fabric && status == kTimeout) {
+                runtime->poisoned = true;
+                write_error(error, error_len, "HIXL FabricMem Disconnect timed out; outcome unknown");
+                return AFS_HIXL_QUARANTINED;
+            }
             write_error(error, error_len, "HIXL Disconnect did not prove a clean link close");
             return status;
         }
+        runtime->peers.erase(peer);
     }
-    runtime->peers.clear();
     return kSuccess;
 }
 
@@ -446,6 +618,7 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
                                     uint32_t transport,
                                     size_t buffer_pool_count,
                                     size_t buffer_pool_size_mib,
+                                    const afs_hixl_fabric_options_t *fabric_options,
                                     uint64_t *out_hccs_domain_id,
                                     void **out_runtime,
                                     char *error,
@@ -456,32 +629,45 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
     if (out_hccs_domain_id != nullptr) {
         *out_hccs_domain_id = 0;
     }
-    const bool hccs = transport == AFS_HIXL_TRANSPORT_HCCS;
+    const bool fabric = transport == AFS_HIXL_TRANSPORT_HCCS_FABRIC;
+    const bool hccs = transport == AFS_HIXL_TRANSPORT_HCCS || fabric;
     const bool relay = buffer_pool_count != 0 && buffer_pool_size_mib != 0;
     if (out_runtime == nullptr || out_hccs_domain_id == nullptr || device_id < 0 || engine_id == nullptr || engine_id[0] == '\0' ||
         device_listen_port > std::numeric_limits<uint16_t>::max() ||
         window_bytes == 0 || window_bytes > kMaxWindowBytes || receive_slots == 0 || export_slots == 0 ||
-        receive_slots > 128 || export_slots > 128 ||
+        receive_slots > kMaxHostSlotsPerPool || export_slots > kMaxHostSlotsPerPool ||
         receive_slots > std::numeric_limits<size_t>::max() - export_slots ||
-        (receive_slots + export_slots) > kMaxSlotPoolBytes / window_bytes ||
+        (receive_slots + export_slots) > std::numeric_limits<size_t>::max() / window_bytes ||
         (transport != AFS_HIXL_TRANSPORT_ROCE && !hccs) ||
         ((buffer_pool_count == 0) != (buffer_pool_size_mib == 0)) ||
-        (hccs && !relay) ||
+        (transport == AFS_HIXL_TRANSPORT_HCCS && !relay) || (fabric && relay) ||
         (relay && (buffer_pool_count > 64 || buffer_pool_size_mib > 64 ||
                    buffer_pool_count * buffer_pool_size_mib > kMaxPoolBytes / (2U * 1024U * 1024U)))) {
         write_error(error, error_len, "invalid HIXL start arguments");
         return kParamInvalid;
     }
-    *out_runtime = nullptr;
+    if (fabric_options != nullptr && (!fabric || !valid_fabric_options(*fabric_options))) {
+        write_error(error, error_len, "invalid HIXL FabricMem SDK overrides");
+        return kParamInvalid;
+    }
+    if (fabric && device_listen_port != 0) {
+        // CANN 9.1 does not apply this override in the Fabric engine path.
+        write_error(error, error_len, "HCCS FabricMem does not support device_listen_port");
+        return kParamInvalid;
+    }
+    if (!fabric && !relay && receive_slots + export_slots > kMaxDirectRegistrations) {
+        write_error(error, error_len, "HIXL direct Host pool exceeds 4000 SDK registrations");
+        return kResourceExhausted;
+    }
     if (hccs) {
         const char *inter_hccs_disable = std::getenv("HCCL_INTER_HCCS_DISABLE");
         if (inter_hccs_disable != nullptr && std::strcmp(inter_hccs_disable, "FALSE") != 0) {
-            write_error(error, error_len, "hccs-buffer-pool requires HCCL_INTER_HCCS_DISABLE unset or FALSE");
+            write_error(error, error_len, "HCCS requires HCCL_INTER_HCCS_DISABLE unset or FALSE");
             return kParamInvalid;
         }
         const char *intra_roce = std::getenv("HCCL_INTRA_ROCE_ENABLE");
         if (intra_roce != nullptr && std::strcmp(intra_roce, "0") != 0) {
-            write_error(error, error_len, "hccs-buffer-pool conflicts with HCCL_INTRA_ROCE_ENABLE; unset it or set 0");
+            write_error(error, error_len, "HCCS conflicts with HCCL_INTRA_ROCE_ENABLE; unset it or set 0");
             return kParamInvalid;
         }
     } else if (relay) {
@@ -505,6 +691,9 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
         auto *runtime = holder.get();
         runtime->device_id = device_id;
         runtime->relay = relay;
+        const char *trace = std::getenv("AFS_HIXL_TRACE_SDK");
+        runtime->trace_sdk = trace != nullptr && std::strcmp(trace, "1") == 0;
+        runtime->fabric = fabric;
         runtime->window_bytes = window_bytes;
         runtime->receive.resize(receive_slots);
         runtime->exports.resize(export_slots);
@@ -521,14 +710,14 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
                 "Ascend910_9372", "Ascend910_9362"};
             const char *soc = aclrtGetSocName();
             if (soc == nullptr || a3_socs.find(soc) == a3_socs.end()) {
-                write_error(error, error_len, "hccs-buffer-pool requires a supported A3 device");
+                write_error(error, error_len, "HCCS requires a supported A3 device");
                 cleanup_failed_start(holder, out_runtime);
                 return kUnsupported;
             }
             int64_t domain = -1;
             const aclError domain_status = aclrtGetDeviceInfo(static_cast<uint32_t>(device_id), ACL_DEV_ATTR_SUPER_POD_ID, &domain);
             if (domain_status != ACL_SUCCESS || domain < 0) {
-                write_error(error, error_len, "HCCS relay cannot verify the device super-pod identity");
+                write_error(error, error_len, "HCCS cannot verify the device super-pod identity");
                 cleanup_failed_start(holder, out_runtime);
                 return kUnsupported;
             }
@@ -536,7 +725,21 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
         }
         std::map<hixl::AscendString, hixl::AscendString> options;
         options.emplace(hixl::AscendString(hixl::OPTION_AUTO_CONNECT), hixl::AscendString("0"));
-        if (relay) {
+        if (fabric) {
+            status = runtime->fabric_provider.open(error, error_len);
+            if (status != kSuccess) {
+                cleanup_failed_start(holder, out_runtime);
+                return status;
+            }
+            options.emplace(hixl::AscendString(hixl::OPTION_ENABLE_USE_FABRIC_MEM), hixl::AscendString("1"));
+            if (fabric_options != nullptr) {
+                const auto json = fabric_config_json(*fabric_options);
+                if (!json.empty()) {
+                    options.emplace(hixl::AscendString(hixl::OPTION_GLOBAL_RESOURCE_CONFIG),
+                                    hixl::AscendString(json.c_str()));
+                }
+            }
+        } else if (relay) {
             const std::string pool = std::to_string(buffer_pool_count) + ":" + std::to_string(buffer_pool_size_mib);
             options.emplace(hixl::AscendString(hixl::OPTION_BUFFER_POOL), hixl::AscendString(pool.c_str()));
             if (device_listen_port != 0) {
@@ -561,17 +764,34 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
                                 hixl::AscendString(global_resource.c_str()));
             }
         }
-        status = runtime->engine.Initialize(hixl::AscendString(engine_id), options);
+        const hixl::AscendString local_engine(engine_id);
+        // For Fabric, a throw from Initialize does not prove the engine is idle.
+        runtime->poisoned = fabric;
+        status = runtime->engine.Initialize(local_engine, options);
+        // A timed-out Fabric initialization may still own device resources.
+        runtime->poisoned = fabric && status == kTimeout;
         if (status != kSuccess) {
             write_error(error, error_len, "HIXL Initialize failed");
             cleanup_failed_start(holder, out_runtime);
             return status;
         }
         runtime->engine_initialized = true;
-        const auto numa_node = afs_hixl_numa::preferred_node(device_id);
-        status = register_pool(runtime, runtime->receive, false, numa_node, error, error_len);
-        if (status == kSuccess) {
-            status = register_pool(runtime, runtime->exports, true, numa_node, error, error_len);
+        if (fabric) {
+            status = register_fabric_slab(runtime, runtime->fabric_receive, runtime->receive, error, error_len);
+            if (status == kSuccess) {
+                status = register_fabric_slab(runtime, runtime->fabric_export, runtime->exports, error, error_len);
+            }
+            if (status == kSuccess) {
+                std::fprintf(stderr, "AFS_HIXL_NUMA device=%d source=%s receive_bytes=%zu export_bytes=%zu\n",
+                             device_id, runtime->fabric_provider.placement_source(),
+                             runtime->fabric_receive.extent, runtime->fabric_export.extent);
+            }
+        } else {
+            const auto numa_node = afs_hixl_numa::preferred_node(device_id);
+            status = register_pool(runtime, runtime->receive, false, numa_node, error, error_len);
+            if (status == kSuccess) {
+                status = register_pool(runtime, runtime->exports, true, numa_node, error, error_len);
+            }
         }
         if (status != kSuccess) {
             cleanup_failed_start(holder, out_runtime);
@@ -597,9 +817,10 @@ extern "C" uint32_t afs_hixl_connect(void *opaque,
                                       uint32_t timeout_ms,
                                       char *error,
                                       size_t error_len) {
+    auto *runtime = static_cast<Runtime *>(opaque);
     try {
-        auto *runtime = static_cast<Runtime *>(opaque);
         uint32_t status = check_runtime(runtime, error, error_len);
+        if (runtime != nullptr && runtime->fabric && runtime->poisoned) { return AFS_HIXL_QUARANTINED; }
         if (status != kSuccess || peer == nullptr || peer[0] == '\0' || timeout_ms == 0 ||
             timeout_ms > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
             if (status == kSuccess) {
@@ -611,20 +832,32 @@ extern "C" uint32_t afs_hixl_connect(void *opaque,
         if (runtime->peers.find(peer) != runtime->peers.end()) {
             return kSuccess;
         }
-        status = runtime->engine.Connect(hixl::AscendString(peer), static_cast<int32_t>(timeout_ms));
+        const hixl::AscendString remote(peer);
+        // Once the SDK has been entered, only a recorded successful Connect
+        // gives shutdown a peer it can safely disconnect. A failed call does
+        // not prove that no link was established or slab mappings exchanged.
+        runtime->poisoned = runtime->fabric;
+        status = runtime->engine.Connect(remote, static_cast<int32_t>(timeout_ms));
         if (status != kSuccess) {
+            if (runtime->fabric) {
+                if (error != nullptr && error_len != 0) {
+                    std::snprintf(error, error_len, "HIXL FabricMem Connect outcome is uncertain (SDK status %llu)",
+                                  static_cast<unsigned long long>(status));
+                }
+                return AFS_HIXL_QUARANTINED;
+            }
             write_error(error, error_len, "HIXL Connect failed");
             return status;
         }
         runtime->peers.emplace(peer);
+        runtime->poisoned = false;
         return kSuccess;
     } catch (const std::exception &exception) {
         write_error(error, error_len, exception.what());
-        return kFailed;
     } catch (...) {
         write_error(error, error_len, "unknown exception while connecting HIXL");
-        return kFailed;
     }
+    return runtime != nullptr && runtime->fabric && runtime->poisoned ? AFS_HIXL_QUARANTINED : kFailed;
 }
 
 static uint32_t pin_export_slot(Runtime *runtime,
@@ -775,6 +1008,7 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
                                                           plan.descriptors,
                                                           static_cast<int32_t>(millis));
         const auto sdk_end = std::chrono::steady_clock::now();
+        if (runtime->trace_sdk) { trace_sdk(*runtime, "READ", plan, elapsed_nanoseconds(sdk_start, sdk_end), status); }
         if (status != kSuccess) {
             quarantine_slots(runtime, plan.slot_ids);
             write_error(error, error_len, "HIXL batch READ outcome is uncertain; Host windows and engine retained");
@@ -876,8 +1110,13 @@ extern "C" uint32_t afs_hixl_write_batch(void *opaque,
         // stopped accessing the native-owned staging and export windows.
         *dispatch_started = 1;
         const auto millis = std::chrono::ceil<std::chrono::milliseconds>(available).count();
+        const auto sdk_start = runtime->trace_sdk ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         status = runtime->engine.TransferSync(remote, hixl::WRITE, plan.descriptors,
                                               static_cast<int32_t>(millis));
+        if (runtime->trace_sdk) {
+            trace_sdk(*runtime, "WRITE", plan, elapsed_nanoseconds(sdk_start, std::chrono::steady_clock::now()), status);
+        }
         if (status != kSuccess) {
             quarantine_slots(runtime, plan.slot_ids);
             write_error(error, error_len, "HIXL batch WRITE outcome is uncertain; Host slots and engine retained");
@@ -935,11 +1174,15 @@ extern "C" uint32_t afs_hixl_release_receives(void *opaque,
 }
 
 extern "C" uint32_t afs_hixl_shutdown(void *opaque, char *error, size_t error_len) {
+    auto *runtime = static_cast<Runtime *>(opaque);
     try {
-        auto *runtime = static_cast<Runtime *>(opaque);
         if (runtime == nullptr || runtime->clean) {
             write_error(error, error_len, "invalid HIXL runtime for shutdown");
             return kParamInvalid;
+        }
+        if (runtime->fabric && runtime->poisoned) {
+            write_error(error, error_len, "HIXL FabricMem generation is quarantined; resources retained");
+            return AFS_HIXL_QUARANTINED;
         }
         if (runtime->poisoned ||
             std::any_of(runtime->receive.begin(), runtime->receive.end(), [](const HostSlot &slot) { return slot.in_use; }) ||
@@ -947,6 +1190,7 @@ extern "C" uint32_t afs_hixl_shutdown(void *opaque, char *error, size_t error_le
             write_error(error, error_len, "HIXL shutdown has not proved drain");
             return kFailed;
         }
+        runtime->shutting_down = true;
         uint32_t status = disconnect_peers(runtime, error, error_len);
         if (status != kSuccess) {
             return status;
@@ -972,9 +1216,13 @@ extern "C" uint32_t afs_hixl_shutdown(void *opaque, char *error, size_t error_le
             }
             return kSuccess;
         };
-        status = cleanup_pool(runtime->receive, "HIXL receive deregistration failed", "aclrtFreeHost receive");
-        if (status == kSuccess) {
-            status = cleanup_pool(runtime->exports, "HIXL export deregistration failed", "aclrtFreeHost export");
+        if (runtime->fabric) {
+            status = cleanup_fabric_slabs(runtime, error, error_len);
+        } else {
+            status = cleanup_pool(runtime->receive, "HIXL receive deregistration failed", "aclrtFreeHost receive");
+            if (status == kSuccess) {
+                status = cleanup_pool(runtime->exports, "HIXL export deregistration failed", "aclrtFreeHost export");
+            }
         }
         if (status != kSuccess) {
             return status;
@@ -999,11 +1247,14 @@ extern "C" uint32_t afs_hixl_shutdown(void *opaque, char *error, size_t error_le
         return kSuccess;
     } catch (const std::exception &exception) {
         write_error(error, error_len, exception.what());
-        return kFailed;
     } catch (...) {
         write_error(error, error_len, "unknown exception shutting down HIXL");
-        return kFailed;
     }
+    if (runtime != nullptr && runtime->fabric) {
+        runtime->poisoned = true;
+        return AFS_HIXL_QUARANTINED;
+    }
+    return kFailed;
 }
 
 extern "C" void afs_hixl_destroy(void *opaque) {

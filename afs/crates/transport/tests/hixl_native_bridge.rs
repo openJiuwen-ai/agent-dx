@@ -1,4 +1,4 @@
-//! Runs the real bridge with fake CANN entrypoints and official SDK headers.
+//! Runs the real bridge with fake CANN and Fabric provider entrypoints and official SDK headers.
 #![cfg(feature = "hixl")]
 
 use std::{fs, path::PathBuf, process::Command};
@@ -22,6 +22,7 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
         .arg("-std=c++17")
         .arg("-DAFS_HIXL_TEST_FAULT_INJECTION")
         .arg(format!("-I{}", sdk.join("include").display()))
+        // The fixture supplies Provider member definitions for this executable.
         .arg(root.join("tests/native/hixl_bridge_test.cc"))
         .arg(root.join("native/hixl.cc"))
         .arg(root.join("native/hixl_numa.cc"));
@@ -106,6 +107,37 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
         "hccs-unknown-domain",
         "hccs-negative-domain",
         "reserve-export",
+        "roce-default-slot-count",
+        "roce-registration-ceiling",
+        "fabric-completed",
+        "fabric-capacity",
+        "fabric-invalid-pool",
+        "fabric-listen-port",
+        "fabric-sdk-tuning",
+        "fabric-sdk-partial",
+        "fabric-sdk-invalid",
+        "roce-rejects-fabric-sdk-options",
+        "fabric-unsupported-soc",
+        "fabric-unknown-domain",
+        "fabric-provider-unavailable",
+        "fabric-partial-allocate",
+        "fabric-partial-register",
+        "fabric-start-quarantine",
+        "fabric-allocate-exception",
+        "fabric-register-exception",
+        "fabric-register-timeout",
+        "fabric-initialize-timeout",
+        "fabric-connect-timeout",
+        "fabric-connect-failure",
+        "fabric-connect-exception",
+        "fabric-pinned-drain",
+        "fabric-deregister-retry",
+        "fabric-disconnect-timeout",
+        "fabric-deregister-timeout",
+        "fabric-free-retry",
+        "fabric-free-exception",
+        "fabric-free-unknown",
+        "fabric-write-timeout",
     ] {
         run(scenario);
     }

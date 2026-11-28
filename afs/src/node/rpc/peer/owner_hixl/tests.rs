@@ -893,21 +893,177 @@ fn pooled_sessions_split_the_remote_export_slots() {
     assert_eq!(window_slots(2, 16, 4), 0);
     assert_eq!(window_slots(128, 128, 4), 32);
     assert_eq!(window_slots(128, 128, 1), 64);
+    assert_eq!(window_slots(256, 256, 8), 32);
+    assert_eq!(window_slots(256, 256, 1), MAX_BATCH_WINDOWS);
+}
+
+#[tokio::test]
+async fn classic_reader_checks_version_memory_and_session_capacity_before_connecting() {
+    use afs_protocol::node_data::{HixlMemoryKind, HixlSlotChecksumAlgorithm, HixlTransport};
+
+    let mut reader_policy = policy(DataMode::Hixl);
+    reader_policy.sessions_per_home = 8;
+    let fixture = fixture(reader_policy, true).await;
+    let access = root_access(&grant());
+    let reply = OwnerNegotiateHixlReply {
+        session_id: 1,
+        home_session_id: access.home_session_id.clone(),
+        protocol_version: 1,
+        transport: HixlTransport::Roce as i32,
+        memory_kind: HixlMemoryKind::ClassicHost as i32,
+        slot_checksum_algorithm: HixlSlotChecksumAlgorithm::Blake3 as i32,
+        lanes: vec![HixlLane {
+            lane_id: 0,
+            engine_id: HOME_ENGINE.to_owned(),
+            engine_generation: 7,
+            window_bytes: SLOT as u64,
+            export_slots: u32::try_from(MAX_OWNERFS_HIXL_SLOTS_PER_POOL).unwrap(),
+        }],
+        ..Default::default()
+    };
+    fixture
+        .reader
+        .validate_negotiation(&reply, &access)
+        .unwrap();
+    let mut small = reply.clone();
+    small.lanes[0].export_slots = 7;
+    let error = fixture
+        .reader
+        .admit_negotiated(
+            "node-a",
+            &small,
+            &access,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+    assert_eq!(fixture.connects(), 0);
+    small.lanes[0].export_slots = 8;
+    fixture
+        .reader
+        .validate_negotiation(&small, &access)
+        .unwrap();
+    for (version, kind) in [(2, 1), (3, 1), (1, 0), (1, 2), (1, i32::MAX)] {
+        let invalid = OwnerNegotiateHixlReply {
+            protocol_version: version,
+            memory_kind: kind,
+            ..reply.clone()
+        };
+        let error = fixture
+            .reader
+            .admit_negotiated(
+                "node-a",
+                &invalid,
+                &access,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+    }
+    assert_eq!(fixture.connects(), 0);
+}
+
+#[tokio::test]
+async fn fabric_reader_requires_matching_v1_memory_link_pool_and_domain() {
+    use afs_protocol::node_data::{HixlMemoryKind, HixlSlotChecksumAlgorithm, HixlTransport};
+    use afs_transport::hixl::ReadTransport;
+
+    let access = root_access(&grant());
+    let mut info = engine("127.0.0.1:7940", 3, SLOT);
+    info.transport = ReadTransport::HccsFabric;
+    info.hccs_domain_id = Some(7);
+    let exports = Arc::new(MemoryExports::new(SLOT, 256));
+    let native = memory_reader(exports, info, HOME_ENGINE);
+    let reader = OwnerHixlReader::from_runtime(
+        Arc::new(MemoryRuntime(native.clone())),
+        "node-b".to_owned(),
+        policy(DataMode::Hixl),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let reply = OwnerNegotiateHixlReply {
+        session_id: 1,
+        home_session_id: access.home_session_id.clone(),
+        protocol_version: 1,
+        transport: HixlTransport::Hccs as i32,
+        memory_kind: HixlMemoryKind::FabricHost as i32,
+        hccs_domain_id: Some(7),
+        slot_checksum_algorithm: HixlSlotChecksumAlgorithm::Blake3 as i32,
+        lanes: vec![HixlLane {
+            lane_id: 0,
+            engine_id: HOME_ENGINE.to_owned(),
+            engine_generation: 7,
+            window_bytes: SLOT as u64,
+            export_slots: u32::try_from(MAX_OWNERFS_HIXL_SLOTS_PER_POOL).unwrap(),
+        }],
+        ..Default::default()
+    };
+    for invalid in [
+        OwnerNegotiateHixlReply {
+            protocol_version: 2,
+            ..reply.clone()
+        },
+        OwnerNegotiateHixlReply {
+            memory_kind: HixlMemoryKind::ClassicHost as i32,
+            ..reply.clone()
+        },
+        OwnerNegotiateHixlReply {
+            transport: HixlTransport::Roce as i32,
+            ..reply.clone()
+        },
+        OwnerNegotiateHixlReply {
+            buffer_pool_count: 4,
+            buffer_pool_size_mib: 8,
+            ..reply.clone()
+        },
+        OwnerNegotiateHixlReply {
+            hccs_domain_id: None,
+            ..reply.clone()
+        },
+        OwnerNegotiateHixlReply {
+            hccs_domain_id: Some(8),
+            ..reply.clone()
+        },
+    ] {
+        let error = reader
+            .admit_negotiated(
+                "node-a",
+                &invalid,
+                &access,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+    }
+    assert_eq!(native.connects.load(Ordering::SeqCst), 0);
+    reader
+        .admit_negotiated(
+            "node-a",
+            &reply,
+            &access,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(native.connects.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn four_sessions_can_prepare_a_128_mib_group_from_a_128_slot_pool() {
+async fn eight_sessions_can_prepare_a_128_mib_group_from_a_256_slot_pool() {
     const WINDOW: usize = 4 * 1024 * 1024;
     const GROUP: usize = 32 * WINDOW;
     let mut wide = policy(DataMode::Hixl);
     wide.max_group_bytes = GROUP;
-    wide.receive_slots = 128;
-    wide.sessions_per_home = 4;
+    wide.receive_slots = 256;
+    wide.sessions_per_home = 8;
     let fixture = fixture_with_exports(
         wide,
         true,
         MemorySource::new(content(), 3000),
-        Arc::new(MemoryExports::new(WINDOW, 128)),
+        Arc::new(MemoryExports::new(WINDOW, 256)),
         WINDOW,
         RELEASE_PARK,
     )

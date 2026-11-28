@@ -8,6 +8,14 @@ fn hixl_public_contract_is_available_without_native_feature() {
     assert_eq!(options.transport, ReadTransport::Roce);
     assert!(!options.buffer_pool);
     assert_eq!(ReadTransport::Hccs.to_string(), "hccs");
+    assert_eq!(ReadTransport::HccsFabric.to_string(), "hccs");
+    assert!(ReadTransport::HccsFabric.is_hccs());
+    assert!(ReadTransport::HccsFabric.is_fabric_mem());
+    assert!(!ReadTransport::Hccs.is_fabric_mem());
+    assert!(!ReadTransport::Roce.is_hccs());
+    assert_eq!(options.window_bytes, 4 * 1024 * 1024);
+    assert_eq!(options.receive_slots, 256);
+    assert_eq!(options.export_slots, 256);
     let info = EngineInfo {
         engine_id: options.engine_id.clone(),
         generation: 1,

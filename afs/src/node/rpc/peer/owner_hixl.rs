@@ -10,6 +10,7 @@
 //! same open and dropped at release or after this node writes the same file.
 
 mod batch;
+mod group_trace;
 
 mod read_session;
 mod write;
@@ -19,13 +20,16 @@ use super::hixl::{
     bind_engines, connect_lanes, engine_transport_parameters, lane_is_valid, least_used_lane,
     remaining,
 };
-use crate::config::DataMode;
+use crate::config::{
+    DataMode, MAX_OWNERFS_HIXL_READ_GROUP_BYTES, MAX_OWNERFS_HIXL_SESSIONS_PER_HOME,
+    MAX_OWNERFS_HIXL_SLOTS_PER_POOL,
+};
 use crate::node::data_plane::hixl::{
     Completion, HixlMetrics, Operation, ReadWindow, SlotChecksum, TransferRuntime,
     checked_slot_length, observe_optional, read_batch,
 };
 use crate::node::rpc::OwnerRpcMetrics;
-use crate::node::rpc::hixl::{HIXL_PROTOCOL_VERSION, is_unsupported};
+use crate::node::rpc::hixl::is_unsupported;
 use afs_protocol::node_data::{
     HixlLane, HixlReleaseOutcome, OwnerCloseHixlRequest, OwnerHandle, OwnerHixlSlot,
     OwnerNegotiateHixlReply, OwnerNegotiateHixlRequest, OwnerPrepareBatchHixlReply,
@@ -55,8 +59,6 @@ const HOME_POOL_IDLE: Duration = Duration::from_secs(60);
 const PREPARE_ATTEMPTS: usize = 3;
 /// Leave room below Home's bounded replay table while rotating busy sessions.
 const MAX_SESSION_WRITE_TICKETS: usize = 1024;
-/// Mirrors the `[hixl].ownerfs_sessions_per_home` configuration bound.
-const MAX_OWNER_HIXL_SESSIONS_PER_HOME: usize = 4;
 const RELEASE_ATTEMPTS: usize = 3;
 /// A parked release that no prepare of its session carries within this long
 /// is sent on its own, so idle slots return to Home promptly.
@@ -169,10 +171,10 @@ impl OwnerHixlReader {
             || timeout.is_zero()
             || timeout > Duration::from_secs(300)
             || native.lane_count() == 0
-            || policy.max_group_bytes == 0
-            || policy.receive_slots == 0
+            || !(1..=MAX_OWNERFS_HIXL_READ_GROUP_BYTES).contains(&policy.max_group_bytes)
+            || !(1..=MAX_OWNERFS_HIXL_SLOTS_PER_POOL).contains(&policy.receive_slots)
             || !(1..=2).contains(&policy.max_inflight)
-            || !(1..=MAX_OWNER_HIXL_SESSIONS_PER_HOME).contains(&policy.sessions_per_home)
+            || !(1..=MAX_OWNERFS_HIXL_SESSIONS_PER_HOME).contains(&policy.sessions_per_home)
             || !(Duration::from_millis(1)..=MAX_SESSION_IDLE).contains(&policy.session_idle)
         {
             return Err(afs_error::Error::coded(
@@ -519,19 +521,19 @@ impl OwnerHixlReader {
         deadline: Instant,
     ) -> afs_error::Result<Option<HomeSession>> {
         let info = self.native.info();
-        let (transport, buffer_pool_count, buffer_pool_size_mib, hccs_domain_id) =
-            engine_transport_parameters(&info)?;
+        let parameters = engine_transport_parameters(&info)?;
         let lane_count = u32::try_from(self.native.lane_count())
             .map_err(|_| protocol_error("OwnerFs HIXL lane count overflow"))?;
         let mut request = afs_tracing::request_with_current_context(OwnerNegotiateHixlRequest {
             access: Some(access.clone()),
             client_engine_id: info.engine_id.clone(),
             client_engine_generation: info.generation,
-            protocol_version: HIXL_PROTOCOL_VERSION,
-            transport: transport as i32,
-            buffer_pool_count,
-            buffer_pool_size_mib,
-            hccs_domain_id,
+            protocol_version: parameters.protocol_version,
+            transport: parameters.transport as i32,
+            memory_kind: parameters.memory_kind as i32,
+            buffer_pool_count: parameters.buffer_pool_count,
+            buffer_pool_size_mib: parameters.buffer_pool_size_mib,
+            hccs_domain_id: parameters.hccs_domain_id,
             lane_count,
             slot_checksum_algorithms: SlotChecksum::OFFER
                 .iter()
@@ -603,15 +605,18 @@ impl OwnerHixlReader {
         access: &RootAccess,
     ) -> afs_error::Result<()> {
         let local = self.native.infos();
-        let (transport, count, size, domain) = engine_transport_parameters(&self.native.info())?;
+        let parameters = engine_transport_parameters(&self.native.info())?;
         if reply.session_id == 0
-            || reply.protocol_version != HIXL_PROTOCOL_VERSION
+            || !parameters.matches_wire(
+                reply.protocol_version,
+                reply.transport,
+                reply.memory_kind,
+                reply.buffer_pool_count,
+                reply.buffer_pool_size_mib,
+                reply.hccs_domain_id,
+            )
             || SlotChecksum::from_reply(reply.slot_checksum_algorithm).is_none()
             || reply.home_session_id != access.home_session_id
-            || reply.transport != transport as i32
-            || reply.buffer_pool_count != count
-            || reply.buffer_pool_size_mib != size
-            || reply.hccs_domain_id != domain
             || local.is_empty()
             || reply.lanes.len() != local.len()
         {
@@ -621,7 +626,10 @@ impl OwnerHixlReader {
         }
         let mut endpoints = HashSet::new();
         for (index, lane) in reply.lanes.iter().enumerate() {
-            if !lane_is_valid(lane, index, &mut endpoints) {
+            // Every pooled session must have at least one usable export window.
+            if !lane_is_valid(lane, index, &mut endpoints)
+                || u64::from(lane.export_slots) < self.policy.sessions_per_home as u64
+            {
                 return Err(protocol_error(
                     "OwnerFs HIXL lane identity or capacity is invalid",
                 ));
@@ -655,13 +663,34 @@ impl OwnerHixlReader {
 
     /// Fetches one verified window. Runs as an owned task: the caller may stop
     /// waiting, but the task keeps the budget and completes Release or fencing.
+    #[cfg(test)]
     async fn fetch(
         self: Arc<Self>,
         request: FetchRequest,
         budget: Option<BudgetLease>,
     ) -> afs_error::Result<Fetched> {
+        self.fetch_traced(request, budget, None).await
+    }
+
+    async fn fetch_traced(
+        self: Arc<Self>,
+        request: FetchRequest,
+        budget: Option<BudgetLease>,
+        trace: Option<group_trace::GroupTrace>,
+    ) -> afs_error::Result<Fetched> {
         let started = Instant::now();
-        let result = self.fetch_inner(&request, budget).await;
+        let result = self.fetch_inner(&request, budget, trace).await;
+        if let Some(trace) = trace {
+            match &result {
+                Ok(Fetched::Window(window)) => {
+                    if let Some(ready) = &window.trace {
+                        ready.emit("fetch_done", window.bytes.len(), "ready");
+                    }
+                }
+                Ok(Fetched::Fallback) => trace.emit("fetch_done", "", 0, 0, "fallback"),
+                Err(_) => trace.emit("fetch_done", "", 0, 0, "error"),
+            }
+        }
         if let Some(metrics) = &self.owner_metrics {
             metrics.observe("client", "read_hixl_window", started.elapsed());
         }
@@ -672,6 +701,7 @@ impl OwnerHixlReader {
         &self,
         request: &FetchRequest,
         budget: Option<BudgetLease>,
+        trace: Option<group_trace::GroupTrace>,
     ) -> afs_error::Result<Fetched> {
         let deadline = request.deadline;
         let Some(mut lease) = self
@@ -701,6 +731,8 @@ impl OwnerHixlReader {
             prior_release: lease.prior_release(),
         };
         let attempt = ReadTicket::for_prepare(&lease.session, &prepare.read_id, &remote);
+        let read_id = prepare.read_id.as_str();
+        let prepare_len = prepare.length;
         let reply = match self
             .prepare(
                 &mut lease,
@@ -708,7 +740,20 @@ impl OwnerHixlReader {
                 &prepare,
                 prepare.prior_release.as_ref(),
                 deadline,
-                |mut client, command| async move { client.prepare_read_hixl(command).await },
+                |mut client, command| async move {
+                    if let Some(trace) = trace {
+                        trace.emit("prepare_rpc_begin", read_id, prepare_len, 0, "begin");
+                    }
+                    let result = client.prepare_read_hixl(command).await;
+                    if let Some(trace) = trace {
+                        let (bytes, outcome) = match &result {
+                            Ok(reply) => (reply.get_ref().read, "ok"),
+                            Err(_) => (0, "error"),
+                        };
+                        trace.emit("prepare_rpc_end", read_id, prepare_len, bytes, outcome);
+                    }
+                    result
+                },
             )
             .await
         {
@@ -731,6 +776,7 @@ impl OwnerHixlReader {
                 offset: request.offset,
                 bytes: Bytes::new(),
                 eof: true,
+                trace: trace.map(|trace| group_trace::ReadyGroup::new(trace, prepare)),
             }));
         }
         let eof = reply.eof;
@@ -753,6 +799,7 @@ impl OwnerHixlReader {
                 None => bytes.into(),
             },
             eof,
+            trace: trace.map(|trace| group_trace::ReadyGroup::new(trace, prepare)),
         }))
     }
 
@@ -1194,6 +1241,7 @@ struct FetchedWindow {
     offset: u64,
     bytes: Bytes,
     eof: bool,
+    trace: Option<group_trace::ReadyGroup>,
 }
 
 enum Fetched {

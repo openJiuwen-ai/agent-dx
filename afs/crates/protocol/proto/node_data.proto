@@ -757,6 +757,13 @@ enum HixlSlotChecksumAlgorithm {
   HIXL_SLOT_CHECKSUM_ALGORITHM_CRC32C = 3;
 }
 
+// Both peers must explicitly identify the memory backing their windows.
+enum HixlMemoryKind {
+  HIXL_MEMORY_KIND_UNSPECIFIED = 0;
+  HIXL_MEMORY_KIND_CLASSIC_HOST = 1;
+  HIXL_MEMORY_KIND_FABRIC_HOST = 2;
+}
+
 // OwnerFs HIXL read-ahead windows. The session is only a transport lease that
 // the authenticated peer opened with one valid RootAccess; every prepare
 // carries its own RootAccess and open handle and is authorized like Read.
@@ -775,6 +782,8 @@ message OwnerNegotiateHixlRequest {
   // Slot digests the reader can verify. Home picks CRC32C when offered and
   // falls back to BLAKE3; an empty list means BLAKE3 only.
   repeated HixlSlotChecksumAlgorithm slot_checksum_algorithms = 10;
+  // Fabric Host requires HCCS, zero pool dimensions and a verified domain.
+  HixlMemoryKind memory_kind = 11;
 }
 
 // A negotiated session supports buffered reads and writes; each operation still
@@ -794,6 +803,7 @@ message OwnerNegotiateHixlReply {
   reserved 10, 11;
   reserved "write_checksum_negotiated";
   bool buffered_write_supported = 12;
+  HixlMemoryKind memory_kind = 13;
 }
 
 // read_id is reader-generated and stays identical across transport retries of

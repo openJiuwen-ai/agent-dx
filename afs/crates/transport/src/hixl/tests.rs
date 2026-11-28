@@ -15,6 +15,7 @@ static RECEIVED: [u8; 4] = *b"read";
 #[derive(Default)]
 struct FakeBackend {
     connect_delay: Option<Duration>,
+    connect_error: Option<NativeCallError>,
     sync_timeout_ms: u32,
     sync_sdk_transfer: Option<Duration>,
     zero_receive_address: bool,
@@ -56,7 +57,7 @@ impl NativeBackend for FakeBackend {
         if let Some(delay) = self.connect_delay {
             std::thread::sleep(delay);
         }
-        Ok(())
+        self.connect_error.take().map_or(Ok(()), Err)
     }
 
     fn reserve_export(&mut self, _: u64, _: u64, _: usize) -> Result<u64, NativeCallError> {
@@ -242,27 +243,59 @@ fn runtime_options_default_device_listen_port_is_unset() {
 }
 
 #[test]
-fn runtime_options_reserve_one_gib_of_host_slots() {
-    let reserved = RuntimeOptions {
-        window_bytes: 4 * 1024 * 1024,
-        receive_slots: 128,
-        export_slots: 128,
-        ..RuntimeOptions::default()
+fn runtime_pool_limits_distinguish_slot_counts_from_registration_counts() {
+    for (transport, buffer_pool) in [
+        (super::ReadTransport::Roce, true),
+        (super::ReadTransport::Hccs, true),
+        (super::ReadTransport::HccsFabric, false),
+    ] {
+        let opts = RuntimeOptions {
+            transport,
+            buffer_pool,
+            receive_slots: 4096,
+            export_slots: 4096,
+            ..options()
+        };
+        assert!(validate_options(&opts).is_ok());
+        assert!(
+            validate_options(&RuntimeOptions {
+                receive_slots: 4097,
+                ..opts.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_options(&RuntimeOptions {
+                export_slots: 4097,
+                ..opts
+            })
+            .is_err()
+        );
+    }
+    let direct = RuntimeOptions {
+        receive_slots: 2000,
+        export_slots: 2000,
+        ..options()
     };
-    assert!(validate_options(&reserved).is_ok());
-    assert!(
+    assert!(validate_options(&direct).is_ok());
+    assert_eq!(
         validate_options(&RuntimeOptions {
-            receive_slots: 129,
-            ..reserved.clone()
+            receive_slots: 2001,
+            ..direct
         })
-        .is_err()
+        .unwrap_err()
+        .kind,
+        HixlErrorKind::ResourceExhausted
     );
-    assert!(
-        validate_options(&RuntimeOptions {
-            export_slots: 129,
-            ..reserved
-        })
-        .is_err()
+}
+
+#[test]
+fn runtime_options_reserve_two_gib_of_host_slots() {
+    let reserved = RuntimeOptions::default();
+    assert!(validate_options(&reserved).is_ok());
+    assert_eq!(
+        reserved.window_bytes * (reserved.receive_slots + reserved.export_slots),
+        2 * 1024 * 1024 * 1024
     );
 }
 
@@ -342,6 +375,31 @@ fn direct_roce_ignores_unused_pool_dimensions() {
     assert_eq!(core.info().buffer_pool_count, 0);
     assert_eq!(core.info().buffer_pool_size_mib, 0);
     assert_eq!(core.info().hccs_domain_id, None);
+}
+
+#[test]
+fn fabric_mem_publishes_verified_domain_and_no_hbm_budget() {
+    let opts = RuntimeOptions {
+        transport: super::ReadTransport::HccsFabric,
+        ..options()
+    };
+    let core = RuntimeCore::new(FakeBackend::default(), opts.clone()).unwrap();
+    assert_eq!(core.info().transport, super::ReadTransport::HccsFabric);
+    assert_eq!(core.info().hccs_domain_id, Some(7));
+    assert_eq!(core.status().hccs_domain_id, Some(7));
+    assert_eq!(core.info().buffer_pool_count, 0);
+    assert_eq!(core.info().buffer_pool_size_mib, 0);
+    assert_eq!(core.status().relay_hbm_budget_bytes, 0);
+    assert_eq!(core.status().allocated_bytes, 8);
+    assert_eq!(
+        validate_options(&RuntimeOptions {
+            buffer_pool: true,
+            ..opts
+        })
+        .unwrap_err()
+        .kind,
+        HixlErrorKind::InvalidArgument
+    );
 }
 
 #[test]
@@ -1063,6 +1121,37 @@ fn failed_native_cleanup_stays_retryable_until_shutdown_succeeds() {
     assert_eq!(runtime.status().state, RuntimeState::Shutdown);
     // A completed shutdown stays idempotent.
     runtime.shutdown().unwrap();
+}
+
+#[test]
+fn retained_native_generation_never_reenters_cleanup() {
+    for during_connect in [true, false] {
+        let retained = NativeCallError::new(Some(super::HIXL_QUARANTINED), "ownership unknown");
+        let backend = FakeBackend {
+            connect_error: during_connect.then(|| retained.clone()),
+            shutdown_error: (!during_connect).then_some(retained),
+            ..FakeBackend::default()
+        };
+        let mut core = RuntimeCore::new(backend, options()).unwrap();
+        if during_connect {
+            let error = core
+                .connect("peer", Instant::now() + Duration::from_secs(1))
+                .unwrap_err();
+            assert_eq!(error.kind, HixlErrorKind::EnginePoisoned);
+        } else {
+            assert_eq!(
+                core.shutdown().unwrap_err().kind,
+                HixlErrorKind::ShutdownIncomplete
+            );
+        }
+        assert_eq!(core.status().state, RuntimeState::Quarantined);
+        assert_eq!(
+            core.status().quarantined_bytes,
+            core.status().allocated_bytes
+        );
+        assert!(core.shutdown().is_err());
+        assert_eq!(core.backend.shutdown_calls, usize::from(!during_connect));
+    }
 }
 
 #[test]

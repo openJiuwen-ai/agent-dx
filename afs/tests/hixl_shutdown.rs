@@ -164,7 +164,9 @@ fn spawn(root: &Path, role: &str, bin: &str, extra: &str, mode: Option<&str>) ->
              [trusted_node_certs]\nnode-a = '{0}/tls/node-a.pem'\n{1}",
             root.display(),
             if mode.is_some() {
-                "[hixl]\nengine_id = '127.0.0.1:31000'\ntrusted_peers = ['node-a']\n"
+                // This test exercises shutdown ordering, not deployment-sized pools.
+                "[hixl]\nengine_id = '127.0.0.1:31000'\ntrusted_peers = ['node-a']\n\
+                 receive_slots = 8\nexport_slots_per_session = 8\nownerfs_sessions_per_home = 1\n"
             } else {
                 ""
             },
@@ -174,6 +176,8 @@ fn spawn(root: &Path, role: &str, bin: &str, extra: &str, mode: Option<&str>) ->
     let log = fs::File::create(root.join(format!("{role}.log"))).unwrap();
     let mut command = Command::new(bin);
     command
+        // Exercise cleanup ordering independently of the host CPU count.
+        .env("TOKIO_WORKER_THREADS", "4")
         .current_dir(root)
         .arg("--config")
         .arg(config)

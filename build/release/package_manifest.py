@@ -2,6 +2,8 @@
 """Verify one ADX release package with the same contract at build and install time."""
 
 import argparse
+import logging
+import sys
 import hashlib
 import json
 import platform
@@ -36,7 +38,7 @@ SANDBOXD_DEPLOYMENT_FILES = (
     "registry_auths.json",
 )
 AFS_BINARIES = ("afs-meta", "afs-node")
-AFS_HIXL_MODULE = "libafs_hixl.so"
+AFS_HIXL_MODULES = ("libafs_hixl.so", "libafs_hixl_fabric.so")
 AFS_REQUIRED_FILES = {
     "etc/examples/afs/meta.toml",
     "etc/examples/afs/node.toml",
@@ -109,12 +111,12 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         required.update(AFS_REQUIRED_FILES)
     elif afs_artifacts:
         raise ValueError("AFS artifacts are present in a default package")
-    hixl_module = f"bin/{AFS_HIXL_MODULE}"
+    hixl_modules = {f"bin/{name}" for name in AFS_HIXL_MODULES}
     if manifest.get("with_hixl") is True:
         if manifest.get("with_afs") is not True or "linux" not in manifest.get("target", ""):
             raise ValueError("the HIXL module requires an AFS package for Linux")
-        required.add(hixl_module)
-    elif hixl_module in expected:
+        required.update(hixl_modules)
+    elif expected & hixl_modules:
         raise ValueError("HIXL module is present without with_hixl")
     if not required.issubset(expected) or not any(
         name.startswith("sdk/adx_environment-") and name.endswith(".whl") for name in expected
@@ -181,7 +183,8 @@ def main() -> None:
         manifest = verify(args.directory, enforce_host_architecture=args.host_architecture)
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
-    print(f"package verified: {manifest['commit']} ({manifest.get('target', '')})")
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
+    logging.info("package verified: %s (%s)", manifest["commit"], manifest.get("target", ""))
 
 
 if __name__ == "__main__":

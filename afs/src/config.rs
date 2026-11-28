@@ -32,7 +32,7 @@ pub use outlet::{DEFAULT_MOUNT_OPTIONS, OutletConfig};
 
 #[cfg(feature = "ownerfs")]
 pub(crate) use hixl::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
-pub use hixl::{HixlConfig, HixlDeviceConfig, HixlTransport};
+pub use hixl::{HixlConfig, HixlDeviceConfig, HixlFabricMemUnfold, HixlTransport};
 pub use tls::read_certificate_der;
 
 /// Whether `id` is safe to embed in filesystem paths and request keys.
@@ -88,6 +88,8 @@ pub enum DataMode {
 
 /// Maximum OwnerFs HIXL group size accepted by configuration and Home Prepare.
 pub(crate) const MAX_OWNERFS_HIXL_READ_GROUP_BYTES: usize = 128 * 1024 * 1024;
+/// Maximum number of peer control sessions configured per Home.
+pub(crate) const MAX_OWNERFS_HIXL_SESSIONS_PER_HOME: usize = 8;
 
 /// `dfs_local_copy`: whether the writing Node must hold a replica. Meta persists
 /// the choice as [`crate::dfs::LocalCopyPolicy`] when it initializes the filesystem.

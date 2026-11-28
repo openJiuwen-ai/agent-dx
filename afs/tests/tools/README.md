@@ -50,3 +50,5 @@ Linux 可用同一个 `tools.version_switch.exercise`，传入既有 role 配置
 | 历史交错矩阵、原始结果、冻结ELF及源码、BPF/临时探针 | 仓外实验/证据归档；不作为当前case通过或性能阈值的来源 |
 
 当前迁移没有新增性能实验。功能核验模式跑过也不能声称测量模式已取得性能成绩。
+
+`hixl_group_timeline.py` 对齐单文件顺序读的 Home/Reader 分组日志。

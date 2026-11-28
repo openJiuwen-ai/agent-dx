@@ -84,12 +84,12 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 HIXL 为 OwnerFs 提供可选的远端缓冲读。不可变数据可单独启用预读窗口和小文件目录批量。
 `cargo build --locked -p afs --bins --features hixl` 在普通 Linux 构建环境中编译支持加载 HIXL 的进程。
-原生模块需要 CANN ≥ 9.1.0 的 HIXL/ACL SDK。在 SDK 环境运行
+构建原生模块时，按传输模式选择 HIXL/ACL SDK：FabricMem 需要 CANN ≥ 9.0.0；RoCE 直传（`roce:device`）需要 CANN ≥ 9.1.0。在对应的 SDK 环境运行
 `make afs-hixl-module ADX_CANN_PATH=/opt/ascend/cann AFS_HIXL_MODULE=/absolute/path/libafs_hixl.so`
 可单独构建模块。也可用
 `make afs-build ADX_WITH_AFS=1 AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`
 一起构建进程和模块。部署 HIXL 时，模块放在 `afs-node` 同目录，或用进程环境变量
-`AFS_HIXL_MODULE` 指定绝对路径。CANN、HDK（≥ 25.5.0）与设备型号需使用配套组合。
+`AFS_HIXL_MODULE` 指定 `libafs_hixl.so` 的绝对路径。启用 Fabric 时，运行时从该主模块的同目录加载 `libafs_hixl_fabric.so`。CANN、HDK（≥ 25.5.0）与设备型号需使用配套组合。
 `data_mode = "grpc" | "rdma" | "hixl" | "auto"` 选择节点间正文通道，控制面走 gRPC，默认使用 `"grpc"`。
 `"hixl"` 用于启用了 HIXL 的 OwnerFs-only Node。HIXL 要求 mTLS 和显式配置 `[hixl].trusted_peers`，名单中的节点必须有 `trusted_node_certs`。默认按需读取，每次由 Home 校验授权。`"auto"` 配置 `[hixl].engine_id` 后为符合条件的 OwnerFs 缓冲读优先选择 HIXL。只有这两种配置选中 HIXL 时才加载模块。`"grpc"` 启动无需模块或 CANN 运行库。
 仅为不可变数据且授权在打开期间保持稳定的部署启用 `ownerfs_snapshot_reads`。HIXL 缓冲写需要两端开启 `ownerfs_buffered_writes`，默认关闭。
@@ -99,9 +99,9 @@ Auto 写的 `[hixl].ownerfs_min_write_bytes` 按本次请求的正文长度判�
 写端推送至 Home 槽位后提交原文件句柄，Home 返回实际写入长度。
 OwnerFs 的 HIXL 传输在设备工作线程调用 `TransferSync`，每批 READ 或 WRITE 提交一次。RoCE 直传注册 Host 缓冲区，启用 `buffer_pool` 时使用中转池；应用写仍以 Home 返回的实际写入长度为准。
 DFS 读写使用各自装配的 RDMA 或 gRPC 路径。
-`[hixl].transport` 选择 `"roce"`（默认）或 `"hccs"`；`buffer_pool` 默认 `false`。RoCE 可直传或启用中转池，A3 同 super-pod 域的 HCCS 必须启用中转池。两端的链路、池开关和启用时的池参数须一致；切换后重启双方 Node。RoCE 启用中转池时，两个 Node 进程都要显式设置 `HCCL_INTRA_ROCE_ENABLE=1`、`HCCL_INTRA_PCIE_ENABLE=0` 和 `HCCL_INTER_HCCS_DISABLE=TRUE`。
+`[hixl].transport` 选择 `"roce"`（默认）或 `"hccs"`；`buffer_pool` 默认 `false`。RoCE 可直传或启用中转池；同一 super-pod 内受支持的 A3 设备可使用 HCCS Buffer Pool 中转或 HCCS FabricMem 直传。两端的链路、内存模式、池开关和启用时的池参数须一致；切换前排空并停止双方 Node，更新配置后再重启。RoCE 启用中转池时，两个 Node 进程都要显式设置 `HCCL_INTRA_ROCE_ENABLE=1`、`HCCL_INTRA_PCIE_ENABLE=0` 和 `HCCL_INTER_HCCS_DISABLE=TRUE`。
 `[[hixl.additional_devices]]` 最多配置 15 个额外设备，含主设备共 16 个。
-每条 lane 分配普通 Host 接收槽和导出槽时，优先选择 NPU 的 PCI NUMA 节点。无法确定 PCI 节点时，才用 `sched_getaffinity` 读取实际分配槽的 owner 线程允许使用的 CPU；只有非空掩码中的每个 CPU 都能确认属于同一个 NUMA 节点时，才用该节点。没有可信节点、已有非默认内存策略或无法设置优先策略时，沿用原策略。
+各 HIXL 模式共用默认容量：每条 lane 使用 4 MiB 窗口、256 个接收槽和 `32 × 8` 个导出槽，合计 2 GiB；启用中转池时另计默认 64 MiB HBM/lane。每条 lane 分配普通 Host 接收槽和导出槽时，优先选择 NPU 的 PCI NUMA 节点。无法确定 PCI 节点时，才用 `sched_getaffinity` 读取实际分配槽的 owner 线程允许使用的 CPU；只有非空掩码中的每个 CPU 都能确认属于同一个 NUMA 节点时，才用该节点。没有可信节点、已有非默认内存策略或无法设置优先策略时，沿用原策略。
 
 `AFS_HIXL_NUMA` 启动日志报告 `source=pci|worker_cpu|unknown` 和 `policy=preferred|inherited`。节点偏好不保证物理页落点，不需要新增 TOML 配置，也不会自动绑核。
 
@@ -109,9 +109,9 @@ DFS 读写使用各自装配的 RDMA 或 gRPC 路径。
 [部署文档](../docs/deployment/afs.md#ownerfs-hixl-预读窗口与目录批量)，协议与失败语义见
 [架构说明](../docs/architecture/afs.md)。A2 RoCE、多设备吞吐、并发 reader 与故障恢复尚未验收。
 
-### 后续计划：HIXL Fabric 内存
+### HCCS FabricMem 直传
 
-AFS 计划支持 Fabric 内存。实现时需要按目标机型核对物理设备号与 Fabric NUMA 节点的映射。上述 PCI 和 owner 线程 CPU 回退规则仅适用于普通 Host 槽池。
+两端设置 `transport = "hccs"`、`buffer_pool = false`、`fabric_mem = true` 才启用 Fabric。普通 Host 和 Host Fabric 共用唯一的 OwnerFs HIXL 线协议 v1。两种模式都必须在协商请求和应答中显式携带有类型的 `memory_kind`；缺省或 `unspecified`（`0`）会被拒绝。Fabric 内存优先由 ADXL 分配，该路径的 NUMA 和页型由 SDK 管理。软件最低条件为 CANN 9.0.0、HDK 25.5。通过 Node 健康状态核对实际内存模式，回退时按部署文档恢复双方原配置。
 
 ## 当前能力边界
 

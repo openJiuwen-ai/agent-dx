@@ -1,6 +1,7 @@
 // Exercises the actual C ABI bridge against a fake external CANN boundary.
 // Official SDK headers remain the ABI contract; no device is initialized.
 #include "../../native/hixl.h"
+#include "../../native/hixl_fabric.h"
 #include <acl/acl_rt.h>
 #include <hixl/hixl.h>
 #include <cassert>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <linux/mempolicy.h>
 #include <sched.h>
 #include <set>
@@ -30,6 +32,33 @@ std::set<uintptr_t> registered_addresses;
 size_t registrations = 0;
 bool retain_failed_start = false;
 bool relay_mode = false;
+bool fabric_mode = false;
+const char *expected_fabric_options = nullptr;
+uint32_t fabric_open_status = hixl::SUCCESS;
+size_t fabric_opens = 0;
+size_t fabric_alloc_attempts = 0;
+size_t fabric_fail_alloc_at = 0;
+bool fabric_throw_allocate = false;
+bool fabric_fail_register = false;
+bool fabric_throw_register = false;
+bool fabric_register_timeout = false;
+bool fabric_initialize_timeout = false;
+uint32_t fabric_connect_status = hixl::SUCCESS;
+bool fabric_throw_connect = false;
+size_t fabric_connect_calls = 0;
+size_t fabric_disconnect_calls = 0;
+size_t fabric_deregister_attempts = 0;
+size_t fabric_deregister_fail_at = 0;
+bool fabric_disconnect_timeout = false;
+bool fabric_deregister_timeout = false;
+bool fabric_fail_deregister = false;
+bool fabric_fail_free = false;
+bool fabric_throw_free = false;
+bool fabric_free_unknown = false;
+bool fabric_connected = false;
+std::map<uintptr_t, size_t> fabric_allocations;
+std::map<uintptr_t, size_t> fabric_registrations;
+std::vector<uintptr_t> fabric_bases;
 uint32_t sync_status = 0;
 size_t sync_calls = 0;
 size_t finalizations = 0;
@@ -170,12 +199,62 @@ extern "C" aclError aclrtMallocHost(void **address, size_t length) {
 }
 extern "C" aclError aclrtFreeHost(void *address) { std::free(address); --allocations; return ACL_SUCCESS; }
 
+namespace afs_hixl_fabric {
+Provider::~Provider() = default;
+uint32_t Provider::open(char *, size_t) {
+    assert(fabric_mode);
+    ++fabric_opens;
+    return fabric_open_status;
+}
+uint32_t Provider::allocate(size_t bytes, void **address, char *, size_t) {
+    assert(fabric_mode && fabric_opens == 1 && fabric_open_status == hixl::SUCCESS);
+    *address = nullptr;
+    if (++fabric_alloc_attempts == fabric_fail_alloc_at) { return hixl::RESOURCE_EXHAUSTED; }
+    assert(bytes == kAllocationAlignment);
+    *address = std::aligned_alloc(kAllocationAlignment, bytes);
+    assert(*address != nullptr);
+    std::memset(*address, 0xa5, bytes);
+    const auto base = reinterpret_cast<uintptr_t>(*address);
+    assert(fabric_allocations.emplace(base, bytes).second);
+    fabric_bases.push_back(base);
+    if (fabric_throw_allocate && fabric_alloc_attempts == 2) {
+        throw std::runtime_error("uncertain Fabric allocation");
+    }
+    return hixl::SUCCESS;
+}
+uint32_t Provider::free(void *address, char *, size_t) {
+    const auto base = reinterpret_cast<uintptr_t>(address);
+    assert(!fabric_connected);
+    assert(fabric_registrations.empty());
+    assert(fabric_allocations.count(base) == 1);
+    if (fabric_throw_free) { throw std::runtime_error("uncertain Fabric free"); }
+    if (fabric_fail_free) { return hixl::FAILED; }
+    if (fabric_free_unknown) { return kOwnershipUnknown; }
+    fabric_allocations.erase(base);
+    std::free(address);
+    return hixl::SUCCESS;
+}
+}
+
 namespace hixl {
 class Hixl::HixlImpl {};
 Hixl::Hixl() = default;
 Hixl::~Hixl() = default;
 Status Hixl::Initialize(const AscendString &, const std::map<AscendString, AscendString> &options) {
     assert(std::string(options.at(AscendString(OPTION_AUTO_CONNECT)).GetString()) == "0");
+    const auto fabric_option = AscendString("EnableUseFabricMem");
+    if (fabric_mode) {
+        const auto global = options.find(AscendString(OPTION_GLOBAL_RESOURCE_CONFIG));
+        if (expected_fabric_options == nullptr) {
+            assert(options.size() == 2 && global == options.end());
+        } else {
+            assert(options.size() == 3 && global != options.end());
+            assert(std::string(global->second.GetString()) == expected_fabric_options);
+        }
+        assert(std::string(options.at(fabric_option).GetString()) == "1");
+        return fabric_initialize_timeout ? TIMEOUT : SUCCESS;
+    }
+    assert(options.count(fabric_option) == 0);
     assert(options.count(AscendString(OPTION_BUFFER_POOL)) == 1);
     const auto pool = std::string(options.at(AscendString(OPTION_BUFFER_POOL)).GetString());
     assert(pool == (relay_mode ? "4:8" : "0:0"));
@@ -208,23 +287,72 @@ Status Hixl::Initialize(const AscendString &, const std::map<AscendString, Ascen
     }
     return SUCCESS;
 }
-void Hixl::Finalize() { ++finalizations; }
+void Hixl::Finalize() {
+    assert(fabric_allocations.empty() && fabric_registrations.empty());
+    ++finalizations;
+}
 Status Hixl::RegisterMem(const MemDesc &desc, MemType type, MemHandle &handle) {
     assert(current_policy == initial_policy && "HIXL RegisterMem must not inherit the slot allocation policy");
     ++registrations;
     assert(!relay_mode);
     if (retain_failed_start && registrations == 2) { return UNSUPPORTED; }
     assert(type == MEM_HOST); assert(desc.addr != 0);
+    if (fabric_mode) {
+        assert(!fabric_connected);
+        assert(fabric_allocations.at(desc.addr) == desc.len);
+        const auto *bytes = reinterpret_cast<const unsigned char *>(desc.addr);
+        for (size_t i = 0; i < desc.len; ++i) { assert(bytes[i] == 0); }
+        if (fabric_fail_register && registrations == 2) { return UNSUPPORTED; }
+        assert(fabric_registrations.emplace(desc.addr, desc.len).second);
+        if (fabric_throw_register && registrations == 2) { throw std::runtime_error("uncertain Fabric registration"); }
+        if (fabric_register_timeout && registrations == 2) { return TIMEOUT; }
+    }
     registered_addresses.insert(desc.addr);
     handle = reinterpret_cast<void *>(desc.addr); return SUCCESS;
 }
-Status Hixl::DeregisterMem(MemHandle) { return retain_failed_start ? FAILED : SUCCESS; }
-Status Hixl::Connect(const AscendString &, int32_t) { return SUCCESS; }
-Status Hixl::Disconnect(const AscendString &, int32_t) { return SUCCESS; }
+Status Hixl::DeregisterMem(MemHandle handle) {
+    if (fabric_mode) {
+        assert(!fabric_connected);
+        ++fabric_deregister_attempts;
+        if (fabric_fail_deregister || fabric_deregister_attempts == fabric_deregister_fail_at) { return FAILED; }
+        assert(fabric_registrations.erase(reinterpret_cast<uintptr_t>(handle)) == 1);
+        if (fabric_deregister_timeout) { return TIMEOUT; }
+    }
+    return retain_failed_start ? FAILED : SUCCESS;
+}
+Status Hixl::Connect(const AscendString &, int32_t) {
+    if (fabric_mode) {
+        assert(fabric_registrations.size() == 2);
+        ++fabric_connect_calls;
+        fabric_connected = true;
+        if (fabric_throw_connect) { throw std::runtime_error("uncertain Fabric connection"); }
+        return fabric_connect_status;
+    }
+    return SUCCESS;
+}
+Status Hixl::Disconnect(const AscendString &, int32_t) {
+    if (fabric_mode) {
+        assert(fabric_connected);
+        ++fabric_disconnect_calls;
+        fabric_connected = false;
+        if (fabric_disconnect_timeout) { return TIMEOUT; }
+    }
+    return SUCCESS;
+}
 Status Hixl::TransferSync(const AscendString &, TransferOp operation, const std::vector<TransferOpDesc> &ops, int32_t timeout) {
     assert(operation == (write_mode ? WRITE : READ)); assert(!ops.empty());
     assert(timeout > 0 && timeout <= 123);
     for (const auto &op : ops) {
+        if (fabric_mode) {
+            const auto inside = [&](uintptr_t base, uintptr_t address) {
+                const size_t length = fabric_registrations.at(base);
+                return address >= base && address - base <= length && op.len <= length - (address - base);
+            };
+            assert(inside(fabric_bases.at(0), op.local_addr));
+            assert(op.local_addr - fabric_bases.at(0) == op.remote_addr - fabric_bases.at(1));
+            assert(inside(fabric_bases.at(1), op.remote_addr));
+            continue;
+        }
         assert(registered_addresses.count(op.local_addr) == (relay_mode ? 0 : 1));
         if (write_mode) { assert(registered_addresses.count(op.remote_addr) == (relay_mode ? 0 : 1)); }
     }
@@ -304,6 +432,198 @@ int main(int argc, char **argv) {
     void *runtime = nullptr;
     uint64_t actual_domain = 0;
     const std::string scenario(argv[1]);
+    fabric_mode = scenario.find("fabric-") == 0;
+    if (fabric_mode) {
+        assert(afs_hixl_abi_version() == 3);
+        assert(AFS_HIXL_TRANSPORT_HCCS_FABRIC == 3);
+        if (scenario == "fabric-unsupported-soc") { soc_name = "Ascend910B2"; }
+        if (scenario == "fabric-unknown-domain") { fail_domain = true; }
+        if (scenario == "fabric-provider-unavailable") { fabric_open_status = hixl::UNSUPPORTED; }
+        if (scenario == "fabric-partial-allocate") { fabric_fail_alloc_at = 2; }
+        fabric_fail_register = scenario == "fabric-partial-register" || scenario == "fabric-start-quarantine";
+        fabric_fail_deregister = scenario == "fabric-start-quarantine";
+        fabric_throw_allocate = scenario == "fabric-allocate-exception";
+        fabric_throw_register = scenario == "fabric-register-exception";
+        fabric_register_timeout = scenario == "fabric-register-timeout";
+        fabric_initialize_timeout = scenario == "fabric-initialize-timeout";
+        const uint32_t port = scenario == "fabric-listen-port" ? 27666 : 0;
+        const size_t pool = scenario == "fabric-invalid-pool" ? 4 : 0;
+        // The 4096-slot case exceeds the direct registration ceiling; it still
+        // uses just two small, rounded slabs and doesn't need large test memory.
+        const size_t slots = scenario == "fabric-capacity" ? 4096 : 3;
+        const auto unset = AFS_HIXL_FABRIC_OPTION_UNSET;
+        afs_hixl_fabric_options_t tuning{unset, unset, unset, unset, unset};
+        const afs_hixl_fabric_options_t *fabric_options = nullptr;
+        if (scenario == "fabric-sdk-tuning") {
+            tuning = {0, 8, 64, 0, 12};
+            fabric_options = &tuning;
+            expected_fabric_options =
+                R"({"fabric_memory.enable_aicpu_unfold":false,"fabric_memory.task_stream_num":8,"fabric_memory.max_capacity":64,"fabric_memory.start_address":0,"transfer_config.max_transfer_count_per_batch":12})";
+        } else if (scenario == "fabric-sdk-partial") {
+            tuning = {1, unset, unset, unset, unset};
+            fabric_options = &tuning;
+            expected_fabric_options = R"({"fabric_memory.enable_aicpu_unfold":true})";
+        } else if (scenario == "fabric-sdk-invalid") {
+            tuning.task_streams = 2;
+            fabric_options = &tuning;
+        }
+        const auto status = afs_hixl_start(0, "127.0.0.1:7920", port, 4, slots, slots,
+            AFS_HIXL_TRANSPORT_HCCS_FABRIC, pool, pool, fabric_options, &actual_domain, &runtime, error, sizeof(error));
+        assert(allocations == 0 && host_alloc_policies.empty());
+        if (scenario == "fabric-listen-port" || scenario == "fabric-invalid-pool" ||
+            scenario == "fabric-sdk-invalid") {
+            assert(status == hixl::PARAM_INVALID && runtime == nullptr && actual_domain == 0);
+            assert(acl_init_calls == 0 && fabric_opens == 0 && registrations == 0);
+            return 0;
+        }
+        if (scenario == "fabric-unsupported-soc" || scenario == "fabric-unknown-domain" ||
+            scenario == "fabric-provider-unavailable" || scenario == "fabric-partial-allocate" ||
+            scenario == "fabric-partial-register") {
+            assert(status == (scenario == "fabric-partial-allocate" ? hixl::RESOURCE_EXHAUSTED : hixl::UNSUPPORTED));
+            assert(runtime == nullptr && actual_domain == 0);
+            assert(fabric_allocations.empty() && fabric_registrations.empty());
+            assert(acl_finalize_calls == 1);
+            if (scenario == "fabric-unsupported-soc" || scenario == "fabric-unknown-domain") {
+                assert(fabric_opens == 0 && finalizations == 0);
+            }
+            return 0;
+        }
+        if (fabric_initialize_timeout) {
+            assert(status == hixl::TIMEOUT && runtime != nullptr && actual_domain == 0);
+            assert(fabric_alloc_attempts == 0 && finalizations == 0 && acl_finalize_calls == 0);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            return 0;
+        }
+        if (scenario == "fabric-start-quarantine" || fabric_throw_register || fabric_throw_allocate ||
+            fabric_register_timeout) {
+            assert(status != hixl::SUCCESS && runtime != nullptr && actual_domain == 0);
+            assert(fabric_registrations.size() == (fabric_throw_register || fabric_register_timeout ? 2 : 1));
+            assert(fabric_allocations.size() == 2);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != hixl::SUCCESS);
+            assert(finalizations == 0 && acl_finalize_calls == 0);
+            return 0;
+        }
+        assert(status == hixl::SUCCESS && runtime != nullptr && actual_domain == 7);
+        assert(fabric_allocations.size() == 2 && registrations == 2);
+        const char *peer = "127.0.0.1:7921";
+        fabric_throw_connect = scenario == "fabric-connect-exception";
+        if (scenario == "fabric-connect-timeout") { fabric_connect_status = hixl::TIMEOUT; }
+        if (scenario == "fabric-connect-failure") { fabric_connect_status = hixl::FAILED; }
+        if (fabric_connect_status != hixl::SUCCESS || fabric_throw_connect) {
+            assert(afs_hixl_connect(runtime, peer, 123, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            assert(afs_hixl_connect(runtime, peer, 123, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            assert(fabric_connect_calls == 1 && fabric_disconnect_calls == 0 && fabric_deregister_attempts == 0);
+            assert(fabric_connected && fabric_allocations.size() == 2 && fabric_registrations.size() == 2);
+            return 0;
+        }
+        assert(afs_hixl_connect(runtime, peer, 123, error, sizeof(error)) == hixl::SUCCESS);
+        afs_hixl_window_t window{};
+        const auto slot = slots - 1;
+        assert(afs_hixl_reserve_export(runtime, slot, 1, 4, &window, error, sizeof(error)) == hixl::SUCCESS);
+        assert(window.address == fabric_bases.at(1) + 4 * slot && window.length == 4);
+        auto *remote = reinterpret_cast<uint8_t *>(window.address);
+        const uint8_t payload[4] = {1, 2, 3, 4};
+        std::memcpy(remote, payload, sizeof(payload));
+        uint32_t started = 0;
+        uint64_t transfer_ns = 0;
+        uint64_t copy_ns = 0;
+        uint8_t output[4] = {};
+        assert(read_sync_one(runtime, slot, peer, window.address, output, sizeof(output), 123, &started,
+            &transfer_ns, &copy_ns, error, sizeof(error)) == hixl::SUCCESS);
+        assert(started == 1 && std::memcmp(output, payload, sizeof(output)) == 0);
+        sync_status = scenario == "fabric-write-timeout" ? hixl::TIMEOUT : hixl::SUCCESS;
+        const uint8_t replacement[4] = {8, 7, 6, 5};
+        const afs_hixl_batch_window_t write_window{slot, window.address, sizeof(replacement)};
+        if (scenario == "fabric-pinned-drain") {
+            uint64_t address = 0;
+            assert(afs_hixl_read_sync_batch(runtime, peer, &write_window, 1, &address, 123, &started,
+                &transfer_ns, error, sizeof(error)) == hixl::SUCCESS);
+            assert(started == 1 && address != 0);
+            assert(afs_hixl_release_export(runtime, slot, 1, error, sizeof(error)) == hixl::SUCCESS);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == hixl::FAILED);
+            assert(fabric_disconnect_calls == 0 && fabric_deregister_attempts == 0);
+            assert(afs_hixl_release_receives(runtime, &write_window.slot_id, 1, error, sizeof(error)) == hixl::SUCCESS);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == hixl::SUCCESS);
+            afs_hixl_destroy(runtime);
+            assert(fabric_allocations.empty() && fabric_registrations.empty() && finalizations == 1);
+            return 0;
+        }
+        write_mode = true;
+        const auto write_status = afs_hixl_write_batch(runtime, peer, &write_window, 1, replacement, sizeof(replacement), 123,
+            &started, error, sizeof(error));
+        assert(write_status == sync_status && started == 1);
+        if (sync_status == hixl::TIMEOUT) {
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            assert(fabric_connected && fabric_allocations.size() == 2 && fabric_registrations.size() == 2);
+            return 0;
+        }
+        assert(std::memcmp(remote, replacement, sizeof(replacement)) == 0);
+        assert(afs_hixl_release_export(runtime, slot, 1, error, sizeof(error)) == hixl::SUCCESS);
+        fabric_disconnect_timeout = scenario == "fabric-disconnect-timeout";
+        fabric_deregister_timeout = scenario == "fabric-deregister-timeout";
+        if (fabric_disconnect_timeout || fabric_deregister_timeout) {
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            const size_t deregistered = fabric_deregister_timeout ? 1 : 0;
+            assert(fabric_disconnect_calls == 1 && fabric_deregister_attempts == deregistered);
+            assert(fabric_allocations.size() == 2 && fabric_registrations.size() == 2 - deregistered);
+            assert(finalizations == 0 && acl_finalize_calls == 0);
+            return 0;
+        }
+        if (scenario == "fabric-deregister-retry") {
+            fabric_deregister_fail_at = 2;
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == hixl::FAILED);
+            assert(fabric_disconnect_calls == 1 && fabric_deregister_attempts == 2);
+            assert(fabric_allocations.size() == 2 && fabric_registrations.size() == 1 && finalizations == 0);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == hixl::SUCCESS);
+            assert(fabric_disconnect_calls == 1 && fabric_deregister_attempts == 3);
+            afs_hixl_destroy(runtime);
+            assert(fabric_allocations.empty() && fabric_registrations.empty() && finalizations == 1);
+            return 0;
+        }
+        if (scenario == "fabric-free-unknown") {
+            fabric_free_unknown = true;
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            fabric_free_unknown = false;
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+            assert(fabric_allocations.size() == 2 && fabric_registrations.empty() && finalizations == 0);
+            return 0;
+        }
+        if (scenario == "fabric-free-retry" || scenario == "fabric-free-exception") {
+            fabric_fail_free = scenario == "fabric-free-retry";
+            fabric_throw_free = !fabric_fail_free;
+            const auto expected = fabric_throw_free ? AFS_HIXL_QUARANTINED : hixl::FAILED;
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == expected);
+            assert(!fabric_connected && fabric_allocations.size() == 2 && finalizations == 0);
+            assert(afs_hixl_connect(runtime, peer, 123, error, sizeof(error)) == expected);
+            fabric_fail_free = false;
+            if (fabric_throw_free) {
+                fabric_throw_free = false;
+                assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == AFS_HIXL_QUARANTINED);
+                assert(fabric_allocations.size() == 2 && finalizations == 0);
+                return 0;
+            }
+        }
+        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == hixl::SUCCESS);
+        afs_hixl_destroy(runtime);
+        assert(fabric_allocations.empty() && fabric_registrations.empty() && finalizations == 1);
+        return 0;
+    }
+    if (scenario == "roce-registration-ceiling" || scenario == "roce-default-slot-count") {
+        const size_t slots = scenario == "roce-registration-ceiling" ? 2001 : 256;
+        const auto status = afs_hixl_start(0, "127.0.0.1:7920", 0, 4, slots, slots,
+            AFS_HIXL_TRANSPORT_ROCE, 0, 0, nullptr, &actual_domain, &runtime, error, sizeof(error));
+        if (slots == 2001) {
+            assert(status == hixl::RESOURCE_EXHAUSTED && runtime == nullptr && allocations == 0);
+        } else {
+            assert(status == hixl::SUCCESS && registrations == 2 * slots);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == hixl::SUCCESS);
+            afs_hixl_destroy(runtime);
+            assert(allocations == 0);
+        }
+        return 0;
+    }
     const bool roce_pool = scenario.find("roce-pool-") == 0;
     const bool hccs = scenario.find("hccs-") == 0 || scenario == "numa-relay";
     relay_mode = hccs || roce_pool;
@@ -344,7 +664,7 @@ int main(int argc, char **argv) {
 
         const auto status = afs_hixl_start(numa_user_id, "127.0.0.1:7920", 0, 4, 1, 1,
             hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
-            relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error));
+            relay_mode ? 4 : 0, relay_mode ? 8 : 0, nullptr, &actual_domain, &runtime, error, sizeof(error));
         if (fail_host_alloc_at != 0) {
             assert(status != 0 && runtime == nullptr && allocations == 0);
             assert(std::strstr(error, "aclrtMallocHost") != nullptr);
@@ -388,12 +708,21 @@ int main(int argc, char **argv) {
     auto start = [&](size_t count = 4, size_t size_mib = 8) {
         return afs_hixl_start(0, "127.0.0.1:7920", expected_listen_port, 4, 1, 1,
             hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
-            relay_mode ? count : 0, relay_mode ? size_mib : 0, &actual_domain, &runtime, error, sizeof(error));
+            relay_mode ? count : 0, relay_mode ? size_mib : 0, nullptr, &actual_domain, &runtime, error, sizeof(error));
     };
+    if (scenario == "roce-rejects-fabric-sdk-options") {
+        const auto unset = AFS_HIXL_FABRIC_OPTION_UNSET;
+        const afs_hixl_fabric_options_t tuning{unset, unset, unset, 0, unset};
+        assert(afs_hixl_start(0, "127.0.0.1:7920", 0, 4, 1, 1,
+            AFS_HIXL_TRANSPORT_ROCE, 0, 0, &tuning, &actual_domain, &runtime, error, sizeof(error)) ==
+            hixl::PARAM_INVALID);
+        assert(runtime == nullptr && acl_init_calls == 0);
+        return 0;
+    }
     auto start_on = [&](int32_t device_id, const char *engine_id, uint32_t listen_port, void **out) {
         expected_listen_port = listen_port;
         return afs_hixl_start(device_id, engine_id, listen_port, 4, 1, 1,
-            AFS_HIXL_TRANSPORT_ROCE, 0, 0, &actual_domain, out, error, sizeof(error));
+            AFS_HIXL_TRANSPORT_ROCE, 0, 0, nullptr, &actual_domain, out, error, sizeof(error));
     };
     if (scenario == "hccs-direct" || scenario == "hccs-partial-pool" || scenario == "roce-pool-partial") {
         assert(start(scenario == "hccs-direct" ? 0 : 4, 0) == hixl::PARAM_INVALID);
@@ -518,7 +847,7 @@ int main(int argc, char **argv) {
         constexpr char peer[] = "127.0.0.1:7921";
         assert(afs_hixl_start(0, "127.0.0.1:7920", 0, 4, 2, 2,
             hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
-            relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error)) == 0);
+            relay_mode ? 4 : 0, relay_mode ? 8 : 0, nullptr, &actual_domain, &runtime, error, sizeof(error)) == 0);
         assert(afs_hixl_connect(runtime, peer, 1000, error, sizeof(error)) == 0);
         afs_hixl_window_t exports[2]{};
         assert(afs_hixl_reserve_export(runtime, 0, 1, 3, &exports[0], error, sizeof(error)) == 0);
@@ -567,7 +896,7 @@ int main(int argc, char **argv) {
         constexpr size_t total_bytes = window_count * window_bytes;
         assert(afs_hixl_start(0, "127.0.0.1:7920", expected_listen_port, window_bytes, window_count, 1,
             hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
-            relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error)) == 0);
+            relay_mode ? 4 : 0, relay_mode ? 8 : 0, nullptr, &actual_domain, &runtime, error, sizeof(error)) == 0);
         assert(allocations == window_count + 1);
         assert(afs_hixl_connect(runtime, "127.0.0.1:7921", 1000, error, sizeof(error)) == 0);
 

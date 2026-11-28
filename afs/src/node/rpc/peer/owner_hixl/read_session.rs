@@ -4,6 +4,7 @@ use super::batch::{
     BatchFetched, BatchRequest, BatchRoute, BatchStore, Claim, FileVersion, batch_cap,
     batch_reservation,
 };
+use super::group_trace::{GroupTrace, ReadyGroup};
 use super::{
     FetchRequest, Fetched, OwnerHixlReader, ReadOutcome, protocol_error, remaining,
     unsupported_read,
@@ -30,11 +31,22 @@ struct CachedWindow {
     bytes: prost::bytes::Bytes,
     eof: bool,
     epoch: u64,
+    trace: Option<ReadyGroup>,
 }
 
 impl CachedWindow {
     fn end(&self) -> u64 {
         self.offset.saturating_add(self.bytes.len() as u64)
+    }
+
+    fn trace_consumed(&mut self, offset: u64, count: usize, path: &'static str) {
+        if self.trace.is_some()
+            && count != 0
+            && offset.saturating_add(count as u64) == self.end()
+            && let Some(trace) = self.trace.take()
+        {
+            trace.emit("window_consumed", self.bytes.len(), path);
+        }
     }
 
     /// A shared slice when the window holds the whole requested range, or the
@@ -69,6 +81,7 @@ impl CachedWindow {
 struct PendingWindow {
     offset: u64,
     epoch: u64,
+    trace: Option<GroupTrace>,
     receiver: oneshot::Receiver<afs_error::Result<Fetched>>,
 }
 
@@ -325,9 +338,10 @@ impl OwnerReadSession {
         }
         let window = state
             .window
-            .as_ref()
+            .as_mut()
             .filter(|window| window.epoch == epoch)?;
         let hit = window.slice_at(offset, size)?;
+        window.trace_consumed(offset, hit.len(), "slice");
         state.streak = if offset == state.next_offset {
             state.streak.saturating_add(1)
         } else {
@@ -432,9 +446,10 @@ impl OwnerReadSession {
         let mut cursor = offset;
         let mut fetched = false;
         while served < out.len() {
-            if let Some(window) = &state.window {
+            if let Some(window) = &mut state.window {
                 let copied = window.copy_at(cursor, &mut out[served..]);
                 if copied > 0 {
+                    window.trace_consumed(cursor, copied, "copy");
                     served += copied;
                     cursor += copied as u64;
                     continue;
@@ -448,12 +463,23 @@ impl OwnerReadSession {
             if let Some(pending) = state.pending.take()
                 && pending.offset == cursor
             {
+                let trace = pending.trace;
+                if let Some(trace) = trace {
+                    trace.emit("demand_wait_start", "", 0, 0, "prefetch");
+                }
                 let waited = handle.block_on(async {
                     match remaining(deadline) {
                         Ok(wait) => tokio::time::timeout(wait, pending.receiver).await.ok(),
                         Err(_) => None,
                     }
                 });
+                if let Some(trace) = trace {
+                    match &waited {
+                        Some(Ok(result)) => trace_wait_end(trace, result),
+                        Some(Err(_)) => trace.emit("demand_wait_end", "", 0, 0, "worker_error"),
+                        None => trace.emit("demand_wait_end", "", 0, 0, "timeout"),
+                    }
+                }
                 match waited {
                     Some(Ok(Ok(Fetched::Window(window)))) => {
                         if entry.epoch.load(Ordering::Acquire) == epoch {
@@ -462,6 +488,7 @@ impl OwnerReadSession {
                                 bytes: window.bytes,
                                 eof: window.eof,
                                 epoch,
+                                trace: window.trace,
                             });
                             reader.count(ReadOutcome::PrefetchHit);
                             continue;
@@ -512,7 +539,11 @@ impl OwnerReadSession {
             };
             let deadline = request.deadline;
             let keep_window = cacheable && budget.is_some();
-            let task = handle.spawn(reader.clone().fetch(request, budget));
+            let trace = GroupTrace::reader(cursor, size);
+            if let Some(trace) = trace {
+                trace.emit("demand_wait_start", "", 0, 0, "direct");
+            }
+            let task = handle.spawn(reader.clone().fetch_traced(request, budget, trace));
             let result = handle.block_on(async move {
                 tokio::time::timeout(remaining(deadline)?, task)
                     .await
@@ -525,18 +556,23 @@ impl OwnerReadSession {
                     .map_err(|error| {
                         afs_error::Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string())
                     })?
-            })?;
-            match result {
+            });
+            if let Some(trace) = trace {
+                trace_wait_end(trace, &result);
+            }
+            match result? {
                 // Without budget the window serves only this READ.
                 Fetched::Window(window) if !keep_window => {
                     fetched = true;
-                    let transient = CachedWindow {
+                    let mut transient = CachedWindow {
                         offset: window.offset,
                         bytes: window.bytes,
                         eof: window.eof,
                         epoch,
+                        trace: window.trace,
                     };
                     let copied = transient.copy_at(cursor, &mut out[served..]);
+                    transient.trace_consumed(cursor, copied, "copy");
                     served += copied;
                     cursor += copied as u64;
                     if copied == 0 || transient.eof {
@@ -550,6 +586,7 @@ impl OwnerReadSession {
                         bytes: window.bytes,
                         eof: window.eof,
                         epoch,
+                        trace: window.trace,
                     });
                 }
                 Fetched::Fallback if policy.mode == DataMode::Auto => {
@@ -788,16 +825,36 @@ impl OwnerReadSession {
             deadline,
         };
         let (sender, receiver) = oneshot::channel();
-        let fetch = reader.clone().fetch(request, Some(budget));
+        let trace = GroupTrace::reader(offset, size);
+        if let Some(trace) = trace {
+            trace.emit("prefetch_submit", "", 0, 0, "queued");
+        }
+        let fetch = reader.clone().fetch_traced(request, Some(budget), trace);
         handle.spawn(async move {
             let _ = sender.send(fetch.await);
         });
         state.pending = Some(PendingWindow {
             offset,
             epoch,
+            trace,
             receiver,
         });
     }
+}
+
+fn trace_wait_end(trace: GroupTrace, result: &afs_error::Result<Fetched>) {
+    let outcome = match result {
+        Ok(Fetched::Window(window)) => {
+            if let Some(ready) = &window.trace {
+                ready.emit("demand_wait_end", window.bytes.len(), "ready");
+                return;
+            }
+            "ready"
+        }
+        Ok(Fetched::Fallback) => "fallback",
+        Err(_) => "error",
+    };
+    trace.emit("demand_wait_end", "", 0, 0, outcome);
 }
 
 /// The directory of a batch-eligible open, keyed by root so two roots of one

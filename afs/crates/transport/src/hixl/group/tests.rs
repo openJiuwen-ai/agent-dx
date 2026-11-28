@@ -23,6 +23,23 @@ fn group_options_validate_listener_and_canonical_engine_identity() {
 }
 
 #[test]
+fn fabric_lanes_require_distinct_engines_without_listener_overrides() {
+    let mut first = options(0, 27000);
+    let mut second = options(1, 27001);
+    for lane in [&mut first, &mut second] {
+        lane.transport = ReadTransport::HccsFabric;
+        lane.device_listen_port = None;
+    }
+    assert!(validate_group_options(&[first.clone(), second.clone()]).is_ok());
+    second.device_listen_port = Some(27001);
+    let error = validate_group_options(&[first.clone(), second.clone()]).unwrap_err();
+    assert!(error.message.contains("device_listen_port"));
+    second.device_listen_port = None;
+    second.engine_id = first.engine_id.clone();
+    assert!(validate_group_options(&[first, second]).is_err());
+}
+
+#[test]
 fn group_options_require_one_to_sixteen_lanes() {
     assert_eq!(
         validate_group_options(&[]).unwrap_err().kind,
@@ -150,7 +167,7 @@ mod lifecycle {
         RuntimeOptions {
             device_id,
             engine_id: format!("127.0.0.1:{}", 7920 + device_id),
-            device_listen_port: Some(27000 + device_id as u16),
+            device_listen_port: (!transport.is_fabric_mem()).then_some(27000 + device_id as u16),
             transport,
             buffer_pool: transport == ReadTransport::Hccs,
             ..RuntimeOptions::default()
@@ -341,6 +358,47 @@ mod lifecycle {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[test]
+    fn fabric_mem_requires_every_lane_in_the_same_verified_domain() {
+        for (domains, valid) in [
+            ([Some(7), Some(7)], true),
+            ([Some(7), Some(8)], false),
+            ([Some(7), None], false),
+            ([None, Some(7)], false),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let result = HixlRuntimeGroup::start_with(
+                vec![
+                    options(0, ReadTransport::HccsFabric),
+                    options(1, ReadTransport::HccsFabric),
+                ],
+                |options| {
+                    Ok(fake_runtime(
+                        &options,
+                        domains[options.device_id as usize],
+                        None,
+                        Arc::clone(&calls),
+                    ))
+                },
+            );
+            if valid {
+                let group = result.unwrap();
+                assert_eq!(
+                    group.status().allocated_bytes as u64,
+                    4 * 1024 * 1024 * 1024
+                );
+                assert_eq!(group.status().relay_hbm_budget_bytes, 0);
+                group.shutdown().unwrap();
+            } else {
+                let Err(error) = result else {
+                    panic!("accepted invalid FabricMem domains: {domains:?}");
+                };
+                assert_eq!(error.kind, HixlErrorKind::InvalidArgument);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
     /// A lane that records each shutdown with its device id, in order.
     fn recording_runtime(
         options: &RuntimeOptions,
@@ -418,13 +476,17 @@ mod lifecycle {
 
     #[test]
     fn quarantine_attempts_every_lane_on_both_planes() {
-        for transport in [ReadTransport::Roce, ReadTransport::Hccs] {
+        for transport in [
+            ReadTransport::Roce,
+            ReadTransport::Hccs,
+            ReadTransport::HccsFabric,
+        ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let group =
                 HixlRuntimeGroup::start_with(vec![options(0, transport), options(1, transport)], {
                     let calls = Arc::clone(&calls);
                     move |options| {
-                        let domain = (transport == ReadTransport::Hccs).then_some(7);
+                        let domain = transport.is_hccs().then_some(7);
                         Ok(fake_runtime(&options, domain, None, Arc::clone(&calls)))
                     }
                 })
@@ -485,9 +547,9 @@ mod lifecycle {
         let status = group.status();
         assert_eq!(group.len(), 2);
         assert_eq!(group.infos().len(), 2);
-        assert_eq!(status.allocated_bytes, 256 * 1024 * 1024);
+        assert_eq!(status.allocated_bytes as u64, 4 * 1024 * 1024 * 1024);
         assert_eq!(status.relay_hbm_budget_bytes, 128 * 1024 * 1024);
-        assert_eq!(status.export_slots, 32);
+        assert_eq!(status.export_slots, 512);
         assert_eq!(status.state, RuntimeState::Running);
     }
 }
