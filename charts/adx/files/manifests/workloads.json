@@ -1,0 +1,998 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "labels": {
+          "app": "activator"
+        },
+        "name": "activator"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "activator"
+          }
+        },
+        "strategy": {
+          "type": "Recreate"
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "activator"
+            }
+          },
+          "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "ADX_RUNTIME_PAYLOAD"
+                  },
+                  {
+                    "name": "POD_IP",
+                    "valueFrom": {
+                      "fieldRef": {
+                        "apiVersion": "v1",
+                        "fieldPath": "status.podIP"
+                      }
+                    }
+                  },
+                  {
+                    "name": "POD_NAME",
+                    "valueFrom": {
+                      "fieldRef": {
+                        "apiVersion": "v1",
+                        "fieldPath": "metadata.name"
+                      }
+                    }
+                  }
+                ],
+                "imagePullPolicy": "IfNotPresent",
+                "name": "activator",
+                "ports": [
+                  {
+                    "containerPort": 8091,
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "failureThreshold": 3,
+                  "initialDelaySeconds": 3,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "tcpSocket": {
+                    "port": 8091
+                  },
+                  "timeoutSeconds": 1
+                },
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  },
+                  "readOnlyRootFilesystem": true
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/secrets",
+                    "name": "credentials"
+                  },
+                  {
+                    "mountPath": "/work",
+                    "name": "work"
+                  },
+                  {
+                    "mountPath": "/tmp",
+                    "name": "tmp"
+                  },
+                  {
+                    "mountPath": "/opt/adx/bootstrap.py",
+                    "name": "bootstrap",
+                    "readOnly": true,
+                    "subPath": "bootstrap.py"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {
+              "fsGroup": 10001,
+              "runAsGroup": 10001,
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+              {
+                "name": "credentials",
+                "secret": {
+                  "defaultMode": 288,
+                  "items": [
+                    {
+                      "key": "ca.pem",
+                      "path": "ca.pem"
+                    },
+                    {
+                      "key": "redis-key",
+                      "path": "redis-key"
+                    },
+                    {
+                      "key": "execd-token",
+                      "path": "execd-token"
+                    },
+                    {
+                      "key": "service-token",
+                      "path": "service-token"
+                    },
+                    {
+                      "key": "tenant-key",
+                      "path": "tenant-key"
+                    }
+                  ]
+                }
+              },
+              {
+                "emptyDir": {},
+                "name": "work"
+              },
+              {
+                "emptyDir": {},
+                "name": "tmp"
+              },
+              {
+                "configMap": {
+                  "defaultMode": 420
+                },
+                "name": "bootstrap"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "labels": {
+          "app": "apiserver"
+        },
+        "name": "apiserver"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "apiserver"
+          }
+        },
+        "strategy": {
+          "type": "Recreate"
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "apiserver"
+            }
+          },
+          "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "ADX_RUNTIME_PAYLOAD"
+                  }
+                ],
+                "imagePullPolicy": "IfNotPresent",
+                "name": "apiserver",
+                "ports": [
+                  {
+                    "containerPort": 8888,
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "failureThreshold": 3,
+                  "initialDelaySeconds": 3,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "tcpSocket": {
+                    "port": 8888
+                  },
+                  "timeoutSeconds": 1
+                },
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  },
+                  "readOnlyRootFilesystem": true
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/secrets",
+                    "name": "credentials"
+                  },
+                  {
+                    "mountPath": "/work",
+                    "name": "work"
+                  },
+                  {
+                    "mountPath": "/tmp",
+                    "name": "tmp"
+                  },
+                  {
+                    "mountPath": "/opt/adx/bootstrap.py",
+                    "name": "bootstrap",
+                    "readOnly": true,
+                    "subPath": "bootstrap.py"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {
+              "fsGroup": 10001,
+              "runAsGroup": 10001,
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+              {
+                "name": "credentials",
+                "secret": {
+                  "defaultMode": 288,
+                  "items": [
+                    {
+                      "key": "ca.pem",
+                      "path": "ca.pem"
+                    },
+                    {
+                      "key": "apiserver.pem",
+                      "path": "apiserver.pem"
+                    },
+                    {
+                      "key": "apiserver.key",
+                      "path": "apiserver.key"
+                    },
+                    {
+                      "key": "redis-key",
+                      "path": "redis-key"
+                    },
+                    {
+                      "key": "execd-token",
+                      "path": "execd-token"
+                    }
+                  ]
+                }
+              },
+              {
+                "emptyDir": {},
+                "name": "work"
+              },
+              {
+                "emptyDir": {},
+                "name": "tmp"
+              },
+              {
+                "configMap": {
+                  "defaultMode": 420
+                },
+                "name": "bootstrap"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "labels": {
+          "app": "coordinator"
+        },
+        "name": "coordinator"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "coordinator"
+          }
+        },
+        "strategy": {
+          "type": "Recreate"
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "coordinator"
+            }
+          },
+          "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "ADX_RUNTIME_PAYLOAD"
+                  }
+                ],
+                "imagePullPolicy": "IfNotPresent",
+                "name": "coordinator",
+                "ports": [
+                  {
+                    "containerPort": 17000,
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "failureThreshold": 3,
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "tcpSocket": {
+                    "port": 17000
+                  },
+                  "timeoutSeconds": 1
+                },
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  },
+                  "readOnlyRootFilesystem": true
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/secrets",
+                    "name": "credentials"
+                  },
+                  {
+                    "mountPath": "/work",
+                    "name": "work"
+                  },
+                  {
+                    "mountPath": "/tmp",
+                    "name": "tmp"
+                  },
+                  {
+                    "mountPath": "/opt/adx/bootstrap.py",
+                    "name": "bootstrap",
+                    "readOnly": true,
+                    "subPath": "bootstrap.py"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {
+              "fsGroup": 10001,
+              "runAsGroup": 10001,
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+              {
+                "name": "credentials",
+                "secret": {
+                  "defaultMode": 288,
+                  "items": [
+                    {
+                      "key": "ca.pem",
+                      "path": "ca.pem"
+                    },
+                    {
+                      "key": "coordinator.pem",
+                      "path": "coordinator.pem"
+                    },
+                    {
+                      "key": "coordinator.key",
+                      "path": "coordinator.key"
+                    },
+                    {
+                      "key": "apiserver.der",
+                      "path": "apiserver.der"
+                    },
+                    {
+                      "key": "ingress.der",
+                      "path": "ingress.der"
+                    },
+                    {
+                      "key": "node.der",
+                      "path": "node.der"
+                    },
+                    {
+                      "key": "admin-key",
+                      "path": "admin-key"
+                    },
+                    {
+                      "key": "tenant-key",
+                      "path": "tenant-key"
+                    },
+                    {
+                      "key": "redis-key",
+                      "path": "redis-key"
+                    },
+                    {
+                      "key": "execd-token",
+                      "path": "execd-token"
+                    }
+                  ]
+                }
+              },
+              {
+                "emptyDir": {},
+                "name": "work"
+              },
+              {
+                "emptyDir": {},
+                "name": "tmp"
+              },
+              {
+                "configMap": {
+                  "defaultMode": 420
+                },
+                "name": "bootstrap"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "labels": {
+          "app": "ingress"
+        },
+        "name": "ingress"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "ingress"
+          }
+        },
+        "strategy": {
+          "rollingUpdate": {
+            "maxSurge": 0,
+            "maxUnavailable": 1
+          },
+          "type": "RollingUpdate"
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "ingress"
+            }
+          },
+          "spec": {
+            "affinity": {
+              "podAntiAffinity": {
+                "preferredDuringSchedulingIgnoredDuringExecution": [
+                  {
+                    "podAffinityTerm": {
+                      "labelSelector": {
+                        "matchLabels": {
+                          "app": "ingress"
+                        }
+                      },
+                      "topologyKey": "kubernetes.io/hostname"
+                    },
+                    "weight": 100
+                  }
+                ]
+              }
+            },
+            "automountServiceAccountToken": false,
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "ADX_RUNTIME_PAYLOAD"
+                  }
+                ],
+                "imagePullPolicy": "IfNotPresent",
+                "name": "ingress",
+                "ports": [
+                  {
+                    "containerPort": 8080,
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 8443,
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/readyz",
+                    "port": 18080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  },
+                  "readOnlyRootFilesystem": true
+                },
+                "startupProbe": {
+                  "failureThreshold": 36,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 18080,
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/secrets",
+                    "name": "credentials"
+                  },
+                  {
+                    "mountPath": "/work",
+                    "name": "work"
+                  },
+                  {
+                    "mountPath": "/tmp",
+                    "name": "tmp"
+                  },
+                  {
+                    "mountPath": "/opt/adx/bootstrap.py",
+                    "name": "bootstrap",
+                    "readOnly": true,
+                    "subPath": "bootstrap.py"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {
+              "fsGroup": 10001,
+              "runAsGroup": 10001,
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+              {
+                "name": "credentials",
+                "secret": {
+                  "defaultMode": 288,
+                  "items": [
+                    {
+                      "key": "ca.pem",
+                      "path": "ca.pem"
+                    },
+                    {
+                      "key": "ingress.pem",
+                      "path": "ingress.pem"
+                    },
+                    {
+                      "key": "ingress.key",
+                      "path": "ingress.key"
+                    },
+                    {
+                      "key": "coordinator.der",
+                      "path": "coordinator.der"
+                    },
+                    {
+                      "key": "redis-key",
+                      "path": "redis-key"
+                    },
+                    {
+                      "key": "execd-token",
+                      "path": "execd-token"
+                    },
+                    {
+                      "key": "service-token",
+                      "path": "service-token"
+                    },
+                    {
+                      "key": "tenant-key",
+                      "path": "tenant-key"
+                    }
+                  ]
+                }
+              },
+              {
+                "emptyDir": {},
+                "name": "work"
+              },
+              {
+                "emptyDir": {},
+                "name": "tmp"
+              },
+              {
+                "configMap": {
+                  "defaultMode": 420
+                },
+                "name": "bootstrap"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "StatefulSet",
+      "metadata": {
+        "labels": {
+          "adx.deployment": "adx-example",
+          "app.kubernetes.io/part-of": "adx"
+        },
+        "name": "adx-node"
+      },
+      "spec": {
+        "persistentVolumeClaimRetentionPolicy": {
+          "whenDeleted": "Retain",
+          "whenScaled": "Retain"
+        },
+        "podManagementPolicy": "OrderedReady",
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "adx-node"
+          }
+        },
+        "serviceName": "adx-node",
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "adx-node"
+            }
+          },
+          "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "POD_NAME",
+                    "valueFrom": {
+                      "fieldRef": {
+                        "apiVersion": "v1",
+                        "fieldPath": "metadata.name"
+                      }
+                    }
+                  },
+                  {
+                    "name": "POD_IP",
+                    "valueFrom": {
+                      "fieldRef": {
+                        "apiVersion": "v1",
+                        "fieldPath": "status.podIP"
+                      }
+                    }
+                  },
+                  {
+                    "name": "ADX_RUNTIME_PAYLOAD"
+                  }
+                ],
+                "imagePullPolicy": "IfNotPresent",
+                "name": "runtime",
+                "readinessProbe": {
+                  "exec": {
+                    "command": [
+                      "python3",
+                      "-c",
+                      "import urllib.request,socket; text=urllib.request.urlopen('http://127.0.0.1:17091/metrics',timeout=2).read().decode(); metrics=dict(line.split() for line in text.splitlines() if line and not line.startswith('#') and len(line.split())==2); assert all(metrics.get(name)=='1' for name in ('adx_node_accepting_allocations','adx_node_resource_observation_fresh','adx_node_device_observation_fresh')); socket.create_connection(('127.0.0.1',17001),timeout=1).close()"
+                    ]
+                  },
+                  "failureThreshold": 3,
+                  "initialDelaySeconds": 15,
+                  "periodSeconds": 15,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 8
+                },
+                "securityContext": {
+                  "privileged": true,
+                  "runAsUser": 0
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/opt/adx/node-start.py",
+                    "name": "node-bootstrap",
+                    "readOnly": true,
+                    "subPath": "start.py"
+                  },
+                  {
+                    "mountPath": "/work",
+                    "name": "data"
+                  },
+                  {
+                    "mountPath": "/secrets",
+                    "name": "credentials"
+                  },
+                  {
+                    "mountPath": "/registry",
+                    "name": "registry"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {},
+            "terminationGracePeriodSeconds": 90,
+            "volumes": [
+              {
+                "configMap": {
+                  "defaultMode": 292
+                },
+                "name": "node-bootstrap"
+              },
+              {
+                "name": "credentials",
+                "secret": {
+                  "defaultMode": 288,
+                  "items": [
+                    {
+                      "key": "ca.pem",
+                      "path": "ca.pem"
+                    },
+                    {
+                      "key": "node.pem",
+                      "path": "node.pem"
+                    },
+                    {
+                      "key": "node.key",
+                      "path": "node.key"
+                    },
+                    {
+                      "key": "coordinator.der",
+                      "path": "coordinator.der"
+                    },
+                    {
+                      "key": "apiserver.der",
+                      "path": "apiserver.der"
+                    },
+                    {
+                      "key": "redis-key",
+                      "path": "redis-key"
+                    },
+                    {
+                      "key": "execd-token",
+                      "path": "execd-token"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "registry",
+                "secret": {
+                  "defaultMode": 256
+                }
+              }
+            ]
+          }
+        },
+        "updateStrategy": {
+          "rollingUpdate": {
+            "partition": 0
+          },
+          "type": "RollingUpdate"
+        },
+        "volumeClaimTemplates": [
+          {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+              "name": "data"
+            },
+            "spec": {
+              "accessModes": [
+                "ReadWriteOnce"
+              ],
+              "resources": {
+                "requests": {}
+              },
+              "volumeMode": "Filesystem"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "activator"
+      },
+      "spec": {
+        "internalTrafficPolicy": "Cluster",
+        "ports": [
+          {
+            "name": "http",
+            "port": 8091,
+            "protocol": "TCP",
+            "targetPort": 8091
+          }
+        ],
+        "selector": {
+          "app": "activator"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "labels": {
+          "adx.deployment": "adx-example",
+          "app.kubernetes.io/part-of": "adx"
+        },
+        "name": "adx-node"
+      },
+      "spec": {
+        "clusterIP": "None",
+        "internalTrafficPolicy": "Cluster",
+        "ports": [
+          {
+            "name": "tcp",
+            "port": 17001,
+            "protocol": "TCP",
+            "targetPort": 17001
+          }
+        ],
+        "selector": {
+          "app": "adx-node"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "apiserver"
+      },
+      "spec": {
+        "internalTrafficPolicy": "Cluster",
+        "ports": [
+          {
+            "name": "https",
+            "port": 8888,
+            "protocol": "TCP",
+            "targetPort": 8888
+          }
+        ],
+        "selector": {
+          "app": "apiserver"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "labels": {
+          "adx.deployment": "adx-example",
+          "app.kubernetes.io/part-of": "adx"
+        },
+        "name": "coordinator"
+      },
+      "spec": {
+        "internalTrafficPolicy": "Cluster",
+        "ports": [
+          {
+            "name": "tcp",
+            "port": 17000,
+            "protocol": "TCP",
+            "targetPort": 17000
+          }
+        ],
+        "selector": {
+          "app": "coordinator"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "labels": {
+          "adx.deployment": "adx-example",
+          "app.kubernetes.io/part-of": "adx"
+        },
+        "name": "ingress"
+      },
+      "spec": {
+        "internalTrafficPolicy": "Cluster",
+        "ports": [
+          {
+            "name": "tcp",
+            "port": 8443,
+            "protocol": "TCP",
+            "targetPort": 8443
+          }
+        ],
+        "selector": {
+          "app": "ingress"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{{- if eq .Values.deployment_component "dependencies" -}}
+{{- if not .Values.managed_dependencies.enabled }}{{ fail "managed_dependencies.enabled must be true to deploy dependencies" }}{{ end -}}
+{{- $v := .Values -}}
+{{- range $base := (.Files.Get "files/manifests/dependencies.json" | fromJsonArray) -}}
+{{- $w := deepCopy $base -}}
+{{- $name := $w.metadata.name -}}
+{{- $params := index $v.managed_dependencies $name -}}
+{{- if $params.enabled -}}
+{{- $_ := set $w.metadata "namespace" $v.namespace -}}
+{{- $pod := $w.spec.template.spec -}}
+{{- $_ := set $pod "imagePullSecrets" (list (dict "name" $v.secrets.registry)) -}}
+{{- $c := first $pod.containers -}}
+{{- $_ := set $c "image" $params.image -}}
+{{- $_ := set $c "resources" $params.resources -}}
+{{- if and (eq $name "redis") (default false $params.use_image_entrypoint) }}{{ $_ := unset $c "command" }}{{ end -}}
+{{- if and (eq $name "redis") (hasKey $params "notify_keyspace_events") }}{{ $_ := set $c "args" (concat $c.args (list "--notify-keyspace-events" $params.notify_keyspace_events)) }}{{ end -}}
+{{- range $vol := $pod.volumes }}{{ if hasKey $vol "secret" }}{{ $_ := set $vol.secret "secretName" $params.secret }}{{ end }}{{ end -}}
+---
+{{ $w | toYaml }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-data
+  namespace: {{ $v.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $params.storage_class }}
+  resources:
+    requests:
+      storage: {{ $params.pvc_size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $v.namespace }}
+spec:
+  selector: {app: {{ $name }}}
+  ports:
+    - port: 6379
+      targetPort: 6379
+{{- end -}}
+{{- end }}
+{{- end }}
