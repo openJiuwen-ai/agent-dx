@@ -401,6 +401,7 @@ impl StoredEnvironment {
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
             runtime: adx_core::Runtime {
                 id: adx_core::runtime_id(&self.spec.id, self.assignment.generation),
                 ip: None,

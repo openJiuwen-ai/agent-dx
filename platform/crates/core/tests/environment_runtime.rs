@@ -50,6 +50,7 @@ fn environment_identity_survives_runtime_replacement() {
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     };
 
     replace_runtime(

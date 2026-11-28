@@ -61,6 +61,7 @@ fn record(id: &str, generation: u64) -> EnvironmentRecord {
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         resources_held: true,
         checkpoint: None,
         execution_artifacts: vec![],

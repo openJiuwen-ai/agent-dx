@@ -42,6 +42,7 @@ impl Environment for Platform {
                 ready: true,
                 runtime_id: Some(request.id.clone()),
                 message: None,
+                resume_pending: false,
             })
             .clone())
     }

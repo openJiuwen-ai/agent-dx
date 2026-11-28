@@ -147,6 +147,7 @@ async fn remote_activation_passes_the_original_deadline_to_environment_create() 
                 ready: true,
                 runtime_id: None,
                 message: None,
+                resume_pending: false,
             })
         }
         async fn get(

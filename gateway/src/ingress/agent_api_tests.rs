@@ -43,6 +43,7 @@ impl Environment for Backend {
             ready: true,
             runtime_id: Some(format!("{}-runtime", r.id)),
             message: None,
+            resume_pending: false,
         };
         self.0
             .lock()

@@ -1432,6 +1432,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         spec: spec("held"),
         assignment: assigned,
         state: EnvironmentState::Running,
@@ -1907,6 +1908,7 @@ async fn coordinator_restart_retains_silent_nodes_until_a_probe_declares_them_lo
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
         };
         session.commit(running.clone()).await.unwrap();
         let session = store.begin(1).await.unwrap();
@@ -2155,6 +2157,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         spec: routed_spec,
         assignment,
         state: EnvironmentState::Running,
@@ -4009,6 +4012,7 @@ async fn shared_checkpoint_recovery(
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     };
     if managed_volume {
         let mut starting = old.clone();

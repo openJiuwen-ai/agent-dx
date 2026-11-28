@@ -143,6 +143,7 @@ impl Environment for ReadyEnvironment {
             ready: true,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         };
         *self.record.lock().unwrap() = Some(observation.clone());
         Ok(observation)

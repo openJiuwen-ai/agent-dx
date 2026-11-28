@@ -149,6 +149,7 @@ fn start_with_local_workload(config: ProbeConfig, local: bool) -> Process {
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     };
     let client = RuntimeControlClient::new(port, Duration::from_secs(1))
         .unwrap()
