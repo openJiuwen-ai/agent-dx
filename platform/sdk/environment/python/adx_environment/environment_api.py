@@ -868,8 +868,9 @@ class Environment:
 
         The returned object owns only its local clients. ``close()`` never
         deletes the remote environment; use :meth:`delete` for explicit teardown.
-        ``require_running=False`` also attaches to a paused environment so the
-        caller can resume it explicitly.
+        ``require_running=False`` additionally attaches to a paused environment
+        so the caller can resume it explicitly. Every other non-running state
+        is still rejected.
         """
         if not isinstance(environment_id, str) or not environment_id.strip():
             raise ValueError("environment_id must be a non-empty string")
@@ -879,7 +880,8 @@ class Environment:
         client = EnvironmentClient() if connection is None else EnvironmentClient(connection=connection)
         try:
             info = client.environment_info(environment_id)
-            if require_running and str(info.get("status", "")).lower() != "running":
+            status = str(info.get("status", "")).lower()
+            if status != "running" and (require_running or status != "paused"):
                 raise RuntimeError(f"environment {environment_id} is not running: {info.get('status', 'unknown')}")
             environment = cls.__new__(cls)
             environment._sid = environment_id

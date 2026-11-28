@@ -305,7 +305,7 @@ async fn cached_create_tracks_current_state_and_receipt_target_without_extra_cal
         (
             pb::EnvironmentState::Paused,
             false,
-            Some(tonic::Code::Unavailable),
+            Some(tonic::Code::Aborted),
         ),
         (
             pb::EnvironmentState::Failed,

@@ -52,10 +52,12 @@ Env creation identity; a replacement Env returns false. Recovery after a lost
 response may conservatively return false. The creation request ID alone is not
 evidence that this caller owns initialization rollback.
 
-A CREATE that resolves to an existing PAUSED Env is not a resume: it returns
-HTTP 409 `CONFLICT` with the stable `environmentId` in the error object and
-preserves the retained checkpoint. The caller attaches to that ID and resumes
-explicitly; CREATE never resumes, replaces or deletes it.
+A CREATE that resolves to an existing PAUSED Env is not a resume: a JSON
+create responds with HTTP 409 `CONFLICT`, and an SSE create reports the same
+error in its `final` event with `errorCode: 409`. The error object carries the
+stable `environmentId`, and the retained checkpoint is preserved. The caller
+attaches to that ID and resumes explicitly; CREATE never resumes, replaces or
+deletes it.
 
 Clients may automatically delete during local initialization rollback only
 when `newlyCreated` is exactly boolean true. Reuse, attachment, missing or

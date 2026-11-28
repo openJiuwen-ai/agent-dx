@@ -21,3 +21,10 @@ class AttachPausedTests(unittest.TestCase):
     def test_from_id_still_rejects_paused_by_default(self):
         with self.assertRaisesRegex(RuntimeError, "not running"):
             Environment.from_id("default-tools-x")
+
+    def test_from_id_without_running_requirement_rejects_other_states(self):
+        for status in ("failed", "deleted"):
+            with self.subTest(status=status):
+                self.client.environment_info.return_value = {"id": "default-tools-x", "status": status}
+                with self.assertRaisesRegex(RuntimeError, "not running"):
+                    Environment.from_id("default-tools-x", require_running=False)
