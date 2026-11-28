@@ -1,21 +1,25 @@
 """Lifecycle HTTP failures keep the stable error contract fields."""
 import unittest
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from adx_environment._transport import EnvironmentClient, EnvironmentHTTPError
+from adx_environment.types import ConnectionConfig
 
 
 class LifecycleErrorTests(unittest.TestCase):
     def _client(self, status_code, payload):
         response = MagicMock(status_code=status_code, headers={})
         response.json.return_value = payload
-        client = EnvironmentClient.__new__(EnvironmentClient)
-        client._http = MagicMock()
-        client._http.post.return_value = response
-        client._base = "http://127.0.0.1:1/api/environment/v1"
-        client._connection = SimpleNamespace(communication_margin_seconds=0)
-        return client
+        http = MagicMock()
+        http.post.return_value = response
+        connection = ConnectionConfig(
+            server_address="127.0.0.1:1",
+            token="test-token",
+            use_tls=False,
+            communication_margin_seconds=0,
+        )
+        with patch("adx_environment._transport.acquire_shared_http_client", return_value=http):
+            return EnvironmentClient(connection=connection)
 
     def test_resume_invalid_argument_keeps_status_and_retry_fields(self):
         client = self._client(
