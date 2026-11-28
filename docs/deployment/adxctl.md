@@ -2,7 +2,7 @@
 
 当前发布包默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay；同时提供 `adx-ingress` 和 `adx-relay`，供显式分进程部署。调试用 `adx-data-plane-forward` 不随包发布。
 
-`adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Environment，也不调用 Environment API；集群 API Key 等远程管理操作使用独立的 [`adxadmin`](adxadmin.md)。
+`adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。`resources` 子命令通过公开 Environment API 只读查询集群资源。集群 API Key 等远程管理操作使用独立的 [`adxadmin`](adxadmin.md)。
 
 release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adxctl`。因此日常命令直接使用 `adxctl`；切换 `/opt/adx/current` 后，命令自动指向新版本。安装器不会把其他内部服务二进制加入系统 `PATH`。发布包还包含与 Redis Server 同为 7.2.5 的 `/opt/adx/current/bin/redis-cli`，供部署者进入 Coordinator 容器后检查 Redis；它不会自动连接或认证，使用时应从部署环境获取地址和凭证。
 
@@ -89,6 +89,30 @@ adxctl -c /srv/adx/node.yaml validate
 `drain` 先要求本机 adxlet 停止新准入并删除其管理的全部 Environment，包括 Paused 对象，清理成功后才按反向顺序退出组件。显式 Drain RPC 完成清理后，adxctl 向 adxlet 发送 SIGTERM，触发 planned unregister。清理失败时命令失败，并保留 Coordinator、Redis、代理等依赖以便重试。
 
 `preserve` 跳过 NodeAdmin Drain，不因退出而删除 Environment 或清理其 checkpoint，按相同的反向顺序停止组件，并仅向 adxlet PID 发送 SIGUSR1 明确保留退出意图（不广播到其进程组）；无需 adxlet 管理 socket 可用。adxlet 收到停止信号后立即关闭新分配与本地创建准入，保留已有 Environment；内嵌 Relay 排水期间继续运行心跳和运行时控制服务，排水完成后退出，不主动注销节点。其余受管进程仍使用 SIGTERM，并执行停止超时及日志收尾，preserve 下 adxlet 终止超时的 SIGKILL 也只作用于其 PID，避免误杀同组后端子进程；进程终止失败仍返回错误，不自动切换为 drain。停止失败的结构化响应包含 `mode`、`phase`（`drain` 或 `terminate`）、`service_id` 和 `message`，CLI 将这些上下文输出到标准错误。直接向 adxlet 发送 SIGTERM/SIGINT 仍表示 planned departure，会主动注销；preserve 应通过 adxctl 选择或向 adxlet 发送 SIGUSR1。保留模式只约束 adxctl 的退出动作，不承诺运行时独立于 Pod 存活或重启后的恢复结果。
+
+### 集群资源
+
+```sh
+# 同一部署文件包含 loopback_http API Server 和 Coordinator 管理员 bootstrap Key 时
+sudo adxctl resources
+sudo adxctl resources --output json
+
+# 分角色部署可明确指定本机配置与已有 Key
+adxctl -c /opt/adx/config/ingress.yaml resources \
+  --token-file /opt/adx/config/secrets/agentos-tenant-key
+
+# 运维机也可只提供公开入口，不读取本机部署文件
+adxctl resources --endpoint https://adx.example.com:8443 \
+  --ca /path/to/ca.pem --token-file /path/to/api.key --output json
+```
+
+默认表格先显示集群汇总，再显示每个节点的 CPU、Memory、Disk、GPU/NPU 各型号的容量、已分配量和剩余可分配量。小于 1 核及暂停调度的在线节点同样展示。已分配量来自调度账本，包含待启动的资源预留，不是实际 CPU 或内存使用量。容量下降时已分配量可以超过容量；暂停调度时保留容量和已分配量，剩余可分配量为零。只包含当前有效节点目录中的在线节点，不把已离线节点记录加入总量。
+
+命令执行一次只读查询，不依赖本机 Supervisor 运行，也不连接 Redis。省略 `--endpoint` 时，从部署文件查找显式启用 `loopback_http` 的回环 API Server。Key 按 `--token-file`、`ADX_TOKEN`、部署文件中 Coordinator 管理员 bootstrap Key 的顺序选择。分角色部署或节点角色文件没有 API Server 时，需要指定入口或 Key。环境变量 `ADX_ENDPOINT`、`ADX_ADMIN_TOKEN_FILE`、`ADX_CA_FILE` 分别对应入口、Key 文件和 CA。HTTPS 始终校验证书，HTTP 仅允许回环地址。`--timeout-seconds` 默认为 30，范围为 1–3600 秒。
+
+JSON 输出包含 `units`、`summary` 和 `nodes`。`summary` 包含节点数、接受新分配的节点数以及 `capacity`、`allocated`、`remaining` 汇总；每个节点包含 `id`、`status` 和同名资源字段。CPU 保持毫核，Memory/Disk 保持 MiB，GPU/NPU 保持整卡数，表格则将 CPU 转成核、较大的内存和磁盘转成 GiB。`status=0` 表示接受新分配，其他值表示阻止新分配。资源名取三个资源映射的并集，所以已从库存移除但仍有预留的 GPU/NPU 型号不会丢失。
+
+命令调用 `GET /api/environment/v1/resources?view=accounting`。该视图需要 API Server 和 Coordinator 同时支持调度账本字段；旧版本缺少这些字段时返回错误，不用容量差值猜测已分配量。默认资源接口和旧 `/global-scheduler/resources` 的调度视图保持原有口径。错误写入 stderr 并以非零状态退出，JSON 模式的 stdout 只包含成功结果。
 
 ## 部署文件的公共字段
 
