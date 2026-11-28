@@ -36,10 +36,16 @@ OVERRIDE_KEYS = {
     "dfs_read_cache_queue_bytes": ("int", 4 * MIB, 1024 * MIB),
     "dfs_read_cache_partial_bytes": ("zero_or", 4 * MIB, 1024 * MIB),
     "dfs_source_single_ttl_ms": ("int", 0, 60_000),
+    "dfs_read_share_concurrent": ("bool",),
+    "dfs_holder_ttl_ms": ("int", 50, 5000),
+    "dfs_holder_wait_ms": ("int", 0, 500),
 }
 # Settings the product range-checks on every Node but uses only while the native read cache runs
 # (dfs_read_cache_bytes non-zero): accepted without it, but recorded as inert instead of effective.
-READ_CACHE_ONLY = ("dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms")
+READ_CACHE_ONLY = ("dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms",
+                   "dfs_read_share_concurrent", "dfs_holder_ttl_ms", "dfs_holder_wait_ms")
+# Used only while concurrent sharing runs on the Node (read_sharing: switch on and the read cache on).
+SHARING_ONLY = ("dfs_holder_ttl_ms", "dfs_holder_wait_ms")
 # Product default of dfs_source_cache_max_ms (config/dfs.rs resolve_read_budget) when a role leaves it unset.
 SOURCE_CACHE_MAX_MS_DEFAULT = 5000
 # The serveable read cache and the private peer cache are exclusive on one Node (the product refuses both).
@@ -147,13 +153,19 @@ def inert_keys(merged):
     on, the single-source TTL is still inert while the ordinary source TTL is 0: the Node then caches no
     source metadata at all (sources.rs source_deadline yields no deadline, so source_expiry none). An
     explicit single TTL of 0 under a non-zero ordinary TTL keeps the ordinary deadline and is not inert.
+    Concurrent sharing (H2 step 2b) runs only with dfs_read_share_concurrent true and the read cache on
+    (assembly/dfs.rs read_sharing); SHARING_ONLY keys are used only while it runs (the holder wait is sent
+    only with holder grants, which come from the holder lists sharing creates).
     """
     if not merged.get("dfs_read_cache_bytes", 0):
         return sorted(k for k in merged if k in READ_CACHE_ONLY)
+    inert = []
     if "dfs_source_single_ttl_ms" in merged and not merged.get("dfs_source_cache_max_ms",
                                                                SOURCE_CACHE_MAX_MS_DEFAULT):
-        return ["dfs_source_single_ttl_ms"]
-    return []
+        inert.append("dfs_source_single_ttl_ms")
+    if merged.get("dfs_read_share_concurrent") is not True:
+        inert.extend(k for k in SHARING_ONLY if k in merged)
+    return sorted(inert)
 
 
 def effective_settings(merged):
@@ -165,7 +177,10 @@ def _override_value(key, value):
     spec = OVERRIDE_KEYS.get(key)
     if spec is None:
         raise Blocked("bench node override not allowed: " + str(key))
-    if spec[0] == "choice":
+    if spec[0] == "bool":
+        if not isinstance(value, bool):
+            raise Blocked("bench node override %s must be true or false" % key)
+    elif spec[0] == "choice":
         if value not in spec[1]:
             raise Blocked("bench node override %s must be one of %s" % (key, ",".join(spec[1])))
     elif spec[0] == "step":
@@ -307,7 +322,7 @@ def node_overrides_toml(overrides, peer_cache_directory):
     """Render whitelisted overrides as Node TOML: top-level keys first, then one table per prefix."""
     top, tables = [], {}
     for key, value in sorted(overrides.items()):
-        rendered = json.dumps(value) if isinstance(value, str) else str(value)
+        rendered = json.dumps(value) if isinstance(value, (str, bool)) else str(value)
         if "." in key:
             table, name = key.split(".", 1)
             tables.setdefault(table, []).append("%s = %s" % (name, rendered))

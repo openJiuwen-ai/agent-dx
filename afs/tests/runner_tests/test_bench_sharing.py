@@ -252,6 +252,94 @@ class SingleTtlAttributionTests(unittest.TestCase):
                 c.write_configs()
 
 
+class ConcurrentShareKeyTests(unittest.TestCase):
+    """H2 step 2b keys. Product: sharing runs only with dfs_read_share_concurrent true and a non-zero
+    dfs_read_cache_bytes (assembly/dfs.rs read_sharing); dfs_holder_ttl_ms is used only while it runs."""
+
+    SHARE, HOLDER, CACHE = "dfs_read_share_concurrent", "dfs_holder_ttl_ms", "dfs_read_cache_bytes"
+    summary = SummaryAttributionTests.summary
+
+    def test_values_follow_the_product_limits(self):
+        for good in ({self.SHARE: True}, {self.SHARE: False}, {self.HOLDER: 50}, {self.HOLDER: 5000}):
+            with self.subTest(good=good):
+                benchlib.parameters(bench(variant="VS", node_overrides={"B": dict(good, **{self.CACHE: 64 * MIB})}))
+        for bad in ({self.SHARE: 1}, {self.SHARE: 0}, {self.SHARE: "true"}, {self.HOLDER: 49}, {self.HOLDER: 5001},
+                    {self.HOLDER: True}, {self.HOLDER: 250.0}):
+            with self.subTest(bad=bad):
+                blocked(self, variant="Vx", node_overrides={"B": dict(bad, **{self.CACHE: 64 * MIB})})
+
+    def test_booleans_render_as_toml_booleans(self):
+        toml = benchlib.node_overrides_toml({self.SHARE: True, self.HOLDER: 100, self.CACHE: 64 * MIB}, "/unused")
+        self.assertIn("dfs_read_share_concurrent = true", toml.splitlines())
+        self.assertIn("dfs_holder_ttl_ms = 100", toml.splitlines())
+
+    def test_share_without_the_read_cache_is_inert(self):
+        p = benchlib.parameters(bench(node_overrides={"*": {self.SHARE: True, self.HOLDER: 100}}))
+        self.assertEqual(p.variant, "V0")  # nothing takes effect, so the baseline label is allowed
+        self.assertEqual(p.inert_overrides("B"), [self.HOLDER, self.SHARE])
+
+    def test_holder_ttl_is_inert_unless_sharing_runs(self):
+        for share in ({}, {self.SHARE: False}):
+            with self.subTest(share=share):
+                p = benchlib.parameters(bench(variant="VR", node_overrides={
+                    "B": dict(share, **{self.CACHE: 64 * MIB, self.HOLDER: 100})}))
+                self.assertEqual(p.inert_overrides("B"), [self.HOLDER])
+        p = benchlib.parameters(bench(variant="VS", node_overrides={
+            "B": {self.CACHE: 64 * MIB, self.SHARE: True, self.HOLDER: 100}}))
+        self.assertEqual(p.inert_overrides("B"), [])
+
+    def test_wildcard_merge_and_summary(self):
+        row = self.summary("MABC", variant="VS", node_overrides={
+            "*": {self.SHARE: True, self.HOLDER: 100}, "B": {self.CACHE: 64 * MIB}, "C": {self.SHARE: False}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.SHARE: True, self.HOLDER: 100}})
+        self.assertTrue(row["variant_applied"])
+        row = self.summary("MABC", variant="Vx", node_overrides={"*": {self.SHARE: True, self.HOLDER: 100}})
+        self.assertEqual((row["node_overrides"], row["variant_applied"]), ({}, False))
+
+    WAIT = "dfs_holder_wait_ms"
+
+    def test_holder_wait_follows_the_product_limits(self):
+        for good in (0, 1, 500):
+            with self.subTest(good=good):
+                benchlib.parameters(bench(variant="VS", node_overrides={
+                    "B": {self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: good}}))
+        for bad in (-1, 501, True, 100.0, "100"):
+            with self.subTest(bad=bad):
+                blocked(self, variant="Vx",
+                        node_overrides={"B": {self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: bad}})
+
+    def test_holder_wait_acts_only_while_sharing_runs(self):
+        # A holder grant (the only source that sends wait_ms) comes from holder lists, which exist only
+        # with read_sharing on the reading Node (assembly/dfs.rs, read/engine/holders.rs).
+        for settings, inert in (({self.WAIT: 200}, [self.WAIT]),
+                                ({self.CACHE: 64 * MIB, self.WAIT: 200}, [self.WAIT]),
+                                ({self.CACHE: 64 * MIB, self.SHARE: False, self.WAIT: 200}, [self.WAIT]),
+                                ({self.SHARE: True, self.WAIT: 200}, [self.WAIT, self.SHARE]),
+                                ({self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: 200}, []),
+                                ({self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: 0}, [])):
+            with self.subTest(settings=settings):
+                p = benchlib.parameters(bench(variant="VS", node_overrides={"B": settings}))
+                self.assertEqual(p.inert_overrides("B"), inert)
+        row = self.summary("MABC", variant="VS", node_overrides={
+            "*": {self.SHARE: True, self.WAIT: 200}, "B": {self.CACHE: 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.SHARE: True, self.WAIT: 200}})
+        self.assertEqual(benchlib.node_overrides_toml({self.WAIT: 200}, "/unused"), "dfs_holder_wait_ms = 200\n")
+
+    def test_node_evidence_keeps_declared_inert_keys_and_checks_them(self):
+        declared = {self.SHARE: True, self.HOLDER: 100}
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, dict(declared, **{self.CACHE: 0}), node_overrides={"B": declared})
+            c.write_configs()
+            self.assertIn("dfs_read_share_concurrent = true", (Path(d) / "config-B.toml").read_text())
+            record = {e["check"]: e["value"] for e in c.evidence}["bench.node_overrides.B"]
+            self.assertEqual(record, {"declared": declared, "mismatches": [], "inert": [self.HOLDER, self.SHARE]})
+        with tempfile.TemporaryDirectory() as d:
+            # A binary without the 2b fields cannot prove them and is refused.
+            c = ClusterRenderingTests().cluster(d, {self.CACHE: 0}, node_overrides={"B": declared})
+            with self.assertRaises(AssertionError):
+                c.write_configs()
+
+
 class AbsentRoleTests(unittest.TestCase):
     @staticmethod
     def topology(roles, **extra):
@@ -497,6 +585,16 @@ class MetricsEvidenceTests(unittest.TestCase):
         self.assertEqual(set(delta), {'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/PublishReadCache"}',
                                       'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/GetChunkSources"}',
                                       'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/GetPlacementSnapshot"}'})
+
+    def test_meta_window_keeps_the_holder_list_rpcs(self):
+        # H2 step 2b: Meta serves holder lists and validates holder-form grants (meta/rpc_metrics.rs).
+        suite = load_suite()
+        name = 'afs_meta_rpc_requests_total{method="afs.meta.v1.DfsMeta/%s"}'
+        before = "".join("%s 1\n" % (name % m) for m in ("GetVersionHolders", "ValidateHolderGrant", "Mkdir"))
+        after = "".join("%s %d\n" % (name % m, n) for m, n in (("GetVersionHolders", 5), ("ValidateHolderGrant", 9),
+                                                                ("Mkdir", 4)))
+        self.assertEqual(benchlib.metrics_delta(before, after, suite.META_METRICS),
+                         {name % "GetVersionHolders": 4.0, name % "ValidateHolderGrant": 8.0})
 
     def test_sent_read_payload_sums_every_transport(self):
         recv = 'afs_dfs_payload_bytes_total{direction="recv",operation="replica",transport="grpc"}'

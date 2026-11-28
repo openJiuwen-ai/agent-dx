@@ -219,10 +219,11 @@ def host_evidence(before, after):
 
 WRITER_METRICS = r"read|peer|serve|slot|reject|admission|gc|reclaim|collect|cache"
 NODE_METRICS = WRITER_METRICS + r"|crc32c_read_bytes"
-# Meta requests that serve read sources, the read cache and replica placement (not namespace traffic).
+# Meta requests that serve read sources, the read cache, holder lists and replica placement (not namespace traffic).
 META_METHODS = ("PublishReadCache", "RetireReadCache", "GetChunkSources", "OpenFileRead", "ValidateReadGrants",
                 "RetainReader", "ReleaseReaders", "ReportReaders", "GetPlacementSnapshot", "ValidateReplicaWrite",
-                "EnsureReplicaPlacement", "ClaimReplicationTask", "ReportReplicationTask")
+                "EnsureReplicaPlacement", "ClaimReplicationTask", "ReportReplicationTask",
+                "GetVersionHolders", "ValidateHolderGrant")
 META_METRICS = r'^afs_meta_rpc_requests_total\{method="[^"]*/(%s)"' % "|".join(META_METHODS)
 
 
