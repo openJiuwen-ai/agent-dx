@@ -285,6 +285,7 @@ pub(crate) fn observed(
         Some("pausing") => EnvironmentPhase::Pausing,
         Some("paused") => EnvironmentPhase::Paused,
         Some("resuming") => EnvironmentPhase::Resuming,
+        Some("deleted") => EnvironmentPhase::Deleted,
         Some("deleting") => {
             return Err(EnvironmentError::Conflict(
                 "Environment is not available for Agent activation".into(),
@@ -308,6 +309,25 @@ pub fn pause_operation_id(tenant: &str, id: &str) -> Result<String, EnvironmentE
     let identity = serde_json::to_vec(&(tenant, id))
         .map_err(|_| EnvironmentError::Invalid("invalid Environment identity".into()))?;
     Ok(format!("pause-activator-{:x}", Sha256::digest(identity)))
+}
+
+pub(crate) fn pause_attempt_operation_id(
+    tenant: &str,
+    id: &str,
+    attempt: Option<u8>,
+) -> Result<String, EnvironmentError> {
+    let id = pause_operation_id(tenant, id)?;
+    Ok(match attempt {
+        Some(attempt) => format!("{id}-a{attempt}"),
+        None => id,
+    })
+}
+
+/// Time after capture for checkpoint and Paused publication to settle.
+pub(crate) const PAUSE_PUBLICATION_GRACE_SECONDS: u64 = 15;
+
+pub(crate) fn pause_response_timeout(capture_seconds: u64) -> Duration {
+    Duration::from_secs(capture_seconds + PAUSE_PUBLICATION_GRACE_SECONDS)
 }
 
 /// Pause submits only the checkpoint capture budget. Retention is intentionally omitted so

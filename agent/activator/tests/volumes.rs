@@ -283,7 +283,10 @@ async fn alias_upgrade_preserves_volume_uid_and_releases_only_the_retired_owner(
         weight: 1,
     }];
     state.put_alias(&config, Some(&revision)).await.unwrap();
-    activator.reconcile_binding(&scope, deadline).await.unwrap();
+    activator
+        .reconcile_binding(&scope, adx_agent_core::unix_time_millis() + 120_000)
+        .await
+        .unwrap();
     let switched = state.binding(&scope).await.unwrap().unwrap();
     assert_eq!(switched.current.version, "2");
     assert_eq!(switched.volumes, original.volumes);
@@ -292,7 +295,10 @@ async fn alias_upgrade_preserves_volume_uid_and_releases_only_the_retired_owner(
         2,
         "new owner must exist before old release"
     );
-    activator.reconcile_binding(&scope, deadline).await.unwrap();
+    activator
+        .reconcile_binding(&scope, adx_agent_core::unix_time_millis() + 120_000)
+        .await
+        .unwrap();
     assert_eq!(
         *platform.owners.lock().unwrap(),
         [switched.current.environment_id].into()

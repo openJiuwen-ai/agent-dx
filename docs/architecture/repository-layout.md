@@ -21,9 +21,9 @@ API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_ad
 
 平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是运行时后端在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
 
-Coordinator 在启动或权威写入恢复时从 Redis 载入记录；正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。节点启动／会话恢复执行完整运行时对账；进程 crash 或 preserve 重启后，旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址经身份校验通过时，才可接管现存 Runtime。adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，关闭准入并保留节点会话，Relay 排水期间继续心跳；显式 drain 清理成功后发送 SIGTERM，执行 planned unregister 并使旧 owner 会话失效；直接向 adxlet 发送 SIGTERM/SIGINT 同样表示 planned departure；节点或后端计划升级先 Pause 并确认持久化恢复点，或迁移／删除实例完成排空，再退出升级和恢复。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及 owner 内存中的每实例单调时钟推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
+Coordinator 在启动或权威写入恢复时从 Redis 载入记录。进程内权威恢复串行执行，失败后退避重试。单个挂卷 Environment 的分配和生命周期提交点查涉及的控制记录、引用和卷，占用校验与状态仍通过同一 Redis CAS 提交。正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。Autoscaling 归属查询使用提交目录快照，在权威恢复期间返回不可用。节点启动／会话恢复执行完整运行时对账；进程 crash 或 preserve 重启后，旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址经身份校验通过时，才可接管现存 Runtime。adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，关闭准入并保留节点会话，Relay 排水期间继续心跳；显式 drain 清理成功后发送 SIGTERM，执行 planned unregister 并使旧 owner 会话失效；直接向 adxlet 发送 SIGTERM/SIGINT 同样表示 planned departure；节点或后端计划升级先 Pause 并确认持久化恢复点，或迁移／删除实例完成排空，再退出升级和恢复。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及 owner 内存中的每实例单调时钟推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
 
-Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
+Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图并优先原节点准入。原归属已失效时，仍健康且兼容共享 Checkpoint 的原节点优先获得新 generation。明确拒绝或节点不可用时可调度其他兼容节点。adxlet 按节点并发上限执行 Pause，并在恢复后提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
 公开 Environment 生命周期 HTTP 契约使用 `/api/environment/v1/environments` 与 `environmentId`，Python SDK 使用 `adx_environment.Environment` 与 `environment_id`；`/api/instances` 保留为目录查询入口。内部 Rust 类型、gRPC、持久化字段与 Metrics 使用 Environment/Runtime，执行设置位于 `EnvironmentSpec.execution`。详见 [命名与抽象](naming.md)。
 
@@ -191,4 +191,4 @@ E2B 列表沿 EnvironmentDirectory 的现有分页，在分页前过滤租户、
 
 启用 E2B 即启用 Gateway envd 鉴权，不保留 gatewayEnvdAuth 配置开关；原生 envd 可继续选择 guest-token。envd ACL 构造与最终校验共享 core::envd 小函数，各原生入口仍校验保护，Ingress 私有端口检查与 backend ACL 保留各自职责。
 
-已登记共享制品由既有 registry/引用/执行 holds 与 GC 回收，不重复写入 cleanup outbox。本地及确实未登记制品的最小 pending 在 Deleted 退役时原子保留，完整 ACK 后移除；源节点永久丢失不代表清理成功。删除幂等沿用 600 秒 DeletedReceipt，并保存规范化 cleanup 摘要，不保留永久 cleanup/artifact fence。journal 重放在 fresh assignment 明确撤销后可丢弃旧记录，但不宣称原提交成功；正常 Snapshot 发布在同一 CAS 比较源记录，防止退役后的迟到发布。artifact scope 继续校验实际物理存储目标。
+已登记共享制品由 registry、引用和执行 holds 保护。Coordinator 每轮最多处理 16 个回收候选，使用提交目录及对账缓存复核引用，并在删除前检查 epoch。已登记制品不重复写入 cleanup outbox。本地及确实未登记制品的最小 pending 在 Deleted 退役时原子保留，完整 ACK 后移除；源节点永久丢失不代表清理成功。删除幂等沿用 600 秒 DeletedReceipt，并保存规范化 cleanup 摘要，不保留永久 cleanup/artifact fence。journal 重放在 fresh assignment 明确撤销后可丢弃旧记录，但不宣称原提交成功；正常 Snapshot 发布在同一 CAS 比较源记录，防止退役后的迟到发布。artifact scope 继续校验实际物理存储目标。

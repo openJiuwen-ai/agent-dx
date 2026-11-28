@@ -104,7 +104,7 @@ impl Session {
         task: &CheckpointCleanup,
         retiring: Option<&str>,
     ) -> Result<bool> {
-        let snapshot = self.snapshot().await?;
+        let (snapshot, _) = self.publication_snapshot()?;
         for environment in snapshot.environments.values() {
             if retiring == Some(environment.spec.id.as_str()) {
                 continue;

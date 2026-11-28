@@ -55,7 +55,7 @@ impl DownloadConfig {
     /// Returns Invalid for malformed templates, missing/relative/traversing paths
     /// or short explicit secrets. Error text never includes secret values.
     pub fn from_template(template: &TemplateVersion) -> Result<Self, Error> {
-        template.validate().map_err(Error::Invalid)?;
+        template.validate_metadata().map_err(Error::Invalid)?;
         let workspace =
             absolute_directory(template.env.get(WORKSPACE).map(String::as_str), WORKSPACE)?;
         // AgentServer trims the asset-root setting, but not workspace or env secrets.

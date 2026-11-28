@@ -17,7 +17,7 @@ use adx_agent_core::{
     activator::{ActivationRequest, Target},
     AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent, TemplateVersion,
 };
-use adx_agent_store::{AgentState, PreparedTemplate, PublishedTemplate};
+use adx_agent_store::{AgentState, PreparedTemplate, PublishedTemplate, RolloutProgress};
 use hashlink::LinkedHashMap;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
@@ -90,6 +90,8 @@ struct Binding {
     attempt: Arc<()>,
     touched: Instant,
 }
+
+const CANDIDATE_PAUSE_TIMEOUT_SECONDS: u64 = 60;
 
 pub struct Activator {
     state: AgentState,
@@ -198,13 +200,21 @@ impl Activator {
             if version == existing.current.version {
                 None
             } else {
-                let template = self
-                    .template(&scope.tenant, &scope.template, &version)
-                    .await?;
+                let progress = self.state.rollout_progress(&existing, &version).await?;
+                if progress.retry_after_unix_ms > adx_agent_core::unix_time_millis() {
+                    return Err(Error::CreationDeferred {
+                        retry_after_unix_ms: progress.retry_after_unix_ms,
+                    });
+                }
+                let published = self
+                    .state
+                    .published_template(&scope.tenant, &scope.template, &version)
+                    .await?
+                    .ok_or(Error::NotFound)?;
                 let snapshot = self
                     .select_template_golden(
                         &scope.tenant,
-                        &template,
+                        &published,
                         &existing.parameters,
                         deadline,
                     )
@@ -311,17 +321,24 @@ impl Activator {
                 )
                 .await?
                 {
-                    let paused = self
+                    let Some(paused) = self
                         .checkpoint_candidate(&binding, &secondary.environment, deadline)
-                        .await?;
+                        .await?
+                    else {
+                        return Ok(false);
+                    };
                     Self::validate_observation(&binding, &secondary.environment, &paused)?;
                 }
             }
             EnvironmentPhase::Paused => (),
             EnvironmentPhase::Failed | EnvironmentPhase::Deleted => {
-                return Err(Error::Conflict(
-                    "candidate Environment failed; inspect Platform state".into(),
-                ));
+                self.retire_rollout_candidate(
+                    &binding,
+                    &secondary.environment,
+                    "terminal Environment",
+                )
+                .await?;
+                return Ok(false);
             }
             _ => return Ok(false),
         }
@@ -330,39 +347,82 @@ impl Activator {
         Ok(false)
     }
 
-    /// Checkpoint a ready candidate to a Paused Environment before the switch. The
-    /// timeout budget is derived from the reconciliation deadline. The result must be
-    /// Paused: a non-paused reply is an unknown outcome that re-queries on the next pass.
+    async fn retire_rollout_candidate(
+        &self,
+        binding: &AgentBinding,
+        environment: &EnvironmentRef,
+        reason: &str,
+    ) -> Result<()> {
+        let failed_candidates = self.state.retire_failed_candidate(binding).await?;
+        if failed_candidates >= 4 {
+            tracing::warn!(
+                scope = ?binding.scope,
+                from_version = %binding.current.version,
+                to_version = %environment.version,
+                failed_candidates, reason,
+                "rollout entering long retry cooldown"
+            );
+        } else {
+            tracing::warn!(scope = ?binding.scope, environment_id = %environment.environment_id,
+                reason, "retiring rollout candidate");
+        }
+        Ok(())
+    }
+
+    /// Pause a ready candidate only when the round can afford the stable per-attempt budget.
     async fn checkpoint_candidate(
         &self,
         binding: &AgentBinding,
         environment: &EnvironmentRef,
         deadline: u64,
-    ) -> Result<EnvironmentObservation> {
-        // Decline to pause once the step's absolute deadline has passed: an expired
-        // round must not fire a pointless capture request. pause_timeout_seconds clamps
-        // an already-expired budget back to 1s, so the check must precede it. The next
-        // reconcile pass observes the candidate's current phase and advances from there.
-        if adx_agent_core::unix_time_millis() >= deadline {
+    ) -> Result<Option<EnvironmentObservation>> {
+        let progress = self
+            .state
+            .rollout_progress(binding, &environment.version)
+            .await?;
+        let attempt = progress.pause_attempt(&environment.environment_id);
+        if attempt >= RolloutProgress::MAX_PAUSE_ATTEMPTS {
+            self.retire_rollout_candidate(binding, environment, "pause attempt limit reached")
+                .await?;
+            return Ok(None);
+        }
+        if environment_request::pause_timeout_seconds(deadline) < CANDIDATE_PAUSE_TIMEOUT_SECONDS {
             return Err(Error::OutcomeUnknown(
-                "checkpoint deadline expired before pause; query the same AgentBinding".into(),
+                "insufficient candidate checkpoint budget; retry with a fresh reconciliation round"
+                    .into(),
             ));
         }
-        let timeout_seconds = environment_request::pause_timeout_seconds(deadline);
-        let paused = self
+        let tenant = &binding.scope.tenant;
+        let id = &environment.environment_id;
+        let paused = match self
             .environment
-            .pause(
-                &binding.scope.tenant,
-                &environment.environment_id,
-                timeout_seconds,
-            )
-            .await?;
+            .pause_attempt(tenant, id, CANDIDATE_PAUSE_TIMEOUT_SECONDS, attempt)
+            .await
+        {
+            Ok(paused) => paused,
+            Err(error @ (EnvironmentError::Conflict(_) | EnvironmentError::Invalid(_))) => {
+                if let Some(current) = self.environment.get(tenant, id).await? {
+                    Self::validate_observation(binding, environment, &current)?;
+                    if current.phase == EnvironmentPhase::Running {
+                        self.state.advance_candidate_pause(binding, attempt).await?;
+                        return Err(Error::OutcomeUnknown(
+                            "candidate pause was rejected; retry the next attempt".into(),
+                        ));
+                    }
+                    if current.phase == EnvironmentPhase::Paused {
+                        return Ok(Some(current));
+                    }
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if paused.phase != EnvironmentPhase::Paused {
-            return Err(Error::Unavailable(
+            return Err(Error::OutcomeUnknown(
                 "checkpoint candidate did not commit Paused".into(),
             ));
         }
-        Ok(paused)
+        Ok(Some(paused))
     }
     pub fn ready(&self) -> bool {
         self.subscription_ready
@@ -387,20 +447,24 @@ impl Activator {
                 return Ok(existing);
             }
         }
-        let mut execution = adx_agent_core::environment::ExecutionSpec::from(prepared.template());
+        let image = match &self.image_resolver {
+            Some(resolver) => resolver.resolve(&template.image).await,
+            None => None,
+        };
+        let resolved_image = image.as_deref();
+        let template = prepared.template();
+        let effective_image = resolved_image.unwrap_or(&template.image);
+        let mut execution = adx_agent_core::environment::ExecutionSpec::from(template);
+        execution.image = effective_image.into();
         // Mount syntax is checked at publication; concrete paths require Binding parameters.
         execution.mounts.clear();
         self.environment.validate_execution(&execution)?;
         let job = template
             .auto_prepare_snapshot
-            .then(|| self.seed_job(tenant, prepared.template()))
+            .then(|| self.seed_job(tenant, template, effective_image))
             .transpose()?;
-        let image = match &self.image_resolver {
-            Some(resolver) => resolver.resolve(&template.image).await,
-            None => None,
-        };
         self.state
-            .publish_with_preparation(prepared, image.as_deref(), job.as_ref(), publication_id)
+            .publish_with_preparation(prepared, resolved_image, job.as_ref(), publication_id)
             .await
             .map_err(Into::into)
     }
@@ -525,10 +589,12 @@ impl Activator {
     async fn select_template_golden(
         &self,
         tenant: &str,
-        template: &TemplateVersion,
+        published: &PublishedTemplate,
         parameters: &adx_agent_core::mounts::Parameters,
         deadline: u64,
     ) -> Result<Option<String>> {
+        let template = &published.template;
+        let effective_image = published.effective_image();
         if template.auto_prepare_snapshot && snapshot_preparation::reserved_workspace(parameters) {
             return Err(Error::Invalid(
                 "workspace name is reserved for anonymous Golden preparation".into(),
@@ -537,7 +603,14 @@ impl Activator {
         let Some(recipe) = adx_agent_core::prewarm::template_golden(template) else {
             return Ok(None);
         };
-        if recipe.restore_profile_digest != snapshot_preparation::restore_digest(template)? {
+        if let Err(error) = recipe.validate(effective_image) {
+            tracing::warn!(tenant, template = %template.name, version = %template.version,
+                snapshot_id = %recipe.snapshot_id, %error, "incompatible Golden recipe; using cold start");
+            return Ok(None);
+        }
+        if recipe.restore_profile_digest
+            != snapshot_preparation::restore_digest(template, effective_image)?
+        {
             return Ok(None);
         }
         let checked = tokio::time::timeout(
@@ -545,7 +618,7 @@ impl Activator {
             self.environment.golden_available(
                 tenant,
                 &recipe.snapshot_id,
-                &template.image,
+                effective_image,
                 &template.isolation_runtime,
             ),
         )
@@ -570,6 +643,11 @@ impl Activator {
                 .ok_or_else(|| {
                     Error::Conflict("committed Golden recipe no longer matches template".into())
                 })?;
+            if !recipe.restore_env.is_empty() {
+                recipe
+                    .validate(published.effective_image())
+                    .map_err(Error::Invalid)?;
+            }
             execution.snapshot_id = Some(id.clone());
             execution.env.extend(recipe.restore_env.clone());
         }
@@ -827,7 +905,7 @@ impl Activator {
                     .await?
                     .ok_or(Error::NotFound)?;
                 let mut execution = published.execution();
-                let template = published.template;
+                let template = &published.template;
                 if let Some(service) = service {
                     service.select(&template.service).map_err(Error::Invalid)?;
                 }
@@ -839,10 +917,15 @@ impl Activator {
                     .render_mounts(&parameters)
                     .map_err(Error::Invalid)?;
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
-                creation::definitions(&template, &parameters, &execution.mounts)?;
+                creation::definitions(template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
                 let chosen = self
-                    .select_template_golden(&scope.tenant, &template, &parameters, deadline_unix_ms)
+                    .select_template_golden(
+                        &scope.tenant,
+                        &published,
+                        &parameters,
+                        deadline_unix_ms,
+                    )
                     .await?;
                 self.state
                     .create_binding_for_version(

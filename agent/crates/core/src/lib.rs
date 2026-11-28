@@ -266,12 +266,12 @@ impl TemplateDraft {
             return Err("GOLDEN_PHASE is reserved for Golden preparation and restore".into());
         }
         if self.auto_prepare_snapshot
-            && !self
+            && self
                 .image
                 .rsplit_once('@')
-                .is_some_and(|(_, digest)| prewarm::sha256(digest))
+                .is_some_and(|(name, digest)| name.is_empty() || !prewarm::sha256(digest))
         {
-            return Err("automatic preparation requires a digest-pinned image".into());
+            return Err("invalid Golden image digest reference".into());
         }
         self.with_version("1".into()).validate()
     }
@@ -362,6 +362,15 @@ impl TemplateVersion {
             .collect()
     }
     pub fn validate(&self) -> ValidationResult {
+        self.validate_metadata()?;
+        if let Some(recipe) = &self.prewarm_recipe {
+            recipe.validate_for_template(&self.image)?;
+        }
+        Ok(())
+    }
+
+    /// Validate template metadata used by public reads independently of optional Golden preparation.
+    pub fn validate_metadata(&self) -> ValidationResult {
         if let Some(network) = &self.network {
             network.validate()?;
         }
@@ -373,9 +382,6 @@ impl TemplateVersion {
             ("isolation_runtime", &self.isolation_runtime),
         ] {
             identifier(value, label)?;
-        }
-        if let Some(recipe) = &self.prewarm_recipe {
-            recipe.validate(&self.image)?;
         }
         for (key, value) in &self.env {
             parameters::render(value, None)?;

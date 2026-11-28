@@ -54,6 +54,21 @@ impl ImageResolver {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test_registry(registry: String, certificate: &[u8]) -> Self {
+        let client = Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_pem(certificate).unwrap())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        Self {
+            client,
+            auths: [(registry, DockerAuth { auth: None })].into(),
+        }
+    }
+
     fn auth_for(&self, registry: &str, endpoint: &Url) -> Option<&DockerAuth> {
         self.auths.get(registry).or_else(|| {
             self.auths.iter().find_map(|(key, auth)| {

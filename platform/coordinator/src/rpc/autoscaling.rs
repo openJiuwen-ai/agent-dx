@@ -4,10 +4,9 @@ use crate::autoscaling::{InstancePage, InstanceQuery, InstanceView, NodeAdmissio
 
 impl CoordinatorRpc {
     pub(crate) async fn scaling_instances(&self, query: InstanceQuery) -> Result<InstancePage> {
-        let mut state = self.0.state.lock().await;
-        state.recover_authoritative_state().await?;
+        let state = self.0.state.lock().await;
         state.healthy()?;
-        let snapshot = state.session.snapshot().await?;
+        let (snapshot, _) = state.session.publication_snapshot()?;
         if query
             .node_id
             .as_ref()
@@ -32,6 +31,8 @@ impl CoordinatorRpc {
                             && live.last_seen.elapsed() < self.0.heartbeat_timeout
                     }),
             });
+        let epoch = state.session.epoch();
+        drop(state);
         let mut count = 0usize;
         let mut instances = Vec::new();
         for stored in snapshot.environments.values() {
@@ -72,7 +73,7 @@ impl CoordinatorRpc {
         Ok(InstancePage {
             count,
             instance_infos: instances,
-            epoch: state.session.epoch(),
+            epoch,
             revision: snapshot.revision,
             node,
         })

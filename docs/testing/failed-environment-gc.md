@@ -32,7 +32,7 @@ services:
 
 `CommitEnvironmentRequest.cleanup_artifacts` 只允许出现在 Deleted 提交中，保存节点仍持有的旧制品清理列表。任务包含完整 Assignment、Deleted revision 和制品列表，以 Environment ID 长度前缀、generation、revision 标识；该任务不进入公开 Sandbox 或 Snapshot 目录。
 
-已登记共享制品由原生 registry、Snapshot 引用、execution holds 和 GC 回收，不重复进入 outbox。outbox 仅保存本地或确实未登记制品；Coordinator 每5秒按游标至多尝试16项，派发前复核持久任务及 Environment checkpoint、执行输入、holds、Ready/Deleting Snapshot 引用。正常 Snapshot 发布在同一 header/源原始记录 CAS 内核对来源，避免 producer 退役后的迟到发布。
+已登记共享制品由原生 registry、Snapshot 引用、execution holds 和 GC 回收。每轮最多尝试 16 个共享制品，在制品锁下使用已提交的 Environment 目录和节点对账缓存复核引用，并在物理删除前检查 Coordinator epoch。已登记共享制品不重复进入 outbox。outbox 仅保存本地或确实未登记制品；Coordinator 每5秒按游标至多尝试16项，派发前复核持久任务及 Environment checkpoint、执行输入、holds、Ready/Deleting Snapshot 引用。正常 Snapshot 发布在同一 header/源原始记录 CAS 内核对来源，避免 producer 退役后的迟到发布。
 
 未登记共享部分由 Coordinator 的 ArtifactReclaimer 物理删除并校验 namespace scope；缺回收器时保留待办，不依赖源节点在线。local 部分要求原节点在线、已对账且 session 匹配；不跨节点猜测本地路径，源节点永久丢失也不以TTL视为清理完成。
 

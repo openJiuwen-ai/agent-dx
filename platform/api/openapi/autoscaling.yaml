@@ -53,8 +53,10 @@ paths:
       description: |
         Returns all matching tenants when tenant_id is omitted. Reserved ownership
         and nonterminal records are included. Deleted records with no resources
-        held are omitted. Each request uses one storage snapshot; separate pages
-        are not a retained snapshot. No authentication or authorization is performed.
+        held are omitted. Each request uses one committed publication snapshot.
+        Separate pages are separate observations. The query returns 503 when
+        the scheduler or catalog requires authoritative recovery.
+        No authentication or authorization is performed.
       parameters:
         - {name: node_id, in: query, schema: {type: string, minLength: 1}}
         - {name: tenant_id, in: query, schema: {type: string, minLength: 1}}

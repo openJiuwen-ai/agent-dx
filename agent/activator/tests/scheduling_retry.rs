@@ -159,7 +159,7 @@ impl Fixture {
     }
     async fn reconcile(&self) -> Result<bool, Error> {
         self.activator()
-            .reconcile_binding(&self.scope, unix_time_millis() + 1000)
+            .reconcile_binding(&self.scope, unix_time_millis() + 120_000)
             .await
     }
     async fn due(&self) {

@@ -18,14 +18,14 @@ fn publish_draft_rejects_a_caller_supplied_prewarm_recipe() {
 }
 
 #[test]
-fn automatic_preparation_is_opt_in_and_requires_a_fixed_image() {
+fn automatic_preparation_is_opt_in_and_accepts_a_tag() {
     let mut input = json!({"name":"assistant", "image":"assistant:1", "isolation_runtime":"runsc",
        "resources":{"cpu_millis":1000,"memory_mib":2048}});
     let disabled: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
     assert!(!disabled.auto_prepare_snapshot);
     input["auto_prepare_snapshot"] = json!(true);
-    let bad: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
-    assert!(bad.validate().is_err());
+    let tagged: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
+    assert!(tagged.validate().is_ok());
     let digest = format!("sha256:{}", "a".repeat(64));
     input["image"] = json!(format!("assistant@{digest}"));
     let automatic: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
@@ -97,6 +97,33 @@ fn phase_free_template() -> TemplateVersion {
         }
     }))
     .unwrap()
+}
+
+#[test]
+fn prepared_recipe_validates_an_optional_digest_against_the_effective_image() {
+    let existing = phase_free_template();
+    let legacy_json = serde_json::to_value(&existing).unwrap();
+    let decoded: TemplateVersion = serde_json::from_value(legacy_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy_json);
+    let pinned_recipe = existing.prewarm_recipe.as_ref().unwrap();
+    assert!(pinned_recipe.validate(&existing.image).is_ok());
+    assert!(pinned_recipe
+        .validate(&format!("assistant@sha256:{}", "b".repeat(64)))
+        .is_err());
+
+    let mut tagged = legacy_json;
+    tagged["image"] = json!("assistant:v1");
+    let projected: TemplateVersion = serde_json::from_value(tagged.clone()).unwrap();
+    assert!(projected.validate().is_ok());
+    tagged["prewarm_recipe"]
+        .as_object_mut()
+        .unwrap()
+        .remove("image_digest");
+    let unpinned: TemplateVersion = serde_json::from_value(tagged).unwrap();
+    assert!(unpinned.validate().is_ok());
+    let tag_recipe = unpinned.prewarm_recipe.as_ref().unwrap();
+    assert!(tag_recipe.validate(&unpinned.image).is_ok());
+    assert!(tag_recipe.validate(&existing.image).is_err());
 }
 
 #[test]

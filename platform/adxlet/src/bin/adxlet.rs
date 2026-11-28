@@ -67,6 +67,8 @@ struct Config {
     execd_health_failure_threshold: Option<u32>,
     #[serde(default)]
     checkpoint_dir: Option<PathBuf>,
+    #[serde(default = "default_max_concurrent_checkpoints")]
+    max_concurrent_checkpoints: usize,
     #[serde(default)]
     checkpoint_storage: Option<adxlet::checkpoint::StorageConfig>,
     #[serde(default)]
@@ -99,6 +101,10 @@ struct Config {
     #[serde(default)]
     platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
+fn default_max_concurrent_checkpoints() -> usize {
+    adxlet::DEFAULT_MAX_CONCURRENT_CHECKPOINTS
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Discovery {
@@ -449,6 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_id.clone(),
     )?
     .with_operation_timeout(timeout)?
+    .with_max_concurrent_checkpoints(config.max_concurrent_checkpoints)?
     .with_health_check(config.execd_health_failure_threshold)?;
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
         (Some(root), None) => Some(adxlet::checkpoint::StorageConfig::Local { root }),

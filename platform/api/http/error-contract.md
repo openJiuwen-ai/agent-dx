@@ -250,7 +250,9 @@ does not publish a `prewarm_recipe` before confirming the catalog entry.
 
 Volume 管理沿用上述错误结构。ensure 与删除应答未知时用相同 tenant/Volume ID 或 owner ID 重试；不能从超时推断定义或关联未提交。删除有引用、关联或占用的卷返回 CONFLICT，数据目录始终保留。接口见 [Volume API](volumes.md)。
 
-自动跨节点恢复只在本地容量不足或后端 restore 之前的执行准入阶段对临时 `Unavailable`、`VolumeBusy`、`NoCapacity` 保留重试。相同错误若来自 checkpoint 读取或后端 restore/初始化/readiness/路由阶段，确认清理后进入 Failed。执行准入控制 RPC 的明确 `Unauthenticated`、`PermissionDenied` 保留认证/权限错误码及原因，清理确认后进入 Failed，不自动重试；`Internal` 保留诊断原因并沿用阶段重试策略。准入失败清理确认后保留 Paused、checkpoint 与待恢复计划；清理或结果发布未知时保留实际进度和必要占用。公开恢复请求等待超时仍使用原 `same_operation / unknown` 契约，不能从内部授权暂不可用推断 `never / not_started`，也不能换 Environment ID 重建。
+Pause 的节点排队计入 checkpoint 预算。没有在预算内取得节点名额时，节点返回 `Unavailable`，保留已运行的执行和路由。Checkpoint 已落盘而 Paused 提交暂不可用时，节点在同一操作内有界重试提交。即使本地已保存制品，公开调用仍需以同一操作身份重试或查询，直到权威状态确认 Paused。
+
+恢复在节点明确返回容量不足或找不到本地执行时可换节点。自动跨节点恢复在后端 restore 之前的执行准入阶段对临时 `Unavailable`、`VolumeBusy`、`NoCapacity` 保留重试。相同错误若来自 checkpoint 读取或后端 restore/初始化/readiness/路由阶段，确认清理后进入 Failed。执行准入控制 RPC 的明确 `Unauthenticated`、`PermissionDenied` 保留认证/权限错误码及原因，清理确认后进入 Failed，不自动重试；`Internal` 保留诊断原因并沿用阶段重试策略。准入失败清理确认后保留 Paused、checkpoint 与待恢复计划；清理或结果发布未知时保留实际进度和必要占用。公开恢复请求等待超时仍使用原 `same_operation / unknown` 契约，不能从内部授权暂不可用推断 `never / not_started`，也不能换 Environment ID 重建。
 
 ### E2B HTTP admission
 

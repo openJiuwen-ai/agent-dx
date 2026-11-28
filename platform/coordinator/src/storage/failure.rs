@@ -29,18 +29,25 @@ impl Session {
                 .connection
                 .publication_sequence
                 .load(Ordering::Acquire);
-            let mut catalog = if saved.environments.values().any(|record| {
-                record.assignment.node_id == id
-                    && !record.invalidated
-                    && volumes::has_volumes(&record.spec)
-            }) {
-                let catalog = self.volume_catalog().await?;
+            let affected: Vec<_> = saved
+                .environments
+                .values()
+                .filter(|record| {
+                    record.assignment.node_id == id
+                        && !record.invalidated
+                        && volumes::has_volumes(&record.spec)
+                })
+                .map(|record| &record.spec)
+                .collect();
+            let mut catalog = if affected.is_empty() {
+                None
+            } else {
+                let mut catalog = self.volume_slice(affected, []).await?;
                 if raw.get(HEADER) != Some(&catalog.header_value) {
                     continue;
                 }
+                catalog.control = raw.clone();
                 Some(catalog)
-            } else {
-                None
             };
             let node = saved.nodes.get_mut(id).ok_or(Error::NotFound)?;
             if node.session.as_ref().is_none_or(|s| s.id != session_id) {

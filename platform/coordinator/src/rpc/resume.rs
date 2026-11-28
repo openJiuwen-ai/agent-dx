@@ -270,9 +270,38 @@ impl CoordinatorRpc {
                         .as_ref()
                         .map(|intent| intent.rejected_nodes.clone())
                         .unwrap_or_default();
-                    let spec =
-                        recovery::checkpoint_spec(&stored, Some(&point), None, &excluded, None)
-                            .map_err(status)?;
+                    let source_id = &stored.assignment.node_id;
+                    let source_available = stored.invalidated
+                        && state.nodes.get(source_id).is_some_and(|node| {
+                            node.node.available
+                                && !node.scheduling_paused
+                                && node.session.as_ref().is_some_and(|session| {
+                                    state
+                                        .live_claimant(
+                                            source_id,
+                                            &session.id,
+                                            self.0.heartbeat_timeout,
+                                        )
+                                        .is_ok()
+                                })
+                                && state
+                                    .live
+                                    .get(source_id)
+                                    .is_some_and(|live| !live.report.reconciling)
+                                && crate::storage::validate_checkpoint_target(
+                                    &stored.spec,
+                                    &point,
+                                    node,
+                                )
+                                .is_ok()
+                        });
+                    let spec = recovery::checkpoint_resume_spec(
+                        &stored,
+                        &point,
+                        &excluded,
+                        source_available,
+                    )
+                    .map_err(status)?;
                     if state
                         .scheduler
                         .requests
@@ -438,7 +467,12 @@ impl CoordinatorRpc {
                     // existing owner and recheck the same Volume wait condition.
                     continue;
                 }
-                Err(error) if error.code() == tonic::Code::ResourceExhausted => {
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        tonic::Code::ResourceExhausted | tonic::Code::NotFound
+                    ) =>
+                {
                     let mut state = self.0.state.lock().await;
                     state.needs_recovery = true;
                     let rejected = state

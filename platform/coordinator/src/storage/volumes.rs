@@ -164,10 +164,6 @@ impl Catalog {
         self.changed.iter().map(|key| format!("volume:{key}"))
     }
 
-    pub(super) fn reference_value(&self, id: &str) -> Result<String> {
-        encode(self.references.get(id).ok_or(Error::Conflict)?)
-    }
-
     /// A verified process replacement retains its assignments under the new session.
     pub(super) fn rebind_execution_session(
         &mut self,
@@ -247,12 +243,6 @@ impl Catalog {
         for record in records {
             let key = volume_key(&result.spec.tenant_id, &record.volume.spec.id)?;
             self.update(key, record);
-        }
-        if result.state == EnvironmentState::Deleted {
-            self.references
-                .get_mut(&result.spec.id)
-                .ok_or(Error::Conflict)?
-                .active = false;
         }
         Ok(())
     }
@@ -471,7 +461,7 @@ impl Session {
         uid: &str,
     ) -> Result<InitializationAction> {
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
+            let catalog = self.volume_slice([&request.spec], []).await?;
             self.validate_initialization_owner(request, session).await?;
             let mut record = catalog
                 .resolve(&request.spec)?
@@ -517,7 +507,7 @@ impl Session {
         error: Option<&str>,
     ) -> Result<()> {
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
+            let catalog = self.volume_slice([&request.spec], []).await?;
             self.validate_initialization_owner(request, session).await?;
             let mut record = catalog
                 .resolve(&request.spec)?
@@ -578,7 +568,9 @@ impl Session {
             return Err(Error::Conflict);
         }
         for _ in 0..ATTEMPTS {
-            let mut catalog = self.volume_catalog().await?;
+            let mut catalog = self
+                .volume_slice([&request.spec], [request.assignment.node_id.as_str()])
+                .await?;
             let field = format!("environment:{}", request.spec.id);
             let previous_value = catalog.control.get(&field).ok_or(Error::NotFound)?.clone();
             let mut stored: StoredEnvironment = decode(&previous_value)?;
@@ -712,7 +704,7 @@ impl Session {
         if !has_volumes(spec) {
             return Ok(Vec::new());
         }
-        self.volume_catalog().await?.resolve(spec)
+        self.volume_slice([spec], []).await?.resolve(spec)
     }
 
     pub(crate) async fn volume_owners(&self) -> Result<BTreeMap<String, Option<Occupancy>>> {
@@ -884,10 +876,70 @@ impl Session {
         format!("{}:volume-references", self.store.key)
     }
 
-    pub(super) async fn volume_catalog(&self) -> Result<Catalog> {
+    /// Read only the volume and control fields participating in the same CAS.
+    /// A Volume carries its own exclusive occupant, so other references are unnecessary.
+    pub(super) async fn volume_slice<'a>(
+        &self,
+        specs: impl IntoIterator<Item = &'a EnvironmentSpec>,
+        nodes: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Catalog> {
+        let mut control = BTreeSet::new();
+        let mut references = BTreeSet::new();
+        let mut volumes = BTreeSet::new();
+        for spec in specs {
+            control.insert(format!("environment:{}", spec.id));
+            references.insert(spec.id.clone());
+            for mount in &spec.execution.mounts {
+                if let MountSource::Volume(reference) = &mount.source {
+                    volumes.insert(volume_key(&spec.tenant_id, &reference.id)?);
+                }
+            }
+        }
+        for node in nodes {
+            control.insert(format!("node:{node}"));
+            control.insert(format!("node-session:{node}"));
+        }
+        self.read_volume_catalog(&control, &references, &volumes, false)
+            .await
+    }
+
+    async fn read_volume_catalog(
+        &self,
+        control: &BTreeSet<String>,
+        references: &BTreeSet<String>,
+        volumes: &BTreeSet<String>,
+        all_volumes: bool,
+    ) -> Result<Catalog> {
         let mut command = redis::cmd("EVAL");
-        command.arg("return {redis.call('HGET', KEYS[1], 'header'), redis.call('HGETALL', KEYS[2]), redis.call('HGETALL', KEYS[3]), redis.call('HGETALL', KEYS[1])}")
-            .arg(3).arg(&self.store.key).arg(self.volumes_key()).arg(self.volume_references_key());
+        command
+            .arg(
+                r#"
+            local function fields(key, names)
+                local result = {}
+                for _, field in ipairs(cjson.decode(names)) do
+                    local value = redis.call('HGET', key, field)
+                    if value then
+                        table.insert(result, field)
+                        table.insert(result, value)
+                    end
+                end
+                return result
+            end
+            local volumes
+            if ARGV[4] == '1' then volumes = redis.call('HGETALL', KEYS[2])
+            else volumes = fields(KEYS[2], ARGV[3]) end
+            return {redis.call('HGET', KEYS[1], 'header'), volumes,
+                    fields(KEYS[3], ARGV[2]), fields(KEYS[1], ARGV[1])}
+        "#,
+            )
+            .arg(3)
+            .arg(&self.store.key)
+            .arg(self.volumes_key())
+            .arg(self.volume_references_key())
+            .arg(encode(control)?)
+            .arg(encode(references)?)
+            .arg(encode(volumes)?)
+            .arg(u8::from(all_volumes));
         type RawFields = BTreeMap<String, String>;
         let (header_value, values, references, control): (
             Option<String>,
@@ -929,6 +981,21 @@ impl Session {
         })
     }
 
+    async fn volume_catalog(&self) -> Result<Catalog> {
+        self.read_volume_catalog(&BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new(), true)
+            .await
+    }
+
+    async fn volume_entry(&self, key: &str) -> Result<Catalog> {
+        self.read_volume_catalog(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[key.to_owned()].into(),
+            false,
+        )
+        .await
+    }
+
     async fn volume_cas(
         &self,
         catalog: &Catalog,
@@ -940,6 +1007,8 @@ impl Session {
         let mut command = redis::cmd("EVAL");
         command.arg(r#"
             if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+            local reference = 4 + 2 * tonumber(ARGV[3])
+            if ARGV[reference + 2] == '1' and redis.call('EXISTS', KEYS[4]) == 1 then return 2 end
             local cursor = 4
             for _ = 1, tonumber(ARGV[3]) do
                 if ARGV[cursor + 1] == '' then redis.call('HDEL', KEYS[2], ARGV[cursor])
@@ -949,7 +1018,8 @@ impl Session {
             if ARGV[cursor] ~= '' then redis.call('HSET', KEYS[3], ARGV[cursor], ARGV[cursor + 1]) end
             redis.call('HSET', KEYS[1], 'header', ARGV[2])
             return 1
-        "#).arg(3).arg(&self.store.key).arg(self.volumes_key()).arg(self.volume_references_key())
+        "#).arg(4).arg(&self.store.key).arg(self.volumes_key()).arg(self.volume_references_key())
+            .arg(self.store.deleted_receipt_key(reference.as_ref().map_or("", |(id, _)| id)))
             .arg(&catalog.header_value).arg(encode(&header)?).arg(writes.len());
         let changed = writes
             .iter()
@@ -962,13 +1032,20 @@ impl Session {
         }
         match reference {
             Some((id, record)) => {
-                command.arg(id).arg(encode(&record)?);
+                command
+                    .arg(id)
+                    .arg(encode(&record)?)
+                    .arg(u8::from(record.active));
             }
             None => {
-                command.arg("").arg("");
+                command.arg("").arg("").arg(0);
             }
         }
-        let applied = self.store.query::<u8>(command).await? == 1;
+        let result = self.store.query::<u8>(command).await?;
+        if result == 2 {
+            return Err(Error::Conflict);
+        }
+        let applied = result == 1;
         if applied {
             self.store.notify_committed_change(header.revision, changed);
         }
@@ -996,7 +1073,7 @@ impl Session {
         validate_owner(owner, true)?;
         let key = volume_key(&spec.tenant_id, &spec.id)?;
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
+            let catalog = self.volume_entry(&key).await?;
             if let Some(existing) = catalog.volumes.get(&key) {
                 if owner.is_empty() || existing.owner_ids.contains(owner) {
                     return Ok(existing.volume.clone());
@@ -1010,6 +1087,10 @@ impl Session {
                 {
                     return Ok(existing.volume.clone());
                 }
+                continue;
+            }
+            let catalog = self.volume_catalog().await?;
+            if catalog.volumes.contains_key(&key) {
                 continue;
             }
             spec.validate()?;
@@ -1074,10 +1155,11 @@ impl Session {
     }
 
     pub async fn get_volume(&self, tenant: &str, id: &str) -> Result<StoredVolume> {
-        self.volume_catalog()
+        let key = volume_key(tenant, id)?;
+        self.volume_entry(&key)
             .await?
             .volumes
-            .remove(&volume_key(tenant, id)?)
+            .remove(&key)
             .ok_or(Error::NotFound)
     }
 
@@ -1111,7 +1193,7 @@ impl Session {
         }
         let digest = request_digest(spec)?;
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
+            let catalog = self.volume_slice([spec], []).await?;
             let old = catalog.references.get(&spec.id);
             if old
                 .is_some_and(|old| old.tenant_id != spec.tenant_id || old.request_digest != digest)
@@ -1198,7 +1280,7 @@ impl Session {
     pub async fn unpin_volumes(&self, spec: &EnvironmentSpec) -> Result<()> {
         let digest = request_digest(spec)?;
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
+            let catalog = self.volume_slice([spec], []).await?;
             let Some(old) = catalog.references.get(&spec.id) else {
                 return Ok(());
             };
@@ -1254,11 +1336,19 @@ impl Session {
     pub async fn release_volume_owner(&self, tenant: &str, owner: &str) -> Result<()> {
         validate_owner(owner, false)?;
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
-            match self.get(owner).await {
-                Ok(_) => return Err(Error::Conflict),
-                Err(Error::NotFound) => (),
-                Err(error) => return Err(error),
+            let catalog = self
+                .read_volume_catalog(
+                    &[format!("environment:{owner}")].into(),
+                    &[owner.to_owned()].into(),
+                    &BTreeSet::new(),
+                    true,
+                )
+                .await?;
+            if catalog
+                .control
+                .contains_key(&format!("environment:{owner}"))
+            {
+                return Err(Error::Conflict);
             }
             let fixed = catalog.references.get(owner);
             if fixed.is_some_and(|fixed| fixed.tenant_id != tenant) {
@@ -1304,11 +1394,54 @@ impl Session {
         ))
     }
 
+    pub(crate) async fn collect_retired_volume_references(&self, cursor: u64) -> Result<u64> {
+        let references = self.volume_references_key();
+        let mut scan = redis::cmd("HSCAN");
+        scan.arg(&references).arg(cursor).arg("COUNT").arg(64);
+        let (next, entries): (u64, Vec<(String, String)>) = self.store.query(scan).await?;
+        for (id, value) in entries {
+            if decode::<FixedReferences>(&value)?.active {
+                continue;
+            }
+            let mut remove = redis::cmd("EVAL");
+            remove
+                .arg(
+                    r#"
+                if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
+                if redis.call('HEXISTS', KEYS[1], ARGV[2]) ~= 0
+                    or redis.call('EXISTS', KEYS[3]) == 0
+                    or redis.call('HGET', KEYS[2], ARGV[3]) ~= ARGV[4] then return 0 end
+                local header = redis.call('HGET', KEYS[1], 'header')
+                if header ~= ARGV[5] then return 0 end
+                redis.call('HDEL', KEYS[2], ARGV[3])
+                redis.call('HSET', KEYS[1], 'header', ARGV[6])
+                return 1
+            "#,
+                )
+                .arg(3)
+                .arg(&self.store.key)
+                .arg(&references)
+                .arg(self.store.deleted_receipt_key(&id))
+                .arg(self.epoch.to_string())
+                .arg(format!("environment:{id}"))
+                .arg(&id)
+                .arg(value);
+            let [header] = self.store.fields([HEADER.into()]).await?;
+            let mut next_header = self.header(&header)?;
+            next_header.advance()?;
+            remove
+                .arg(header.ok_or(Error::Conflict)?)
+                .arg(encode(&next_header)?);
+            let _: u8 = self.store.query(remove).await?;
+        }
+        Ok(next)
+    }
+
     /// Remove a definition only. Directory data is never changed by this operation.
     pub async fn delete_volume(&self, tenant: &str, id: &str) -> Result<()> {
         let key = volume_key(tenant, id)?;
         for _ in 0..ATTEMPTS {
-            let catalog = self.volume_catalog().await?;
+            let catalog = self.volume_entry(&key).await?;
             let Some(record) = catalog.volumes.get(&key) else {
                 return Ok(());
             };

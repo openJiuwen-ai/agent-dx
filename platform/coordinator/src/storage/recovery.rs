@@ -256,7 +256,7 @@ impl Session {
     ) -> Result<StoredEnvironment> {
         let (planned, resume) = (planned_resume.is_some(), planned_resume.unwrap_or(true));
         if previous.environment_id != replacement.environment_id
-            || previous.node_id == replacement.node_id
+            || (planned && previous.node_id == replacement.node_id)
             || previous.generation >= replacement.generation
         {
             return Err(Error::Conflict);
@@ -346,6 +346,16 @@ impl Session {
                 return Ok(stored_environment);
             }
             if &stored_environment.assignment != previous {
+                return Err(Error::Conflict);
+            }
+            if previous.node_id == replacement.node_id
+                && (!stored_environment.invalidated
+                    || stored_environment.resume_point(now).is_none()
+                    || stored_environment
+                        .resume
+                        .as_ref()
+                        .is_some_and(|intent| intent.rejected_nodes.contains(&replacement.node_id)))
+            {
                 return Err(Error::Conflict);
             }
             let planned_point = stored_environment
@@ -457,7 +467,9 @@ impl Session {
             }
             stored_environment.validate()?;
             let catalog = if super::volumes::has_volumes(&stored_environment.spec) {
-                let mut catalog = self.volume_catalog().await?;
+                let mut catalog = self
+                    .volume_slice([&stored_environment.spec], [target.node.id.as_str()])
+                    .await?;
                 if Some(&catalog.header_value) != header_value.as_ref() {
                     continue;
                 }

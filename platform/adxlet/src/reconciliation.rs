@@ -552,6 +552,28 @@ impl Adxlet {
             operation_id: format!("recover-{}", record.assignment.generation),
             expected_revision: record.revision,
         };
+        // The Coordinator may reassign an invalidated shared pause to the same
+        // healthy node at a fresh generation. Retire the old controller in
+        // its serial queue and leave cached checkpoint data to the catalog GC.
+        let previous = self
+            .environments
+            .lock()
+            .expect("shared state lock poisoned")
+            .get(&record.spec.id)
+            .filter(|(_, owner, _)| owner.generation < record.assignment.generation)
+            .map(|(_, owner, handle)| (owner.clone(), handle.clone()));
+        if let Some((owner, handle)) = previous {
+            self.reconcile_controller(
+                owner,
+                handle,
+                controller::AuthorityCheck {
+                    record: Some(record.clone()),
+                    references: None,
+                    recover: false,
+                },
+            )
+            .await?;
+        }
         let handle = {
             let now = tokio::time::Instant::now();
             let mut retired = self

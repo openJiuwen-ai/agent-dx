@@ -143,6 +143,74 @@ async fn paused_live_adoption_does_not_leak_a_tentative_create_hold() {
 }
 
 #[tokio::test]
+async fn periodic_comparison_keeps_a_published_pause_without_recommitting() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact_path = dir.path().join("retained");
+    std::fs::create_dir_all(&artifact_path).unwrap();
+    let hooks = Arc::new(Hooks::default());
+    let node = Adxlet::new(
+        "n".into(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(crate::checkpoint::LocalCheckpointStore::new(dir.path().into()).unwrap()),
+        hooks.clone(),
+    )
+    .unwrap();
+    let mut record = pending_record();
+    record.state = EnvironmentState::Paused;
+    record.revision = 1;
+    record.resources_held = false;
+    record.checkpoint = Some(adx_core::RestorePoint {
+        id: "pause".into(),
+        artifact: adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: artifact_path.display().to_string(),
+            size_bytes: 8,
+        },
+        source_runtime_id: record.runtime.id.clone(),
+        recovery_profile: Default::default(),
+        expires_at_unix_seconds: None,
+        origin: None,
+    });
+    let handle = node.adopt_record(&record, false).unwrap().unwrap();
+    handle
+        .check_authority(AuthorityCheck {
+            record: Some(record.clone()),
+            references: None,
+            recover: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(handle.view().1, Some(Durability::Published));
+    let published = handle.view().0;
+    assert_eq!(published.state, EnvironmentState::Paused);
+    assert_eq!(published.revision, 1);
+    for _ in 0..3 {
+        let basis = node
+            .comparison_basis(std::time::Duration::from_secs(1))
+            .await;
+        let result = node
+            .compare_retained(
+                basis,
+                vec![published.clone()],
+                vec![],
+                vec![],
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, ReconciliationOutcome::Complete));
+        assert_eq!(handle.view().0, published);
+    }
+    assert_eq!(hooks.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn live_comparison_preserves_an_already_registered_unstarted_create() {
     for locally_reserved in [false, true] {
         let hooks = Arc::new(Hooks::default());
@@ -333,6 +401,15 @@ impl StateSink for Hooks {
     async fn commit(&self, _: &EnvironmentRecord) -> Result<Durability> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(Durability::Published)
+    }
+}
+#[async_trait]
+impl crate::checkpoint::CheckpointCooperation for Hooks {
+    async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn abort_unstarted(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+        Ok(())
     }
 }
 

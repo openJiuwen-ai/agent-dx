@@ -14,7 +14,156 @@ fn alias_key(tenant: &str, template: &str, alias: &str) -> Result<Key> {
     }
     Key::new("alias", &[tenant, template, alias])
 }
+pub(crate) fn rollout_key(scope: &Scope) -> Result<Key> {
+    Key::new(
+        "binding-rollout",
+        &[
+            &scope.tenant,
+            &scope.template,
+            scope.template_ref.kind(),
+            scope.template_ref.name(),
+            &scope.binding_id,
+        ],
+    )
+}
+
+/// Persisted retry metadata for one Binding generation and version change.
+#[derive(Default, Serialize, Deserialize)]
+pub struct RolloutProgress {
+    generation: String,
+    from_version: String,
+    to_version: String,
+    pause_environment: String,
+    pause_attempt: u8,
+    failed_candidates: u8,
+    pub retry_after_unix_ms: u64,
+}
+
+impl RolloutProgress {
+    pub const MAX_PAUSE_ATTEMPTS: u8 = 4;
+    pub const MAX_REBUILD_BACKOFF_SECONDS: u64 = 300;
+    const REBUILD_BACKOFF_SECONDS: [u64; 5] = [5, 15, 45, 120, Self::MAX_REBUILD_BACKOFF_SECONDS];
+
+    pub fn pause_attempt(&self, environment_id: &str) -> u8 {
+        if self.pause_environment == environment_id {
+            self.pause_attempt
+        } else {
+            0
+        }
+    }
+
+    fn for_binding(record: Option<&Record>, binding: &AgentBinding, version: &str) -> Result<Self> {
+        if let Some(record) = record {
+            let progress: Self = record.decode()?;
+            if progress.generation == binding.generation
+                && progress.from_version == binding.current.version
+                && progress.to_version == version
+            {
+                return Ok(progress);
+            }
+        }
+        Ok(Self {
+            generation: binding.generation.clone(),
+            from_version: binding.current.version.clone(),
+            to_version: version.into(),
+            ..Self::default()
+        })
+    }
+}
+
 impl AgentState {
+    pub async fn rollout_progress(
+        &self,
+        binding: &AgentBinding,
+        version: &str,
+    ) -> Result<RolloutProgress> {
+        let record = self.store.get(&rollout_key(&binding.scope)?).await?;
+        RolloutProgress::for_binding(record.as_ref(), binding, version)
+    }
+
+    /// Forget the finished pause identity only after Platform explicitly rejected it.
+    pub async fn advance_candidate_pause(&self, saved: &AgentBinding, attempt: u8) -> Result<()> {
+        self.update_candidate_retry(saved, Some(attempt))
+            .await
+            .map(|_| ())
+    }
+
+    /// Atomically retire the candidate and return the committed number of failures for this version change.
+    pub async fn retire_failed_candidate(&self, saved: &AgentBinding) -> Result<u8> {
+        self.update_candidate_retry(saved, None).await
+    }
+
+    async fn update_candidate_retry(
+        &self,
+        saved: &AgentBinding,
+        rejected_pause: Option<u8>,
+    ) -> Result<u8> {
+        let key = binding_key(&saved.scope)?;
+        let progress_key = rollout_key(&saved.scope)?;
+        let record = self
+            .store
+            .get(&key)
+            .await?
+            .ok_or_else(|| Error::Conflict("binding missing".into()))?;
+        let mut binding: AgentBinding = record.decode()?;
+        if binding.generation != saved.generation
+            || binding.phase != BindingPhase::Active
+            || binding.current != saved.current
+            || binding.secondary != saved.secondary
+        {
+            return Err(Error::Conflict(
+                "candidate changed before updating retry state".into(),
+            ));
+        }
+        let secondary = binding
+            .secondary
+            .as_ref()
+            .filter(|s| s.intent == SecondaryIntent::Preparing)
+            .ok_or_else(|| Error::Conflict("candidate is no longer preparing".into()))?;
+        let progress_record = self.store.get(&progress_key).await?;
+        let mut progress = RolloutProgress::for_binding(
+            progress_record.as_ref(),
+            &binding,
+            &secondary.environment.version,
+        )?;
+        let mut writes = Vec::new();
+        if let Some(attempt) = rejected_pause {
+            let current = progress.pause_attempt(&secondary.environment.environment_id);
+            if current != attempt || current >= RolloutProgress::MAX_PAUSE_ATTEMPTS {
+                return Ok(progress.failed_candidates);
+            }
+            progress.pause_environment = secondary.environment.environment_id.clone();
+            progress.pause_attempt = current + 1;
+        } else {
+            progress.failed_candidates = progress.failed_candidates.saturating_add(1);
+            let delay_index = (usize::from(progress.failed_candidates) - 1)
+                .min(RolloutProgress::REBUILD_BACKOFF_SECONDS.len() - 1);
+            let delay_ms = RolloutProgress::REBUILD_BACKOFF_SECONDS[delay_index] * 1_000;
+            progress.retry_after_unix_ms =
+                adx_agent_core::unix_time_millis().saturating_add(delay_ms);
+            let mut retired = secondary.clone();
+            retired.intent = SecondaryIntent::Retiring;
+            binding.secondary = Some(retired);
+            writes.push(put(&key, &binding)?);
+        }
+        writes.push(put(&progress_key, &progress)?);
+        let checks = vec![
+            check(&key, &record),
+            Check {
+                key: progress_key,
+                expected: progress_record.map(|record| record.revision),
+            },
+        ];
+        if !self
+            .store
+            .commit(&Transaction::new(checks, writes)?)
+            .await?
+        {
+            return Err(Error::Conflict("candidate retry state changed".into()));
+        }
+        Ok(progress.failed_candidates)
+    }
+
     pub async fn selected_version(&self, scope: &Scope) -> Result<String> {
         scope.validate().map_err(Error::Invalid)?;
         Ok(self.desired_version(scope).await?.0)
@@ -218,9 +367,19 @@ impl AgentState {
         binding.secondary = Some(secondary);
         let mut checks = vec![check(&key, &record)];
         checks.extend(alias_check);
+        let progress_key = rollout_key(&binding.scope)?;
+        let mut deletes = Vec::new();
+        if let Some(progress) = self.store.get(&progress_key).await? {
+            checks.push(check(&progress_key, &progress));
+            deletes.push(progress_key);
+        }
         if !self
             .store
-            .commit(&Transaction::new(checks, vec![put(&key, &binding)?])?)
+            .commit(&Transaction::with_deletes(
+                checks,
+                vec![put(&key, &binding)?],
+                deletes,
+            )?)
             .await?
         {
             return Err(Error::Conflict("binding changed during switch".into()));

@@ -389,6 +389,7 @@ impl HttpEnvironment {
         tenant: &str,
         id: &str,
         timeout_seconds: u64,
+        attempt: Option<u8>,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
         validate_identity(tenant)?;
         validate_identity(id)?;
@@ -412,10 +413,10 @@ impl HttpEnvironment {
             .client
             .post(url)
             .bearer_auth(key)
-            .timeout(Duration::from_secs(timeout_seconds))
+            .timeout(environment_request::pause_response_timeout(timeout_seconds))
             .header(
                 "x-adx-request-id",
-                environment_request::pause_operation_id(tenant, id)?,
+                environment_request::pause_attempt_operation_id(tenant, id, attempt)?,
             )
             .json(&environment_request::pause_input(timeout_seconds));
         let uncertain = || {
@@ -719,6 +720,15 @@ impl Environment for HttpEnvironment {
         id: &str,
         timeout_seconds: u64,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
-        HttpEnvironment::pause(self, tenant, id, timeout_seconds).await
+        HttpEnvironment::pause(self, tenant, id, timeout_seconds, None).await
+    }
+    async fn pause_attempt(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+        attempt: u8,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        HttpEnvironment::pause(self, tenant, id, timeout_seconds, Some(attempt)).await
     }
 }

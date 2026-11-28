@@ -263,8 +263,8 @@ impl Coordinator {
         Ok(shard)
     }
 
-    /// Publish the durable spec after recovery placement. Required-node filters
-    /// added for checkpoint access and source exclusion are only placement inputs;
+    /// Publish the durable spec after recovery placement. Node selectors added
+    /// for checkpoint access, source preference and exclusions are placement inputs;
     /// claims and execution grants must see the unchanged Environment identity.
     /// Reject any other spec change or a different assignment without mutation.
     pub(crate) fn finish_recovery_placement(
@@ -282,6 +282,17 @@ impl Coordinator {
         }
         let mut canonical = queued.clone();
         canonical.scheduling.required_node = spec.scheduling.required_node.clone();
+        if !canonical
+            .scheduling
+            .preferred_node
+            .starts_with(&spec.scheduling.preferred_node)
+        {
+            return Err(Error::Conflict);
+        }
+        canonical
+            .scheduling
+            .preferred_node
+            .truncate(spec.scheduling.preferred_node.len());
         if canonical != *spec {
             return Err(Error::Conflict);
         }

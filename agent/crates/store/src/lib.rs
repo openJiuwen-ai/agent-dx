@@ -12,6 +12,7 @@ pub use notifications::{MetadataChange, RedisChanges};
 mod state;
 pub use state::{AgentState, PreparedTemplate, PublishedTemplate};
 mod aliases;
+pub use aliases::RolloutProgress;
 #[cfg(feature = "test-memory")]
 mod memory;
 mod prewarm;
@@ -72,6 +73,7 @@ impl Key {
                 | "template-sequence"
                 | "binding"
                 | "binding-launch"
+                | "binding-rollout"
                 | "alias"
                 | "binding-history"
                 | "snapshot-preparation"

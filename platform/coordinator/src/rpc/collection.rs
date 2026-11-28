@@ -2,6 +2,18 @@
 use super::*;
 
 impl CoordinatorRpc {
+    /// Sweep one page of legacy released references with a matching deletion receipt.
+    pub async fn collect_retired_volume_references(&self) -> Result<()> {
+        let (session, cursor) = {
+            let state = self.0.state.lock().await;
+            state.healthy()?;
+            (state.session.clone(), state.volume_reference_cursor)
+        };
+        let next = session.collect_retired_volume_references(cursor).await?;
+        self.0.state.lock().await.volume_reference_cursor = next;
+        Ok(())
+    }
+
     /// Collect at most sixteen terminal failures, preserving pending restarts and recovery.
     /// Cleanup or persistence failures retain the record for a later collection pass.
     pub async fn collect_failed(&self, retention: Duration) -> Result<usize> {

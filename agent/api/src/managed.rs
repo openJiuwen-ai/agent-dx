@@ -98,7 +98,7 @@ impl ManagedService {
                 if value.name != name || value.version != version {
                     return Err(Error::Unavailable("template identity mismatch".into()));
                 }
-                value.validate().map_err(Error::Invalid)?;
+                value.validate_metadata().map_err(Error::Invalid)?;
                 Ok(value)
             })
             .await
@@ -123,7 +123,7 @@ impl ManagedService {
             if value.name != name || value.version != version {
                 return Err(Error::Unavailable("template identity mismatch".into()));
             }
-            value.validate().map_err(Error::Invalid)?;
+            value.validate_metadata().map_err(Error::Invalid)?;
             Ok(value)
         })
         .await
@@ -160,7 +160,7 @@ impl ManagedService {
                 "Binding/template identity mismatch".into(),
             ));
         }
-        view.template.validate().map_err(Error::Invalid)?;
+        view.template.validate_metadata().map_err(Error::Invalid)?;
         Ok(view)
     }
     pub async fn update_alias(

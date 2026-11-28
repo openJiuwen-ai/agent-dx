@@ -7,7 +7,9 @@ use adx_agent_core::{
     discovery::{ranked_endpoints, ActivatorEndpoint},
     BindingPhase, Scope, TemplateRef,
 };
-use adx_agent_store::{discovery::RedisRegistry, MetadataChange, RedisChanges, RedisRepository};
+use adx_agent_store::{
+    discovery::RedisRegistry, MetadataChange, RedisChanges, RedisRepository, RolloutProgress,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -30,7 +32,7 @@ impl Default for ReconcileSettings {
     fn default() -> Self {
         Self {
             concurrency: 8,
-            request_timeout_seconds: 60,
+            request_timeout_seconds: 120,
             membership_refresh_seconds: 5,
         }
     }
@@ -38,7 +40,8 @@ impl Default for ReconcileSettings {
 impl ReconcileSettings {
     fn validate(&self) -> Result<()> {
         if !(1..=128).contains(&self.concurrency)
-            || !(1..=3600).contains(&self.request_timeout_seconds)
+            || !(super::CANDIDATE_PAUSE_TIMEOUT_SECONDS..=3600)
+                .contains(&self.request_timeout_seconds)
             || !(1..=300).contains(&self.membership_refresh_seconds)
         {
             return Err(Error::Invalid("invalid alias reconciliation limits".into()));
@@ -276,7 +279,9 @@ async fn run(
             }
             running.insert(scope.clone());
             let worker = activator.clone();
-            let timeout = Duration::from_secs(settings.request_timeout_seconds);
+            let timeout = crate::environment_request::pause_response_timeout(
+                settings.request_timeout_seconds,
+            );
             jobs.spawn(async move {
                 // Count the job for the embedded host's shutdown criterion:
                 // it creates Environments and commits bindings in the
@@ -300,7 +305,7 @@ async fn run(
                             + Duration::from_millis(
                                 retry_after_unix_ms
                                     .saturating_sub(adx_agent_core::unix_time_millis())
-                                    .min(60_000),
+                                    .min(RolloutProgress::MAX_REBUILD_BACKOFF_SECONDS * 1_000),
                             ),
                     ),
                     _ => None,
@@ -364,6 +369,17 @@ mod tests {
             panic!("scanning must not delete an Env")
         }
     }
+    #[test]
+    fn reconciliation_accepts_a_sixty_second_capture_budget() {
+        let mut settings = ReconcileSettings {
+            request_timeout_seconds: 60,
+            ..ReconcileSettings::default()
+        };
+        assert!(settings.validate().is_ok());
+        settings.request_timeout_seconds = 59;
+        assert!(settings.validate().is_err());
+    }
+
     #[tokio::test]
     async fn alias_scan_reads_only_the_matching_index() {
         let repository = Arc::new(ObservedRepository::default());

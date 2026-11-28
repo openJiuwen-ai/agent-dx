@@ -166,59 +166,67 @@ impl Session {
                 .try_write_owned()
                 .map_err(|_| Error::Conflict)?,
         };
-        let raw = self.store.raw().await?;
-        let header = raw.get(HEADER).ok_or(Error::Conflict)?;
-        self.header(&Some(header.clone()))?;
-        let saved = snapshot(&raw)?;
-        if saved.environments.values().any(|e| {
-            e.result.as_ref().is_some_and(|r| {
-                record_references(r)
+        // Force a Redis round-trip before reading in-memory publication state so a
+        // dropped connection updates transport_generation before the cache check.
+        let mut cmd = redis::cmd("HGET");
+        cmd.arg(&self.store.key).arg("epoch");
+        if self.store.query::<Option<u64>>(cmd).await? != Some(self.epoch) {
+            return Err(Error::Conflict);
+        }
+        let (publication, _) = self.publication_snapshot()?;
+        if publication.environments.values().any(|environment| {
+            environment.result.as_ref().is_some_and(|record| {
+                record
+                    .checkpoint
                     .iter()
-                    .any(|a| same_artifact(a, artifact))
+                    .chain(record.snapshot_source.iter())
+                    .map(|point| &point.artifact)
+                    .chain(&record.execution_artifacts)
+                    .any(|reference| same_artifact(reference, artifact))
             })
         }) {
             return Err(Error::Conflict);
         }
-        let mut cmd = redis::cmd("HGETALL");
-        cmd.arg(self.snapshots_key());
-        let snapshots: BTreeMap<String, String> = self.store.query(cmd).await?;
-        for (id, value) in &snapshots {
-            let s: Snapshot = decode(value)?;
-            if same_artifact(&s.artifact, artifact)
-                && s.state != adx_core::snapshots::SnapshotState::Deleted
-                && !(deleting_snapshot == Some(id.as_str()) && s.collectable())
-            {
-                return Err(Error::Conflict);
-            }
-        }
-        let mut cmd = redis::cmd("HGETALL");
-        cmd.arg(format!("{}:input-holds", self.store.key));
-        let holds: BTreeMap<String, String> = self.store.query(cmd).await?;
-        for value in holds.values() {
-            if decode::<ExecutionHold>(value)?
-                .artifacts
+        let snapshot_references = |snapshot: &Snapshot| {
+            same_artifact(&snapshot.artifact, artifact)
+                && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
+                && !(deleting_snapshot == Some(snapshot.id.as_str()) && snapshot.collectable())
+        };
+        let hold_references = |hold: &ExecutionHold| {
+            hold.artifacts
                 .iter()
-                .any(|a| same_artifact(a, artifact))
-            {
-                return Err(Error::Conflict);
+                .any(|reference| same_artifact(reference, artifact))
+        };
+        let cached = {
+            let inventory = self.inspection.lock().await;
+            inventory.as_ref().map(|inventory| {
+                inventory.snapshots.values().any(snapshot_references)
+                    || inventory.holds.values().any(hold_references)
+            })
+        };
+        let referenced = match cached {
+            Some(referenced) => referenced,
+            // Storage-only sessions can run without the Coordinator's inspection cache.
+            None => {
+                self.retained_snapshots()
+                    .await?
+                    .iter()
+                    .any(snapshot_references)
+                    || self.execution_holds().await?.iter().any(hold_references)
             }
-        }
-        let mut cmd = redis::cmd("EVAL");
-        cmd.arg(
-            r#"
-            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
-            return 1
-        "#,
-        )
-        .arg(3)
-        .arg(&self.store.key)
-        .arg(self.snapshots_key())
-        .arg(format!("{}:input-holds", self.store.key))
-        .arg(self.epoch.to_string())
-        .arg(encode(&snapshots)?)
-        .arg(encode(&holds)?);
-        if self.store.query::<u64>(cmd).await? != 1 {
+        };
+        if referenced {
             return Err(Error::Conflict);
+        }
+        let mut cmd = redis::cmd("HGET");
+        cmd.arg(&self.store.key).arg("epoch");
+        if self.store.query::<Option<u64>>(cmd).await? != Some(self.epoch) {
+            return Err(Error::Conflict);
+        }
+        if !self.publication_ready() {
+            return Err(Error::Unavailable(
+                "publication invalidated during deletion check".into(),
+            ));
         }
         Ok(guard)
     }
@@ -235,10 +243,10 @@ impl Session {
         Ok(())
     }
 }
-pub(super) fn artifact_key(a: &CheckpointArtifact) -> String {
+pub(crate) fn artifact_key(a: &CheckpointArtifact) -> String {
     format!("{}:{}", a.storage, a.location)
 }
-pub(super) fn record_artifacts(r: &EnvironmentRecord) -> Vec<CheckpointArtifact> {
+pub(crate) fn record_artifacts(r: &EnvironmentRecord) -> Vec<CheckpointArtifact> {
     record_references(r)
         .into_iter()
         .filter(|a| a.storage != "local")

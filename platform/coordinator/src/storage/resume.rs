@@ -163,7 +163,7 @@ impl Session {
         Err(Error::Unavailable("resume demand contention".into()))
     }
 
-    /// Only call after the node returned NoCapacity before invoking restore.
+    /// Only call after the node definitively rejected resume without a running execution.
     pub async fn reject_local_resume(
         &self,
         assignment: &Assignment,

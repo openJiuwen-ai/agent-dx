@@ -55,8 +55,9 @@ pub(super) fn reserved_workspace(parameters: &Parameters) -> bool {
         .is_some_and(|value| value.starts_with(SEED_PREFIX))
 }
 
-pub(super) fn restore_digest(template: &TemplateVersion) -> Result<String> {
-    let spec = ExecutionSpec::from(template);
+pub(super) fn restore_digest(template: &TemplateVersion, effective_image: &str) -> Result<String> {
+    let mut spec = ExecutionSpec::from(template);
+    spec.image = effective_image.into();
     let normalized = serde_json::to_vec(&(TEMPLATE_HANDOFF_VERSION, spec, &template.volumes))
         .map_err(|_| Error::Invalid("cannot encode Golden template contract".into()))?;
     Ok(format!("sha256:{:x}", Sha256::digest(normalized)))
@@ -67,6 +68,7 @@ impl Activator {
         &self,
         tenant: &str,
         template: &TemplateVersion,
+        effective_image: &str,
     ) -> Result<PreparationJob> {
         if template.isolation_runtime != "runsc" || template.readiness_probe.is_none() {
             return Err(Error::Invalid(
@@ -78,23 +80,22 @@ impl Activator {
         let volume = seed_volume(template, &identity)?;
         let params = Parameters::from([("workspace".into(), identity)]);
         let mut execution = ExecutionSpec::from(template);
+        execution.image = effective_image.into();
         execution.env = template.render_env(&params).map_err(Error::Invalid)?;
         execution.lifecycle = Default::default();
         execution.mounts = template.render_mounts(&params).map_err(Error::Invalid)?;
         execution.mounts[0].volume_id = Some(volume.id.clone());
         self.environment.validate_execution(&execution)?;
-        let (_, image_digest) = template
-            .image
-            .rsplit_once('@')
-            .ok_or_else(|| Error::Invalid("Golden requires a digest-pinned image".into()))?;
         let recipe = PrewarmRecipe {
             snapshot_id: "pending".into(),
-            image_digest: image_digest.into(),
-            restore_profile_digest: restore_digest(template)?,
+            image_digest: effective_image
+                .rsplit_once('@')
+                .map(|(_, digest)| digest.into()),
+            restore_profile_digest: restore_digest(template, effective_image)?,
             handoff_contract_version: TEMPLATE_HANDOFF_VERSION.into(),
             restore_env: Default::default(),
         };
-        recipe.validate(&template.image).map_err(Error::Invalid)?;
+        recipe.validate(effective_image).map_err(Error::Invalid)?;
         let mut seed = SeedExecution {
             execution,
             volume,
@@ -275,5 +276,226 @@ impl Activator {
             Err(error) => return Err(error.into()),
         }
         Ok(Ok(recipe))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adx_agent_core::environment::{
+        CreateEnvironment, Environment, EnvironmentObservation, EnvironmentPhase,
+    };
+    use adx_agent_store::{AgentState, MemoryRepository};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio_rustls::{rustls, TlsAcceptor};
+
+    struct Platform {
+        image: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Environment for Platform {
+        async fn prepare_snapshot(
+            &self,
+            _: &str,
+            _: &str,
+            seed: &SeedExecution,
+            _: u64,
+        ) -> std::result::Result<SeedResult, EnvironmentError> {
+            assert_eq!(seed.execution.image, self.image);
+            Ok(SeedResult::Ready {
+                snapshot_id: "golden".into(),
+            })
+        }
+
+        async fn golden_available(
+            &self,
+            _: &str,
+            id: &str,
+            image: &str,
+            runtime: &str,
+        ) -> std::result::Result<bool, EnvironmentError> {
+            Ok(id == "golden" && image == self.image && runtime == "runsc")
+        }
+
+        async fn update_snapshot_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _: &adx_agent_core::environment::SnapshotChange,
+        ) -> std::result::Result<(), EnvironmentError> {
+            Ok(())
+        }
+
+        async fn snapshot_revision(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<u64, EnvironmentError> {
+            Ok(1)
+        }
+
+        async fn ensure_volume(
+            &self,
+            _: &str,
+            _: &str,
+            spec: &VolumeSpec,
+        ) -> std::result::Result<adx_agent_core::volumes::VolumeRef, EnvironmentError> {
+            Ok(adx_agent_core::volumes::VolumeRef {
+                id: spec.id.clone(),
+                uid: "fixture-volume".into(),
+            })
+        }
+
+        async fn create(
+            &self,
+            request: &CreateEnvironment,
+        ) -> std::result::Result<EnvironmentObservation, EnvironmentError> {
+            assert_eq!(request.execution.image, self.image);
+            assert_eq!(request.execution.snapshot_id.as_deref(), Some("golden"));
+            Ok(EnvironmentObservation {
+                id: request.id.clone(),
+                tenant: request.tenant.clone(),
+                phase: EnvironmentPhase::Running,
+                ready: true,
+                runtime_id: None,
+                message: None,
+            })
+        }
+
+        async fn get(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<Option<EnvironmentObservation>, EnvironmentError> {
+            Ok(None)
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<EnvironmentObservation, EnvironmentError> {
+            Err(EnvironmentError::NotFound)
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_tag_keeps_the_public_input_and_selects_the_pinned_golden() {
+        const CERT: &[u8] = include_bytes!("../../../gateway/tests/fixtures/ingress-cert.pem");
+        const KEY: &[u8] = include_bytes!("../../../gateway/tests/fixtures/ingress-key.pem");
+        let certs = rustls_pemfile::certs(&mut &CERT[..])
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut &KEY[..]).unwrap().unwrap();
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry = listener.local_addr().unwrap().to_string();
+        let tag = format!("{registry}/app:v1");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let image = format!("{registry}/app@{digest}");
+        let response = format!("HTTP/1.1 200 OK\r\nDocker-Content-Digest: {digest}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(tls))
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "HEAD /v2/app/manifests/v1 HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let state = AgentState::new(Arc::new(MemoryRepository::default()));
+        let mut activator = Activator::new(
+            state.clone(),
+            Arc::new(Platform {
+                image: image.clone(),
+            }),
+        );
+        activator.image_resolver = Some(crate::image_resolution::ImageResolver::for_test_registry(
+            registry, CERT,
+        ));
+        let draft = serde_json::from_value(serde_json::json!({
+            "name":"app", "image":tag, "isolation_runtime":"runsc",
+            "auto_prepare_snapshot":true, "resources":{"cpu_millis":1000,"memory_mib":512},
+            "readiness_probe":{"http_get":{"path":"/ready","port":8080}},
+            "mounts":[{"type":"bind","volume_id":"user-${workspace}","target":"/data","options":["rw"]}],
+            "volumes":[{"id":"user-${workspace}","source":{"type":"directory","storage_domain":"sfs","path":"tenant/users/${workspace}"},
+                "access_mode":"exclusive","create_if_missing":true}]
+        })).unwrap();
+        let version = activator
+            .publish_with_id("tenant", &draft, Some("publish"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version.image, tag);
+        activator.reconcile_snapshot_preparations().await.unwrap();
+        let published = state
+            .published_template("tenant", "app", "1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.template.image, tag);
+        assert_eq!(published.execution().image, image);
+        let recipe = published.template.prewarm_recipe.as_ref().unwrap();
+        assert_eq!(recipe.image_digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            activator
+                .select_template_golden(
+                    "tenant",
+                    &published,
+                    &Parameters::new(),
+                    adx_agent_core::unix_time_millis() + 5_000,
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("golden"),
+        );
+        let binding = adx_agent_core::Scope {
+            tenant: "tenant".into(),
+            template: "app".into(),
+            template_ref: adx_agent_core::TemplateRef::Version("1".into()),
+            binding_id: "golden".into(),
+        };
+        let target = activator
+            .activate_with_parameters(
+                &binding,
+                None,
+                adx_agent_core::unix_time_millis() + 5_000,
+                false,
+                Some(b"workspace=user"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            target.binding.current.snapshot_id.as_deref(),
+            Some("golden")
+        );
+        let replay = activator
+            .publish_with_id("tenant", &draft, Some("publish"))
+            .await
+            .unwrap();
+        assert_eq!(replay, published.template);
     }
 }

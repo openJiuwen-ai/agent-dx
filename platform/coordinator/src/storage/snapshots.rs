@@ -49,7 +49,7 @@ impl Session {
         let catalog = if volumes::has_volumes(&next.template)
             && (old.is_none() || next.state == SnapshotState::Deleted)
         {
-            let mut catalog = self.volume_catalog().await?;
+            let mut catalog = self.volume_slice([&next.template], []).await?;
             if old.is_none() {
                 catalog.protect_snapshot(next)?;
             } else {

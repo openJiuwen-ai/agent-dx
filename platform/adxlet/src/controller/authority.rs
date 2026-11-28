@@ -157,13 +157,24 @@ impl Controller {
         // A live controller owns its pending journal results. Replay them in
         // this queue before comparing revisions, without a node-wide journal
         // writer waiting behind another environment's in-flight commit.
-        if self.durability == Some(Durability::Journaled)
+        let checkpoint_awaiting_publication = self.pause_publication_pending
+            && self.record.state == EnvironmentState::Paused
+            && !self.record.resources_held
+            && self.record.checkpoint.is_some()
+            && self.durability.is_none()
+            && record.revision <= self.record.revision;
+        if (self.durability == Some(Durability::Journaled) || checkpoint_awaiting_publication)
             && !(settled(&record)
                 && (record.state != EnvironmentState::Paused
                     || record.revision > self.record.revision))
-            && self.sync().await?.durability != Durability::Published
         {
-            return Err(Error::Unavailable("environment publication pending".into()));
+            if self.sync().await?.durability != Durability::Published {
+                return Err(Error::Unavailable("environment publication pending".into()));
+            }
+            self.pause_publication_pending = false;
+        }
+        if self.durability == Some(Durability::Published) {
+            self.pause_publication_pending = false;
         }
         let comparison = self.compare_authority(&record)?;
         if comparison == AuthorityComparison::Unstarted && !check.recover {

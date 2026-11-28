@@ -328,4 +328,16 @@ pub trait Environment: Send + Sync {
             "Environment pause unavailable".into(),
         ))
     }
+
+    /// Pause using a caller-persisted attempt. Replay the same attempt and arguments
+    /// while its outcome is unknown.
+    async fn pause_attempt(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+        _attempt: u8,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.pause(tenant, id, timeout_seconds).await
+    }
 }

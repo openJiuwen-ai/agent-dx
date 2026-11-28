@@ -1,7 +1,7 @@
 //! Recover invalidated executions through normal ShardScheduler placement and a durable
 //! Paused record at a new generation. No image-start fallback is permitted.
 use super::*;
-use adx_core::scheduling::{LabelRequirement, LabelSelector, SelectorOp};
+use adx_core::scheduling::{LabelRequirement, LabelSelector, SelectorOp, WeightedSelector};
 use futures_util::{stream, StreamExt};
 
 pub(super) fn now() -> Result<u64> {
@@ -17,6 +17,33 @@ pub(super) fn checkpoint_spec(
     source: Option<&StoredNode>,
     excluded: &BTreeSet<String>,
     target: Option<&str>,
+) -> Result<EnvironmentSpec> {
+    checkpoint_placement(stored, checkpoint, source, excluded, target, false)
+}
+
+pub(super) fn checkpoint_resume_spec(
+    stored: &StoredEnvironment,
+    checkpoint: &adx_core::RestorePoint,
+    excluded: &BTreeSet<String>,
+    source_available: bool,
+) -> Result<EnvironmentSpec> {
+    checkpoint_placement(
+        stored,
+        Some(checkpoint),
+        None,
+        excluded,
+        None,
+        source_available,
+    )
+}
+
+fn checkpoint_placement(
+    stored: &StoredEnvironment,
+    checkpoint: Option<&adx_core::RestorePoint>,
+    source: Option<&StoredNode>,
+    excluded: &BTreeSet<String>,
+    target: Option<&str>,
+    source_available: bool,
 ) -> Result<EnvironmentSpec> {
     let (alias, scope, profile) = if let Some(point) = checkpoint {
         (
@@ -50,13 +77,21 @@ pub(super) fn checkpoint_spec(
     if spec.scheduling.required_node.is_empty() {
         spec.scheduling.required_node.push(LabelSelector::default());
     }
-    let excluded: Vec<_> = excluded
-        .iter()
-        .cloned()
-        .chain(std::iter::once(stored.assignment.node_id.clone()))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let source_id = &stored.assignment.node_id;
+    let mut excluded = excluded.clone();
+    if !source_available {
+        excluded.insert(source_id.clone());
+    }
+    if !excluded.contains(source_id) {
+        spec.scheduling.preferred_node.push(WeightedSelector {
+            selector: LabelSelector {
+                match_labels: [("NODE_ID".into(), source_id.clone())].into(),
+                ..Default::default()
+            },
+            weight: 100,
+        });
+    }
+    let excluded: Vec<_> = excluded.into_iter().collect();
     for selector in &mut spec.scheduling.required_node {
         selector
             .expressions
@@ -65,11 +100,13 @@ pub(super) fn checkpoint_spec(
                 op: SelectorOp::In,
                 values: vec![value.clone()],
             }));
-        selector.expressions.push(LabelRequirement {
-            key: "NODE_ID".into(),
-            op: SelectorOp::NotIn,
-            values: excluded.clone(),
-        });
+        if !excluded.is_empty() {
+            selector.expressions.push(LabelRequirement {
+                key: "NODE_ID".into(),
+                op: SelectorOp::NotIn,
+                values: excluded.clone(),
+            });
+        }
         if let Some(target) = target {
             selector.expressions.push(LabelRequirement {
                 key: "NODE_ID".into(),
@@ -289,6 +326,34 @@ mod tests {
             runtime_classes: vec!["runsc".into()],
         };
         (stored, point, node)
+    }
+
+    #[test]
+    fn invalidated_resume_prefers_its_source_and_excludes_a_definitive_rejection() {
+        let (mut stored, point, target) = fixture();
+        stored.invalidated = true;
+        let mut source = target.clone();
+        source.id = stored.assignment.node_id.clone();
+        source.labels.insert("NODE_ID".into(), source.id.clone());
+        let mut scheduler = Coordinator::new(1, Placement::Pack).unwrap();
+        scheduler.register(target).unwrap();
+        scheduler.register(source.clone()).unwrap();
+        let mut excluded = BTreeSet::new();
+        let preferred = checkpoint_resume_spec(&stored, &point, &excluded, true).unwrap();
+        assert!(preferred.scheduling.matches_node(&source.labels));
+        assert_eq!(
+            scheduler.recovery_candidate(&preferred).unwrap().as_deref(),
+            Some("source")
+        );
+        let offline = checkpoint_resume_spec(&stored, &point, &excluded, false).unwrap();
+        assert!(!offline.scheduling.matches_node(&source.labels));
+        excluded.insert(source.id.clone());
+        let rejected = checkpoint_resume_spec(&stored, &point, &excluded, true).unwrap();
+        assert!(!rejected.scheduling.matches_node(&source.labels));
+        assert_eq!(
+            scheduler.recovery_candidate(&rejected).unwrap().as_deref(),
+            Some("target")
+        );
     }
 
     #[test]

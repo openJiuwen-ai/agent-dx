@@ -208,7 +208,10 @@ impl Session {
                 None
             };
             let catalog = if volumes::has_volumes(&record.spec) {
-                Some(self.volume_catalog().await?)
+                Some(
+                    self.volume_slice([&record.spec], [record.assignment.node_id.as_str()])
+                        .await?,
+                )
             } else {
                 None
             };

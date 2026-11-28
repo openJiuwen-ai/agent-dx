@@ -11,7 +11,8 @@ pub const TEMPLATE_HANDOFF_VERSION: &str = "3";
 #[serde(deny_unknown_fields)]
 pub struct PrewarmRecipe {
     pub snapshot_id: String,
-    pub image_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
     pub restore_profile_digest: String,
     pub handoff_contract_version: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -19,17 +20,42 @@ pub struct PrewarmRecipe {
 }
 
 impl PrewarmRecipe {
-    pub fn validate(&self, image: &str) -> ValidationResult {
+    /// A pinned execution requires the same digest in its recipe. A tag has no digest.
+    pub fn validate(&self, effective_image: &str) -> ValidationResult {
+        if effective_image.rsplit_once('@').map(|(_, digest)| digest)
+            != self.image_digest.as_deref()
+        {
+            return Err("invalid fixed Golden restore input".into());
+        }
+        self.validate_fields()
+    }
+
+    pub(crate) fn validate_for_template(&self, image: &str) -> ValidationResult {
+        if self.handoff_contract_version == TEMPLATE_HANDOFF_VERSION
+            && !image.contains('@')
+            && self.image_digest.is_some()
+        {
+            // Public template views retain the submitted tag. The store checks the
+            // recipe against the separately persisted execution image.
+            self.validate_fields()
+        } else {
+            self.validate(image)
+        }
+    }
+
+    fn validate_fields(&self) -> ValidationResult {
         identifier(&self.snapshot_id, "snapshot_id")?;
         identifier(&self.handoff_contract_version, "handoff_contract_version")?;
         if self.snapshot_id.trim() != self.snapshot_id
             || matches!(self.snapshot_id.as_str(), "." | "..")
             || self.snapshot_id.contains(['/', '\\'])
-            || !sha256(&self.image_digest)
+            || self
+                .image_digest
+                .as_deref()
+                .is_some_and(|digest| !sha256(digest))
+            || (self.handoff_contract_version != TEMPLATE_HANDOFF_VERSION
+                && self.image_digest.is_none())
             || !sha256(&self.restore_profile_digest)
-            || image
-                .rsplit_once('@')
-                .is_none_or(|(_, digest)| digest != self.image_digest)
         {
             return Err("invalid fixed Golden restore input".into());
         }

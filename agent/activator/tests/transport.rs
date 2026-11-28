@@ -525,37 +525,28 @@ async fn pause_rejects_timeout_seconds_outside_the_api_bound() {
 }
 
 #[tokio::test]
-async fn pause_client_budget_is_clamped_to_timeout_seconds() {
-    // A slow Platform pause must give up after timeout_seconds (the reconciliation
-    // step's remaining budget), not after self.timeout + timeout_seconds, so the
-    // step deadline bounds the capture instead of overshooting into the outer
-    // reconciliation timeout. self.timeout (10s) + timeout_seconds (1s) would wait
-    // ~11s; the clamped client budget returns at ~1s.
-    let router = Router::new().fallback(|| async {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        axum::http::StatusCode::OK
+async fn pause_client_waits_for_publication_after_the_capture_budget() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let router = Router::new().fallback(|Json(input): Json<serde_json::Value>| async move {
+        assert_eq!(input["timeoutSeconds"], 1);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        Json(serde_json::json!({
+            "code": 200,
+            "data": STANDARD.encode(r#"{"environmentId":"adx-id","state":"paused"}"#)
+        }))
     });
     let (url, task) = serve(router).await;
     let client = HttpEnvironment::new(
         &url,
         credentials(),
-        Duration::from_secs(10),
+        Duration::from_millis(50),
         None,
         true,
         None,
     )
     .unwrap();
-    let start = std::time::Instant::now();
-    let result = client.pause("tenant", "adx-id", 1).await;
-    let elapsed = start.elapsed();
-    assert!(
-        matches!(result, Err(EnvironmentError::OutcomeUnknown(_))),
-        "a slow pause is an unknown outcome: {result:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "pause must give up after ~timeout_seconds (1s), not self.timeout+timeout_seconds (11s); got {elapsed:?}"
-    );
+    let result = client.pause("tenant", "adx-id", 1).await.unwrap();
+    assert_eq!(result.phase, EnvironmentPhase::Paused);
     task.abort();
 }
 
