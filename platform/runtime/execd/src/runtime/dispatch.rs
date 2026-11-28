@@ -1,7 +1,8 @@
 //! HTTP environment action dispatch.
 
 use super::codec;
-use std::collections::{HashMap, VecDeque};
+use super::command_output::{ActionResult, CommandOutput, Output, Reader, Spool};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -11,8 +12,29 @@ const REQUEST_DEDUP_EVICTION_BATCH: usize = 64;
 
 struct DedupSlot {
     created: Instant,
-    response: Mutex<Option<Result<rmpv::Value, String>>>,
+    protected: bool,
+    response: Mutex<Option<CompletedInvocation>>,
     ready: Condvar,
+}
+
+struct CompletedInvocation {
+    at: Instant,
+    result: Result<ActionResult, String>,
+}
+
+impl DedupSlot {
+    fn expired(&self, now: Instant) -> bool {
+        let origin = if self.protected {
+            self.response
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|completed| completed.at)
+        } else {
+            Some(self.created)
+        };
+        origin.is_some_and(|origin| now.saturating_duration_since(origin) > REQUEST_DEDUP_TTL)
+    }
 }
 
 #[derive(Default)]
@@ -33,9 +55,10 @@ impl DedupCache {
             let Some(slot) = self.slots.get(&request_id) else {
                 continue;
             };
-            let expired = now.duration_since(slot.created) > REQUEST_DEDUP_TTL;
-            let completed_over_limit =
-                self.slots.len() >= max_entries && slot.response.lock().unwrap().is_some();
+            let expired = slot.expired(now);
+            let completed_over_limit = self.slots.len() >= max_entries
+                && !slot.protected
+                && slot.response.lock().unwrap().is_some();
             if expired || completed_over_limit {
                 self.slots.remove(&request_id);
                 if self.slots.len() < max_entries {
@@ -54,11 +77,12 @@ impl DedupCache {
         request_id: &str,
         now: Instant,
         max_entries: usize,
-    ) -> (Arc<DedupSlot>, bool) {
+        protected: bool,
+    ) -> Option<(Arc<DedupSlot>, bool)> {
         let max_entries = max_entries.max(1);
         if let Some(slot) = self.slots.get(request_id) {
-            if now.duration_since(slot.created) <= REQUEST_DEDUP_TTL {
-                return (slot.clone(), false);
+            if !slot.expired(now) {
+                return Some((slot.clone(), false));
             }
             // Remove the expired key before general cleanup. Its queue entry
             // is harmless and will be discarded when the cursor reaches it.
@@ -66,14 +90,18 @@ impl DedupCache {
         }
 
         self.evict_incrementally(now, max_entries);
+        if protected && self.slots.len() >= max_entries {
+            return None;
+        }
         let slot = Arc::new(DedupSlot {
             created: now,
+            protected,
             response: Mutex::new(None),
             ready: Condvar::new(),
         });
         self.slots.insert(request_id.to_string(), slot.clone());
         self.order.push_back(request_id.to_string());
-        (slot, true)
+        Some((slot, true))
     }
 }
 
@@ -82,24 +110,35 @@ fn dedup_cache() -> &'static Mutex<DedupCache> {
     CACHE.get_or_init(|| Mutex::new(DedupCache::default()))
 }
 
-fn reserve_request_id(request_id: &str) -> (Arc<DedupSlot>, bool) {
+pub(super) fn reap_expired_results() {
     let now = Instant::now();
     let mut cache = dedup_cache().lock().unwrap();
-    cache.reserve(request_id, now, REQUEST_DEDUP_MAX_ENTRIES)
+    let DedupCache { slots, order } = &mut *cache;
+    slots.retain(|_, slot| !slot.expired(now));
+    order.retain(|id| slots.contains_key(id));
 }
 
-fn wait_dedup_response(slot: Arc<DedupSlot>) -> Result<rmpv::Value, String> {
+fn reserve_request_id(request_id: &str, protected: bool) -> Option<(Arc<DedupSlot>, bool)> {
+    let now = Instant::now();
+    let mut cache = dedup_cache().lock().unwrap();
+    cache.reserve(request_id, now, REQUEST_DEDUP_MAX_ENTRIES, protected)
+}
+
+fn wait_dedup_response(slot: Arc<DedupSlot>) -> Result<ActionResult, String> {
     let mut guard = slot.response.lock().unwrap();
     loop {
-        if let Some(response) = guard.clone() {
-            return response;
+        if let Some(completed) = &*guard {
+            return completed.result.clone();
         }
         guard = slot.ready.wait(guard).unwrap();
     }
 }
 
-fn complete_dedup_response(slot: &Arc<DedupSlot>, response: Result<rmpv::Value, String>) {
-    *slot.response.lock().unwrap() = Some(response);
+fn complete_dedup_response(slot: &Arc<DedupSlot>, result: Result<ActionResult, String>) {
+    *slot.response.lock().unwrap() = Some(CompletedInvocation {
+        at: Instant::now(),
+        result,
+    });
     slot.ready.notify_all();
 }
 
@@ -300,46 +339,37 @@ fn reap_timed_out_child(
     }
 }
 
-/// Run one shell command and return `{stdout, stderr, exit_code}`, matching akernel cmd_run.
-///
-/// Timed commands run in their own process group so expiry can terminate the
-/// shell and every descendant. Output is redirected to anonymous temporary
-/// files instead of pipes: a descendant that escapes the process group cannot
-/// keep a pipe open and block this function after the shell has been reaped.
+/// Keep the synchronous command deadline and exit contract. A deployment with
+/// spooling enabled uses the same pipe capture as registry commands.
 fn run_command(
     cmd: &str,
     cwd: Option<&str>,
     envs: Option<&rmpv::Value>,
     timeout: Option<Duration>,
     trace_id: &str,
-) -> rmpv::Value {
+) -> ActionResult {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
 
-    let mut stdout = match tempfile::tempfile() {
-        Ok(file) => file,
-        Err(e) => return command_result(String::new(), e.to_string(), -1),
-    };
-    let mut stderr = match tempfile::tempfile() {
-        Ok(file) => file,
-        Err(e) => return command_result(String::new(), e.to_string(), -1),
-    };
-    let stdout_child = match stdout.try_clone() {
-        Ok(file) => file,
-        Err(e) => return command_result(String::new(), e.to_string(), -1),
-    };
-    let stderr_child = match stderr.try_clone() {
-        Ok(file) => file,
-        Err(e) => return command_result(String::new(), e.to_string(), -1),
-    };
-
+    let spool = Spool::configured();
     let mut c = Command::new("/bin/sh");
-    c.arg("-c")
-        .arg(cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_child))
-        .stderr(Stdio::from(stderr_child))
-        .process_group(0);
+    c.arg("-c").arg(cmd).stdin(Stdio::null()).process_group(0);
+    let legacy_files = if spool.is_some() {
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        None
+    } else {
+        let files = (|| -> std::io::Result<_> {
+            let stdout = tempfile::tempfile()?;
+            let stderr = tempfile::tempfile()?;
+            c.stdout(Stdio::from(stdout.try_clone()?))
+                .stderr(Stdio::from(stderr.try_clone()?));
+            Ok((stdout, stderr))
+        })();
+        match files {
+            Ok(files) => Some(files),
+            Err(error) => return command_result(String::new(), error.to_string(), -1).into(),
+        }
+    };
     super::child_env::apply(&mut c);
     if let Some(d) = cwd {
         if !d.is_empty() {
@@ -350,7 +380,7 @@ fn run_command(
         for (k, v) in kvs {
             if let (Some(k), Some(v)) = (k.as_str(), v.as_str()) {
                 if let Err(error) = super::child_env::validate_override(k) {
-                    return command_result(String::new(), error, -1);
+                    return command_result(String::new(), error, -1).into();
                 }
                 c.env(k, v);
             }
@@ -368,6 +398,7 @@ fn run_command(
                 return exec_argument_error(
                     "args.timeout exceeds the supported execution deadline".into(),
                 )
+                .into();
             }
         },
         None => None,
@@ -385,9 +416,24 @@ fn run_command(
                 sanitize_log_field(trace_id),
                 sanitize_log_field(&e.to_string())
             );
-            return command_result(String::new(), e.to_string(), -1);
+            return command_result(String::new(), e.to_string(), -1).into();
         }
     };
+    let readers = spool.map(|spool| {
+        (
+            Reader::spawn(
+                child.stdout.take(),
+                "EXECD_COMMAND_STDOUT_LIMIT_BYTES",
+                Some(spool.clone()),
+            ),
+            Reader::spawn(
+                child.stderr.take(),
+                "EXECD_COMMAND_STDERR_LIMIT_BYTES",
+                Some(spool),
+            ),
+        )
+    });
+    let _command_activity = super::activity::enter_command();
     let pid = child.id() as libc::pid_t;
     execd_info!(
         "[execd-command] phase=spawned_pid traceid={} pid={}",
@@ -439,9 +485,20 @@ fn run_command(
         std::thread::sleep(sleep_for);
     };
 
-    let stdout = read_command_output(&mut stdout);
-    let captured_stderr = read_command_output(&mut stderr);
-    match status {
+    let output = readers.map(|(stdout, stderr)| {
+        stdout.request_finish();
+        stderr.request_finish();
+        CommandOutput::from_readers(&stdout, &stderr)
+    });
+    let (stdout, captured_stderr) = legacy_files
+        .map(|(mut stdout, mut stderr)| {
+            (
+                read_command_output(&mut stdout),
+                read_command_output(&mut stderr),
+            )
+        })
+        .unwrap_or_default();
+    let result = match status {
         Ok(Some(status)) => {
             let exit_code = status.code().unwrap_or(-1) as i64;
             execd_info!(
@@ -486,6 +543,25 @@ fn run_command(
             );
             command_result(stdout, e.to_string(), -1)
         }
+    };
+    if let Some(mut output) = output {
+        if output.stderr.failure().is_none() {
+            if let Some(message) = result.as_map().and_then(|fields| {
+                fields
+                    .iter()
+                    .find_map(|(key, value)| {
+                        (key.as_str() == Some("stderr"))
+                            .then(|| value.as_str())
+                            .flatten()
+                    })
+                    .filter(|message| !message.is_empty())
+            }) {
+                output.stderr = Output::text(message.to_owned());
+            }
+        }
+        ActionResult::with_output(result, output)
+    } else {
+        result.into()
     }
 }
 
@@ -534,11 +610,24 @@ pub(crate) fn normalize_environment_action(action: &str) -> Option<&'static str>
     }
 }
 
-pub(crate) fn dispatch_runtime_action_with_trace(
+fn dispatch_runtime_action_with_trace(
     method: &str,
-    kw: &std::collections::BTreeMap<String, rmpv::Value>,
+    kw: &BTreeMap<String, rmpv::Value>,
     trace_id: &str,
-) -> Option<rmpv::Value> {
+) -> Option<ActionResult> {
+    match method {
+        "cmd_run" => Some(match exec_args(kw) {
+            Ok(args) => run_command(args.cmd, args.cwd, args.envs, args.timeout, trace_id),
+            Err(error) => exec_argument_error(error).into(),
+        }),
+        "cmd_get" => Some(super::cmd::cmd_get(kw)),
+        "cmd_poll" => Some(super::cmd::cmd_poll(kw)),
+        "cmd_wait" => Some(super::cmd::cmd_wait(kw)),
+        _ => dispatch_value(method, kw).map(ActionResult::from),
+    }
+}
+
+fn dispatch_value(method: &str, kw: &BTreeMap<String, rmpv::Value>) -> Option<rmpv::Value> {
     match method {
         "ping" => Some(codec::map_value(vec![("status", rmpv::Value::from("ok"))])),
         "runtime_probe_status" => {
@@ -560,19 +649,6 @@ pub(crate) fn dispatch_runtime_action_with_trace(
                 Err(error) => codec::map_value(vec![("error", error.to_string().into())]),
             })
         }
-        "cmd_run" => {
-            let args = match exec_args(kw) {
-                Ok(args) => args,
-                Err(error) => return Some(exec_argument_error(error)),
-            };
-            Some(run_command(
-                args.cmd,
-                args.cwd,
-                args.envs,
-                args.timeout,
-                trace_id,
-            ))
-        }
         "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list" | "fs_search"
         | "fs_exists" | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => {
             Some(match method {
@@ -589,17 +665,15 @@ pub(crate) fn dispatch_runtime_action_with_trace(
                 _ => super::fs::fs_get_info(kw),
             })
         }
-        "cmd_start" | "cmd_get" | "cmd_poll" | "cmd_wait" | "cmd_kill" | "cmd_list"
-        | "cmd_capabilities" | "cmd_send_stdin" => Some(match method {
-            "cmd_start" => super::cmd::cmd_start(kw),
-            "cmd_get" => super::cmd::cmd_get(kw),
-            "cmd_poll" => super::cmd::cmd_poll(kw),
-            "cmd_wait" => super::cmd::cmd_wait(kw),
-            "cmd_kill" => super::cmd::cmd_kill(kw),
-            "cmd_list" => super::cmd::cmd_list(kw),
-            "cmd_capabilities" => super::cmd::cmd_capabilities(kw),
-            _ => super::cmd::cmd_send_stdin(kw),
-        }),
+        "cmd_start" | "cmd_kill" | "cmd_list" | "cmd_capabilities" | "cmd_send_stdin" => {
+            Some(match method {
+                "cmd_start" => super::cmd::cmd_start(kw),
+                "cmd_kill" => super::cmd::cmd_kill(kw),
+                "cmd_list" => super::cmd::cmd_list(kw),
+                "cmd_capabilities" => super::cmd::cmd_capabilities(kw),
+                _ => super::cmd::cmd_send_stdin(kw),
+            })
+        }
         "bash_init" | "bash_submit" | "bash_poll" | "bash_destroy" => Some(match method {
             "bash_init" => super::bash::bash_init(kw),
             "bash_submit" => super::bash::bash_submit(kw),
@@ -623,11 +697,11 @@ pub(crate) fn dispatch_runtime_action_with_trace(
 
 /// Execute one public environment action through the same normalized EXECD primitive
 /// used by the HTTP endpoint.
-pub(crate) fn execute_environment_action(
+fn execute_environment_action(
     action: &str,
     kw: &std::collections::BTreeMap<String, rmpv::Value>,
     trace_id: &str,
-) -> Result<rmpv::Value, String> {
+) -> Result<ActionResult, String> {
     let started = Instant::now();
     let method = normalize_environment_action(action)
         .ok_or_else(|| format!("unsupported environment action: {action}"))?;
@@ -641,16 +715,29 @@ pub(crate) fn execute_environment_action(
 /// Execute a environment action at most once for a non-empty request ID. Both
 /// HTTP requests use this cache, so concurrent retries
 /// observe the same result.
-pub(crate) fn execute_environment_action_once(
+pub(super) fn execute_environment_action_once(
     request_id: Option<&str>,
     action: &str,
     kw: &std::collections::BTreeMap<String, rmpv::Value>,
     trace_id: &str,
-) -> Result<rmpv::Value, String> {
+) -> Result<ActionResult, String> {
     let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
         return execute_environment_action(action, kw, trace_id);
     };
-    let (slot, owner) = reserve_request_id(request_id);
+    // Result reads are side-effect free. Caching their output here would
+    // extend retention beyond the command registry's expiry.
+    let method = normalize_environment_action(action);
+    if matches!(method, Some("cmd_get" | "cmd_poll" | "cmd_wait")) {
+        return execute_environment_action(action, kw, trace_id);
+    }
+    let protected = method == Some("cmd_run") && Spool::enabled();
+    let Some((slot, owner)) = reserve_request_id(request_id, protected) else {
+        return Ok(codec::map_value(vec![
+            ("error_code", "RESOURCE_EXHAUSTED".into()),
+            ("error", "command request replay capacity exhausted".into()),
+        ])
+        .into());
+    };
     if !owner {
         return wait_dedup_response(slot);
     }
@@ -686,7 +773,8 @@ mod tests {
         let kw = BTreeMap::new();
         for action in ["ping", "noop"] {
             let result = execute_environment_action(action, &kw, "trace-test")
-                .expect("lightweight action should dispatch through the shared path");
+                .expect("lightweight action should dispatch through the shared path")
+                .into_value();
             assert_eq!(result_field(&result, "status").as_str(), Some("ok"));
         }
     }
@@ -695,25 +783,33 @@ mod tests {
     fn dedup_cache_reuses_live_slots_and_expires_old_slots() {
         let now = Instant::now();
         let mut cache = DedupCache::default();
-        let (first, owner) = cache.reserve("request-a", now, 4);
+        let (first, owner) = cache.reserve("request-a", now, 4, false).unwrap();
         assert!(owner);
-        complete_dedup_response(&first, Ok(rmpv::Value::from("first")));
+        complete_dedup_response(&first, Ok(rmpv::Value::from("first").into()));
 
-        let (duplicate, owner) = cache.reserve("request-a", now + Duration::from_secs(1), 4);
+        let (duplicate, owner) = cache
+            .reserve("request-a", now + Duration::from_secs(1), 4, false)
+            .unwrap();
         assert!(!owner);
         assert!(Arc::ptr_eq(&first, &duplicate));
 
-        cache.reserve(
-            "request-b",
-            now + REQUEST_DEDUP_TTL + Duration::from_secs(1),
-            4,
-        );
+        cache
+            .reserve(
+                "request-b",
+                now + REQUEST_DEDUP_TTL + Duration::from_secs(1),
+                4,
+                false,
+            )
+            .unwrap();
         assert!(!cache.slots.contains_key("request-a"));
-        let (_, owner) = cache.reserve(
-            "request-a",
-            now + REQUEST_DEDUP_TTL + Duration::from_secs(2),
-            4,
-        );
+        let (_, owner) = cache
+            .reserve(
+                "request-a",
+                now + REQUEST_DEDUP_TTL + Duration::from_secs(2),
+                4,
+                false,
+            )
+            .unwrap();
         assert!(owner);
     }
 
@@ -721,12 +817,16 @@ mod tests {
     fn dedup_cache_evicts_oldest_completed_slot_at_capacity() {
         let now = Instant::now();
         let mut cache = DedupCache::default();
-        let (first, _) = cache.reserve("request-a", now, 2);
-        complete_dedup_response(&first, Ok(rmpv::Value::from("first")));
-        let (second, _) = cache.reserve("request-b", now + Duration::from_secs(1), 2);
-        complete_dedup_response(&second, Ok(rmpv::Value::from("second")));
+        let (first, _) = cache.reserve("request-a", now, 2, false).unwrap();
+        complete_dedup_response(&first, Ok(rmpv::Value::from("first").into()));
+        let (second, _) = cache
+            .reserve("request-b", now + Duration::from_secs(1), 2, false)
+            .unwrap();
+        complete_dedup_response(&second, Ok(rmpv::Value::from("second").into()));
 
-        cache.reserve("request-c", now + Duration::from_secs(2), 2);
+        cache
+            .reserve("request-c", now + Duration::from_secs(2), 2, false)
+            .unwrap();
         assert_eq!(cache.slots.len(), 2);
         assert!(!cache.slots.contains_key("request-a"));
         assert!(cache.slots.contains_key("request-b"));
@@ -737,10 +837,12 @@ mod tests {
     fn dedup_cache_preserves_a_duplicate_at_capacity() {
         let now = Instant::now();
         let mut cache = DedupCache::default();
-        let (first, _) = cache.reserve("request-a", now, 1);
-        complete_dedup_response(&first, Ok(rmpv::Value::from("first")));
+        let (first, _) = cache.reserve("request-a", now, 1, false).unwrap();
+        complete_dedup_response(&first, Ok(rmpv::Value::from("first").into()));
 
-        let (duplicate, owner) = cache.reserve("request-a", now + Duration::from_secs(1), 1);
+        let (duplicate, owner) = cache
+            .reserve("request-a", now + Duration::from_secs(1), 1, false)
+            .unwrap();
         assert!(!owner);
         assert!(Arc::ptr_eq(&first, &duplicate));
         assert_eq!(cache.slots.len(), 1);
@@ -750,10 +852,14 @@ mod tests {
     fn dedup_cache_never_evicts_an_in_flight_slot_for_capacity() {
         let now = Instant::now();
         let mut cache = DedupCache::default();
-        let (in_flight, _) = cache.reserve("request-a", now, 1);
+        let (in_flight, _) = cache.reserve("request-a", now, 1, false).unwrap();
 
-        cache.reserve("request-b", now + Duration::from_secs(1), 1);
-        let (duplicate, owner) = cache.reserve("request-a", now + Duration::from_secs(2), 1);
+        cache
+            .reserve("request-b", now + Duration::from_secs(1), 1, false)
+            .unwrap();
+        let (duplicate, owner) = cache
+            .reserve("request-a", now + Duration::from_secs(2), 1, false)
+            .unwrap();
         assert!(!owner);
         assert!(Arc::ptr_eq(&in_flight, &duplicate));
         assert_eq!(cache.slots.len(), 2);
@@ -763,11 +869,15 @@ mod tests {
     fn dedup_cache_evicts_completed_slots_behind_an_in_flight_slot() {
         let now = Instant::now();
         let mut cache = DedupCache::default();
-        cache.reserve("request-a", now, 2);
-        let (completed, _) = cache.reserve("request-b", now + Duration::from_secs(1), 2);
-        complete_dedup_response(&completed, Ok(rmpv::Value::from("done")));
+        cache.reserve("request-a", now, 2, false).unwrap();
+        let (completed, _) = cache
+            .reserve("request-b", now + Duration::from_secs(1), 2, false)
+            .unwrap();
+        complete_dedup_response(&completed, Ok(rmpv::Value::from("done").into()));
 
-        cache.reserve("request-c", now + Duration::from_secs(2), 2);
+        cache
+            .reserve("request-c", now + Duration::from_secs(2), 2, false)
+            .unwrap();
         assert_eq!(cache.slots.len(), 2);
         assert!(cache.slots.contains_key("request-a"));
         assert!(!cache.slots.contains_key("request-b"));
@@ -808,7 +918,9 @@ mod tests {
             ("exit 137", None, 137),
         ] {
             let kw = BTreeMap::from([("cmd".into(), rmpv::Value::from(command))]);
-            let value = execute_environment_action("process.exec", &kw, "signal-test").unwrap();
+            let value = execute_environment_action("process.exec", &kw, "signal-test")
+                .unwrap()
+                .into_value();
             let rmpv::Value::Map(fields) = value else {
                 panic!("expected command result")
             };
@@ -831,7 +943,8 @@ mod tests {
             rmpv::Value::from("printf environment-invoke"),
         );
         let result = execute_environment_action("process.exec", &kw, "trace-test")
-            .expect("environment action should dispatch through the shared path");
+            .expect("environment action should dispatch through the shared path")
+            .into_value();
         if let rmpv::Value::Map(fields) = result {
             let stdout = fields
                 .iter()
@@ -868,7 +981,8 @@ mod tests {
         ]);
         let started = Instant::now();
         let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
-            .expect("cmd_run should dispatch");
+            .expect("cmd_run should dispatch")
+            .into_value();
 
         // The budget starts before spawn. A busy worker may kill the child
         // before it executes any shell statements; no readiness file is needed.
@@ -899,7 +1013,8 @@ mod tests {
 
         let started = Instant::now();
         let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
-            .expect("cmd_run should dispatch");
+            .expect("cmd_run should dispatch")
+            .into_value();
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -946,14 +1061,16 @@ mod tests {
             &first_args,
             "trace-first",
         )
-        .expect("first action should run");
+        .expect("first action should run")
+        .into_value();
         let duplicate = execute_environment_action_once(
             Some("execd-dedup-test-request"),
             "process.exec",
             &second_args,
             "trace-second",
         )
-        .expect("duplicate action should reuse the first result");
+        .expect("duplicate action should reuse the first result")
+        .into_value();
 
         assert_eq!(duplicate, first);
     }

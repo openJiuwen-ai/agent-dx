@@ -3,7 +3,9 @@
 
 import argparse
 import json
+import logging
 import re
+import sys
 from pathlib import Path
 
 import yaml
@@ -95,7 +97,7 @@ def control_routes():
 
 def runtime_actions():
     source = (ROOT / 'platform/runtime/execd/src/runtime/dispatch.rs').read_text()
-    table = source.split('fn normalize_environment_action(', 1)[1].split('pub(crate) fn dispatch_runtime_action_with_trace', 1)[0]
+    table = source.split('fn normalize_environment_action(', 1)[1].split('\n}\n', 1)[0]
     return set(re.findall(r'"((?:process|file|shell|entrypoint)\.[^"]+)"', table))
 
 
@@ -145,10 +147,13 @@ def audit(control, data, *, routes=None, actions=None):
                 errors.append(f'{label}: invalid schema {name}: {error.message}')
         if valid_refs:
             errors.extend(f'{label}: {error}' for error in example_errors(doc))
-    documented = {(method.upper(), path) for path, entry in control['paths'].items() for method in entry if method in METHODS}
+    documented = set()
+    for path, entry in control['paths'].items():
+        documented.update((method.upper(), path) for method in entry if method in METHODS)
     for method, path in sorted((control_routes() if routes is None else routes) - documented):
         errors.append(f'missing control operation: {method} {path}')
-    for name in sorted(create_fields() - control['components']['schemas']['CreateEnvironmentRequest']['properties'].keys()):
+    create_properties = control['components']['schemas']['CreateEnvironmentRequest']['properties']
+    for name in sorted(create_fields() - create_properties.keys()):
         errors.append(f'missing create field: {name}')
     schemas = data['components']['schemas']
     covered = set()
@@ -183,10 +188,12 @@ def main():
         'runtime_actions': len(runtime_actions()),
         'errors': audit(control, data),
     }
+    rendered = json.dumps(result, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(result, indent=2) + '\n')
-    print(json.dumps(result, indent=2))
+        args.output.write_text(rendered + '\n')
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(message)s', force=True)
+    logging.info('%s', rendered)
     return bool(result['errors'])
 
 

@@ -98,6 +98,11 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/InvokeResult"}
+        "507":
+          description: Execd could not retain or read complete command output.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CommandOutputIncomplete"}
         "4XX":
           $ref: "#/components/responses/RuntimeError"
         default:
@@ -436,6 +441,31 @@ components:
         text/plain:
           schema: {type: string}
   schemas:
+    CommandOutputIncomplete:
+      type: object
+      required: [error, exit_code, exit_signal, truncated, stdout_truncated, stderr_truncated]
+      properties:
+        error:
+          type: object
+          required: [code, message, retry, outcome, requestForwarded]
+          properties:
+            code: {type: string, const: COMMAND_OUTPUT_INCOMPLETE}
+            message: {type: string}
+            retry: {type: string, const: never}
+            outcome: {type: string, const: terminal}
+            requestForwarded: {type: boolean, const: true}
+            requestId: {type: [string, 'null']}
+            operationId: {type: [string, 'null']}
+            environmentId: {type: [string, 'null']}
+        command_id: {type: [string, 'null']}
+        status: {type: [string, 'null']}
+        exit_code: {type: [integer, 'null']}
+        exit_signal: {type: [integer, 'null']}
+        truncated: {type: boolean, const: true}
+        stdout_truncated: {type: boolean}
+        stderr_truncated: {type: boolean}
+        stdout_output_failure: {type: [string, 'null']}
+        stderr_output_failure: {type: [string, 'null']}
     GatewayError:
       type: object
       required: [error]

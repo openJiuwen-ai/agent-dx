@@ -94,6 +94,17 @@ SDK `commands.run` 的默认／长等待路径和后台命令使用 `process.sta
 环境变量对象的值必须全部为字符串。timeout 不接受 null、布尔值或数字字符串。
 合法请求的非零退出码、启动失败与执行超时仍使用原有命令结果，不作为参数类型错误。
 
+启用 Execd 命令输出转存后，`process.exec` 和后台命令分别捕获 stdout 和 stderr。
+单路输出达到内存上限，或共享输出预算不足时，Execd 将该路的已保留字节和后续字节接续写入临时文件。
+`process.exec`、`process.get`、`process.poll` 和 `process.wait` 仍返回原有 JSON 字符串字段。
+转存结果通过分块 HTTP 正文发送。命令输出文本仍按 UTF-8 解码，非法序列使用替换字符。
+对通过管道捕获的输出，主进程退出后，Execd 读取收尾时管道中已经排队的字节并封存结果。
+后代进程继续持有管道不会延迟终态发布，之后写入的字节不进入原命令结果。
+转存结果在对应的命令结果保留期内可重复读取。连接中断时，同步执行使用原 Request ID 重试，
+后台命令使用原 `command_id` 读取同一结果。重试从 JSON 正文开头读取。
+输出因配额、磁盘空间或 I/O 错误无法完整保留时，Execd 返回 HTTP 507
+`COMMAND_OUTPUT_INCOMPLETE`，并携带原命令退出信息和受影响的输出流。
+
 `process.start.timeout` 省略或零不设置执行截止；正值到期终止进程组。
 `process.wait.timeout` 只约束本次等待，不杀进程；到期仍返回 HTTP 200：
 

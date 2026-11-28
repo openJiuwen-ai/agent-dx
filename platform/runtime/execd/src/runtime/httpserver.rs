@@ -23,6 +23,7 @@
 //! backend pool can reuse a connection through the Ingress proxy. Streaming responses
 //! that require EOF framing still advertise `Connection: close`.
 
+use super::command_output::{ActionResult, CommandOutput, Output};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, SeekFrom, Write};
@@ -30,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -235,9 +236,16 @@ pub(crate) async fn serve_listener(
     let address = listener.local_addr()?;
     execd_info!("[execd-http] atomic-ops server listening on {address}");
     let mut connections = tokio::task::JoinSet::new();
+    let mut reap = tokio::time::interval(Duration::from_secs(10));
+    reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
+            _ = reap.tick() => {
+                super::cmd::reap_expired_results();
+                super::dispatch::reap_expired_results();
+                continue;
+            }
             _ = connections.join_next(), if !connections.is_empty() => continue,
         };
         let (mut sock, _peer) = accepted?;
@@ -326,17 +334,17 @@ async fn handle_one_request(
         let trace_id = parse_header(&head, "x-trace-id").unwrap_or_default();
         let route = request_path(&path);
         execd_info!(
-        "[execd-http] request method={} path={} body_mode={} content_len={} initial_body={} trace={}",
-        method,
-        route,
-        body_mode.label(),
-        body_mode
-            .expected_len()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        buf[header_end..].len(),
-        trace_id
-    );
+            "[execd-http] request method={} path={} body_mode={} content_len={} initial_body={} trace={}",
+            method,
+            route,
+            body_mode.label(),
+            body_mode
+                .expected_len()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            buf[header_end..].len(),
+            trace_id
+        );
 
         // Health checks do not need a body.
         if method == "GET" && route == "/healthz" {
@@ -350,16 +358,20 @@ async fn handle_one_request(
         if method == "GET" && route == "/metrics" {
             let metrics = super::cmd::command_metrics();
             let body = format!(
-            "command_records {}\ncommand_running {}\ncommand_completed {}\ncommand_result_bytes {}\ncommand_result_truncated_total {}\ncommand_record_expired_total {}\ncommand_id_conflict_total {}\ncommand_watch_connections {}\n",
-            metrics.records,
-            metrics.running,
-            metrics.completed,
-            metrics.result_bytes,
-            metrics.result_truncated_total,
-            metrics.record_expired_total,
-            metrics.id_conflict_total,
-            COMMAND_WATCHERS.load(std::sync::atomic::Ordering::Relaxed),
-        );
+                "command_records {}\ncommand_running {}\ncommand_completed {}\ncommand_result_bytes {}\ncommand_result_truncated_total {}\ncommand_spool_bytes {}\ncommand_spool_files {}\ncommand_spool_streams_total {}\ncommand_output_incomplete_total {}\ncommand_record_expired_total {}\ncommand_id_conflict_total {}\ncommand_watch_connections {}\n",
+                metrics.records,
+                metrics.running,
+                metrics.completed,
+                metrics.result_bytes,
+                metrics.result_truncated_total,
+                metrics.spool_bytes,
+                metrics.spool_files,
+                metrics.spool_streams_total,
+                metrics.output_incomplete_total,
+                metrics.record_expired_total,
+                metrics.id_conflict_total,
+                COMMAND_WATCHERS.load(std::sync::atomic::Ordering::Relaxed),
+            );
             return write_resp(sock, 200, &body).await;
         }
         // Auth: EXECD requires token authentication. /invoke, /upload, and /download are all control-plane capabilities.
@@ -497,8 +509,10 @@ async fn handle_one_request(
         let kw = json_args_to_kwargs(parsed.get("args"));
         let request_id = request_id_from(&head, &parsed);
 
-        let resp = execute_invoke(request_id, action, kw, trace_id).await;
-        write_resp(sock, resp.status, &resp.body).await
+        match execute_invoke(request_id.clone(), action.clone(), kw, trace_id).await {
+            Ok(result) => write_invoke_result(sock, &action, request_id.as_deref(), result).await,
+            Err(resp) => write_resp(sock, resp.status, &resp.body).await,
+        }
     };
     match trace {
         Some(trace) => trace.run_result(request).await,
@@ -549,7 +563,7 @@ async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedRespon
             return CachedResponse {
                 status: 404,
                 body: err_json("unknown control operation"),
-            }
+            };
         }
     };
     match result {
@@ -954,8 +968,7 @@ async fn execute_invoke(
     action: String,
     kw: BTreeMap<String, rmpv::Value>,
     trace_id: String,
-) -> CachedResponse {
-    let normalized_action = super::dispatch::normalize_environment_action(&action);
+) -> Result<ActionResult, CachedResponse> {
     // Blocking pool threads do not inherit the task's OTel context. Capture it
     // before the hop so dispatch logs keep the request trace.
     let context = adx_observability::trace::current_context();
@@ -972,43 +985,202 @@ async fn execute_invoke(
     .await;
 
     match result {
-        Ok(Ok(result)) => {
-            let json = rmpv_to_json(&result);
-            let error = json
-                .get("error")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let error_code = json
-                .get("error_code")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let status = if error.is_empty() {
-                200
-            } else {
-                match error_code {
-                    "COMMAND_NOT_FOUND" => 404,
-                    "COMMAND_EXPIRED" => 410,
-                    "COMMAND_CONFLICT" => 409,
-                    "DEADLINE_EXCEEDED" => 408,
-                    "RESOURCE_EXHAUSTED" => 429,
-                    "UNSUPPORTED_FEATURE" => 501,
-                    _ if normalized_action == Some("cmd_start") => 400,
-                    _ => 400,
-                }
-            };
-            CachedResponse {
-                status,
-                body: serde_json::to_string(&json).unwrap_or_else(|_| "{}".into()),
-            }
-        }
-        Ok(Err(message)) => CachedResponse {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(message)) => Err(CachedResponse {
             status: 400,
             body: err_json(&message),
-        },
-        Err(e) => CachedResponse {
+        }),
+        Err(error) => Err(CachedResponse {
             status: 500,
-            body: err_json(&format!("dispatch failed: {e}")),
+            body: err_json(&format!("invoke failed: {error}")),
+        }),
+    }
+}
+
+async fn write_invoke_result(
+    sock: &mut tokio::net::TcpStream,
+    action: &str,
+    request_id: Option<&str>,
+    result: ActionResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(output) = &result.output {
+        let mut stdout_failure = output.stdout.failure();
+        let mut stderr_failure = output.stderr.failure();
+        if stdout_failure.is_none() && stderr_failure.is_none() && output.has_files() {
+            let output = output.clone();
+            let checks = tokio::task::spawn_blocking(move || {
+                (output.stdout.check_file(), output.stderr.check_file())
+            })
+            .await?;
+            stdout_failure = checks.0.err().map(|_| "spool_read");
+            stderr_failure = checks.1.err().map(|_| "spool_read");
+        }
+        if stdout_failure.is_some() || stderr_failure.is_some() {
+            let failure = output_error(&result.fields, request_id, stdout_failure, stderr_failure);
+            return write_resp(sock, 507, &failure.to_string()).await;
+        }
+        if output.has_files() {
+            return write_command_json(sock, rmpv_to_json(&result.fields), output).await;
+        }
+    }
+    let json = rmpv_to_json(&result.into_value());
+    let error = json
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let code = json
+        .get("error_code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let status = if error.is_empty() {
+        200
+    } else {
+        match code {
+            "COMMAND_NOT_FOUND" => 404,
+            "COMMAND_EXPIRED" => 410,
+            "COMMAND_CONFLICT" => 409,
+            "DEADLINE_EXCEEDED" => 408,
+            "RESOURCE_EXHAUSTED" => 429,
+            "UNSUPPORTED_FEATURE" => 501,
+            _ if super::dispatch::normalize_environment_action(action) == Some("cmd_start") => 400,
+            _ => 400,
+        }
+    };
+    write_resp(sock, status, &json.to_string()).await
+}
+
+fn output_error(
+    fields: &rmpv::Value,
+    request_id: Option<&str>,
+    stdout_failure: Option<&str>,
+    stderr_failure: Option<&str>,
+) -> serde_json::Value {
+    let fields = rmpv_to_json(fields);
+    let command_id = fields["command_id"].as_str();
+    serde_json::json!({
+        "error": {
+            "code": "COMMAND_OUTPUT_INCOMPLETE",
+            "message": "Execd could not retain or read complete command output",
+            "retry": "never",
+            "outcome": "terminal",
+            "requestForwarded": true,
+            "requestId": request_id,
+            "operationId": command_id.or(request_id),
+            "environmentId": std::env::var("ADX_ENVIRONMENT_ID").ok(),
         },
+        "command_id": command_id,
+        "exit_code": fields["exit_code"],
+        "exit_signal": fields["exit_signal"],
+        "status": fields["status"],
+        "stdout_truncated": stdout_failure.is_some(),
+        "stderr_truncated": stderr_failure.is_some(),
+        "truncated": true,
+        "stdout_output_failure": stdout_failure,
+        "stderr_output_failure": stderr_failure,
+    })
+}
+
+async fn write_command_json(
+    sock: &mut tokio::net::TcpStream,
+    fields: serde_json::Value,
+    output: &CommandOutput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fields = fields
+        .as_object()
+        .ok_or_else(|| std::io::Error::other("expected command result object"))?;
+    write_chunked_headers(sock, 200, "application/json").await?;
+    write_command_chunk(sock, b"{").await?;
+    for (index, (key, field)) in fields.iter().enumerate() {
+        let mut prefix = Vec::new();
+        if index != 0 {
+            prefix.push(b',');
+        }
+        serde_json::to_writer(&mut prefix, key)?;
+        prefix.push(b':');
+        match key.as_str() {
+            "stdout" | "stderr" => {
+                prefix.push(b'"');
+                write_command_chunk(sock, &prefix).await?;
+                let stream = if key == "stdout" {
+                    &output.stdout
+                } else {
+                    &output.stderr
+                };
+                write_output_string(sock, stream).await?;
+                write_command_chunk(sock, b"\"").await?;
+            }
+            _ => {
+                serde_json::to_writer(&mut prefix, field)?;
+                write_command_chunk(sock, &prefix).await?;
+            }
+        }
+    }
+    write_command_chunk(sock, b"}").await?;
+    write_command_chunk(sock, &[]).await
+}
+
+async fn write_command_chunk(
+    sock: &mut tokio::net::TcpStream,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(30), write_chunk(sock, bytes)).await?
+}
+
+async fn write_output_string(
+    sock: &mut tokio::net::TcpStream,
+    output: &Output,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const CHUNK: usize = 64 * 1024;
+    let mut input = vec![0; CHUNK + 3];
+    let mut encoded = Vec::with_capacity(CHUNK + 2);
+    let mut offset = 0;
+    let mut carry = 0;
+    let len = output.len();
+    while offset < len {
+        let end = carry + CHUNK.min(len - offset);
+        let count;
+        if output.is_file() {
+            let file = output.clone();
+            (input, count) = tokio::task::spawn_blocking(move || {
+                let count = file.read_at(offset, &mut input[carry..end])?;
+                Ok::<_, std::io::Error>((input, count))
+            })
+            .await??;
+        } else {
+            count = output.read_at(offset, &mut input[carry..end])?;
+        }
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "command output ended early",
+            )
+            .into());
+        }
+        offset += count;
+        let valid_end = output_chunk_end(&input[..carry + count], offset == len);
+        if valid_end > 0 {
+            encoded.clear();
+            serde_json::to_writer(&mut encoded, &String::from_utf8_lossy(&input[..valid_end]))?;
+            write_command_chunk(sock, &encoded[1..encoded.len() - 1]).await?;
+        }
+        input.copy_within(valid_end..carry + count, 0);
+        carry = carry + count - valid_end;
+    }
+    Ok(())
+}
+
+fn output_chunk_end(input: &[u8], eof: bool) -> usize {
+    if eof {
+        return input.len();
+    }
+    let tail = input
+        .utf8_chunks()
+        .last()
+        .map_or(&[][..], |chunk| chunk.invalid());
+    if std::str::from_utf8(tail).is_err_and(|error| error.error_len().is_none()) {
+        input.len() - tail.len()
+    } else {
+        input.len()
     }
 }
 
@@ -1525,7 +1697,7 @@ async fn handle_download(
         _ => {
             return write_resp(sock, 400, "{\"error\":\"missing path\"}")
                 .await
-                .map(|_| false)
+                .map(|_| false);
         }
     };
     match upload_type(raw_path).as_str() {
@@ -1605,7 +1777,7 @@ async fn handle_file_download(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return write_resp(sock, 404, &err_json("file not found"))
                 .await
-                .map(|_| false)
+                .map(|_| false);
         }
         Err(error) => return Err(error.into()),
     };
@@ -1800,6 +1972,7 @@ async fn write_resp(
         501 => "Not Implemented",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        507 => "Insufficient Storage",
         _ => "Error",
     };
     let resp = format!(
@@ -2196,7 +2369,11 @@ mod tests {
         });
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
         let body = serde_json::json!({"action": action, "args": args}).to_string();
-        let request = format!("POST /invoke HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+        let request = format!(
+            "POST /invoke HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
         client.write_all(request.as_bytes()).await.unwrap();
         let (head, body) = tokio::time::timeout(
             std::time::Duration::from_secs(5),

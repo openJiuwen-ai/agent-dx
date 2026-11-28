@@ -178,6 +178,12 @@ Python SDK 对结构化错误抛出 `EnvironmentHTTPError`，并公开 `status_c
 首次状态读取失败仍抛出原异常；首次异步读取的本地计时器到期仍报告 `COMMAND_STATE_UNAVAILABLE / same_operation / unknown`。
 明确终态、不可重试错误，以及在调用方等待期限之前耗尽 30 秒读取重试预算的错误保留原有异常与诊断。
 
+启用命令输出转存时，Execd 已确认命令退出但输出无法完整保留或重读，返回 HTTP 507，
+`error.code=COMMAND_OUTPUT_INCOMPLETE`、`retry=never`、`outcome=terminal` 及
+`requestForwarded=true`。响应保留 `exit_code`、`exit_signal` 和受影响流的失败原因。
+这项错误表示完整输出交付失败，真实的命令退出码可以为 `0`。Python SDK 将其作为
+`EnvironmentHTTPError` 公开，并保留错误响应载荷。
+
 创建请求未显式提供名称时，SDK 使用 `create-*` Request ID 中的 UUID 生成稳定名称。跨 API Server 重试因此仍得到相同 Environment ID；查询暂时返回 404 不能触发换名称或创建第二个实例。
 
 实现位置：

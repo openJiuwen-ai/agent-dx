@@ -59,6 +59,47 @@ is retained. Tombstones are bounded by `EXECD_COMMAND_EXPIRED_MAX_RECORDS`
 (default 4096) and `EXECD_COMMAND_EXPIRED_TTL_SECS` (default 3600); after that
 window, EXECD can no longer distinguish the ID from one never submitted.
 
+## Large command output
+
+Set `ADX_EXECD_COMMAND_SPOOL_DIR` on the API Server, or set
+`EXECD_COMMAND_SPOOL_DIR` in the Runtime, to enable automatic command output
+spooling. Use an existing writable directory on an adequately sized Runtime
+filesystem. An empty directory setting disables spooling. Small synchronous and
+background command output is kept in memory when spooling is enabled. Execd
+spools each overflowing stdout or stderr stream independently. Overflow can
+come from the stream limit or the shared in-memory output budget. The registry
+high watermark continues to govern command admission.
+
+For command output captured through pipes, Execd seals the result after the
+direct child exits and the readers consume the bytes already queued at their
+final drain. A descendant can keep writing to an inherited pipe. Execd discards
+those later bytes and leaves the published result available for replay.
+
+| Runtime variable | Default | Scope |
+| --- | --- | --- |
+| `EXECD_COMMAND_SPOOL_MAX_BYTES` | `1073741824` | Total raw spool bytes per Execd |
+| `EXECD_COMMAND_SPOOL_MAX_COMMAND_BYTES` | `536870912` | Combined raw spool bytes per command, capped by the Execd total |
+| `EXECD_COMMAND_SPOOL_MAX_FILES` | `256` | Simultaneous spool files per Execd |
+
+The API Server accepts these variables with an `ADX_` prefix. Anonymous files
+are retained with the corresponding command result. A response reader can
+finish after registry eviction. Execd releases the disk reservation after the
+last file reference closes. Synchronous `process.exec` requests with a Request
+ID can replay the same result for 30 minutes after completion while Execd stays
+up. Capacity pressure rejects new synchronous requests with protected Request
+IDs when the replay cache cannot hold another protected result.
+
+Large results are streamed as the original JSON `stdout` and `stderr` strings.
+The client still allocates memory to decode the complete response. If storage
+cannot retain all output, Execd drains the pipes and reports HTTP 507
+`COMMAND_OUTPUT_INCOMPLETE` with the command's exit information. A connection
+cut during response delivery can be retried within the existing caller deadline
+using the same request or command identity. The response is read again from
+its beginning. Monitor `command_spool_bytes`, `command_spool_files`,
+`command_spool_streams_total`, and `command_output_incomplete_total` on
+`/metrics`. Before enabling on a checkpointing Runtime profile, verify that
+its backend restores open anonymous files and their contents.
+
 Adxlet supplies `ADX_ENVIRONMENT_ID`, `ADX_RUNTIME_ID` and `ADX_OWNERSHIP_GENERATION` through sandboxd. When the node configures `runtime_control`, Execd initiates a bidirectional gRPC stream using the node-injected `ADX_RUNTIME_CONTROL_ADDRESS` and execution-scoped `ADX_RUNTIME_CONTROL_TOKEN`. It sends readiness, probe failure and checkpoint state, and receives Status/Prepare/Abort/Finish commands. Otherwise runtime cooperation uses the HTTP listener. Both transports share the same control state machine. See the [stream contract](../../api/proto/runtime-control.md), [HTTP contract](../../api/http/runtime-control.md), and [node configuration](../../../docs/deployment/runtime-control-stream.md).
 
 Checkpoint restore validates the new execution identity, refreshes child environment and HTTP credentials, retires inherited connections, replaces the HTTP listening socket after its previous accept task exits, and rearms tunnel listeners. The HTTP socket is bound afresh so neither its checkpoint-era readiness state nor its pending accept backlog is reused; Node readiness waits for the restored HTTP control endpoint. Missing or stale restored identity leaves the runtime unavailable. Backend handoff uses `/proc/gvisor/checkpoint` or `ADX_CHECKPOINT_HANDOFF_FILE`; the restored environment comes from `/proc/gvisor/spec_environ` or `ADX_ENV_FILE`.

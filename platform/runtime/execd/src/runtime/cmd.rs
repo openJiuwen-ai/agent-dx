@@ -7,23 +7,22 @@ use super::codec::{kw_str, map_value};
 use rmpv::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+use super::command_output::{
+    self, ActionResult, CommandOutput, Reader, Spool, DEFAULT_REGISTRY_MAX_BYTES,
+};
 const DEFAULT_RESULT_TTL_SECS: u64 = 3600;
 const DEFAULT_EXPIRED_TOMBSTONE_TTL_SECS: u64 = 3600;
 const DEFAULT_EXPIRED_TOMBSTONE_MAX_RECORDS: usize = 4096;
 const DEFAULT_REGISTRY_MAX_RECORDS: usize = 4096;
-const DEFAULT_REGISTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_REGISTRY_HIGH_WATERMARK_BYTES: usize = 192 * 1024 * 1024;
-static RETAINED_OUTPUT_BYTES: AtomicUsize = AtomicUsize::new(0);
 static COMMAND_COMPLETED: AtomicU64 = AtomicU64::new(0);
-static COMMAND_RESULT_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 static COMMAND_RECORD_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static COMMAND_ID_CONFLICT: AtomicU64 = AtomicU64::new(0);
 
@@ -157,49 +156,6 @@ fn observation_error(record: &CommandSnapshot, message: &'static str, legacy: bo
         ("retry", Value::from("same_operation")),
         ("outcome", Value::from("unknown")),
     ])
-}
-
-struct BoundedBuffer {
-    data: Vec<u8>,
-    total_bytes: u64,
-    truncated: bool,
-    limit: usize,
-}
-
-impl BoundedBuffer {
-    fn append(&mut self, bytes: &[u8]) {
-        let stream_take = self.limit.saturating_sub(self.data.len()).min(bytes.len());
-        let global_limit = env_usize(
-            "EXECD_COMMAND_REGISTRY_MAX_BYTES",
-            DEFAULT_REGISTRY_MAX_BYTES,
-        );
-        let mut take = 0;
-        if stream_take > 0 {
-            let _ =
-                RETAINED_OUTPUT_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    take = stream_take.min(global_limit.saturating_sub(used));
-                    (take > 0).then_some(used + take)
-                });
-        }
-        self.data.extend_from_slice(&bytes[..take]);
-        self.total_bytes += bytes.len() as u64;
-        if take != bytes.len() && !self.truncated {
-            COMMAND_RESULT_TRUNCATED.fetch_add(1, Ordering::Relaxed);
-        }
-        self.truncated |= take != bytes.len();
-    }
-}
-
-impl Drop for BoundedBuffer {
-    fn drop(&mut self) {
-        RETAINED_OUTPUT_BYTES.fetch_sub(self.data.len(), Ordering::AcqRel);
-    }
-}
-
-#[derive(Clone)]
-struct Reader {
-    buf: Arc<Mutex<BoundedBuffer>>,
-    finished: Arc<AtomicBool>,
 }
 
 struct CommandRecord {
@@ -353,58 +309,8 @@ fn cleanup_expired(records: &mut HashMap<String, CommandRecord>) {
     COMMAND_RECORD_EXPIRED.fetch_add((before - records.len()) as u64, Ordering::Relaxed);
 }
 
-fn output_limit(name: &str) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            env_usize(
-                "EXECD_COMMAND_OUTPUT_LIMIT_BYTES",
-                DEFAULT_OUTPUT_LIMIT_BYTES,
-            )
-        })
-}
-
-fn spawn_reader(stream: Option<impl Read + Send + 'static>, limit_name: &str) -> Reader {
-    let limit = output_limit(limit_name);
-    let buf = Arc::new(Mutex::new(BoundedBuffer {
-        data: Vec::new(),
-        total_bytes: 0,
-        truncated: false,
-        limit,
-    }));
-    let finished = Arc::new(AtomicBool::new(false));
-    if let Some(mut stream) = stream {
-        let output = Arc::clone(&buf);
-        let done = Arc::clone(&finished);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(size) => output.lock().unwrap().append(&chunk[..size]),
-                }
-            }
-            done.store(true, Ordering::Release);
-        });
-    } else {
-        finished.store(true, Ordering::Release);
-    }
-    Reader { buf, finished }
-}
-
-fn empty_reader(limit_name: &str) -> Reader {
-    let limit = output_limit(limit_name);
-    Reader {
-        buf: Arc::new(Mutex::new(BoundedBuffer {
-            data: Vec::new(),
-            total_bytes: 0,
-            truncated: false,
-            limit,
-        })),
-        finished: Arc::new(AtomicBool::new(true)),
-    }
+pub(super) fn reap_expired_results() {
+    cleanup_expired(&mut commands().lock().unwrap());
 }
 
 fn make_exit_state() -> Arc<ExitState> {
@@ -468,8 +374,8 @@ fn registry_retained_bytes(records: &HashMap<String, CommandRecord>) -> usize {
             record.command_id.len()
                 + record.request_fingerprint.len()
                 + record.cmd.len()
-                + record.stdout.buf.lock().unwrap().data.len()
-                + record.stderr.buf.lock().unwrap().data.len()
+                + record.stdout.memory_bytes()
+                + record.stderr.memory_bytes()
                 + std::mem::size_of::<CommandRecord>()
         })
         .sum()
@@ -567,18 +473,6 @@ fn wait_exit(exit: &ExitState, timeout: Option<Duration>) -> Option<i64> {
     }
 }
 
-fn collect_reader(reader: &Reader) -> (String, bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !reader.finished.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let output = reader.buf.lock().unwrap();
-    (
-        String::from_utf8_lossy(&output.data).into_owned(),
-        output.truncated,
-    )
-}
-
 fn command_status(pid: i64, exit: &ExitState) -> &'static str {
     if exit.spawn_error.lock().unwrap().is_some() {
         "FAILED"
@@ -602,9 +496,13 @@ fn status(record: &CommandRecord) -> &'static str {
 }
 
 fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
+    record_reply(record, include_output).into_value()
+}
+
+fn record_reply(record: &CommandSnapshot, include_output: bool) -> ActionResult {
     match observe_exit(&record.exit) {
         Ok(exit) => record_value_observed(record, include_output, &exit),
-        Err(message) => observation_error(record, message, false),
+        Err(message) => observation_error(record, message, false).into(),
     }
 }
 
@@ -612,7 +510,7 @@ fn record_value_observed(
     record: &CommandSnapshot,
     include_output: bool,
     exit: &ExitObservation,
-) -> Value {
+) -> ActionResult {
     let spawn_error = exit.spawn_error.clone();
     let raw_code = exit.code;
     let code = if spawn_error.is_some() || exit.killed || exit.timed_out {
@@ -623,30 +521,23 @@ fn record_value_observed(
     let finished_at = exit.finished_at_ms;
     let status = exit.status(record.pid);
     let terminal = !matches!(status, "PENDING" | "RUNNING");
-    let (stdout, stdout_truncated, stderr, stderr_truncated) = if include_output && terminal {
-        let (stdout, stdout_truncated) = collect_reader(&record.stdout);
-        let (stderr, stderr_truncated) = collect_reader(&record.stderr);
-        (stdout, stdout_truncated, stderr, stderr_truncated)
-    } else {
-        (String::new(), false, String::new(), false)
-    };
-    let stdout_buf = record.stdout.buf.lock().unwrap();
-    let stdout_total_bytes = stdout_buf.total_bytes;
-    let stdout_retained_bytes = stdout_buf.data.len() as u64;
-    drop(stdout_buf);
-    let stderr_buf = record.stderr.buf.lock().unwrap();
-    let stderr_total_bytes = stderr_buf.total_bytes;
-    let stderr_retained_bytes = stderr_buf.data.len() as u64;
-    drop(stderr_buf);
-    map_value(vec![
+    let output = (include_output && terminal)
+        .then(|| CommandOutput::from_readers(&record.stdout, &record.stderr));
+    let stdout_truncated = output
+        .as_ref()
+        .is_some_and(|output| output.stdout.truncated());
+    let stderr_truncated = output
+        .as_ref()
+        .is_some_and(|output| output.stderr.truncated());
+    let fields = map_value(vec![
         ("command_id", Value::from(record.command_id.clone())),
         ("pid", Value::from(record.pid)),
         ("cmd", Value::from(record.cmd.clone())),
         ("status", Value::from(status)),
         ("running", Value::from(!terminal)),
         ("state_version", Value::from(exit.state_version)),
-        ("stdout", Value::from(stdout)),
-        ("stderr", Value::from(stderr)),
+        ("stdout", Value::from("")),
+        ("stderr", Value::from("")),
         ("exit_code", code.map(Value::from).unwrap_or(Value::Nil)),
         (
             "exit_signal",
@@ -667,10 +558,22 @@ fn record_value_observed(
             "truncated",
             Value::from(stdout_truncated || stderr_truncated),
         ),
-        ("stdout_total_bytes", Value::from(stdout_total_bytes)),
-        ("stdout_retained_bytes", Value::from(stdout_retained_bytes)),
-        ("stderr_total_bytes", Value::from(stderr_total_bytes)),
-        ("stderr_retained_bytes", Value::from(stderr_retained_bytes)),
+        (
+            "stdout_total_bytes",
+            Value::from(record.stdout.total_bytes()),
+        ),
+        (
+            "stdout_retained_bytes",
+            Value::from(record.stdout.retained_bytes() as u64),
+        ),
+        (
+            "stderr_total_bytes",
+            Value::from(record.stderr.total_bytes()),
+        ),
+        (
+            "stderr_retained_bytes",
+            Value::from(record.stderr.retained_bytes() as u64),
+        ),
         (
             "error_code",
             spawn_error
@@ -682,18 +585,19 @@ fn record_value_observed(
             "error_message",
             spawn_error.map(Value::from).unwrap_or(Value::Nil),
         ),
-    ])
+    ]);
+    ActionResult { fields, output }
 }
 
 /// PID-based clients predate stable command identities and recognize only the
 /// running/done/error states. Keep their result and signal-exit-code contract.
-fn legacy_record_value(record: &CommandSnapshot, include_output: bool) -> Value {
+fn legacy_record_reply(record: &CommandSnapshot, include_output: bool) -> ActionResult {
     let exit = match observe_exit(&record.exit) {
         Ok(exit) => exit,
-        Err(message) => return observation_error(record, message, true),
+        Err(message) => return observation_error(record, message, true).into(),
     };
     let mut value = record_value_observed(record, include_output, &exit);
-    let Value::Map(items) = &mut value else {
+    let Value::Map(items) = &mut value.fields else {
         unreachable!("command result is a map");
     };
     for (key, value) in items.iter_mut() {
@@ -819,8 +723,8 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
             stdin_enabled: want_stdin,
             stdin_closed: false,
             stdin: None,
-            stdout: empty_reader("EXECD_COMMAND_STDOUT_LIMIT_BYTES"),
-            stderr: empty_reader("EXECD_COMMAND_STDERR_LIMIT_BYTES"),
+            stdout: Reader::empty(),
+            stderr: Reader::empty(),
             exit: Arc::clone(&exit),
         },
     );
@@ -873,7 +777,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
             let snapshot = CommandSnapshot::from(record);
             drop(records);
             return if legacy {
-                legacy_record_value(&snapshot, true)
+                legacy_record_reply(&snapshot, true).into_value()
             } else {
                 record_value(&snapshot, true)
             };
@@ -881,8 +785,19 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
     };
     let pid = child.id() as i64;
     let stdin = child.stdin.take();
-    let stdout = spawn_reader(child.stdout.take(), "EXECD_COMMAND_STDOUT_LIMIT_BYTES");
-    let stderr = spawn_reader(child.stderr.take(), "EXECD_COMMAND_STDERR_LIMIT_BYTES");
+    let spool = Spool::configured();
+    let stdout = Reader::spawn(
+        child.stdout.take(),
+        "EXECD_COMMAND_STDOUT_LIMIT_BYTES",
+        spool.clone(),
+    );
+    let stderr = Reader::spawn(
+        child.stderr.take(),
+        "EXECD_COMMAND_STDERR_LIMIT_BYTES",
+        spool,
+    );
+    let waiter_stdout = stdout.clone();
+    let waiter_stderr = stderr.clone();
     let waiter_exit = Arc::clone(&exit);
     let command_timeout = kw_f64(kw, "timeout")
         .filter(|value| *value > 0.0)
@@ -892,48 +807,43 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
         let deadline = command_timeout.map(|timeout| Instant::now() + timeout);
         loop {
             let signal_guard = waiter_exit.signal_guard.lock().unwrap();
-            match child.try_wait() {
-                Ok(Some(result)) => {
-                    *waiter_exit.signal.lock().unwrap() = result.signal();
-                    *waiter_exit.code.lock().unwrap() = Some(result.code().unwrap_or(-1) as i64);
-                    *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
-                    waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
-                    COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    notify_state_change(&waiter_exit);
-                    break;
-                }
+            let result = match child.try_wait() {
+                Ok(Some(result)) => Ok(Some(result)),
                 Ok(None) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
                     waiter_exit.timed_out.store(true, Ordering::Release);
-                    // SAFETY: child is still live and owns this process-group ID. kill receives
-                    // only the scalar ID and retains no Rust data.
-                    unsafe {
-                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-                    }
-                    let result = child.wait().ok();
-                    *waiter_exit.signal.lock().unwrap() = result.and_then(|result| result.signal());
-                    let code = result.and_then(|result| result.code()).unwrap_or(-1) as i64;
-                    *waiter_exit.code.lock().unwrap() = Some(code);
-                    *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
-                    waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
-                    COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    notify_state_change(&waiter_exit);
-                    break;
+                    // SAFETY: child is live and owns the process-group ID passed by value.
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                    Ok(child.wait().ok())
                 }
                 Ok(None) => {
                     drop(signal_guard);
                     std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => Err(error),
+            };
+            waiter_stdout.request_finish();
+            waiter_stderr.request_finish();
+            match result {
+                Ok(result) => {
+                    *waiter_exit.signal.lock().unwrap() = result.and_then(|result| result.signal());
+                    let code = result.and_then(|result| result.code()).unwrap_or(-1) as i64;
+                    *waiter_exit.code.lock().unwrap() = Some(code);
                 }
                 Err(error) => {
                     *waiter_exit.spawn_error.lock().unwrap() = Some(error.to_string());
                     *waiter_exit.code.lock().unwrap() = Some(-1);
-                    *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
-                    waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
-                    COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    notify_state_change(&waiter_exit);
-                    break;
                 }
             }
+            *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
+            waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
+            COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
+            notify_state_change(&waiter_exit);
+            break;
         }
+        // Keep the Runtime active until both readers seal the result. Result
+        // reads can wait for sealing without holding the signal or registry lock.
+        let _ = CommandOutput::from_readers(&waiter_stdout, &waiter_stderr);
     });
     let record = records
         .get_mut(&command_id)
@@ -955,7 +865,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
     ])
 }
 
-pub fn cmd_get(kw: &BTreeMap<String, Value>) -> Value {
+pub(super) fn cmd_get(kw: &BTreeMap<String, Value>) -> ActionResult {
     let mut records = commands().lock().unwrap();
     cleanup_expired(&mut records);
     let snapshot = resolve_key(&records, kw)
@@ -963,13 +873,13 @@ pub fn cmd_get(kw: &BTreeMap<String, Value>) -> Value {
         .map(CommandSnapshot::from);
     drop(records);
     match snapshot {
-        Some(record) if !kw.contains_key("command_id") => legacy_record_value(&record, true),
-        Some(record) => record_value(&record, true),
-        None => missing_command(kw),
+        Some(record) if !kw.contains_key("command_id") => legacy_record_reply(&record, true),
+        Some(record) => record_reply(&record, true),
+        None => missing_command(kw).into(),
     }
 }
 
-pub fn cmd_wait(kw: &BTreeMap<String, Value>) -> Value {
+pub(super) fn cmd_wait(kw: &BTreeMap<String, Value>) -> ActionResult {
     let timeout = kw_f64(kw, "timeout").map(Duration::from_secs_f64);
     let exit = {
         let records = commands().lock().unwrap();
@@ -977,7 +887,7 @@ pub fn cmd_wait(kw: &BTreeMap<String, Value>) -> Value {
             .and_then(|key| records.get(&key).map(|record| Arc::clone(&record.exit)))
         {
             Some(exit) => exit,
-            None => return missing_command(kw),
+            None => return missing_command(kw).into(),
         }
     };
     if wait_exit(&exit, timeout).is_none() {
@@ -986,12 +896,13 @@ pub fn cmd_wait(kw: &BTreeMap<String, Value>) -> Value {
             ("error_code", Value::from("WAIT_TIMEOUT")),
             ("error_message", Value::from("command wait timed out")),
             ("error", nil()),
-        ]);
+        ])
+        .into();
     }
     cmd_get(kw)
 }
 
-pub fn cmd_poll(kw: &BTreeMap<String, Value>) -> Value {
+pub(super) fn cmd_poll(kw: &BTreeMap<String, Value>) -> ActionResult {
     let wait_timeout = kw_f64(kw, "wait_timeout").unwrap_or(0.0).max(0.0);
     let exit = {
         let records = commands().lock().unwrap();
@@ -999,7 +910,7 @@ pub fn cmd_poll(kw: &BTreeMap<String, Value>) -> Value {
             .and_then(|key| records.get(&key).map(|record| Arc::clone(&record.exit)))
         {
             Some(exit) => exit,
-            None => return missing_command(kw),
+            None => return missing_command(kw).into(),
         }
     };
     let _ = wait_exit(&exit, Some(Duration::from_secs_f64(wait_timeout)));
@@ -1052,6 +963,10 @@ pub struct CommandMetricSnapshot {
     pub completed: u64,
     pub result_bytes: usize,
     pub result_truncated_total: u64,
+    pub spool_bytes: usize,
+    pub spool_files: usize,
+    pub spool_streams_total: u64,
+    pub output_incomplete_total: u64,
     pub record_expired_total: u64,
     pub id_conflict_total: u64,
 }
@@ -1059,6 +974,14 @@ pub struct CommandMetricSnapshot {
 pub fn command_metrics() -> CommandMetricSnapshot {
     let mut records = commands().lock().unwrap();
     cleanup_expired(&mut records);
+    let (
+        result_bytes,
+        result_truncated_total,
+        spool_bytes,
+        spool_files,
+        spool_streams_total,
+        output_incomplete_total,
+    ) = command_output::metrics();
     CommandMetricSnapshot {
         records: records.len(),
         running: records
@@ -1066,8 +989,12 @@ pub fn command_metrics() -> CommandMetricSnapshot {
             .filter(|record| matches!(status(record), "PENDING" | "RUNNING"))
             .count(),
         completed: COMMAND_COMPLETED.load(Ordering::Relaxed),
-        result_bytes: RETAINED_OUTPUT_BYTES.load(Ordering::Relaxed),
-        result_truncated_total: COMMAND_RESULT_TRUNCATED.load(Ordering::Relaxed),
+        result_bytes,
+        result_truncated_total,
+        spool_bytes,
+        spool_files,
+        spool_streams_total,
+        output_incomplete_total,
         record_expired_total: COMMAND_RECORD_EXPIRED.load(Ordering::Relaxed),
         id_conflict_total: COMMAND_ID_CONFLICT.load(Ordering::Relaxed),
     }
@@ -1142,7 +1069,7 @@ pub fn cmd_kill(kw: &BTreeMap<String, Value>) -> Value {
                     ("killed", Value::from(false)),
                     ("error_code", nil()),
                     ("error", nil()),
-                ])
+                ]);
             }
         }
     };
@@ -1242,6 +1169,18 @@ pub fn cmd_send_stdin(kw: &BTreeMap<String, Value>) -> Value {
 mod tests {
     use super::*;
 
+    fn inline_get(kw: &BTreeMap<String, Value>) -> Value {
+        cmd_get(kw).into_value()
+    }
+
+    fn inline_poll(kw: &BTreeMap<String, Value>) -> Value {
+        cmd_poll(kw).into_value()
+    }
+
+    fn inline_wait(kw: &BTreeMap<String, Value>) -> Value {
+        cmd_wait(kw).into_value()
+    }
+
     fn args(command_id: &str, cmd: &str) -> BTreeMap<String, Value> {
         BTreeMap::from([
             ("command_id".to_string(), Value::from(command_id)),
@@ -1302,8 +1241,8 @@ mod tests {
                 cmd: "true".into(),
                 created_at_ms: 1,
                 started_at_ms: Some(2),
-                stdout: empty_reader("EXECD_COMMAND_STDOUT_LIMIT_BYTES"),
-                stderr: empty_reader("EXECD_COMMAND_STDERR_LIMIT_BYTES"),
+                stdout: Reader::empty(),
+                stderr: Reader::empty(),
                 exit: make_exit_state(),
             };
             let observed = observe_exit(&record.exit).unwrap();
@@ -1316,7 +1255,7 @@ mod tests {
             // Force the real interleaving: the child finishes after exit-code
             // observation, before the response is formatted. Status and result
             // must still describe the same observation.
-            let response = record_value_observed(&record, true, &observed);
+            let response = record_value_observed(&record, true, &observed).into_value();
             assert_eq!(field(&response, "status").as_str(), Some("RUNNING"));
             assert_eq!(field(&response, "running").as_bool(), Some(true));
             assert!(field(&response, "exit_code").is_nil());
@@ -1362,8 +1301,8 @@ mod tests {
             cmd: "true".into(),
             created_at_ms: 1,
             started_at_ms: Some(2),
-            stdout: empty_reader("EXECD_COMMAND_STDOUT_LIMIT_BYTES"),
-            stderr: empty_reader("EXECD_COMMAND_STDERR_LIMIT_BYTES"),
+            stdout: Reader::empty(),
+            stderr: Reader::empty(),
             exit: make_exit_state(),
         };
         let result = std::panic::catch_unwind(|| {
@@ -1373,7 +1312,7 @@ mod tests {
         assert!(result.is_err());
         for (error, expected_status) in [
             (record_value(&record, true), "FAILED"),
-            (legacy_record_value(&record, true), "error"),
+            (legacy_record_reply(&record, true).into_value(), "error"),
         ] {
             assert_eq!(field(&error, "status").as_str(), Some(expected_status));
             assert_eq!(field(&error, "pid").as_i64(), Some(42));
@@ -1404,7 +1343,7 @@ mod tests {
             ("wait_timeout".into(), Value::from(5)),
         ]);
         for _ in 0..2 {
-            let result = cmd_poll(&lookup);
+            let result = inline_poll(&lookup);
             assert_eq!(field(&result, "exit_signal").as_i64(), Some(9));
             assert!(field(&result, "error_code").is_nil());
         }
@@ -1425,12 +1364,12 @@ mod tests {
                 ("pid".to_string(), field(started, "pid").clone()),
                 ("wait_timeout".to_string(), Value::from(5)),
             ]);
-            let result = cmd_poll(&lookup);
+            let result = inline_poll(&lookup);
             assert_eq!(field(&result, "status").as_str(), Some("done"));
             assert_eq!(field(&result, "stdout").as_str(), Some("legacy"));
             assert_eq!(field(&result, "stderr").as_str(), Some("err"));
             assert_eq!(field(&result, "exit_code").as_i64(), Some(17));
-            let stable = cmd_get(&BTreeMap::from([(
+            let stable = inline_get(&BTreeMap::from([(
                 "command_id".to_string(),
                 field(started, "command_id").clone(),
             )]));
@@ -1445,7 +1384,7 @@ mod tests {
             ("want_stdin".to_string(), Value::from(true)),
         ]));
         let mut lookup = BTreeMap::from([("pid".to_string(), field(&started, "pid").clone())]);
-        let running = cmd_poll(&lookup);
+        let running = inline_poll(&lookup);
         assert_eq!(field(&running, "status").as_str(), Some("running"));
         let listed = cmd_list(&BTreeMap::new());
         let process = field(&listed, "processes")
@@ -1459,7 +1398,7 @@ mod tests {
         lookup.insert("eof".to_string(), Value::from(true));
         assert!(field(&cmd_send_stdin(&lookup), "error").is_nil());
         lookup.insert("timeout".to_string(), Value::from(5));
-        let result = cmd_wait(&lookup);
+        let result = inline_wait(&lookup);
         assert_eq!(field(&result, "status").as_str(), Some("done"));
         assert_eq!(field(&result, "stdout").as_str(), Some("legacy stdin\n"));
         assert_eq!(field(&result, "exit_code").as_i64(), Some(0));
@@ -1481,7 +1420,7 @@ mod tests {
         assert_eq!(field(&repeated, "status").as_str(), Some("ALREADY_EXITED"));
         assert_eq!(field(&repeated, "killed").as_bool(), Some(false));
         assert!(field(&repeated, "error").is_nil());
-        let result = cmd_poll(&lookup);
+        let result = inline_poll(&lookup);
         assert_eq!(field(&result, "status").as_str(), Some("done"));
         assert_eq!(field(&result, "exit_code").as_i64(), Some(-1));
         let failed = cmd_start(&BTreeMap::from([
@@ -1493,7 +1432,7 @@ mod tests {
         ]));
         assert_eq!(field(&failed, "status").as_str(), Some("error"));
         assert!(field(&failed, "error").as_str().is_some());
-        let missing = cmd_poll(&BTreeMap::from([(
+        let missing = inline_poll(&BTreeMap::from([(
             "pid".to_string(),
             Value::from(i64::MAX),
         )]));
@@ -1541,7 +1480,7 @@ mod tests {
         let id = format!("test-recover-{}", now_ms());
         cmd_start(&args(&id, "printf recovered"));
         let lookup = BTreeMap::from([("command_id".to_string(), Value::from(id.clone()))]);
-        let result = cmd_wait(&lookup);
+        let result = inline_wait(&lookup);
         assert_eq!(field(&result, "command_id").as_str(), Some(id.as_str()));
         assert_eq!(field(&result, "status").as_str(), Some("SUCCEEDED"));
         assert_eq!(field(&result, "stdout").as_str(), Some("recovered"));
@@ -1556,7 +1495,7 @@ mod tests {
         assert!(field(&started, "error").is_nil());
         let lookup = BTreeMap::from([("command_id".to_string(), Value::from(id.clone()))]);
         assert_eq!(
-            field(&cmd_wait(&lookup), "status").as_str(),
+            field(&inline_wait(&lookup), "status").as_str(),
             Some("SUCCEEDED")
         );
         {
@@ -1566,13 +1505,13 @@ mod tests {
             *record.exit.finished_at_ms.lock().unwrap() =
                 Some(now_ms().saturating_sub(ttl.saturating_mul(1000) + 1));
         }
-        let expired = cmd_get(&lookup);
+        let expired = inline_get(&lookup);
         assert_eq!(field(&expired, "status").as_str(), Some("EXPIRED"));
         assert_eq!(
             field(&cmd_start(&request), "error_code").as_str(),
             Some("COMMAND_EXPIRED")
         );
-        let missing = cmd_get(&BTreeMap::from([(
+        let missing = inline_get(&BTreeMap::from([(
             "command_id".to_string(),
             Value::from(format!("{id}-never-seen")),
         )]));
@@ -1587,7 +1526,7 @@ mod tests {
             ("command_id".to_string(), Value::from(id)),
             ("timeout".to_string(), Value::from(0)),
         ]);
-        let result = cmd_wait(&lookup);
+        let result = inline_wait(&lookup);
         let killed = cmd_kill(&lookup);
         assert_eq!(field(&result, "status").as_str(), Some("running"));
         assert_eq!(field(&result, "error_code").as_str(), Some("WAIT_TIMEOUT"));
@@ -1606,21 +1545,6 @@ mod tests {
         assert_eq!(field(&result, "killed").as_bool(), Some(false));
         assert!(field(&result, "error_code").is_nil());
         assert!(field(&result, "error").is_nil());
-    }
-
-    #[test]
-    fn bounded_output_keeps_the_first_bytes_and_marks_truncation() {
-        let mut output = BoundedBuffer {
-            data: Vec::new(),
-            total_bytes: 0,
-            truncated: false,
-            limit: 4,
-        };
-        output.append(b"abcdef");
-        output.append(b"gh");
-        assert_eq!(output.data, b"abcd");
-        assert_eq!(output.total_bytes, 8);
-        assert!(output.truncated);
     }
 
     #[test]
