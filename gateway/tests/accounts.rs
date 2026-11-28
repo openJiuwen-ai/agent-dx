@@ -53,6 +53,7 @@ struct ModelState {
     users: Mutex<HashMap<String, Value>>,
     keys: Mutex<HashMap<String, Value>>,
     lose_response: AtomicBool,
+    fail_reads: AtomicBool,
     creates: AtomicUsize,
     updates: AtomicUsize,
 }
@@ -104,6 +105,9 @@ async fn key_info(
         return (StatusCode::UNAUTHORIZED, Json(json!({})));
     }
     assert_eq!(q["key"].len(), 64, "management query must use a hash");
+    if s.fail_reads.load(Ordering::SeqCst) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+    }
     match s.keys.lock().unwrap().get(&q["key"]).cloned() {
         Some(v) => (StatusCode::OK, Json(json!({"info":v}))),
         None => (StatusCode::NOT_FOUND, Json(json!({}))),
@@ -299,6 +303,126 @@ async fn litellm_quota_uses_key_budget_and_spend_one_to_one() {
     assert_eq!(quota.quota.used, 1.1);
     assert_eq!(model.keys.lock().unwrap()[&digest]["spend"], json!(1.1));
     server.abort();
+}
+
+#[tokio::test]
+async fn litellm_admin_reads_do_not_create_users_or_keys() {
+    let model = Arc::new(ModelState::default());
+    let (url, server) = serve_model(model.clone()).await;
+    let provider = LiteLlm::with_key(config(&url).litellm, "mock-admin".into()).unwrap();
+    assert!(provider.admin_user_info("missing").await.unwrap().is_none());
+    assert!(provider.admin_key_info("missing", "sk-missing").await.unwrap().is_none());
+    provider.ensure("owner","sk-blocked","existing").await.unwrap();
+    let digest = hex::encode(Sha256::digest(b"sk-blocked"));
+    model.keys.lock().unwrap().get_mut(&digest).unwrap()["blocked"] = json!(true);
+    let info = provider.admin_key_info("owner","sk-blocked").await.unwrap().unwrap();
+    assert_eq!(info["blocked"],true);
+    assert_eq!(model.creates.load(Ordering::SeqCst), 1);
+    model.keys.lock().unwrap().clear();
+    model.creates.store(0,Ordering::SeqCst);
+    assert_eq!(model.creates.load(Ordering::SeqCst), 0);
+    assert!(model.keys.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL with accounts/schema.sql applied"]
+async fn admin_detail_reads_saved_key_quota_and_preserves_failure_states() {
+    let db = std::env::var("ADX_ACCOUNT_TEST_DATABASE_URL").unwrap();
+    let model = Arc::new(ModelState::default());
+    let (url, server) = serve_model(model.clone()).await;
+    let mut cfg = config(&url);
+    cfg.litellm.points_per_budget_unit = 2.0;
+    cfg.admin = Some(serde_json::from_value(json!({"grants":[{"tenant":"admin-tenant","identity_scope":{"mode":"exclusive","exclusive_tenant":"admin-tenant"}}]})).unwrap());
+    let provider = LiteLlm::with_key(cfg.litellm.clone(),"mock-admin".into()).unwrap();
+    let service = AccountService::new_with_agc(
+        cfg, "test-app".into(), AccountStore::from_url(&db,true,None).await.unwrap(),
+        Arc::new(Identity), None, Arc::new(provider),
+        CredentialCipher::new([8;32],"tenant").unwrap(),
+    ).unwrap();
+    let login = service.login(login(&format!("quota-{}",uuid::Uuid::new_v4()))).await.unwrap();
+    let principal = service.authenticate(&login.token).await.unwrap();
+    let absent = service.admin_detail("admin-tenant",&login.user_id).await.unwrap();
+    let parameters = service.model_parameters(&principal).await.unwrap();
+    let plain = parameters["model_api_key"].as_str();
+    let hash = hex::encode(Sha256::digest(plain.as_bytes()));
+    let owner = absent["litellm"]["user_id"].as_str().unwrap();
+    model.users.lock().unwrap().get_mut(owner).unwrap()["max_budget"] = Value::Null;
+    {
+        let mut keys = model.keys.lock().unwrap();
+        let info = keys.get_mut(&hash).unwrap();
+        info["max_budget"] = json!(15);
+        info["spend"] = json!(0);
+        info["budget_duration"] = json!("30d");
+        info["budget_reset_at"] = json!("2026-12-01T00:00:00Z");
+    }
+    let creates = model.creates.load(Ordering::SeqCst);
+    let detail = service.admin_detail("admin-tenant",&login.user_id).await.unwrap();
+    assert_eq!(detail["quota"]["total"],"30");
+    assert_eq!(detail["quota"]["used"],"0");
+    assert_eq!(detail["quota"]["balance"],"30");
+    assert_eq!(detail["quota"]["reset_at"],"2026-12-01T00:00:00Z");
+    assert_eq!(detail["quota"]["state"],"ok");
+    assert_eq!(detail["degraded"],json!([]));
+    assert_eq!(absent["quota"]["state"],"absent");
+    assert_eq!(absent["degraded"],json!([]));
+    let queried = detail["quota"]["queried_at"].as_str().expect("UTC timestamp string");
+    assert!(queried.contains('T') && queried.ends_with('Z'));
+    assert!(!detail.to_string().contains(plain));
+    model.keys.lock().unwrap().get_mut(&hash).unwrap()["user_id"] = json!("wrong-owner");
+    let conflict = service.admin_detail("admin-tenant",&login.user_id).await.unwrap();
+    assert_eq!(conflict["quota"]["state"],"failed");
+    assert!(conflict["quota"]["total"].is_null());
+    assert_eq!(conflict["degraded"],json!(["litellm"]));
+    model.keys.lock().unwrap().get_mut(&hash).unwrap()["user_id"] = json!(owner);
+    model.fail_reads.store(true,Ordering::SeqCst);
+    server.abort();
+    let failed = service.admin_detail("admin-tenant",&login.user_id).await.unwrap();
+    assert_eq!(failed["quota"]["state"],"failed");
+    assert_eq!(failed["degraded"],json!(["litellm"]));
+    let (client, connection) = tokio_postgres::connect(&db,tokio_postgres::NoTls).await.unwrap();
+    let task = tokio::spawn(async move { let _ = connection.await; });
+    client.execute("UPDATE adx_accounts.model_credentials SET encrypted_key=$2 WHERE user_id=$1",&[&login.user_id,&vec![0u8;32]]).await.unwrap();
+    let broken = service.admin_detail("admin-tenant",&login.user_id).await.unwrap();
+    assert_eq!(broken["quota"]["state"],"not_recoverable");
+    assert!(broken["quota"]["balance"].is_null());
+    assert_eq!(broken["degraded"],json!(["litellm"]));
+    assert_eq!(model.creates.load(Ordering::SeqCst),creates);
+    assert_eq!(model.updates.load(Ordering::SeqCst),0);
+    for table in ["model_credentials","sessions","users"] {
+        client.execute(&format!("DELETE FROM adx_accounts.{table} WHERE user_id=$1"),&[&login.user_id]).await.unwrap();
+    }
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL with accounts/schema.sql applied"]
+async fn admin_details_keep_unprovisioned_users_without_model_writes() {
+    use data_plane_gateway::ingress::accounts::admin::AdminQuery;
+    let db = std::env::var("ADX_ACCOUNT_TEST_DATABASE_URL").unwrap();
+    let model = Arc::new(ModelState::default());
+    let (url, server) = serve_model(model.clone()).await;
+    let mut cfg = config(&url);
+    cfg.admin = Some(serde_json::from_value(json!({"grants":[{"tenant":"admin-tenant","identity_scope":{"mode":"exclusive","exclusive_tenant":"admin-tenant"}}]})).unwrap());
+    let service = AccountService::new_with_agc(cfg,"test-app".into(),AccountStore::from_url(&db,true,None).await.unwrap(),Arc::new(Identity),None,Arc::new(LiteLlm::with_key(config(&url).litellm,"mock-admin".into()).unwrap()),CredentialCipher::new([8;32],"tenant").unwrap()).unwrap();
+    let user = service.login(login("admin-unprovisioned")).await.unwrap();
+    let detail = service.admin_detail("admin-tenant", &user.user_id).await.unwrap();
+    assert_eq!(detail["user"]["user_id"],user.user_id);
+    assert_eq!(detail["litellm"]["key_state"],"absent");
+    assert!(detail["quota"]["total"].is_null());
+    assert!(service.admin_detail("other",&user.user_id).await.is_err());
+    assert!(service.admin_reveal("admin-tenant",&user.user_id,"unknown").await.is_err());
+    let page = service.admin_list("admin-tenant","operator",&AdminQuery::parse("user_id=missing").unwrap()).await.unwrap();
+    assert_eq!(page["total"],0);
+    assert_eq!(model.creates.load(Ordering::SeqCst),0);
+    server.abort();
+    let failed = service.admin_detail("admin-tenant",&user.user_id).await.unwrap();
+    assert_eq!(failed["user"]["user_id"],user.user_id);
+    assert_eq!(failed["quota"]["state"],"absent");
+    assert_eq!(failed["degraded"],json!([]));
+    let owner = failed["litellm"]["user_id"].as_str().unwrap();
+    let query = AdminQuery::parse(&format!("litellm_user_id={owner}")).unwrap();
+    assert!(service.admin_list("admin-tenant","operator",&query).await.is_err());
 }
 
 #[tokio::test]

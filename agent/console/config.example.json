@@ -1,0 +1,24 @@
+{
+  "listen": "0.0.0.0:8088",
+  "public_origin": "https://console.example.com",
+  "upstream_ca_file": null,
+  "agent_api": {"base_url": "https://gateway.example.com/api/agent/v2", "timeout_ms": 10000},
+  "apiserver": {"base_url": "https://platform.example.com", "timeout_ms": 10000},
+  "ingress": {"base_url": "https://gateway.example.com", "execd_port": 49983, "connect_timeout_ms": 10000},
+  "cookie_secret_file": "/run/secrets/console-session",
+  "session_ttl_seconds": 28800,
+  "terminal_idle_timeout_seconds": 600,
+  "terminal_lost_timeout_seconds": 30,
+  "file_preview_bytes_limit": 262144,
+  "platform_admins": [],
+  "tenants": [
+    {
+      "tenant_id": "example",
+      "display_name": "Example",
+      "type": "standard",
+      "admin_token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "agent": {"enabled": true},
+      "upstream_token_file": "/run/secrets/example-upstream"
+    }
+  ]
+}

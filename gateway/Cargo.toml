@@ -53,6 +53,7 @@ mime_guess = "2"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 percent-encoding = "2"
 h2 = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-auto"] }
@@ -72,6 +73,7 @@ rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rust_decimal = "1"
 thiserror = "1"
 tonic = { version = "0.12", optional = true, features = ["transport"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "io-util", "io-std", "time", "signal", "sync", "fs"] }

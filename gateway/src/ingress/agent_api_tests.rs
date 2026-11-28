@@ -114,6 +114,23 @@ async fn fixture() -> (Arc<Ingress>, Arc<dyn Environment>) {
     let (gateway, backend, _) = fixture_with_routes().await;
     (gateway, backend)
 }
+
+#[tokio::test]
+async fn accounts_management_is_tls_only_and_requires_tenant_authentication() {
+    let (gateway, _) = fixture().await;
+    for (security, credential, expected) in [
+        (IngressSecurity::Plaintext,"tenant",StatusCode::UPGRADE_REQUIRED),
+        (IngressSecurity::Tls,"invalid",StatusCode::UNAUTHORIZED),
+        (IngressSecurity::Tls,"tenant",StatusCode::NOT_FOUND),
+    ] {
+        let (mut sender, serving, connection) = connection(gateway.clone(),security).await;
+        let response = sender.send_request(request("GET","/api/accounts/v1/admin/users",credential,"accounts",serde_json::json!({}))).await.unwrap();
+        assert_eq!(response.status(),expected);
+        response.collect().await.unwrap();
+        serving.abort();
+        connection.abort();
+    }
+}
 async fn fixture_with_routes() -> (Arc<Ingress>, Arc<dyn Environment>, Arc<RouteStore>) {
     fixture_with_backend(Arc::new(Backend::default())).await
 }
@@ -514,6 +531,26 @@ async fn managed_binding_management_and_protocol_forwarding() {
     assert_eq!(response.status(), StatusCode::OK);
     let published = json(response).await;
     assert_eq!(published["template"]["version"], "1");
+    for (uri, credential, field, total) in [
+        ("/api/agent/v2/templates?name=de", "tenant", "templates", 1),
+        ("/api/agent/v2/templates?name=de", "other", "templates", 0),
+        ("/api/agent/v2/templates/demo/versions?version=1", "tenant", "versions", 1),
+        ("/api/agent/v2/templates/demo/aliases", "tenant", "aliases", 0),
+        ("/api/agent/v2/bindings", "tenant", "bindings", 0),
+    ] {
+        let response = sender.send_request(request("GET", uri, credential, "catalog", serde_json::json!({}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let page = json(response).await;
+        assert_eq!(page["total"], total);
+        assert_eq!(page[field].as_array().unwrap().len(), total as usize);
+    }
+    for uri in ["/api/agent/v2/templates?tenant=other", "/api/agent/v2/templates?page_size=0",
+        "/api/agent/v2/templates?page_size=1&page_size=2", "/api/agent/v2/templates/demo/versions?version=01",
+        "/api/agent/v2/bindings?ref_kind=invalid"] {
+        let response = sender.send_request(request("GET", uri, "tenant", "invalid-catalog", serde_json::json!({}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        json(response).await;
+    }
     let path = "/api/agent/v2/templates/demo/versions/1/bindings/env";
     let mut traffic = Request::builder()
         .uri("/agent/http/path?target=urn:adx:template:demo:1&port=8080")

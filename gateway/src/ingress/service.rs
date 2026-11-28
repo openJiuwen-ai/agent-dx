@@ -138,32 +138,59 @@ impl IngressService {
             None
         };
         #[cfg(feature = "agent-api")]
+        let digitalmate_settings = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
+            Some(
+                serde_json::from_slice::<
+                    super::digitalmategateway::entrypoint::DigitalMateGatewayConfig,
+                >(&std::fs::read(path)?)
+                .map_err(|_| "invalid DigitalMateGateway configuration")?,
+            )
+        } else {
+            None
+        };
+        #[cfg(feature = "agent-api")]
+        let accounts = if let Ok(path) = std::env::var("ADX_ACCOUNT_CONFIG") {
+            let settings: super::accounts::AccountConfig =
+                serde_json::from_slice(&std::fs::read(path)?)
+                    .map_err(|_| "invalid account configuration")?;
+            let namespace = super::accounts::admin::model_namespace(
+                digitalmate_settings
+                    .as_ref()
+                    .map(|settings| settings.tenant.as_str()),
+                settings.model_namespace.as_deref(),
+            )?
+            .to_owned();
+            let enabled = settings
+                .admin
+                .as_ref()
+                .is_some_and(|admin| !admin.grants.is_empty());
+            Some((
+                Arc::new(super::accounts::AccountService::connect(settings, &namespace).await?),
+                enabled,
+            ))
+        } else {
+            None
+        };
+        #[cfg(feature = "agent-api")]
         let observation = super::digitalmategateway::observation::Observation::from_env(
-            std::env::var("ADX_JIUWEN_CONFIG").is_ok(),
+            digitalmate_settings.is_some(),
         )
         .await
         .map_err(|error| send_error(Box::new(std::io::Error::other(error))))?;
         #[cfg(feature = "agent-api")]
-        let digitalmategateway_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
-            use super::digitalmategateway::entrypoint::{
-                DigitalMateGatewayApi, DigitalMateGatewayConfig,
-            };
-            let settings: DigitalMateGatewayConfig = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| "invalid DigitalMateGateway configuration")?;
+        let digitalmategateway_api = if let Some(settings) = digitalmate_settings {
+            use super::digitalmategateway::entrypoint::DigitalMateGatewayApi;
             let agent = agent_api
                 .as_ref()
                 .ok_or("DigitalMateGateway requires ADX_AGENT_CONFIG")?;
             if file_access.is_none() {
                 return Err("DigitalMateGateway requires ADX_ENVIRONMENT_FILES_CONFIG".into());
             }
-            let account_path = std::env::var("ADX_ACCOUNT_CONFIG")
-                .map_err(|_| "DigitalMateGateway requires ADX_ACCOUNT_CONFIG")?;
-            let account_config: super::accounts::AccountConfig =
-                serde_json::from_slice(&std::fs::read(account_path)?)
-                    .map_err(|_| "invalid account configuration")?;
-            let auth = Arc::new(
-                super::accounts::AccountService::connect(account_config, &settings.tenant).await?,
-            );
+            let auth = accounts
+                .as_ref()
+                .ok_or("DigitalMateGateway requires ADX_ACCOUNT_CONFIG")?
+                .0
+                .clone();
             Some(Arc::new(
                 DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth)
                     .await?
@@ -214,6 +241,11 @@ impl IngressService {
             gateway.with_digitalmategateway_api(api.clone())
         } else {
             gateway
+        };
+        #[cfg(feature = "agent-api")]
+        let gateway = match accounts {
+            Some((service, true)) => gateway.with_accounts_admin(service),
+            _ => gateway,
         };
         #[cfg(feature = "agent-api")]
         let gateway = if digitalmategateway_api.is_some() {

@@ -170,6 +170,27 @@ fn segment(value: &str) -> Result<String, Error> {
     }
     Ok(value)
 }
+
+fn catalog_params(raw: Option<&str>, allowed: &[&str]) -> Result<std::collections::BTreeMap<String, String>, Error> {
+    let mut result = std::collections::BTreeMap::new();
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        if (!matches!(key.as_ref(), "page_size" | "page_token") && !allowed.contains(&key.as_ref()))
+            || result.insert(key.into_owned(), value.into_owned()).is_some() {
+            return Err(Error::Invalid("unknown or duplicate catalog parameter".into()));
+        }
+    }
+    Ok(result)
+}
+
+fn catalog_page(params: &std::collections::BTreeMap<String, String>, filter: &str) -> Result<adx_agent_core::activator::ListPage, Error> {
+    let page = adx_agent_core::activator::ListPage {
+        page_size: params.get("page_size").map(|size| size.parse().map_err(|_| Error::Invalid("invalid page_size".into()))).transpose()?.unwrap_or_else(adx_agent_core::activator::default_page_size),
+        page_token: params.get("page_token").cloned(),
+        name: params.get(filter).cloned(),
+    };
+    page.validate().map_err(Error::Invalid)?;
+    Ok(page)
+}
 impl AgentApi {
     async fn managed_management(
         &self,
@@ -178,16 +199,53 @@ impl AgentApi {
         ctx: &RequestContext,
     ) -> Result<serde_json::Value, Error> {
         let (parts, body) = request.into_parts();
-        let path: Vec<_> = parts
-            .uri
+        let uri = parts.uri.clone();
+        let path: Vec<_> = uri
             .path()
             .strip_prefix("/api/agent/v2/")
             .ok_or(Error::NotFound)?
             .split('/')
             .collect();
+        if parts.method == http::Method::GET {
+            use adx_agent_core::{activator::{BindingCatalog, CatalogRequest}, TemplateRef};
+            let raw = parts.uri.query();
+            let result = match path.as_slice() {
+                ["templates"] => {
+                    let params = catalog_params(raw, &["name"])?;
+                    serde_json::to_value(self.managed.list_templates(ctx, &CatalogRequest { tenant: tenant.into(), template: None, page: catalog_page(&params, "name")? }).await?)
+                }
+                ["templates", template, collection @ ("versions" | "aliases")] => {
+                    let filter = if *collection == "versions" { "version" } else { "name" };
+                    let params = catalog_params(raw, &[filter])?;
+                    let query = CatalogRequest { tenant: tenant.into(), template: Some(segment(template)?), page: catalog_page(&params, filter)? };
+                    if *collection == "versions" { serde_json::to_value(self.managed.list_versions(ctx, &query).await?) }
+                    else { serde_json::to_value(self.managed.list_aliases(ctx, &query).await?) }
+                }
+                ["bindings"] => {
+                    let params = catalog_params(raw, &["template", "ref_kind", "ref", "binding_id", "actual_version"])?;
+                    let template_ref = match (params.get("ref_kind").map(String::as_str), params.get("ref")) {
+                        (None, None) => None,
+                        (Some("aliases" | "versions"), None) => None,
+                        (Some("versions"), Some(value)) => Some(TemplateRef::Version(value.clone())),
+                        (Some("aliases"), Some(value)) => Some(TemplateRef::Alias(value.clone())),
+                        _ => return Err(Error::Invalid("invalid reference filter".into())),
+                    };
+                    let ref_kind = params.get("ref_kind").map(|kind| if kind == "aliases" { "alias".into() } else { "version".into() });
+                    let query = BindingCatalog { tenant: tenant.into(), template: params.get("template").cloned(), template_ref, ref_kind,
+                        binding_id: params.get("binding_id").cloned(), actual_version: params.get("actual_version").cloned(), page: catalog_page(&params, "")? };
+                    serde_json::to_value(self.managed.list_bindings_tenant(ctx, &query).await?)
+                }
+                _ => return self.managed_scoped(parts, body, &path, tenant, ctx).await,
+            };
+            return result.map_err(|_| Error::Unavailable("catalog serialization failed".into()));
+        }
+        self.managed_scoped(parts, body, &path, tenant, ctx).await
+    }
+
+    async fn managed_scoped(&self, parts: http::request::Parts, body: hyper::body::Incoming, path: &[&str], tenant: &str, ctx: &RequestContext) -> Result<serde_json::Value, Error> {
         let listing = parts.method == http::Method::GET
             && matches!(
-                path.as_slice(),
+                path,
                 ["templates", _, "versions" | "aliases", _, "bindings"]
             );
         if !listing && parts.uri.query().is_some() {
@@ -196,7 +254,7 @@ impl AgentApi {
             ));
         }
         let managed = &self.managed;
-        if let ["prewarm-artifacts", snapshot] = path.as_slice() {
+        if let ["prewarm-artifacts", snapshot] = path {
             if parts.method != http::Method::DELETE {
                 return Err(Error::NotFound);
             }
@@ -213,7 +271,7 @@ impl AgentApi {
             let published = managed.publish(ctx, tenant, &input).await?;
             return Ok(serde_json::json!({"template":published}));
         }
-        let ["templates", name, kind, reference, rest @ ..] = path.as_slice() else {
+        let ["templates", name, kind, reference, rest @ ..] = path else {
             return Err(Error::NotFound);
         };
         let name = segment(name)?;

@@ -24,6 +24,12 @@ pub trait AgcIdentityProvider: Send + Sync {
 }
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
+    async fn admin_user_info(&self, _user_id: &str) -> Result<Option<Value>> {
+        Err(Error::Unavailable)
+    }
+    async fn admin_key_info(&self, _user_id: &str, _key: &str) -> Result<Option<Value>> {
+        Err(Error::Unavailable)
+    }
     async fn ensure(&self, user_id: &str, key: &str, key_alias: &str) -> Result<()>;
     async fn quota(&self, user_id: &str, key: &str) -> Result<QuotaResponse>;
 }
@@ -518,6 +524,13 @@ impl LiteLlm {
         format!("{}{path}", self.config.management_url.trim_end_matches('/'))
     }
     async fn key_info(&self, user_id: &str, key: &str) -> Result<Option<Value>> {
+        let info = self.read_key_info(user_id, key).await?;
+        if info.as_ref().is_some_and(|info| info["blocked"].as_bool() == Some(true)) {
+            return Err(Error::Forbidden);
+        }
+        Ok(info)
+    }
+    async fn read_key_info(&self, user_id: &str, key: &str) -> Result<Option<Value>> {
         // Query by hash to avoid logging the usable key in provider access URLs.
         let response = self
             .client
@@ -535,7 +548,7 @@ impl LiteLlm {
         }
         let value = json_response(response).await?;
         let info = &value["info"];
-        if info["user_id"].as_str() != Some(user_id) || info["blocked"].as_bool() == Some(true) {
+        if info["user_id"].as_str() != Some(user_id) {
             return Err(Error::Forbidden);
         }
         Ok(Some(info.clone()))
@@ -640,6 +653,12 @@ impl LiteLlm {
 }
 #[async_trait]
 impl ModelProvider for LiteLlm {
+    async fn admin_user_info(&self, user_id: &str) -> Result<Option<Value>> {
+        self.user_info(user_id).await
+    }
+    async fn admin_key_info(&self, user_id: &str, key: &str) -> Result<Option<Value>> {
+        self.read_key_info(user_id, key).await
+    }
     async fn ensure(&self, user_id: &str, key: &str, key_alias: &str) -> Result<()> {
         if let Some(info) = self.key_info(user_id, key).await? {
             if has_proxy_access(&info) && info["key_alias"].as_str() == Some(key_alias) {

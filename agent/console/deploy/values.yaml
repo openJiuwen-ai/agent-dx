@@ -1,0 +1,36 @@
+# All secrets are created separately; never put credential plaintext in values.
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+proxyImage: nginx:stable-alpine
+configSecret: adx-console-config
+credentialsSecret: adx-console-credentials
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+tlsSecret: adx-console-browser-tls
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+proxyResources:
+  requests:
+    cpu: 20m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+sharedStorage:
+  enabled: false
+  claimName: sfs-workspaces
+  mountPath: /srv/adx-shared
+# Optional, only after verifying actual SAN and Service IPs.
+hostAliases: []

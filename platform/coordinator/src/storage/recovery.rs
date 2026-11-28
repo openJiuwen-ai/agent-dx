@@ -3,6 +3,36 @@ use super::*;
 use adx_core::checkpoint::{immutable_oci_rootfs, RECOVERY_OCI_NODE, RECOVERY_OCI_ROOTFS};
 use std::borrow::Cow;
 
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_oci_proof_preserves_verified_image_and_rejects_unknown_evidence() {
+        let profile = serde_json::json!({
+            "ADX_RECOVERY_RUNTIME_runsc": "a".repeat(64),
+            "ADX_RECOVERY_ROOTFS_SHA256": "b".repeat(64),
+            "ADX_RECOVERY_ROOTFS_PATH": "/opt/adx/runtime/root.erofs",
+            "ADX_RECOVERY_OCI_ROOTFS": format!("registry.example/image@sha256:{}", "c".repeat(64))
+        });
+        let mut proof = serde_json::json!([{
+            "artifact": {"storage":"shared", "scope":"backend", "location":"point", "size_bytes":1},
+            "runtime_class":"runsc", "source_runtime_id":"env-1", "recovery_profile":profile
+        }]);
+        let parsed = serde_json::from_value::<LegacyCheckpointProofs>(proof.clone());
+        assert!(parsed.is_ok(), "verified OCI evidence must be accepted");
+        proof[0]["recovery_profile"]["UNKNOWN"] = serde_json::json!("unverified");
+        assert!(serde_json::from_value::<LegacyCheckpointProofs>(proof.clone()).is_err());
+        proof[0]["recovery_profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("UNKNOWN");
+        proof[0]["recovery_profile"]["ADX_RECOVERY_OCI_ROOTFS"] =
+            serde_json::json!("registry.example/image:latest");
+        assert!(serde_json::from_value::<LegacyCheckpointProofs>(proof).is_err());
+    }
+}
+
 /// Operator-audited capture facts for one immutable shared artifact.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +55,19 @@ impl TryFrom<Vec<LegacyCheckpointProof>> for LegacyCheckpointProofs {
         let mut by_storage = BTreeMap::<String, BTreeMap<String, LegacyCheckpointProof>>::new();
         for proof in proofs {
             let artifact = &proof.artifact;
+            let mut expected =
+                recovery_profile_requirements(&proof.runtime_class, &proof.recovery_profile)?;
+            if let Some(image) = proof.recovery_profile.get(RECOVERY_OCI_ROOTFS) {
+                let valid = image.split_once('@').is_some_and(|(repository, digest)| {
+                    !repository.is_empty() && adx_core::checkpoint::is_oci_digest(digest)
+                });
+                if !valid {
+                    return Err(Error::Invalid(
+                        "invalid legacy checkpoint OCI image proof".into(),
+                    ));
+                }
+                expected.insert(RECOVERY_OCI_ROOTFS.into(), image.clone());
+            }
             if artifact.storage.is_empty()
                 || artifact.storage == "local"
                 || artifact.scope.is_empty()
@@ -32,8 +75,7 @@ impl TryFrom<Vec<LegacyCheckpointProof>> for LegacyCheckpointProofs {
                 || artifact.size_bytes == 0
                 || proof.runtime_class.is_empty()
                 || proof.source_runtime_id.is_empty()
-                || recovery_profile_requirements(&proof.runtime_class, &proof.recovery_profile)?
-                    != proof.recovery_profile
+                || expected != proof.recovery_profile
             {
                 return Err(Error::Invalid("invalid legacy checkpoint proof".into()));
             }

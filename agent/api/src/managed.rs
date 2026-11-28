@@ -206,6 +206,18 @@ impl ManagedService {
     pub async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
         self.control.binding(ctx, scope).await
     }
+    pub async fn list_templates(&self, ctx: &RequestContext, query: &activator::CatalogRequest) -> Result<activator::TemplateSummaryPage> {
+        self.control.list_templates(ctx, query).await
+    }
+    pub async fn list_versions(&self, ctx: &RequestContext, query: &activator::CatalogRequest) -> Result<activator::VersionSummaryPage> {
+        self.control.list_versions(ctx, query).await
+    }
+    pub async fn list_aliases(&self, ctx: &RequestContext, query: &activator::CatalogRequest) -> Result<activator::AliasPage> {
+        self.control.list_aliases(ctx, query).await
+    }
+    pub async fn list_bindings_tenant(&self, ctx: &RequestContext, query: &activator::BindingCatalog) -> Result<activator::BindingCatalogPage> {
+        self.control.list_bindings_tenant(ctx, query).await
+    }
     pub async fn list_bindings(
         &self,
         ctx: &RequestContext,

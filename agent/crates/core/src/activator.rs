@@ -3,6 +3,93 @@ use crate::{AgentBinding, Scope, Service};
 use serde::{Deserialize, Serialize};
 
 pub const DEADLINE_HEADER: &str = "x-adx-deadline-ms";
+
+/// Read-only catalog filters: exact versions, prefix template and alias names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListPage {
+    #[serde(default = "default_page_size")]
+    pub page_size: usize,
+    #[serde(default)]
+    pub page_token: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+impl Default for ListPage {
+    fn default() -> Self {
+        Self { page_size: default_page_size(), page_token: None, name: None }
+    }
+}
+impl ListPage {
+    pub fn validate(&self) -> crate::ValidationResult {
+        if !(1..=crate::limits::BINDING_PAGE_SIZE).contains(&self.page_size)
+            || self.page_token.as_ref().is_some_and(|v| v.len() > 16384)
+        { return Err("invalid catalog page size or token".into()); }
+        if let Some(name) = &self.name { crate::identifier(name, "catalog filter")?; }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogRequest {
+    pub tenant: String,
+    #[serde(default)]
+    pub template: Option<String>,
+    pub page: ListPage,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateSummary {
+    pub name: String,
+    pub latest_version: String,
+    pub published_at: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateSummaryPage {
+    pub templates: Vec<TemplateSummary>,
+    pub total: usize,
+    pub next_page_token: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionSummary {
+    pub version: String,
+    pub published_at: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionSummaryPage {
+    pub versions: Vec<VersionSummary>,
+    pub total: usize,
+    pub next_page_token: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasPage {
+    pub aliases: Vec<AliasSnapshot>,
+    pub total: usize,
+    pub next_page_token: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingCatalog {
+    pub tenant: String,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub template_ref: Option<crate::TemplateRef>,
+    #[serde(default)]
+    pub ref_kind: Option<String>,
+    #[serde(default)]
+    pub binding_id: Option<String>,
+    /// Match actual current or secondary version, independently of the stored reference.
+    #[serde(default)]
+    pub actual_version: Option<String>,
+    #[serde(default)]
+    pub page: ListPage,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingCatalogPage {
+    pub bindings: Vec<AgentBinding>,
+    pub total: usize,
+    pub next_page_token: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeRequest {

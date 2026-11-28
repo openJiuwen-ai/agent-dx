@@ -10,6 +10,7 @@ pub use redis_store::RedisRepository;
 mod notifications;
 pub use notifications::{MetadataChange, RedisChanges};
 mod state;
+mod catalog;
 pub use state::{AgentState, PreparedTemplate, PublishedTemplate};
 mod aliases;
 #[cfg(feature = "test-memory")]
@@ -214,6 +215,10 @@ impl Transaction {
 
 #[async_trait]
 pub trait Repository: Send + Sync {
+    /// Bounded scan of existing record keys; implementations must not return partial success.
+    async fn scan(&self, _kind: &str, _parts: &[&str]) -> Result<Vec<(String, Record)>> {
+        Err(Error::Unavailable("catalog enumeration unavailable".into()))
+    }
     async fn get(&self, key: &Key) -> Result<Option<Record>>;
     /// False means a definite conflict with no writes. Errors may mean unknown outcome.
     async fn commit(&self, transaction: &Transaction) -> Result<bool>;

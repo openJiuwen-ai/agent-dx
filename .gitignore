@@ -32,6 +32,7 @@ env/
 .DS_Store
 
 # Monorepo build products
+/agent/console/frontend/node_modules/
 /target/
 /out/
 /.adx-cache/

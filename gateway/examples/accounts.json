@@ -4,6 +4,9 @@
   "database_url_env": "ADX_ACCOUNT_DATABASE_URL",
   "database_allow_plaintext": false,
   "session_ttl_seconds": 604800,
+  "admin": {
+    "grants": []
+  },
   "agc": {
     "project_id": "101653523864899612",
     "api_client_id": "2061575285978955776",

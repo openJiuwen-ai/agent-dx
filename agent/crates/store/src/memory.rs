@@ -15,6 +15,13 @@ struct MemoryState {
 
 #[async_trait]
 impl Repository for MemoryRepository {
+    async fn scan(&self, kind: &str, parts: &[&str]) -> Result<Vec<(String, Record)>> {
+        let key = Key::new(kind, parts)?;
+        let prefix = format!("{}2c", &key.as_str()[..key.as_str().len() - 2]);
+        Ok(self.state.lock().await.records.iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| (key.clone(), value.clone())).collect())
+    }
     async fn get(&self, key: &Key) -> Result<Option<Record>> {
         Ok(self.state.lock().await.records.get(&key.0).cloned())
     }

@@ -18,6 +18,18 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn list_templates(&self, _ctx: &RequestContext, _query: &CatalogRequest) -> Result<TemplateSummaryPage> {
+        Err(Error::Unsupported("template catalog unavailable".into()))
+    }
+    async fn list_versions(&self, _ctx: &RequestContext, _query: &CatalogRequest) -> Result<VersionSummaryPage> {
+        Err(Error::Unsupported("version catalog unavailable".into()))
+    }
+    async fn list_aliases(&self, _ctx: &RequestContext, _query: &CatalogRequest) -> Result<AliasPage> {
+        Err(Error::Unsupported("alias catalog unavailable".into()))
+    }
+    async fn list_bindings_tenant(&self, _ctx: &RequestContext, _query: &BindingCatalog) -> Result<BindingCatalogPage> {
+        Err(Error::Unsupported("binding catalog unavailable".into()))
+    }
     async fn retire_golden(
         &self,
         _ctx: &RequestContext,
@@ -304,6 +316,18 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn list_templates(&self, ctx: &RequestContext, query: &CatalogRequest) -> Result<TemplateSummaryPage> {
+        self.request(ctx, "templates/list", query, false, None).await
+    }
+    async fn list_versions(&self, ctx: &RequestContext, query: &CatalogRequest) -> Result<VersionSummaryPage> {
+        self.request(ctx, "versions/list", query, false, None).await
+    }
+    async fn list_aliases(&self, ctx: &RequestContext, query: &CatalogRequest) -> Result<AliasPage> {
+        self.request(ctx, "aliases/list", query, false, None).await
+    }
+    async fn list_bindings_tenant(&self, ctx: &RequestContext, query: &BindingCatalog) -> Result<BindingCatalogPage> {
+        self.request(ctx, "bindings/catalog", query, false, None).await
+    }
     async fn retire_golden(&self, ctx: &RequestContext, request: &GoldenRetirement) -> Result<()> {
         self.request(ctx, "prewarm/retire", request, true, None)
             .await
