@@ -1182,3 +1182,10 @@ The minimum dependency and lockfile include the upstream
 [write-recheck flush fix](https://github.com/hyperium/hyper/pull/4143).
 The HTTP/1 streaming regression checks that the terminator reaches a raw client
 before it sends the next request on the same connection.
+
+
+## DigitalMate performance capture
+
+The opt-in [passive transport observer](performance-observation.md) records
+connection setup and bounded metadata at the four local forwarding boundaries.
+It does not terminate, modify or authorize WebSocket messages.
