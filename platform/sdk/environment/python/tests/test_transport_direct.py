@@ -1757,7 +1757,7 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
             return original_client._safe_id(environment_id)
 
     class FakeTunnelClient:
-        def __init__(self, upstream, token=None, *, environment_id=None):
+        def __init__(self, upstream, token=None, *, environment_id=None, http_timeout=None):
             seen["upstream"] = upstream
             seen["token"] = token
             seen["environment_id"] = environment_id
@@ -1853,7 +1853,7 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
             return original_client._safe_id(environment_id)
 
     class FakeTunnelClient:
-        def __init__(self, upstream, token=None, *, environment_id=None):
+        def __init__(self, upstream, token=None, *, environment_id=None, http_timeout=None):
             seen["token"] = token
             seen["environment_id"] = environment_id
 
@@ -1868,14 +1868,15 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
     try:
         environment_api.EnvironmentClient = FakeClient
         tunnel_client.TunnelClient = FakeTunnelClient
-        sb = environment_api.Environment(
-            image="python:3.12-slim",
-            upstream="127.0.0.1:8000",
-            proxy_port=9876,
-            env={"USER_ENV": "ok"},
-            tunnel_connect_timeout=1,
-            detached=True,
-        )
+        with patch.dict(os.environ, {"ADX_TUNNEL_HTTP_TIMEOUT": "600"}):
+            sb = environment_api.Environment(
+                image="python:3.12-slim",
+                upstream="127.0.0.1:8000",
+                proxy_port=9876,
+                env={"USER_ENV": "ok"},
+                tunnel_connect_timeout=1,
+                detached=True,
+            )
         _check(sb.get_tunnel_url() == "http://127.0.0.1:8766", "frontend proxyUrl mismatch")
         sb.kill()
     finally:
@@ -1886,7 +1887,10 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
 
     _check(seen["url"] == "ws://router:8080/tunnel/frontend-returned", f"returned tunnel url mismatch: {seen['url']}")
     _check(seen["create_ports"] is None, f"SDK leaked control ports: {seen['create_ports']}")
-    _check(seen["create_env"] == {"USER_ENV": "ok"}, f"SDK should not set EXECD envs: {seen['create_env']}")
+    _check(
+        seen["create_env"] == {"USER_ENV": "ok", "ADX_TUNNEL_HTTP_TIMEOUT": "600.0"},
+        f"SDK should preserve user env and add the tunnel timeout: {seen['create_env']}",
+    )
     _check(
         seen["create_tunnel"] == {"enabled": True, "proxyPort": 9876},
         f"declarative tunnel mismatch: {seen['create_tunnel']}",

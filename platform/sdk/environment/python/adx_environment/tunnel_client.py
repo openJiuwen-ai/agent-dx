@@ -21,12 +21,13 @@ import contextlib
 import http.cookiejar
 import json
 import logging
+import math
 import os
 import ssl
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -103,13 +104,26 @@ def _positive_int_env(name: str, default: int, maximum: int) -> int:
     return min(value, maximum)
 
 
-def _http_timeout_for_tunnel() -> httpx.Timeout:
-    """Preserve the legacy tunnel-wide HTTP timeout environment contract."""
+HTTP_TIMEOUT_ENV = "ADX_TUNNEL_HTTP_TIMEOUT"
+DEFAULT_HTTP_TIMEOUT = 600.0
+
+
+def resolve_http_timeout(raw: Optional[Union[str, float]] = None) -> float:
+    """Resolve seconds once, with the same fallback as the Execd server."""
+    if raw is None:
+        raw = os.environ.get(HTTP_TIMEOUT_ENV, str(DEFAULT_HTTP_TIMEOUT))
     try:
-        seconds = float(os.environ.get("ADX_TUNNEL_HTTP_TIMEOUT", "600"))
-    except ValueError:
-        seconds = 600.0
-    return httpx.Timeout(seconds)
+        seconds = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_HTTP_TIMEOUT
+    # Execd represents durations as unsigned seconds plus nanoseconds.
+    if not math.isfinite(seconds) or not 1e-9 <= seconds < 2**64:
+        return DEFAULT_HTTP_TIMEOUT
+    return seconds
+
+
+def _http_timeout_for_tunnel(seconds: Optional[float] = None) -> httpx.Timeout:
+    return httpx.Timeout(resolve_http_timeout(seconds))
 
 
 def _header_pairs(headers):
@@ -185,6 +199,8 @@ class TunnelClient:
     ``ping_interval`` and ``ping_timeout`` configure JSON application
     heartbeats. WebSocket protocol ping is disabled because some gateways
     don't count control frames when enforcing idle timeouts.
+    ``http_timeout`` pins HTTP forwarding waits to this client's lifetime;
+    omission resolves ``ADX_TUNNEL_HTTP_TIMEOUT`` at construction.
     """
 
     def __init__(
@@ -195,6 +211,7 @@ class TunnelClient:
         ping_timeout: float = _PING_TIMEOUT,
         *,
         environment_id: Optional[str] = None,
+        http_timeout: Optional[float] = None,
     ):
         if ping_interval <= 0:
             raise ValueError("ping_interval must be greater than zero")
@@ -203,6 +220,7 @@ class TunnelClient:
         self._upstream = upstream
         self._token = token
         self._environment_id = environment_id
+        self._http_timeout = _http_timeout_for_tunnel(http_timeout)
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._protocol_version = _positive_int_env("ADX_TUNNEL_PROTOCOL_VERSION", PROTOCOL_VERSION, PROTOCOL_VERSION)
@@ -385,7 +403,7 @@ class TunnelClient:
         }
         self._http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-            timeout=_http_timeout_for_tunnel(),
+            timeout=self._http_timeout,
             verify=http_ssl_context,
             trust_env=False,
             cookies=_NoCookieJar(),
@@ -510,7 +528,7 @@ class TunnelClient:
         verify = http_ssl_context if http_ssl_context is not None else True
         async with httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-            timeout=_http_timeout_for_tunnel(),
+            timeout=self._http_timeout,
             verify=verify,
             trust_env=False,
             cookies=_NoCookieJar(),
