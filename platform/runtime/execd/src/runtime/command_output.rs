@@ -6,14 +6,12 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
 
 use rmpv::Value;
 
 pub(super) const DEFAULT_REGISTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const CAPTURE_CHUNK_BYTES: usize = 8192;
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 static MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static SPOOL_BYTES: AtomicUsize = AtomicUsize::new(0);
 static SPOOL_FILES: AtomicUsize = AtomicUsize::new(0);
@@ -191,7 +189,6 @@ enum OutputFailure {
     NoSpace,
     SpoolIo,
     PipeRead,
-    DrainTimeout,
 }
 
 impl OutputFailure {
@@ -212,7 +209,6 @@ impl OutputFailure {
             Self::NoSpace => "no_space",
             Self::SpoolIo => "spool_io",
             Self::PipeRead => "pipe_read",
-            Self::DrainTimeout => "drain_timeout",
         }
     }
 }
@@ -278,16 +274,24 @@ impl Capture {
             });
             data.0.extend_from_slice(&bytes[..take]);
             if take < bytes.len() {
-                self.truncated = true;
-                TRUNCATED_STREAMS.fetch_add(1, Ordering::Relaxed);
+                self.mark_truncated();
             }
         }
         Ok(())
     }
 
-    fn fail_pipe(&mut self, reason: OutputFailure) {
-        if !matches!(self.storage, Storage::Failed(_)) && self.spool.is_some() {
-            self.storage = Storage::Failed(reason);
+    fn mark_truncated(&mut self) {
+        if !self.truncated {
+            self.truncated = true;
+            TRUNCATED_STREAMS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn fail_pipe(&mut self) {
+        if self.spool.is_none() {
+            self.mark_truncated();
+        } else if !matches!(self.storage, Storage::Failed(_)) {
+            self.storage = Storage::Failed(OutputFailure::PipeRead);
             INCOMPLETE_STREAMS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -389,7 +393,6 @@ impl Output {
 
 #[derive(Default)]
 struct ReaderState {
-    deadline: Option<Instant>,
     output: Option<Output>,
 }
 
@@ -402,6 +405,7 @@ pub(super) struct Reader(Arc<ReaderInner>);
 struct ReaderInner {
     state: Mutex<ReaderState>,
     completed: Condvar,
+    finishing: AtomicBool,
     total: AtomicU64,
     memory: AtomicUsize,
 }
@@ -430,49 +434,100 @@ impl Reader {
         });
         if started.is_err() {
             let mut capture = Capture::new(limit, spool);
-            capture.fail_pipe(OutputFailure::PipeRead);
+            capture.fail_pipe();
             reader.publish(capture.seal());
         }
         reader
     }
 
-    fn drain(&self, mut stream: impl Read + AsRawFd, mut capture: Capture) {
+    fn drain(self, mut stream: impl Read + AsRawFd, mut capture: Capture) {
         let mut buffer = [0; CAPTURE_CHUNK_BYTES];
-        loop {
-            let deadline = self.0.state.lock().ok().and_then(|state| state.deadline);
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                capture.fail_pipe(OutputFailure::DrainTimeout);
-                break;
+        let inherited_writer = loop {
+            if self.0.finishing.load(Ordering::Acquire) {
+                // The direct child has exited. With only this reader consuming
+                // the pipe, the queued byte count bounds the final drain even
+                // if a descendant keeps producing output.
+                if self
+                    .capture_queued(&mut stream, &mut buffer, &mut capture)
+                    .is_err()
+                {
+                    capture.fail_pipe();
+                }
+                break true;
             }
             match poll_pipe(&stream) {
                 Ok(false) => continue,
+                Ok(true) if self.0.finishing.load(Ordering::Acquire) => continue,
                 Ok(true) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    capture.fail_pipe(OutputFailure::PipeRead);
-                    break;
+                    capture.fail_pipe();
+                    break false;
                 }
             }
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    self.0.total.fetch_add(count as u64, Ordering::Relaxed);
-                    capture.append(&buffer[..count]);
-                    self.0
-                        .memory
-                        .store(capture.memory_bytes(), Ordering::Relaxed);
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            match self.capture_read(&mut stream, &mut buffer, &mut capture) {
+                Ok(0) => break false,
+                Ok(_) => {}
                 Err(_) => {
-                    capture.fail_pipe(OutputFailure::PipeRead);
-                    break;
+                    capture.fail_pipe();
+                    break false;
                 }
             }
-        }
+        };
         self.0
             .memory
             .store(capture.memory_bytes(), Ordering::Relaxed);
         self.publish(capture.seal());
+
+        // Late output belongs to the inherited writer. Keep its pipe usable
+        // without holding a result reference or extending the command activity.
+        drop(self);
+        if inherited_writer {
+            let _ = io::copy(&mut stream, &mut io::sink());
+        }
+    }
+
+    fn capture_queued(
+        &self,
+        stream: &mut (impl Read + AsRawFd),
+        buffer: &mut [u8],
+        capture: &mut Capture,
+    ) -> io::Result<()> {
+        let mut queued = queued_pipe_bytes(stream)?;
+        while queued > 0 {
+            let take = queued.min(buffer.len());
+            let count = self.capture_read(stream, &mut buffer[..take], capture)?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "command pipe ended early",
+                ));
+            }
+            queued -= count;
+        }
+        Ok(())
+    }
+
+    fn capture_read(
+        &self,
+        stream: &mut impl Read,
+        buffer: &mut [u8],
+        capture: &mut Capture,
+    ) -> io::Result<usize> {
+        let count = loop {
+            match stream.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if count > 0 {
+            self.0.total.fetch_add(count as u64, Ordering::Relaxed);
+            capture.append(&buffer[..count]);
+            self.0
+                .memory
+                .store(capture.memory_bytes(), Ordering::Relaxed);
+        }
+        Ok(count)
     }
 
     fn publish(&self, output: Output) {
@@ -506,42 +561,42 @@ impl Reader {
             .and_then(|state| state.output.clone())
     }
 
-    fn set_deadline(&self, deadline: Instant) {
-        if let Ok(mut state) = self.0.state.lock() {
-            state.deadline = Some(deadline);
-        }
+    pub(super) fn request_finish(&self) {
+        self.0.finishing.store(true, Ordering::Release);
     }
 
-    fn wait(&self, deadline: Instant) {
-        if let Ok(state) = self.0.state.lock() {
-            drop(self.0.completed.wait_timeout_while(
-                state,
-                deadline.saturating_duration_since(Instant::now()),
-                |state| state.output.is_none(),
-            ));
-        }
-    }
-
-    pub(super) fn finish(stdout: &Self, stderr: &Self) {
-        let deadline = Instant::now() + DRAIN_TIMEOUT;
-        stdout.set_deadline(deadline);
-        stderr.set_deadline(deadline);
-        // Allow the worker to finish its final poll and publish the sealed state.
-        let publish_deadline = deadline + Duration::from_millis(100);
-        stdout.wait(publish_deadline);
-        stderr.wait(publish_deadline);
-        for reader in [stdout, stderr] {
-            let Ok(mut state) = reader.0.state.lock() else {
-                continue;
-            };
-            if state.output.is_none() {
-                state.output = Some(Output(Arc::new(SealedOutput {
-                    storage: Storage::Failed(OutputFailure::DrainTimeout),
-                    truncated: false,
-                })));
-                INCOMPLETE_STREAMS.fetch_add(1, Ordering::Relaxed);
-                reader.0.completed.notify_all();
+    fn wait_output(&self) -> Output {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(output) = &state.output {
+                return output.clone();
             }
+            state = self
+                .0
+                .completed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+fn queued_pipe_bytes(pipe: &impl AsRawFd) -> io::Result<usize> {
+    let mut queued: libc::c_int = 0;
+    loop {
+        // SAFETY: the borrowed reader owns this pipe descriptor and FIONREAD
+        // writes the queued byte count to a valid c_int for the call's duration.
+        if unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut queued) } == 0 {
+            return usize::try_from(queued).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative pipe byte count")
+            });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -570,12 +625,8 @@ pub(super) struct CommandOutput {
 impl CommandOutput {
     pub(super) fn from_readers(stdout: &Reader, stderr: &Reader) -> Self {
         Self {
-            stdout: stdout
-                .output()
-                .unwrap_or_else(|| Output::text(String::new())),
-            stderr: stderr
-                .output()
-                .unwrap_or_else(|| Output::text(String::new())),
+            stdout: stdout.wait_output(),
+            stderr: stderr.wait_output(),
         }
     }
 

@@ -50,7 +50,6 @@ struct ExitState {
     code: Mutex<Option<i64>>,
     signal: Mutex<Option<i32>>,
     finished_at_ms: Mutex<Option<u64>>,
-    reaped: AtomicBool,
     killed: AtomicBool,
     timed_out: AtomicBool,
     spawn_error: Mutex<Option<String>>,
@@ -320,7 +319,6 @@ fn make_exit_state() -> Arc<ExitState> {
         code: Mutex::new(None),
         signal: Mutex::new(None),
         finished_at_ms: Mutex::new(None),
-        reaped: AtomicBool::new(false),
         killed: AtomicBool::new(false),
         timed_out: AtomicBool::new(false),
         spawn_error: Mutex::new(None),
@@ -807,7 +805,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
     std::thread::spawn(move || {
         let _command_activity = command_activity;
         let deadline = command_timeout.map(|timeout| Instant::now() + timeout);
-        let result = loop {
+        loop {
             let signal_guard = waiter_exit.signal_guard.lock().unwrap();
             let result = match child.try_wait() {
                 Ok(Some(result)) => Ok(Some(result)),
@@ -824,26 +822,28 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
                 }
                 Err(error) => Err(error),
             };
-            waiter_exit.reaped.store(true, Ordering::Release);
-            break result;
-        };
-        Reader::finish(&waiter_stdout, &waiter_stderr);
-        let _signal_guard = waiter_exit.signal_guard.lock().unwrap();
-        match result {
-            Ok(result) => {
-                *waiter_exit.signal.lock().unwrap() = result.and_then(|result| result.signal());
-                let code = result.and_then(|result| result.code()).unwrap_or(-1) as i64;
-                *waiter_exit.code.lock().unwrap() = Some(code);
+            waiter_stdout.request_finish();
+            waiter_stderr.request_finish();
+            match result {
+                Ok(result) => {
+                    *waiter_exit.signal.lock().unwrap() = result.and_then(|result| result.signal());
+                    let code = result.and_then(|result| result.code()).unwrap_or(-1) as i64;
+                    *waiter_exit.code.lock().unwrap() = Some(code);
+                }
+                Err(error) => {
+                    *waiter_exit.spawn_error.lock().unwrap() = Some(error.to_string());
+                    *waiter_exit.code.lock().unwrap() = Some(-1);
+                }
             }
-            Err(error) => {
-                *waiter_exit.spawn_error.lock().unwrap() = Some(error.to_string());
-                *waiter_exit.code.lock().unwrap() = Some(-1);
-            }
+            *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
+            waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
+            COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
+            notify_state_change(&waiter_exit);
+            break;
         }
-        *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
-        waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
-        COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-        notify_state_change(&waiter_exit);
+        // Keep the Runtime active until both readers seal the result. Result
+        // reads can wait for sealing without holding the signal or registry lock.
+        let _ = CommandOutput::from_readers(&waiter_stdout, &waiter_stderr);
     });
     let record = records
         .get_mut(&command_id)
@@ -1075,7 +1075,6 @@ pub fn cmd_kill(kw: &BTreeMap<String, Value>) -> Value {
     };
     let _signal_guard = exit.signal_guard.lock().unwrap();
     if pid <= 0
-        || exit.reaped.load(Ordering::Acquire)
         || exit.code.lock().unwrap().is_some()
         || exit.spawn_error.lock().unwrap().is_some()
         || exit.killed.load(Ordering::Acquire)

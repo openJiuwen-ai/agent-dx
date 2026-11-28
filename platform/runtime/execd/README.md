@@ -70,6 +70,11 @@ spools each overflowing stdout or stderr stream independently. Overflow can
 come from the stream limit or the shared in-memory output budget. The registry
 high watermark continues to govern command admission.
 
+For command output captured through pipes, Execd seals the result after the
+direct child exits and the readers consume the bytes already queued at their
+final drain. A descendant can keep writing to an inherited pipe. Execd discards
+those later bytes and leaves the published result available for replay.
+
 | Runtime variable | Default | Scope |
 | --- | --- | --- |
 | `EXECD_COMMAND_SPOOL_MAX_BYTES` | `1073741824` | Total raw spool bytes per Execd |

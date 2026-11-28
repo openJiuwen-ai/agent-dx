@@ -486,7 +486,8 @@ fn run_command(
     };
 
     let output = readers.map(|(stdout, stderr)| {
-        Reader::finish(&stdout, &stderr);
+        stdout.request_finish();
+        stderr.request_finish();
         CommandOutput::from_readers(&stdout, &stderr)
     });
     let (stdout, captured_stderr) = legacy_files

@@ -18,11 +18,23 @@ impl Execd {
     }
 
     fn with_limits(spool_limit: usize, registry_limit: usize) -> Self {
+        Self::with_spool(Some(spool_limit), registry_limit)
+    }
+
+    fn with_spool(spool_limit: Option<usize>, registry_limit: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
         drop(socket);
-        let child = Command::new(env!("CARGO_BIN_EXE_adx-execd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adx-execd"));
+        if let Some(limit) = spool_limit {
+            command
+                .env("EXECD_COMMAND_SPOOL_DIR", directory.path())
+                .env("EXECD_COMMAND_SPOOL_MAX_BYTES", limit.to_string());
+        } else {
+            command.env_remove("EXECD_COMMAND_SPOOL_DIR");
+        }
+        let child = command
             .env("EXECD_HTTP_ONLY", "1")
             .env("EXECD_HTTP_PORT", port.to_string())
             .env("EXECD_HTTP_TOKEN", "test-command-output")
@@ -32,8 +44,6 @@ impl Execd {
                 "EXECD_COMMAND_REGISTRY_MAX_BYTES",
                 registry_limit.to_string(),
             )
-            .env("EXECD_COMMAND_SPOOL_DIR", directory.path())
-            .env("EXECD_COMMAND_SPOOL_MAX_BYTES", spool_limit.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -145,6 +155,97 @@ fn run(server: &Execd, command: &str, background: bool, id: &str) -> (u16, bool,
         )
     } else {
         server.invoke("process.exec", json!({"cmd": command, "timeout": 5}), id)
+    }
+}
+
+// The shell exits with a writer still holding both pipes. Release that writer
+// only after fetching the terminal result so it cannot close the pipes early.
+const INHERITED_PIPE_COMMAND: &str = r#"
+(i=0; while [ ! -f release ] && [ "$i" -lt 140 ]; do
+    i=$((i + 1)); sleep 0.05
+done; printf late && printf late >&2 && touch writer-finished) &
+head -c 4096 /dev/zero | tr '\0' x
+printf error >&2
+exit 7
+"#;
+
+fn release_inherited_writer(server: &Execd) {
+    std::fs::write(server.directory.path().join("release"), b"").unwrap();
+    let done = server.directory.path().join("writer-finished");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !done.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the inherited writer did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn synchronous_spooled_result_does_not_wait_for_an_inherited_pipe_to_close() {
+    let server = Execd::start(16384);
+    let started = Instant::now();
+    let (status, streamed, body) = server.invoke(
+        "process.exec",
+        json!({"cmd": INHERITED_PIPE_COMMAND, "cwd": server.directory.path(), "timeout": 3}),
+        "sync-inherited-pipe",
+    );
+    assert_eq!((status, streamed), (200, true));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "waited for the inherited pipe"
+    );
+    assert_eq!(body["exit_code"], 7);
+    assert_eq!(body["stdout"], "x".repeat(4096));
+    assert_eq!(body["stderr"], "error");
+    release_inherited_writer(&server);
+}
+
+#[test]
+fn background_terminal_result_and_kill_agree_while_a_descendant_holds_pipes() {
+    for spool_limit in [Some(16384), None] {
+        let server = Execd::with_spool(spool_limit, 4096);
+        let command_id = "background-inherited-pipe";
+        let (status, _, _) = server.invoke(
+            "process.start",
+            json!({"command_id": command_id, "command": INHERITED_PIPE_COMMAND, "cwd": server.directory.path()}),
+            "background-inherited-start",
+        );
+        assert_eq!(status, 200);
+        let (status, streamed, first) = server.invoke(
+            "process.wait",
+            json!({"command_id": command_id, "timeout": 1}),
+            "background-inherited-wait",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(first["status"], "FAILED", "{first}");
+        assert_eq!(first["exit_code"], 7);
+        assert!(first["finished_at_ms"].is_number());
+        assert_eq!(streamed, spool_limit.is_some());
+        assert_eq!(
+            first["stdout"],
+            "x".repeat(if streamed { 4096 } else { 32 })
+        );
+        assert_eq!(first["stderr"], "error");
+        assert_eq!(first["truncated"], !streamed);
+
+        let (status, _, kill) = server.invoke(
+            "process.kill",
+            json!({"command_id": command_id}),
+            "background-inherited-kill",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(kill["status"], "ALREADY_EXITED");
+        assert_eq!(kill["killed"], false);
+        release_inherited_writer(&server);
+        let (status, _, replay) = server.invoke(
+            "process.get",
+            json!({"command_id": command_id}),
+            "background-inherited-get",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(replay, first);
     }
 }
 
