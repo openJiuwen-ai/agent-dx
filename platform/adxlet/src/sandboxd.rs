@@ -16,7 +16,7 @@ use tonic::{Code, Request};
 use tower::service_fn;
 
 mod overlaybd;
-mod recovery;
+pub(crate) mod recovery;
 mod runsc_mounts;
 use overlaybd::OverlaybdConnector;
 
