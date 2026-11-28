@@ -206,12 +206,7 @@ impl ChunkTransfer for NodeTransfer {
             self.holder_form
                 .lock()
                 .unwrap()
-                .push(item.source.holder_grant.is_some());
-            // A holder candidate never carries a per-copy token (review P1).
-            assert!(
-                item.source.holder_grant.is_none() || item.source.read_grant.token.is_empty(),
-                "a holder candidate carries a per-copy token"
-            );
+                .push(item.source.grant.is_holder());
             if self.not_ready.contains(node_id) {
                 return Err(Error::coded(
                     afs_error::NODE_TRANSFER_NOT_READY,
@@ -1245,7 +1240,7 @@ fn h2_review_all_stale_candidates_are_kept_for_reauthorization() {
         ],
     );
     for source in &mut set.sources {
-        source.read_grant.expires_at_unix_ms = 1;
+        source.grant.copy_mut_for_test().expires_at_unix_ms = 1;
     }
     let ordered = engine.distributed_sources(&read_op(chunk, 1), &[set]);
     assert_eq!(ordered[0].sources.len(), 2);
@@ -1788,7 +1783,14 @@ fn holder_fixture(
     transfer: NodeTransfer,
     published: Option<&str>,
 ) -> (DfsReadEngine, Arc<MetaStub>, Arc<NodeTransfer>, ChunkId) {
-    let chunk = ChunkId::new("shared-chunk");
+    let chunk = (0..64)
+        .map(|index| ChunkId::new(format!("shared-chunk-{index}")))
+        .find(|chunk| {
+            holders
+                .iter()
+                .all(|node| *node == "node-a" || holders::holder_ranks_above(chunk, node, "node-a"))
+        })
+        .expect("fixture needs remote holders ranked above the reader");
     let mut candidates = vec![candidate("a", &chunk, "node-b", CopyRole::DurableReplica)];
     if let Some(node) = published {
         candidates.push(candidate("cache", &chunk, node, CopyRole::VerifiedCache));
@@ -1963,7 +1965,10 @@ async fn h2_step2b_holders_are_offered_only_for_range_verifiable_chunks() {
         },
         encoding: crate::dfs::ChunkEncoding::Raw,
     };
-    let crc = ChunkId::new("crc");
+    let crc = (0..64)
+        .map(|index| ChunkId::new(format!("crc-{index}")))
+        .find(|chunk| holders::holder_ranks_above(chunk, "node-d", "node-a"))
+        .unwrap();
     let blake3 = ChunkId::new("blake3");
     let unknown = ChunkId::new("unknown");
     let set = |id: &ChunkId, chunk| ChunkSources {
@@ -1994,7 +1999,7 @@ async fn h2_step2b_holders_are_offered_only_for_range_verifiable_chunks() {
         with[index]
             .sources
             .iter()
-            .filter(|source| source.holder_grant.is_some())
+            .filter(|source| source.grant.is_holder())
             .count()
     };
     assert_eq!((holders(0), holders(1), holders(2)), (1, 0, 0));
@@ -2099,9 +2104,8 @@ fn h2_a2_concurrent_reads_share_one_holder_list_lookup() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-/// review/18 a3: of a version's holders, a Chunk is offered only the one
-/// ranked highest for it (rendezvous over the version, the Chunk and the
-/// Node); its NOT_READY sends the read straight to the copies.
+/// Review/18 a3: only one remote holder can be offered for a Chunk, and
+/// different Chunks can designate different readers.
 #[tokio::test]
 async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
     let fixture = Fixture::new();
@@ -2132,7 +2136,7 @@ async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
         let holders: Vec<&str> = set
             .sources
             .iter()
-            .filter(|source| source.holder_grant.is_some())
+            .filter(|source| source.grant.is_holder())
             .map(|source| match &source.location {
                 CopyLocation::Node { node_id, .. } => node_id.as_str(),
                 CopyLocation::External { .. } => "",
@@ -2140,12 +2144,22 @@ async fn h2_a3_one_holder_per_chunk_the_highest_ranked() {
             .collect();
         let best = nodes
             .iter()
-            .max_by_key(|node| {
-                super::distribution::rendezvous_weight("version", &set.chunk_id, node)
+            .copied()
+            .chain(["node-a"])
+            .reduce(|left, right| {
+                if holders::holder_ranks_above(&set.chunk_id, right, left) {
+                    right
+                } else {
+                    left
+                }
             })
             .unwrap();
-        assert_eq!(holders, vec![*best], "{}", set.chunk_id.0);
-        chosen.insert(*best);
+        if best == "node-a" {
+            assert!(holders.is_empty(), "{}", set.chunk_id.0);
+        } else {
+            assert_eq!(holders, vec![best], "{}", set.chunk_id.0);
+        }
+        chosen.insert(best);
     }
     assert!(
         chosen.len() > 1,
@@ -2322,7 +2336,7 @@ fn h2_round2_wait_order_for_a_chunk_is_the_same_in_every_version() {
     };
     let item = |holder: &str, caller: &str, version: &str| {
         let mut source = candidate("h", &chunk, holder, CopyRole::VerifiedCache);
-        source.holder_grant = Some(grant(holder, caller, version));
+        source.grant = crate::dfs::SourceGrant::Holder(grant(holder, caller, version));
         ResolvedReadOp {
             op: read_op(chunk.clone(), 4).ops[0].clone(),
             source,
@@ -2345,4 +2359,157 @@ fn h2_round2_wait_order_for_a_chunk_is_the_same_in_every_version() {
         1,
         "across versions, exactly one of two readers may wait for the other"
     );
+}
+
+/// Plan 27 T1/T3. Identical membership gives one fetcher for every Chunk.
+#[tokio::test]
+async fn h2_2c1_one_designated_fetcher_across_readers_and_versions() {
+    let nodes = ["node-a", "node-d", "node-e"];
+    let chunks: Vec<_> = (0..16)
+        .map(|index| ChunkId::new(format!("designation-{index}")))
+        .collect();
+    let sources: Vec<_> = chunks
+        .iter()
+        .map(|chunk| ChunkSources {
+            chunk_id: chunk.clone(),
+            chunk: Some(crc_object(chunk, 4)),
+            allowed_ranges: vec![(0, 4)],
+            sources: vec![candidate("a", chunk, "node-b", CopyRole::DurableReplica)],
+        })
+        .collect();
+    let mut assignments = Vec::new();
+    for version in ["version", "other-version"] {
+        let mut per_reader = Vec::new();
+        let mut metrics = Vec::new();
+        for node in nodes {
+            let fixture = Fixture::new();
+            let (mut engine, meta, _, _) =
+                holder_fixture(&fixture, &nodes, NodeTransfer::default(), None);
+            engine.local_node_id = node.into();
+            for holder in meta.holders.lock().unwrap().iter_mut() {
+                holder.grant.caller_node_id = node.into();
+                holder.grant.file_version_id = FileVersionId::new(version);
+            }
+            let mut batch = read_op(chunks[0].clone(), 4);
+            batch.file_version_id = Some(FileVersionId::new(version));
+            let selected: Vec<_> = engine
+                .with_version_holders(&batch, &sources, Instant::now() + Duration::from_secs(1))
+                .await
+                .into_iter()
+                .map(|set| {
+                    let holders: Vec<_> = set
+                        .sources
+                        .iter()
+                        .filter(|source| source.grant.is_holder())
+                        .collect();
+                    assert!(holders.len() <= 1, "{}", set.chunk_id.0);
+                    holders
+                        .first()
+                        .map(|source| match &source.location {
+                            CopyLocation::Node { node_id, .. } => node_id.clone(),
+                            _ => panic!("expected a Node holder"),
+                        })
+                        .unwrap_or_else(|| node.to_owned())
+                })
+                .collect();
+            let self_count = selected.iter().filter(|choice| *choice == node).count() as u64;
+            per_reader.push(selected);
+            metrics.push((fixture, self_count));
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chosen = &per_reader[0][index];
+            assert!(
+                per_reader.iter().all(|reader| &reader[index] == chosen),
+                "readers disagree for {}",
+                chunk.0
+            );
+            assert_eq!(
+                nodes
+                    .iter()
+                    .zip(&per_reader)
+                    .filter(|(node, reader)| **node == reader[index].as_str())
+                    .count(),
+                1
+            );
+        }
+        assignments.push((per_reader, metrics));
+    }
+    assert_eq!(assignments[0].0, assignments[1].0);
+    for (_, metrics) in assignments {
+        for (fixture, self_count) in metrics {
+            if self_count > 0 {
+                assert_eq!(fixture.metric(&cache_event("designated_self")), self_count);
+            }
+            if self_count < 16 {
+                assert_eq!(
+                    fixture.metric(&cache_event("designated_remote")),
+                    16 - self_count
+                );
+            }
+        }
+    }
+}
+/// Plan 27 T5: once the foreground read ends, its queued segment still has a mark.
+#[test]
+fn h2_2c1_segment_channel_keeps_its_fetch_in_flight() {
+    let fixture = Fixture::new();
+    let (engine, _, _, chunk) = share_engine(&fixture, true, true);
+    let data = vec![7; chunk.length as usize];
+    engine.remember_trusted_crc_table(
+        &chunk,
+        crate::node::chunk_crc32c::CrcTable::build(&data).unwrap(),
+    );
+    let flights = engine.holder_in_flight().unwrap();
+    let fetched = flights.begin(&chunk.id);
+    stage_segment(&engine, &chunk, &data, 0, chunk.length as usize / 2);
+    drop(fetched);
+    assert!(
+        flights.contains(&chunk.id),
+        "no fetch mark while the segment waits in the channel"
+    );
+}
+
+/// Plan 27 T5/T7. The completed buffer is available while still queued.
+#[tokio::test]
+async fn h2_2c1_assembled_buffer_remains_servable_through_install() {
+    let fixture = Fixture::new();
+    let (engine, _, _, chunk) = share_engine(&fixture, true, true);
+    let data = vec![7; chunk.length as usize];
+    let flights = engine.holder_in_flight().unwrap();
+    let cache = engine.distributed_cache.as_ref().unwrap();
+    let half = data.len() / 2;
+    stage_segment(&engine, &chunk, &data, 0, half);
+    cache.assemble_pending(&engine.local);
+    assert!(
+        flights.partials.covering(&chunk.id, 1, 0, 1).is_none(),
+        "a body without a trusted CRC table cannot serve"
+    );
+    engine.remember_trusted_crc_table(
+        &chunk,
+        crate::node::chunk_crc32c::CrcTable::build(&data).unwrap(),
+    );
+    stage_segment(&engine, &chunk, &data, half, half);
+    cache.assemble_pending(&engine.local);
+    assert!(!engine.local.has_servable_record(&chunk.id));
+    assert!(flights.contains(&chunk.id));
+    let jobs = cache.queued_jobs_for_test();
+    assert_eq!(jobs.len(), 1);
+    let body = flights
+        .partials
+        .covering(&chunk.id, 1, 0, chunk.length)
+        .expect("completed body available before install");
+    assert_eq!(
+        body.read(123, 17, |bytes| Ok(bytes.to_vec()))
+            .unwrap()
+            .unwrap(),
+        &data[123..140]
+    );
+    assert!(flights.partials.covering(&chunk.id, 2, 0, 1).is_none());
+    drop(body);
+    for job in jobs {
+        engine.run_install_job(job, cache.capacity()).await;
+    }
+    assert!(engine.local.has_servable_record(&chunk.id));
+    assert!(!flights.contains(&chunk.id));
+    assert!(flights.partials.covering(&chunk.id, 1, 0, 1).is_none());
 }

@@ -209,7 +209,7 @@ async fn distribution_deadline_drains_children_and_never_fetches_other_versions(
     let transfer = Arc::new(transfer);
     let (_temp, engine, batch, mut sources) = striped_fixture(transfer.clone());
     let mut wrong = sources[0].sources[0].clone();
-    wrong.read_grant.file_version_id = FileVersionId::new("different-version");
+    wrong.grant.copy_mut_for_test().file_version_id = FileVersionId::new("different-version");
     wrong.location = CopyLocation::Node {
         node_id: "wrong-version".into(),
         node_epoch: 1,
@@ -237,7 +237,8 @@ async fn distribution_deadline_drains_children_and_never_fetches_other_versions(
         engine.distributed_sources(&batch, &sources)[0]
             .sources
             .iter()
-            .all(|s| s.read_grant.file_version_id == batch.file_version_id.clone().unwrap())
+            .all(|s| s.grant.copy().unwrap().file_version_id
+                == batch.file_version_id.clone().unwrap())
     );
 }
 

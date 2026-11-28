@@ -1077,6 +1077,38 @@ impl LocalChunkStore {
         })
     }
 
+    #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn pause_after_holder_op(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached, at_op) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *self.test_hooks.holder_op_gate.lock().unwrap() = Some((reached, paused));
+        (at_op, resume)
+    }
+
+    #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn holder_op_complete(&self) {
+        let gate = self.test_hooks.holder_op_gate.lock().unwrap().take();
+        if let Some((reached, paused)) = gate {
+            let _ = reached.send(());
+            paused
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("holder op gate timed out");
+        }
+    }
+
+    #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn occupy_peer_payload_budget(&self) -> Result<PeerReadReservation> {
+        self.reserve_peer_read_payload(
+            (self.peer_read_budget.limit - self.peer_read_budget.used.load(Ordering::Acquire))
+                as usize,
+        )
+    }
+
     /// RDMA packed and object payloads share one configured actual-capacity ledger.
     #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {
@@ -1673,6 +1705,32 @@ impl LocalChunkStore {
             }
         }
         self.read_peer_full_fill(request, slot, view, capacity_fallback, repair_proof)
+    }
+
+    /// Gives a verified in-memory range the same payload accounting as disk
+    /// reads. Frame slices retain this lease if they outlive the producer.
+    /// Memory serving takes a read slot first and never waits for capacity.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn copy_verified_peer_range(&self, range: &[u8]) -> Result<PeerReadPayload> {
+        let _reader = self.begin_peer_serve_read()?;
+        let deadline = Instant::now();
+        let mut reservation = self.reserve_peer_read_payload_until(range.len(), deadline)?;
+        let mut bytes = self
+            .peer_buffer_pool
+            .take(range.len(), self.read_work.clone())?;
+        reservation.retain_capacity(bytes.capacity())?;
+        bytes.copy_from_slice(range);
+        Ok(PeerReadPayload {
+            object: Arc::new(PeerVerifiedObject {
+                bytes,
+                outboard: None,
+                _reservation: reservation,
+                identity: None,
+                _control: self.peer_object_control(None, deadline)?,
+            }),
+            start: 0,
+            length: range.len(),
+        })
     }
 
     /// CRC-format objects: request-private, never shared through the flight.

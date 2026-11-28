@@ -52,7 +52,7 @@ impl DfsReadEngine {
         if !context.sources.sources.iter().any(|source| {
             self.source_matches(&context.batch, source)
                 && (context.authority.epoch == 0
-                    || source.read_grant.caller_node_epoch == context.authority.epoch)
+                    || source.grant.context().caller_node_epoch == context.authority.epoch)
         }) {
             return Err(external_denied("DFS prefetch has no valid caller grant"));
         }

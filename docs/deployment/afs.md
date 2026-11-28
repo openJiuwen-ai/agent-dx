@@ -371,9 +371,9 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_read_cache_queue_bytes` | 调优 | Node | `268435456` | 仅开启 `dfs_read_cache_bytes` 时生效：等待安装的读缓存正文字节上限，`4194304..=1073741824`；计入读者内存（见下方内存说明）。FUSE 读从不等待，满了丢弃并计 `dropped_queue_full` |
 | `dfs_read_cache_partial_bytes` | 调优 | Node | `33554432` | 仅开启 `dfs_read_cache_bytes` 时生效：由多次读拼装中的部分 chunk 正文字节上限，`0` 或 `4194304..=1073741824`；0 不拼装；计入读者内存，满了先挤出最旧的部分块 |
 | `dfs_source_single_ttl_ms` | 调优 | Node | `500` | 仅在本 Node 开启 `dfs_read_cache_bytes` 时生效：某 chunk 的候选只有一个远端 Node 时，来源缓存时长取此值与 `dfs_source_cache_max_ms` 的较小者，不超过 60000；0 表示沿用 `dfs_source_cache_max_ms` |
-| `dfs_read_share_concurrent` | 调优 | Node | `false` | 仅在本 Node 开启 `dfs_read_cache_bytes`、原生 DFS 时生效：只读打开登记为共享读者，同时打开同一版本的其他读者可以读本 Node 已安装的读缓存副本，本 Node 也会读它们的；默认关 |
+| `dfs_read_share_concurrent` | 调优 | Node | `false` | 原生 DFS 本 Node 开启 `dfs_read_cache_bytes` 后生效。只读打开登记为共享读者，同一版本的读者可从选出的持有者读取已安装的副本或有可信 CRC 表且覆盖所请求范围的部分体 |
 | `dfs_holder_ttl_ms` | 调优 | Node | `250` | 开启 `dfs_read_share_concurrent` 时，读者缓存某版本持有者名单的时长，50..=5000 |
-| `dfs_holder_wait_ms` | 调优 | Node | `30` | 开启 `dfs_read_share_concurrent` 时，读者请持有者等它正在取的块的时长，0..=500；只对该块上权重高于本读者的持有者生效。0 不请求等待，持有者只供已安装的块。默认 30 只是可调的起点。已有测量只覆盖一种形态：内存后端，写者与读者分在两台机器、所有读者在同一台机器，每节点 2 CPU，512 MiB 文件、1 MiB 读、每读者 1 个线程。在这一形态下，4 个读者同时开读，合计吞吐是关共享的 1.14 倍；2 个读者完全同步，是关共享的 0.79 倍（逐轮 0.67–0.93 倍）。其他读者数、并发度、后端和部署形态没有测过 |
+| `dfs_holder_wait_ms` | 调优 | Node | `30` | `0..=500` 毫秒。单块读可等排名高于自己的指定持有者补齐正在取的范围。0 仅使用当时已经可供的范围 |
 | `dfs_source_lookahead_chunks` | 调优 | Node | `64` | 来源元数据前瞻 chunk 数，不超过 128 |
 | `dfs_source_cache_bytes` | 调优 | Node | `4194304` | 来源元数据缓存字节上限，不超过 4 MiB |
 | `allow_volatile_meta` | 测试专用 | Node | `false` | 允许 Node 在 Meta 为 `memory` 时报告就绪；不在 `--help` 中显示，启用时打 WARN |
@@ -633,13 +633,25 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_read_cache_queue_bytes` | `268435456`（256MiB） | `4194304..=1073741824`；读缓存等待安装的正文上限，FUSE读路径只尝试占用、不等待，满则丢弃计数；管理面预取在后台按自身期限等待。开启`dfs_read_cache_bytes`的读者最坏多占约 256MiB（队列）+32MiB（部分块）+16MiB（在途段）=304MiB；盘后端实测队列峰值192MiB。未开启读缓存时为0 |
 | `dfs_read_cache_partial_bytes` | `33554432`（32MiB） | `0`或`4194304..=1073741824`；拼装中的部分chunk正文上限，0不拼装；FUSE交给后台拼装的在途段另以其一半为上限；2 s未拼完的部分chunk被释放 |
 | `dfs_source_single_ttl_ms` | `500` | `0..=60000`；仅开启`dfs_read_cache_bytes`的Node生效：候选只含一个远端Node的chunk（含前瞻chunk）按此时长缓存，使他人新发布的读缓存副本在此时限内可见；0沿用`dfs_source_cache_max_ms` |
-| `dfs_read_share_concurrent` | `false` | 需要`dfs_read_cache_bytes`与原生DFS：只读打开向Meta登记为共享读者；Meta只把持有者名单给同样在读该版本的Node，并签发版本级持有者授权；持有者对每个请求先向Meta验证授权（结果最多缓存2 s）、再按该版本的layout查范围，块正在取且读者请求了等待时最多等500 ms（读者默认请求 30 ms，见`dfs_holder_wait_ms`），否则回`NODE_TRANSFER_NOT_READY`；每块只问权重最高的一个持有者，它回`NOT_READY`就直接读已发布副本或持久副本 |
+| `dfs_read_share_concurrent` | `false` | 需要原生 DFS 和 `dfs_read_cache_bytes`。Meta 向共享读者提供同版本持有者和授权。读者从名单与自身中为每块选一个取源者，先尝试已发布的读缓存副本，再尝试被选中的远端持有者，最后回退持久副本。持有者在认证、Meta 授权和版本布局范围校验后，可供已安装的块，也可供已覆盖且通过 CRC 核验的部分范围 |
 | `dfs_holder_ttl_ms` | `250` | `50..=5000`；持有者名单的缓存时长；同一版本同一时刻只查一次，查询期间其他读沿用上一张名单（最多再用一个时长）或本次不带持有者 |
-| `dfs_holder_wait_ms` | `30` | `0..=500`；读者请权重更高的持有者等待正在取的块的时长，0不请求等待 |
+| `dfs_holder_wait_ms` | `30` | `0..=500` 毫秒。仅单块读可向排名高于自己的取源者请求等待，且请求范围有在途数据。0 不请求等待 |
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |
 | `dfs_read_crc_mode` | `"receiver"` | 仅原生DFS且`data_mode = "grpc"`可设置，取值`"receiver"`或`"off"`。`receiver`（默认）：读取方按Meta可信CRC表校验完整32KiB分段，非对齐片段由服务方校验，校验失败换下一个副本并复核上报，同时关闭原生预取；`off`：远端读正文不做CRC校验（损坏字节原样交付），仅在明确接受该风险时显式设置。只影响本Node发起的远端读；服务方按请求方声明的模式执行，各Node可以不同。原`both`在S1a-7删除 |
+
+共享读的请求在途范围已消失、部分体被回收或指定持有者还未开始取该块时，
+读者收到 `NODE_TRANSFER_NOT_READY` 并继续用其余副本。一次读跨多个块时
+仍可使用已可供的持有者范围，等待预算为 0。没有配置变更或协议升级。
+CRC 片段由发送方核验覆盖段，只发送请求授权的字节。节点选取持有者时排除已降级的候选，再从其余候选和自己中选排名最高者。
+
+读者的 `afs_dfs_read_cache_events_total` 中，`designated_self` 和 `designated_remote` 按每次选源所处理的块计数。同一块分多段读或重新选源可计多次。
+持有者从拼装中或等待安装的内存体成功发送一个授权范围后，`holder_served_partial` 事件加一，`afs_dfs_holder_served_partial_bytes_total` 累加该范围的字节数。已安装副本走磁盘供数路径，两项部分体计数都保持原值。
+
+持有者取得读槽后先为整组请求准备已验证的授权范围，再发送首帧。每个请求最多保留 8 个范围，超过上限、部分体已回收或 payload 额度不足时，读者可直接回退副本。磁盘数据和部分体数据共用既有 payload 额度。持有者在发布快照前核验本地 CRC；请求方的 CRC 模式继续决定线上校验标记。
+
+若发送首段后响应中断，持有者将 `holder_abandoned_after_send` 事件加一，并把该请求已成功放入 gRPC 响应队列的正文计入 `afs_dfs_holder_abandoned_after_send_bytes_total`。首帧前拒绝和完整响应的增量均为零。对账时还应核对持久副本发送量和读者实收量。
 
 Linux DFS挂载完成后仅设置自身FUSE设备的BDI `read_ahead_kb`，默认16384KiB；显式0禁用。
 INIT协商值与BDI有效值分别记录在`dfs.fuse_cache_init`和`dfs.fuse_readahead`。

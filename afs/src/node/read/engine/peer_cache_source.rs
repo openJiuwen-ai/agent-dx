@@ -47,18 +47,14 @@ pub(super) struct PeerCacheRecheckHook {
 
 impl DfsReadEngine {
     pub(super) fn source_matches(&self, batch: &ReadBatch, source: &SourceCandidate) -> bool {
-        let grant = &source.read_grant;
-        Some(&grant.file_version_id) == batch.file_version_id.as_ref()
-            && grant.layout_root_id == batch.layout_root_id
-            && grant.namespace_id == self.namespace_id
-            && grant.caller_node_id == self.local_node_id
+        let grant = source.grant.context();
+        Some(grant.file_version_id) == batch.file_version_id.as_ref()
+            && grant.layout_root_id == &batch.layout_root_id
+            && grant.namespace_id == &self.namespace_id
+            && grant.caller_node_id == &self.local_node_id
             && grant.caller_node_epoch != 0
             && grant.expires_at_unix_ms > now_unix_ms()
-            && match &source.holder_grant {
-                // A version holder carries its token in the holder grant.
-                Some(holder) => !holder.token.is_empty(),
-                None => !grant.token.is_empty(),
-            }
+            && !grant.token.is_empty()
     }
 
     /// A remote candidate the verified peer cache can fill from: a current
@@ -91,7 +87,7 @@ impl DfsReadEngine {
     ) -> Result<()> {
         self.check_native_read_authority(authority)?;
         if !self.source_matches(batch, source)
-            || (authority.epoch != 0 && source.read_grant.caller_node_epoch != authority.epoch)
+            || (authority.epoch != 0 && source.grant.context().caller_node_epoch != authority.epoch)
         {
             return Err(external_denied(
                 "Peer cache read grant expired or changed before publication",

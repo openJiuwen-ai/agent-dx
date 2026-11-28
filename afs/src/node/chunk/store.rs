@@ -48,7 +48,7 @@ impl CatalogCommitTestControl {
 }
 
 impl LocalChunkStore {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dfs"))]
     pub(crate) fn fail_next_catalog_wal_after_sync(&self) {
         self.test_hooks
             .catalog_commit_test
@@ -56,7 +56,7 @@ impl LocalChunkStore {
             .store(3, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dfs"))]
     pub(crate) fn pause_next_catalog_wal(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -314,6 +314,13 @@ impl LocalChunkStore {
     pub(crate) fn record_read_cache_event(&self, event: &'static str) {
         if let Some(metrics) = &self.read_work {
             metrics.read_cache_event(event);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_holder_served_partial(&self, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.holder_served_partial(bytes);
         }
     }
 

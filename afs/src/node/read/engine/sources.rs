@@ -229,7 +229,7 @@ impl SourceCache {
             bytes = bytes.saturating_add(heap(chunk.id.0.capacity()));
         }
         for source in &sources.sources {
-            let grant = &source.read_grant;
+            let grant = source.grant.context();
             for size in [
                 source.copy_id.0.capacity(),
                 source.chunk_id.0.capacity(),
@@ -241,6 +241,9 @@ impl SourceCache {
                 grant.token.capacity(),
             ] {
                 bytes = bytes.saturating_add(heap(size));
+            }
+            if let Some(grant) = source.grant.holder() {
+                bytes = bytes.saturating_add(heap(grant.holder_node_id.capacity()));
             }
             match &source.location {
                 CopyLocation::Node {
@@ -460,7 +463,7 @@ impl DfsReadEngine {
         let earliest = sources
             .sources
             .iter()
-            .map(|source| source.read_grant.expires_at_unix_ms)
+            .map(|source| source.grant.context().expires_at_unix_ms)
             .min()?;
         let remaining = earliest
             .saturating_sub(SOURCE_GRANT_SAFETY_MS)
@@ -673,7 +676,7 @@ impl DfsReadEngine {
         let matches = |source: &SourceCandidate| {
             self.source_matches(batch, source)
                 && authority.as_ref().is_none_or(|view| {
-                    view.epoch == 0 || source.read_grant.caller_node_epoch == view.epoch
+                    view.epoch == 0 || source.grant.context().caller_node_epoch == view.epoch
                 })
         };
         let now = Instant::now();
@@ -796,7 +799,7 @@ impl DfsReadEngine {
         let matches = |source: &SourceCandidate| {
             self.source_matches(batch, source)
                 && authority.as_ref().is_none_or(|view| {
-                    view.epoch == 0 || source.read_grant.caller_node_epoch == view.epoch
+                    view.epoch == 0 || source.grant.context().caller_node_epoch == view.epoch
                 })
         };
         let fresh = match reply {

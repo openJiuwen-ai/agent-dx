@@ -915,11 +915,10 @@ fn domain_dfs_source_candidate(
         location,
         data_endpoint: value.data_endpoint,
         load_hint: value.load_hint,
-        read_grant: domain_dfs_read_grant(required(
+        grant: crate::dfs::SourceGrant::Copy(domain_dfs_read_grant(required(
             value.read_grant,
             "DfsSourceCandidate.read_grant",
-        )?),
-        holder_grant: None,
+        )?)),
     })
 }
 

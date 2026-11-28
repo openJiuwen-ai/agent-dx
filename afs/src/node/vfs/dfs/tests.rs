@@ -1188,7 +1188,7 @@ impl ReadSourceProvider for CurrentExternalFixture {
                             },
                             data_endpoint: None,
                             load_hint: 0,
-                            read_grant: DfsReadGrant {
+                            grant: crate::dfs::SourceGrant::Copy(DfsReadGrant {
                                 namespace_id: request.namespace_id.clone(),
                                 file_version_id: request.file_version_id.clone(),
                                 layout_root_id: request.layout_root_id.clone(),
@@ -1197,8 +1197,7 @@ impl ReadSourceProvider for CurrentExternalFixture {
                                 expires_at_unix_ms: u64::MAX,
                                 fence: 1,
                                 token: "test-token".into(),
-                            },
-                            holder_grant: None,
+                            }),
                         }],
                     })
                 })

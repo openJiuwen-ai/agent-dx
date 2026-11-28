@@ -273,8 +273,8 @@ impl DfsReadEngine {
         let batch = round.batch;
         let holder_group = group.iter().all(|&index| {
             progress.candidates[index][progress.next[index]]
-                .holder_grant
-                .is_some()
+                .grant
+                .is_holder()
         });
         if holder_group && Instant::now() >= attempt_deadline(round.deadline, true) {
             // The read's holder time is over: go on to the copies.
@@ -355,19 +355,26 @@ impl DfsReadEngine {
                 if attempt
                     .operations
                     .iter()
-                    .all(|item| item.source.holder_grant.is_none()) =>
+                    .all(|item| !item.source.grant.is_holder()) =>
             {
                 attempt
                     .operations
                     .iter()
-                    .map(|item| flights.begin(&item.op.chunk_id))
+                    .map(|item| {
+                        flights.begin_range(
+                            &item.op.chunk_id,
+                            item.source.grant.context().caller_node_epoch,
+                            item.op.chunk_offset,
+                            item.op.length,
+                        )
+                    })
                     .collect()
             }
             _ => Vec::new(),
         };
         let role = {
             let source = &attempt.operations[0].source;
-            if source.holder_grant.is_some() {
+            if source.grant.is_holder() {
                 "peer_holder"
             } else if source.role == CopyRole::VerifiedCache {
                 "verified_cache"
@@ -383,7 +390,7 @@ impl DfsReadEngine {
         let holder = attempt
             .operations
             .iter()
-            .all(|item| item.source.holder_grant.is_some());
+            .all(|item| item.source.grant.is_holder());
         #[cfg(test)]
         if holder {
             self.test_hooks
@@ -452,7 +459,7 @@ impl DfsReadEngine {
                 if attempt
                     .operations
                     .iter()
-                    .all(|item| item.source.holder_grant.is_some())
+                    .all(|item| item.source.grant.is_holder())
                 {
                     let not_ready = crate::node::fault::classify::peer_not_ready(&error);
                     let denied = crate::node::fault::classify::read_authority_rejected(&error);
@@ -839,7 +846,7 @@ impl DfsReadEngine {
     /// fan-out shows who supplied whom without inferring it from senders.
     pub(super) fn record_source_bytes(&self, source: &SourceCandidate, bytes: u64) {
         let role = match source.role {
-            _ if source.holder_grant.is_some() => "peer_holder",
+            _ if source.grant.is_holder() => "peer_holder",
             CopyRole::VerifiedCache => "verified_cache",
             _ => "durable",
         };
@@ -898,7 +905,7 @@ impl DfsReadEngine {
                 let fetch = self
                     .transfer
                     .read_ranges_async(&single_batch, &mut single_scratch);
-                let holder = item.source.holder_grant.is_some();
+                let holder = item.source.grant.is_holder();
                 match self
                     .try_peer_before(
                         attempt_deadline(round.deadline, holder),

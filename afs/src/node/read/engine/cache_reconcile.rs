@@ -1,7 +1,10 @@
 //! Catalog-backed desired state. Runtime state is only an optimization; after a
 //! crash every pending publication/retirement is reconstructed from the same WAL.
 use super::*;
-use crate::node::chunk::ReadCacheIntent;
+use crate::node::{
+    chunk::{ReadCacheIntent, SharedChunkBytes},
+    read::holder_partial::{PartialBytes, RegisteredPartial},
+};
 use std::{collections::VecDeque, ops::Range};
 use tokio::sync::{oneshot, watch};
 
@@ -489,9 +492,14 @@ impl StageBudget {
     }
 }
 
+#[cfg(test)]
+type AfterFreeze = Box<dyn FnOnce() + Send>;
+
 /// One byte-budgeted queue and one supervised installer per node. Cache
 /// persistence and metadata publication never gate foreground delivery.
 pub(super) struct ReadCacheRuntime {
+    #[cfg(test)]
+    after_freeze: Mutex<Option<AfterFreeze>>,
     session: String,
     capacity: u64,
     send: tokio::sync::mpsc::UnboundedSender<CacheJob>,
@@ -537,6 +545,7 @@ pub(super) struct ReadCacheRuntime {
 pub(super) struct CacheJob {
     chunk: ChunkObject,
     body: Vec<u8>,
+    shared: Option<(RegisteredPartial, SharedChunkBytes)>,
     version: FileVersionId,
     layout: LayoutRootId,
     epoch: u64,
@@ -557,17 +566,28 @@ const MAX_PARTIAL_RANGES: usize = 256;
 
 struct PartialCopy {
     job: CacheJob,
-    coverage: Vec<Range<usize>>,
-    /// Zero bytes the last `copy_range` wrote to fill a gap (tests).
-    #[cfg(test)]
-    last_zero_fill: usize,
+    body: PartialBody,
     _charge: StageCharge,
     /// When the first segment arrived; a body still incomplete after
     /// [`PARTIAL_MAX_AGE`] is released (a segment was lost or never read).
     created: Instant,
 }
 
-/// One verified range of a Chunk, copied off the FUSE path for assembly.
+enum PartialBody {
+    Private(PartialBytes),
+    Shared(RegisteredPartial),
+}
+
+impl PartialBody {
+    fn update<T>(&mut self, f: impl FnOnce(&mut PartialBytes) -> T) -> T {
+        match self {
+            Self::Private(body) => f(body),
+            Self::Shared(partial) => f(&mut partial.body.lock()),
+        }
+    }
+}
+
+/// One range of a Chunk, copied off the FUSE path for assembly.
 pub(super) struct Segment {
     table: Option<Arc<crate::node::chunk_crc32c::CrcTable>>,
     chunk: ChunkObject,
@@ -577,6 +597,7 @@ pub(super) struct Segment {
     offset: usize,
     data: Vec<u8>,
     _charge: StageCharge,
+    _in_flight: Option<crate::node::read::holders::InFlightGuard>,
 }
 
 /// An incomplete partial body older than this is released. A sequential
@@ -587,26 +608,25 @@ pub(super) const PARTIAL_MAX_AGE: Duration = Duration::from_secs(2);
 pub(super) const SEGMENT_POOL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FRESH_INSTALLS: usize = 1024;
 
-impl PartialCopy {
+impl PartialBytes {
     /// Takes a first segment (offset 0) as the body without copying it.
-    fn adopt(&mut self, mut data: Vec<u8>) -> bool {
+    fn adopt(&mut self, mut data: Vec<u8>, length: usize) -> bool {
         let end = data.len();
-        let length = self.job.chunk.length as usize;
         // Grow (or trim) to exactly one Chunk, the partial budget's charge.
         data.reserve_exact(length.saturating_sub(data.len()));
         data.shrink_to(length);
-        self.job.body = data;
+        self.data = data;
         self.coverage = vec![Range { start: 0, end }];
-        end as u64 == self.job.chunk.length
+        end == length
     }
 
     /// Writes `data` at `offset`; only a gap before `offset` is zero filled.
-    fn copy_range(&mut self, offset: usize, data: &[u8]) -> bool {
+    fn copy_range(&mut self, offset: usize, data: &[u8], length: usize) -> bool {
         let mut end = offset + data.len();
         let mut start = offset;
-        let body = &mut self.job.body;
-        if body.capacity() < self.job.chunk.length as usize {
-            body.reserve_exact(self.job.chunk.length as usize - body.len());
+        let body = &mut self.data;
+        if body.capacity() < length {
+            body.reserve_exact(length - body.len());
         }
         #[cfg(test)]
         let before = body.len();
@@ -634,7 +654,7 @@ impl PartialCopy {
         }
         self.coverage
             .splice(left..right, std::iter::once(start..end));
-        matches!(self.coverage.as_slice(), [range] if range.start == 0 && range.end as u64 == self.job.chunk.length)
+        matches!(self.coverage.as_slice(), [range] if range.start == 0 && range.end == length)
     }
 }
 
@@ -648,6 +668,8 @@ impl ReadCacheRuntime {
         let (send, receive) = tokio::sync::mpsc::unbounded_channel();
         let (segment_send, segment_receive) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            #[cfg(test)]
+            after_freeze: Mutex::new(None),
             session,
             capacity,
             send,
@@ -809,7 +831,7 @@ impl ReadCacheRuntime {
         job.in_flight = self
             .in_flight
             .get()
-            .map(|flights| flights.begin(&job.chunk.id));
+            .map(|flights| flights.begin_range(&job.chunk.id, job.epoch, 0, job.chunk.length));
         job.queued_at = Instant::now();
         self.send
             .send(job)
@@ -852,8 +874,8 @@ impl ReadCacheRuntime {
             return;
         }
         // Partial range: copy it (the same one copy the table path made) and
-        // hand it to the assembler. No lock is taken here, so concurrent
-        // completions of one Chunk can no longer lose a segment.
+        // hand it to the assembler. The foreground never locks its bodies;
+        // the optional flight bridges the segment queue when sharing is on.
         if self.partial_budget.limit == 0 {
             local.record_read_cache_event("dropped_partial");
             return;
@@ -875,6 +897,9 @@ impl ReadCacheRuntime {
             offset,
             data: copy,
             _charge: charge,
+            _in_flight: self.in_flight.get().map(|flights| {
+                flights.begin_range(&chunk.id, epoch, offset as u64, data.len() as u64)
+            }),
         };
         if self.segment_send.send(segment).is_err() {
             local.record_read_cache_event("dropped_segment_full");
@@ -890,11 +915,12 @@ impl ReadCacheRuntime {
             return;
         };
         Self::expire_partial(&mut partial, local, Instant::now());
+        let flights = self.in_flight.get();
         let position = partial.iter().position(|copy| {
             copy.job.chunk == segment.chunk
-                && copy.job.version == segment.version
-                && copy.job.layout == segment.layout
                 && copy.job.epoch == segment.epoch
+                && ((copy.job.chunk.is_segment_crc32c() && flights.is_some())
+                    || (copy.job.version == segment.version && copy.job.layout == segment.layout))
         });
         let length = segment.chunk.length;
         let mut copy = match position.and_then(|position| partial.remove(position)) {
@@ -931,9 +957,7 @@ impl ReadCacheRuntime {
                 job.table = segment.table.clone();
                 PartialCopy {
                     job,
-                    coverage: Vec::new(),
-                    #[cfg(test)]
-                    last_zero_fill: 0,
+                    body: PartialBody::Private(PartialBytes::default()),
                     _charge: charge,
                     created: Instant::now(),
                 }
@@ -942,40 +966,77 @@ impl ReadCacheRuntime {
         if copy.job.table.is_none() {
             copy.job.table = segment.table.clone();
         }
+        if let (Some(flights), Some(table), PartialBody::Private(bytes)) =
+            (flights, &copy.job.table, &mut copy.body)
+            && copy.job.chunk.is_segment_crc32c()
+            && table.valid_shape(length)
+            && table.descriptor_digest() == copy.job.chunk.content_digest
+        {
+            copy.body = PartialBody::Shared(flights.partials.register(
+                copy.job.chunk.id.clone(),
+                copy.job.epoch,
+                table.clone(),
+                std::mem::take(bytes),
+            ));
+        }
         let Segment {
             offset,
             data,
             _charge: segment_charge,
+            _in_flight: segment_flight,
             ..
         } = segment;
-        let complete = if copy.coverage.is_empty() && offset == 0 {
-            #[cfg(test)]
-            self.adopted_bodies
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // The body is charged to the partial budget for the whole
-            // Chunk; the segment charge ends with the segment.
-            drop(segment_charge);
-            copy.adopt(data)
-        } else {
-            let done = copy.copy_range(offset, &data);
-            #[cfg(test)]
-            self.zero_fill_bytes.fetch_add(
-                copy.last_zero_fill as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            self.recycle_segment(data, segment_charge);
-            done
-        };
+        let shared = matches!(copy.body, PartialBody::Shared(_));
+        let (complete, ranges, frozen) = copy.body.update(|bytes| {
+            let complete = if bytes.coverage.is_empty() && offset == 0 {
+                #[cfg(test)]
+                self.adopted_bodies
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(segment_charge);
+                bytes.adopt(data, length as usize)
+            } else {
+                let done = bytes.copy_range(offset, &data, length as usize);
+                #[cfg(test)]
+                self.zero_fill_bytes.fetch_add(
+                    bytes.last_zero_fill as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.recycle_segment(data, segment_charge);
+                done
+            };
+            let frozen = (complete && shared).then(|| {
+                let frozen = SharedChunkBytes::from_vec(std::mem::take(&mut bytes.data));
+                bytes.complete = Some(frozen.clone());
+                frozen
+            });
+            (complete, bytes.coverage.len(), frozen)
+        });
         if complete {
-            // A complete body is never parked again: no later range would
-            // ever resend it, so a full queue is a counted drop.
-            let PartialCopy { job, _charge, .. } = copy;
+            #[cfg(test)]
+            if let Some(hook) = self.after_freeze.lock().unwrap().take() {
+                hook();
+            }
+            let PartialCopy {
+                mut job,
+                body,
+                _charge,
+                ..
+            } = copy;
+            match body {
+                PartialBody::Private(bytes) => job.body = bytes.data,
+                PartialBody::Shared(partial) => {
+                    job.shared = frozen.map(|body| (partial, body));
+                }
+            }
             self.enqueue_staged(local, length, || job);
-        } else if copy.coverage.len() <= MAX_PARTIAL_RANGES {
+        } else if ranges <= MAX_PARTIAL_RANGES {
             partial.push_back(copy);
         } else {
             local.record_read_cache_event("dropped_partial_ranges");
         }
+        // The segment's guard spans both the channel and assembly handoff.
+        // Dropping it announces new coverage (or that the segment was lost).
+        drop(segment_flight);
     }
 
     /// Releases partial bodies older than [`PARTIAL_MAX_AGE`].
@@ -1338,10 +1399,14 @@ impl DfsReadEngine {
 
     /// Returns whether a new cache copy was recorded for publication.
     fn install_read_cache(&self, job: CacheJob, capacity: u64, required: bool) -> Result<bool> {
+        let body = job
+            .shared
+            .as_ref()
+            .map_or_else(|| job.body.into(), |(_, body)| body.clone());
         let (item, reused) = crate::node::chunk::StagedChunk::from_replica_with_table(
             crate::dfs::OperationId::new("read-cache"),
             &job.chunk,
-            job.body,
+            body,
             job.table.as_ref(),
         )?;
         self.local.record_read_cache_event(if reused {
@@ -1385,7 +1450,9 @@ impl CacheJob {
 
     #[cfg(test)]
     pub(super) fn body(&self) -> &[u8] {
-        &self.body
+        self.shared
+            .as_ref()
+            .map_or(&self.body, |(_, body)| body.as_ref())
     }
 
     pub(super) fn explicit(mut self, deadline: Instant) -> (Self, oneshot::Receiver<Result<()>>) {
@@ -1404,6 +1471,7 @@ impl CacheJob {
         Self {
             chunk,
             body,
+            shared: None,
             version,
             layout,
             epoch,
@@ -1412,6 +1480,73 @@ impl CacheJob {
             queued_at: Instant::now(),
             table: None,
             in_flight: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl DfsReadEngine {
+    pub(crate) fn checkpoint_stage(
+        &self,
+        chunk: &ChunkObject,
+        version: &FileVersionId,
+        layout: &LayoutRootId,
+        data: &[u8],
+        offset: usize,
+        length: usize,
+    ) {
+        self.remember_trusted_crc_table(
+            chunk,
+            crate::node::chunk_crc32c::CrcTable::build(data).unwrap(),
+        );
+        let batch = ReadBatch {
+            file_version_id: Some(version.clone()),
+            layout_root_id: layout.clone(),
+            ops: vec![ChunkReadOp {
+                chunk_id: chunk.id.clone(),
+                chunk_offset: offset as u64,
+                length: length as u64,
+                output_offset: 0,
+            }],
+            lookahead: Vec::new(),
+        };
+        let sources = [ChunkSources {
+            chunk_id: chunk.id.clone(),
+            chunk: Some(chunk.clone()),
+            sources: Vec::new(),
+            allowed_ranges: vec![(0, chunk.length)],
+        }];
+        self.cache_completed_ranges(&batch, &sources, &data[offset..offset + length]);
+    }
+
+    pub(crate) fn checkpoint_assemble(&self) {
+        self.distributed_cache
+            .as_ref()
+            .unwrap()
+            .assemble_pending(&self.local);
+    }
+
+    pub(crate) fn checkpoint_expire_partials(&self) {
+        self.distributed_cache
+            .as_ref()
+            .unwrap()
+            .sweep_partial_at(&self.local, Instant::now() + PARTIAL_MAX_AGE);
+    }
+
+    pub(crate) fn checkpoint_after_freeze(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .distributed_cache
+            .as_ref()
+            .unwrap()
+            .after_freeze
+            .lock()
+            .unwrap() = Some(Box::new(hook));
+    }
+
+    pub(crate) async fn checkpoint_install(self: &Arc<Self>) {
+        let cache = self.distributed_cache.as_ref().unwrap();
+        for job in cache.queued_jobs_for_test() {
+            self.run_install_job(job, cache.capacity()).await;
         }
     }
 }
@@ -1599,34 +1734,14 @@ mod tests {
 
     #[test]
     fn distribution_cache_accumulates_out_of_order_verified_ranges_without_holes() {
-        let staged = crate::node::chunk::StagedChunk::new(
-            crate::dfs::OperationId::new("paged"),
-            b"0123456789".to_vec(),
-        );
-        let budget = StageBudget::new(
-            64,
-            None,
-            "partial_bytes",
-            "partial_peak_bytes",
-            "partial_limit_bytes",
-        );
-        let mut partial = PartialCopy {
-            job: CacheJob::new(
-                staged.chunk.clone(),
-                vec![0; 10],
-                FileVersionId::new("version"),
-                LayoutRootId::new("layout"),
-                1,
-            ),
-            coverage: Vec::new(),
-            last_zero_fill: 0,
-            _charge: budget.try_charge(10).unwrap(),
-            created: Instant::now(),
+        let mut partial = PartialBytes {
+            data: vec![0; 10],
+            ..Default::default()
         };
-        assert!(!partial.copy_range(7, b"789"));
-        assert!(!partial.copy_range(0, b"0123"));
-        assert!(!partial.copy_range(2, b"234"));
-        assert!(partial.copy_range(5, b"56"));
-        assert_eq!(partial.job.body, b"0123456789");
+        assert!(!partial.copy_range(7, b"789", 10));
+        assert!(!partial.copy_range(0, b"0123", 10));
+        assert!(!partial.copy_range(2, b"234", 10));
+        assert!(partial.copy_range(5, b"56", 10));
+        assert_eq!(partial.data, b"0123456789");
     }
 }

@@ -391,7 +391,10 @@ fn wire_source_candidate(
         location: Some(wire_copy_location(source.location)),
         data_endpoint: source.data_endpoint,
         load_hint: source.load_hint,
-        read_grant: Some(wire_read_grant(source.read_grant)),
+        read_grant: match source.grant {
+            crate::dfs::SourceGrant::Copy(grant) => Some(wire_read_grant(grant)),
+            crate::dfs::SourceGrant::Holder(_) => None,
+        },
     }
 }
 

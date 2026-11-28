@@ -3,6 +3,8 @@ use afs::config::{
 };
 use clap::{CommandFactory, Parser};
 
+const BACKEND_NOT_COMPILED: &str = "requested filesystem backend is not compiled in";
+
 #[test]
 fn workspace_api_requires_node_mount_and_outlet() {
     let directory = tempfile::tempdir().unwrap();
@@ -24,12 +26,12 @@ fn workspace_api_requires_node_mount_and_outlet() {
     );
     assert!(resolve(Role::Node, api).is_err());
     assert!(resolve(Role::Meta, &format!("{outlet}{api}")).is_err());
-    assert!(
-        resolve(Role::Node, &format!("{outlet}{api}"))
-            .unwrap()
-            .ownerfs_workspace_api
-            .is_some()
-    );
+    let node = resolve(Role::Node, &format!("{outlet}{api}"));
+    if cfg!(feature = "ownerfs") {
+        assert!(node.unwrap().ownerfs_workspace_api.is_some());
+    } else {
+        assert!(node.unwrap_err().to_string().contains(BACKEND_NOT_COMPILED));
+    }
     assert!(
         resolve(
             Role::Node,
@@ -543,7 +545,12 @@ fn ownerfs_adopt_on_startup_is_opt_in_and_node_only() {
     );
 
     let error = resolve(Role::Node, "fs='dfs'\nownerfs_adopt_on_startup=true\n").unwrap_err();
-    assert!(error.to_string().contains("requires Node with fs=ownerfs"));
+    let expected = if cfg!(feature = "dfs") {
+        "requires Node with fs=ownerfs"
+    } else {
+        BACKEND_NOT_COMPILED
+    };
+    assert!(error.to_string().contains(expected), "{error}");
     let error = resolve(
         Role::Meta,
         &format!("{ownerfs}ownerfs_adopt_on_startup=true\n"),
@@ -573,7 +580,7 @@ fn ownerfs_data_dir_defaults_to_the_private_root_and_follows_data_dir() {
         "default storage root must stay under data_dir"
     );
 
-    let derived = resolve(Role::Node, "fs='ownerfs'\ndata_dir='/srv/afs/data'\n").unwrap();
+    let derived = resolve(Role::Node, "data_dir='/srv/afs/data'\n").unwrap();
     assert_eq!(
         derived.ownerfs_data_dir,
         std::path::PathBuf::from("/srv/afs/data/ownerfs")
@@ -582,12 +589,20 @@ fn ownerfs_data_dir_defaults_to_the_private_root_and_follows_data_dir() {
     let adopted = resolve(
         Role::Node,
         "fs='ownerfs'\ndata_dir='/srv/afs/data'\nownerfs_data_dir='/home/agentos/.users'\n",
-    )
-    .unwrap();
-    assert_eq!(
-        adopted.ownerfs_data_dir,
-        std::path::PathBuf::from("/home/agentos/.users")
     );
+    if cfg!(feature = "ownerfs") {
+        assert_eq!(
+            adopted.unwrap().ownerfs_data_dir,
+            std::path::PathBuf::from("/home/agentos/.users")
+        );
+    } else {
+        assert!(
+            adopted
+                .unwrap_err()
+                .to_string()
+                .contains(BACKEND_NOT_COMPILED)
+        );
+    }
 
     let error = resolve(Role::Node, "ownerfs_data_dir='relative/root'\n").unwrap_err();
     assert!(
@@ -596,7 +611,12 @@ fn ownerfs_data_dir_defaults_to_the_private_root_and_follows_data_dir() {
             .contains("ownerfs_data_dir must be absolute")
     );
     let error = resolve(Role::Node, "fs='dfs'\nownerfs_data_dir='/srv/ownerfs'\n").unwrap_err();
-    assert!(error.to_string().contains("ownerfs_data_dir requires Node"));
+    let expected = if cfg!(feature = "dfs") {
+        "ownerfs_data_dir requires Node"
+    } else {
+        BACKEND_NOT_COMPILED
+    };
+    assert!(error.to_string().contains(expected), "{error}");
     let error = resolve(Role::Meta, "ownerfs_data_dir='/srv/ownerfs'\n").unwrap_err();
     assert!(error.to_string().contains("ownerfs_data_dir requires Node"));
 }
@@ -847,15 +867,19 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
         Cli::parse_from(["afs-meta", "--config", meta_path.to_str().unwrap()]),
     )
     .unwrap();
+    assert!(meta.ownerfs && meta.dfs);
+    assert_eq!(meta.trusted_node_certs.len(), 1);
     let node = Config::resolve(
         Role::Node,
         Cli::parse_from(["afs-node", "--config", node_path.to_str().unwrap()]),
-    )
-    .unwrap();
-
-    assert!(meta.ownerfs && meta.dfs);
+    );
+    if !cfg!(all(feature = "ownerfs", feature = "dfs")) {
+        let error = node.unwrap_err();
+        assert!(error.to_string().contains(BACKEND_NOT_COMPILED), "{error}");
+        return;
+    }
+    let node = node.unwrap();
     assert!(node.ownerfs && node.dfs);
-    assert_eq!(meta.trusted_node_certs.len(), 1);
     assert_eq!(node.trusted_node_certs.len(), 1);
     assert!(
         node.meta_endpoint

@@ -882,23 +882,33 @@ impl DfsChunksService {
             event("holder_not_ready");
             return Err(status);
         }
-        // 4. present, or wait (bounded) for Chunks being fetched here. Only
-        // the in-memory catalog is consulted (no file is opened or hashed
-        // before a slot, code review S1), and only for Chunks still missing.
-        let mut missing: Vec<crate::dfs::ChunkId> = Vec::new();
-        for op in &request.operations {
+        // 4. Probe readiness only after both checks and authorized ranges.
+        // A partial lookup here does not retain the body across slot admission.
+        let available = |op: &&afs_protocol::node_data::DfsChunkReadOp| {
             let chunk = crate::dfs::ChunkId::new(op.chunk_id.clone());
-            if !local.has_servable_record(&chunk) && !missing.contains(&chunk) {
-                missing.push(chunk);
-            }
-        }
+            local.has_servable_record(&chunk)
+                || holders
+                    .in_flight
+                    .partials
+                    .covering(&chunk, grant.holder_node_epoch, op.chunk_offset, op.length)
+                    .is_some()
+        };
+        let mut missing: Vec<_> = request
+            .operations
+            .iter()
+            .filter(|op| !available(op))
+            .collect();
         if !missing.is_empty() {
             let budget = wait_budget(&request);
-            // Wait only when every missing Chunk is expected (review N2).
-            let all_in_flight = |missing: &[crate::dfs::ChunkId]| {
-                missing
-                    .iter()
-                    .all(|chunk| holders.in_flight.contains(chunk))
+            let all_in_flight = |missing: &[&afs_protocol::node_data::DfsChunkReadOp]| {
+                missing.iter().all(|op| {
+                    holders.in_flight.overlaps(
+                        &crate::dfs::ChunkId::new(op.chunk_id.clone()),
+                        grant.holder_node_epoch,
+                        op.chunk_offset,
+                        op.length,
+                    ) || available(op)
+                })
             };
             if budget.is_zero() || !all_in_flight(&missing) {
                 event("holder_not_ready");
@@ -924,7 +934,7 @@ impl DfsChunksService {
                 // being shared (!318 P3-3): both armed before the checks.
                 let changed = holders.in_flight.changed();
                 let unshared = holders.registry.unshared();
-                missing.retain(|chunk| !local.has_servable_record(chunk));
+                missing.retain(|op| !available(op));
                 if missing.is_empty() {
                     break;
                 }
@@ -934,6 +944,8 @@ impl DfsChunksService {
                     ended("not_ready");
                     return Err(holder_not_ready());
                 }
+                #[cfg(test)]
+                holders.reach(super::dfs_holder_serve::TestPoint::Waiting);
                 let woke = tokio::time::timeout_at(deadline, async {
                     tokio::select! {
                         () = changed => {}
@@ -942,7 +954,7 @@ impl DfsChunksService {
                 })
                 .await;
                 if woke.is_err() {
-                    missing.retain(|chunk| !local.has_servable_record(chunk));
+                    missing.retain(|op| !available(op));
                     if missing.is_empty() {
                         break;
                     }
@@ -990,65 +1002,64 @@ impl DfsChunksService {
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         let metrics = self.payload_metrics.clone();
+        #[cfg(test)]
+        let poll_hooks = holders.clone();
         let until = authorized.until;
         let registry = holders.registry.clone();
         let version = grant.file_version_id.clone();
         let (started, ready) = tokio::sync::oneshot::channel();
-        #[cfg(test)]
-        let hooks = holders.clone();
-        crate::node::bridge::spawn_blocking(move || {
-            let _permit = permit;
-            // 7. inside the slot: the deadline only, no Meta; and the version
-            // must still be shared here (code review S3)
+        // 7. Recheck expiry and sharing after slot admission, when the
+        // producer actually starts. This step does not call Meta.
+        let start = move |local: &LocalChunkStore| {
             if std::time::Instant::now() >= until {
                 let _ = started.send(Err(holder_denied()));
-                return;
+                return false;
             }
             if !registry.is_shared(&version) {
                 local.record_read_cache_event("holder_not_ready");
                 let _ = started.send(Err(holder_not_ready()));
-                return;
+                return false;
             }
-            if started.send(Ok(())).is_err() || sender.is_closed() {
-                return;
+            if started.send(Ok(())).is_err() {
+                return false;
             }
             local.record_read_cache_event("holder_served");
+            true
+        };
+        let stream = Arc::new(super::dfs_holder_stream::HolderStream {
+            local: local.clone(),
+            request: Arc::new(request),
+            sender,
+            metrics,
+            read_mode: crc_mode,
+            admission_deadline,
+            authorized_until: until,
+        });
+        tokio::spawn(async move {
+            let _permit = permit;
+            if !start(&local) || stream.sender.is_closed() {
+                return;
+            }
             #[cfg(test)]
-            hooks.reach(super::dfs_holder_serve::TestPoint::Serve);
-            let serving = timing.as_ref().map(|t| t.holder_request("serve"));
-            // 8. serve
-            let served = stream_dfs_ranges_until(
-                &local,
-                &request,
-                &sender,
-                metrics.as_ref(),
-                admission_deadline,
-                crc_mode,
-            );
-            drop(serving);
-            if let Err(error) = served {
-                // A Chunk that left the catalog after the checks was evicted
-                // (or collected), as caches are: not ready here, not a failed
-                // copy (!318 P2-3). A Chunk still cataloged keeps its error,
-                // so damage is never reported as NOT_READY.
-                let evicted = request.operations.iter().any(|op| {
-                    !local.has_catalog_record(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
-                });
-                let error = if evicted {
-                    local.record_read_cache_event("holder_not_ready");
-                    holder_not_ready()
-                } else {
-                    error
-                };
-                let _ = sender.blocking_send(Err(error));
+            holders.reach(super::dfs_holder_serve::TestPoint::Serve);
+            let _serving = timing.as_ref().map(|t| t.holder_request("serve"));
+            if let Err(error) = stream
+                .serve(&holders.in_flight, grant.holder_node_epoch)
+                .await
+            {
+                let _ = tokio::time::timeout_at(until.into(), stream.sender.send(Err(error))).await;
             }
         });
         ready
             .await
             .map_err(|_| Status::internal("DFS holder read producer stopped"))??;
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
-        )))
+        let stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
+        #[cfg(test)]
+        let stream = tokio_stream::StreamExt::map(stream, move |frame| {
+            poll_hooks.reach(super::dfs_holder_serve::TestPoint::ResponsePoll);
+            frame
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 

@@ -77,7 +77,7 @@ impl DfsReadEngine {
             let fallback = cached && source.role != CopyRole::VerifiedCache;
             // H2 step 2: version holders after the published copies, before
             // the durable ones.
-            let holder = source.holder_grant.is_some();
+            let holder = source.grant.is_holder();
             let node = match &source.location {
                 CopyLocation::Node { node_id, .. } => node_id.as_str(),
                 CopyLocation::External { .. } => "",
@@ -100,7 +100,7 @@ impl DfsReadEngine {
         // A version holder may answer NOT_READY: never a stripe.
         let usable = |s: &&SourceCandidate| {
             self.is_remote_candidate(s)
-                && s.holder_grant.is_none()
+                && !s.grant.is_holder()
                 && self.source_matches(batch, s)
                 && !demoted.contains(&s.copy_id)
         };

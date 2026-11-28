@@ -2075,7 +2075,7 @@ async fn memory_read_authority_fixture() -> (
         .await
         .unwrap();
     let source = &sources.chunks[0].sources[0];
-    let grant = &source.read_grant;
+    let grant = source.grant.copy().unwrap();
     let request = DfsReadRangesRequest {
         include_blake3_outboard: false,
         read_id: "read".into(),
@@ -2921,7 +2921,7 @@ async fn dfs_product_rdma_replica_and_read_real_verbs_with_mode(
                 },
                 data_endpoint: Some(endpoint.clone()),
                 load_hint: 0,
-                read_grant: crate::dfs::DfsReadGrant {
+                grant: crate::dfs::SourceGrant::Copy(crate::dfs::DfsReadGrant {
                     namespace_id: crate::dfs::NamespaceId::new(wire.namespace_id.clone()),
                     file_version_id: crate::dfs::FileVersionId::new(wire.file_version_id.clone()),
                     layout_root_id: crate::dfs::LayoutRootId::new(wire.layout_root_id.clone()),
@@ -2930,8 +2930,7 @@ async fn dfs_product_rdma_replica_and_read_real_verbs_with_mode(
                     expires_at_unix_ms: wire.expires_at_unix_ms,
                     fence: wire.fence,
                     token: wire.token.clone(),
-                },
-                holder_grant: None,
+                }),
             },
         }],
     };

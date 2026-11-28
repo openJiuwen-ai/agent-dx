@@ -614,6 +614,8 @@ fn conflict(message: impl Into<String>) -> Error {
 
 #[cfg(all(test, feature = "dfs"))]
 mod read_recovery_tests;
+#[cfg(all(test, feature = "dfs"))]
+pub(crate) use read_recovery_tests::open_partial_readers;
 
 #[cfg(all(test, feature = "dfs"))]
 mod external_policy_tests;

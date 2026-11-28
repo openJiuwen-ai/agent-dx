@@ -1005,7 +1005,7 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
                             },
                             data_endpoint: Some("http://node-b".into()),
                             load_hint: 0,
-                            read_grant: DfsReadGrant {
+                            grant: crate::dfs::SourceGrant::Copy(DfsReadGrant {
                                 namespace_id: request.namespace_id.clone(),
                                 file_version_id: request.file_version_id.clone(),
                                 layout_root_id: request.layout_root_id.clone(),
@@ -1014,8 +1014,7 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
                                 expires_at_unix_ms: u64::MAX,
                                 fence: 1,
                                 token: "test-token".into(),
-                            },
-                            holder_grant: None,
+                            }),
                         }],
                     })
                     .collect(),

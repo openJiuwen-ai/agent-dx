@@ -448,7 +448,7 @@ pub(super) fn disk_stream_batch(
                 },
                 data_endpoint: Some(endpoint),
                 load_hint: 0,
-                read_grant: DfsReadGrant {
+                grant: crate::dfs::SourceGrant::Copy(DfsReadGrant {
                     namespace_id: NamespaceId::new("test"),
                     file_version_id: FileVersionId::new("version"),
                     layout_root_id: LayoutRootId::new("layout"),
@@ -457,8 +457,7 @@ pub(super) fn disk_stream_batch(
                     expires_at_unix_ms: u64::MAX,
                     fence: 1,
                     token: "test-token".into(),
-                },
-                holder_grant: None,
+                }),
             },
         }],
     }
@@ -2241,7 +2240,6 @@ async fn owner_prefetch_cache_hits_do_not_count_as_client_rpc_or_payload() {
     client.prefetched_reads.lock().unwrap().entries.insert(
         file.handle.clone(),
         super::PrefetchedOwnerRead {
-            #[cfg(feature = "dfs")]
             identity: file.identity.0.clone(),
             bytes: b"cached".to_vec(),
         },
@@ -4057,7 +4055,7 @@ mod dfs_rdma_tests {
                         },
                         data_endpoint: Some("http://127.0.0.1:1".into()),
                         load_hint: 0,
-                        read_grant: DfsReadGrant {
+                        grant: crate::dfs::SourceGrant::Copy(DfsReadGrant {
                             namespace_id: NamespaceId::new("ns"),
                             file_version_id: FileVersionId::new("version"),
                             layout_root_id: LayoutRootId::new("layout"),
@@ -4066,8 +4064,7 @@ mod dfs_rdma_tests {
                             expires_at_unix_ms: u64::MAX,
                             fence: 1,
                             token: "fixture".into(),
-                        },
-                        holder_grant: None,
+                        }),
                     },
                 })
                 .collect(),

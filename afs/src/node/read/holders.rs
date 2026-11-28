@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::dfs::{ChunkId, ChunkObject, FileVersionId, LayoutRoot, LayoutRootId};
 
+use super::holder_partial::HolderPartials;
+
 /// The intervals one shared version exposes, by Chunk.
 #[derive(Debug)]
 pub(crate) struct HolderLayout {
@@ -1141,40 +1143,107 @@ mod tests {
 /// Chunks this Node is fetching or installing right now, so a holder can let
 /// a reader wait for one instead of answering `NOT_READY` (plan/15 §1.3).
 /// Every change wakes the waiters; they re-check their Chunk themselves.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HolderInFlight {
-    chunks: Mutex<HashMap<ChunkId, usize>>,
-    changed: tokio::sync::Notify,
+    chunks: Mutex<HashMap<ChunkId, Vec<FlightRange>>>,
+    changed: Arc<tokio::sync::Notify>,
+    pub(crate) partials: Arc<HolderPartials>,
 }
 
-/// Marks one Chunk in flight until dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FlightRange {
+    Exact {
+        epoch: u64,
+        start: u64,
+        end: u64,
+    },
+    #[cfg(test)]
+    Whole,
+}
+
+/// Marks one range in flight until dropped.
 #[derive(Debug)]
 pub(crate) struct InFlightGuard {
     owner: Arc<HolderInFlight>,
     chunk: ChunkId,
+    range: FlightRange,
 }
 
 impl HolderInFlight {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let changed = Arc::new(tokio::sync::Notify::new());
+        Arc::new(Self {
+            chunks: Mutex::new(HashMap::new()),
+            partials: Arc::new(HolderPartials::new(changed.clone())),
+            changed,
+        })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ChunkId, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ChunkId, Vec<FlightRange>>> {
         self.chunks
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(crate) fn begin(self: &Arc<Self>, chunk: &ChunkId) -> InFlightGuard {
-        *self.lock().entry(chunk.clone()).or_default() += 1;
+    fn mark(self: &Arc<Self>, chunk: &ChunkId, range: FlightRange) -> InFlightGuard {
+        self.lock()
+            .entry(chunk.clone())
+            .or_default()
+            .push(range.clone());
         InFlightGuard {
             owner: self.clone(),
             chunk: chunk.clone(),
+            range,
         }
     }
 
+    pub(crate) fn begin_range(
+        self: &Arc<Self>,
+        chunk: &ChunkId,
+        epoch: u64,
+        start: u64,
+        length: u64,
+    ) -> InFlightGuard {
+        self.mark(
+            chunk,
+            FlightRange::Exact {
+                epoch,
+                start,
+                end: start.saturating_add(length),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin(self: &Arc<Self>, chunk: &ChunkId) -> InFlightGuard {
+        self.mark(chunk, FlightRange::Whole)
+    }
+
+    #[cfg(test)]
     pub(crate) fn contains(&self, chunk: &ChunkId) -> bool {
         self.lock().contains_key(chunk)
+    }
+
+    /// An arriving range may complete a covering CRC segment for a fragment
+    /// already cached. An unrelated range of the Chunk cannot make progress.
+    pub(crate) fn overlaps(&self, chunk: &ChunkId, epoch: u64, offset: u64, length: u64) -> bool {
+        let segment = crate::node::chunk_crc32c::SEGMENT as u64;
+        let lower = offset / segment * segment;
+        let upper = offset
+            .saturating_add(length)
+            .div_ceil(segment)
+            .saturating_mul(segment);
+        self.lock().get(chunk).is_some_and(|ranges| {
+            ranges.iter().any(|range| match range {
+                FlightRange::Exact {
+                    epoch: marked_epoch,
+                    start,
+                    end,
+                } => *marked_epoch == epoch && *start < upper && *end > lower,
+                #[cfg(test)]
+                FlightRange::Whole => true,
+            })
+        })
     }
 
     /// Something was installed or finished: wake every waiter.
@@ -1192,9 +1261,11 @@ impl HolderInFlight {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let mut chunks = self.owner.lock();
-        if let Some(count) = chunks.get_mut(&self.chunk) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(ranges) = chunks.get_mut(&self.chunk) {
+            if let Some(index) = ranges.iter().position(|range| *range == self.range) {
+                ranges.swap_remove(index);
+            }
+            if ranges.is_empty() {
                 chunks.remove(&self.chunk);
             }
         }

@@ -145,7 +145,8 @@ impl DfsReadEngine {
             .filter_map(|source| {
                 admitted_at.checked_add(Duration::from_millis(
                     source
-                        .read_grant
+                        .grant
+                        .context()
                         .expires_at_unix_ms
                         .saturating_sub(admitted_wall),
                 ))
@@ -200,7 +201,7 @@ impl DfsReadEngine {
                         !set.sources.iter().any(|source| {
                             self.source_matches(batch, source)
                                 && (authority.epoch == 0
-                                    || source.read_grant.caller_node_epoch == authority.epoch)
+                                    || source.grant.context().caller_node_epoch == authority.epoch)
                         })
                     }) {
                         return Err(external_denied("DFS queued fetch grant expired"));
