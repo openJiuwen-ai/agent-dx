@@ -10,7 +10,7 @@ RUN sed -i 's|http://mirrors.aliyun.com/ubuntu-ports|https://mirrors.aliyun.com/
     && apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 -o Acquire::Retries=2 update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        autoconf automake binutils build-essential busybox-static ca-certificates \
-       cmake curl git libssl-dev libtool musl-tools pkg-config strace unzip \
+       cmake curl git libssl-dev libtool musl-tools pkg-config strace unzip wget \
        libbz2-dev libffi-dev liblzma-dev libreadline-dev libsqlite3-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -21,11 +21,16 @@ ARG PYTHON_VERSION=3.11.14
 ARG PYTHON_SHA256=8d3ed8ec5c88c1c95f5e558612a725450d2452813ddad5e58fdb1a53b1209b78
 ARG PROTOC_VERSION=25.1
 ARG GO_VERSION=1.25.5
-ARG GO_SHA256=9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b
-RUN case "$TARGETARCH" in amd64|arm64) ;; *) exit 2 ;; esac \
+ARG GO_SHA256_AMD64=9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b
+ARG GO_SHA256_ARM64=b00b694903d126c588c378e72d3545549935d3982635ba3f7a964c9fa23fe3b9
+RUN case "$TARGETARCH" in \
+      amd64) go_sha=$GO_SHA256_AMD64 ;; \
+      arm64) go_sha=$GO_SHA256_ARM64 ;; \
+      *) exit 2 ;; \
+    esac \
     && curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
       "https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz \
-    && echo "${GO_SHA256}  /tmp/go.tar.gz" | sha256sum --check \
+    && echo "${go_sha}  /tmp/go.tar.gz" | sha256sum --check \
     && rm -rf /usr/local/go \
     && tar -xzf /tmp/go.tar.gz -C /usr/local \
     && rm /tmp/go.tar.gz
@@ -52,6 +57,32 @@ RUN case "$TARGETARCH" in amd64) rust_host=x86_64-unknown-linux-gnu ;; arm64) ru
     && rustup component add rustfmt clippy \
     && GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 \
     && GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+RUN mkdir -p /root/.cargo \
+    && printf '%s\n' \
+       '# 多个国内源可同时定义，但同一时刻只有 replace-with 指向的那个生效' \
+       '[source.crates-io]' \
+       "replace-with = 'aliyun'" \
+       '' \
+       '# 阿里云（当前生效，稀疏索引，dl 走 mirrors.aliyun.com/crates/api/v1/crates）' \
+       '[source.aliyun]' \
+       'registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"' \
+       '' \
+       '# 字节 rsproxy（备选）' \
+       '[source.rsproxy]' \
+       'registry = "sparse+https://rsproxy.cn/index/"' \
+       '' \
+       '# 中科大（备选）' \
+       '[source.ustc]' \
+       'registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"' \
+       '' \
+       '# 清华（备选）' \
+       '[source.tuna]' \
+       'registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"' \
+       '' \
+       '[net]' \
+       'git-fetch-with-cli = true' \
+       > /root/.cargo/config.toml
 
 RUN case "$TARGETARCH" in amd64) protoc_arch=x86_64 ;; arm64) protoc_arch=aarch_64 ;; *) exit 2 ;; esac \
     && curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
@@ -102,5 +133,7 @@ RUN python3 -m venv /opt/adx-build-tools/python \
 COPY .buildkite/verify-build-image.sh /usr/local/bin/adx-verify-build-image
 RUN chmod 0755 /usr/local/bin/adx-verify-build-image \
     && /usr/local/bin/adx-verify-build-image
+
+RUN /opt/adx-build-tools/python/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --upgrade pip
 
 WORKDIR /workspace
