@@ -348,6 +348,7 @@ async fn control_plane_https_verifies_ca_and_name_and_preserves_environment_requ
         .unwrap();
     std::fs::write(dir.join("server.pem"), certificate.pem()).unwrap();
     std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
+
     let acceptor = adx_transport::tls::http_server_acceptor(
         dir.join("server.pem"),
         dir.join("server.key"),

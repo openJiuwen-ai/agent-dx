@@ -438,7 +438,8 @@ impl Ingress {
             port_host_domain: None,
             e2b_enabled: false,
             e2b_allow_http: false,
-            frontend_address: frontend_address.into(),
+            frontend_address: super::reverse_proxy::control_plane_url(&frontend_address.into())
+                .into_owned(),
             reverse_proxy: ReverseProxy::new(ReverseProxyConfig::default()),
             proxy_routes: Arc::new(Vec::new()),
             control_plane_routes: Arc::new(control_plane_routes),
@@ -489,7 +490,7 @@ impl Ingress {
         config: ReverseProxyConfig,
         ca_file: Option<&std::path::Path>,
     ) -> Result<Self, BoxError> {
-        super::reverse_proxy::control_plane_origin(&self.frontend_address, ca_file)?;
+        super::reverse_proxy::validate_control_plane_origin(&self.frontend_address, ca_file)?;
         self.reverse_proxy = ReverseProxy::with_control_plane_config(config, ca_file)?;
         Ok(self)
     }
@@ -1631,16 +1632,12 @@ impl Ingress {
         let route = ProxyRoute {
             name: "apiserver".into(),
             path_prefix: "/".into(),
-            upstream: if self.frontend_address.contains("://") {
-                self.frontend_address.clone()
-            } else {
-                format!("http://{}", self.frontend_address)
-            },
+            upstream: self.frontend_address.clone(),
             strip_prefix: false,
             host: None,
         };
         self.reverse_proxy
-            .proxy_control_plane(
+            .proxy_with_tls(
                 request,
                 &route,
                 peer,

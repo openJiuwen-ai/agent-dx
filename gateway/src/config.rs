@@ -736,13 +736,12 @@ fn parse_control_plane_upstream(
 ) -> Result<(String, Option<PathBuf>), ConfigError> {
     let address = address.trim();
     let ca_file = ca_file.filter(|path| !path.is_empty()).map(PathBuf::from);
-    crate::ingress::reverse_proxy::control_plane_origin(address, ca_file.as_deref()).map_err(
-        |error| {
+    crate::ingress::reverse_proxy::validate_control_plane_origin(address, ca_file.as_deref())
+        .map_err(|error| {
             ConfigError::Invalid(format!(
                 "{CONTROL_PLANE_ADDRESS_ENV} / {CONTROL_PLANE_CA_FILE_ENV}: {error}"
             ))
-        },
-    )?;
+        })?;
     Ok((address.to_owned(), ca_file))
 }
 
