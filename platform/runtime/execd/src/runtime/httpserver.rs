@@ -825,24 +825,6 @@ async fn handle_pty(
     )
     .await;
 
-<<<<<<< HEAD
-    let pty = portable_pty::native_pty_system();
-    let pair = pty.openpty(portable_pty::PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-    let mut process = portable_pty::CommandBuilder::new(&command[0]);
-    for argument in &command[1..] {
-        process.arg(argument);
-    }
-    super::child_env::apply_pty(&mut process);
-    // Preserve Execd's validated working directory. portable-pty otherwise
-    // defaults to HOME, which can be inaccessible before the helper drops uid.
-    apply_pty_cwd(&mut process)?;
-    let mut child = pair.slave.spawn_command(process)?;
-=======
     static NEXT_PTY: AtomicU64 = AtomicU64::new(1);
     let session_id = format!(
         "pty-{}-{}",
@@ -870,6 +852,8 @@ async fn handle_pty(
             process.arg(argument);
         }
         super::child_env::apply_pty(&mut process);
+        // Preserve Execd's validated working directory instead of defaulting to HOME.
+        apply_pty_cwd(&mut process)?;
         let child = pair.slave.spawn_command(process)?;
         Ok((child, writer, reader, pair.master))
     })();
@@ -880,7 +864,6 @@ async fn handle_pty(
             return Ok(());
         }
     };
->>>>>>> 7a116c74b755b1f5de7a0502f52c85b0aeb76f69
     let mut killer = child.clone_killer();
     let mut writer = Some(writer);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();

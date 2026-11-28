@@ -249,7 +249,7 @@ impl AgentApi {
             ));
         }
         let managed = &self.managed;
-        if let ["prewarm-artifacts", snapshot] = path.as_slice() {
+        if let ["prewarm-artifacts", snapshot] = path {
             if parts.method != http::Method::DELETE {
                 return Err(Error::NotFound);
             }
