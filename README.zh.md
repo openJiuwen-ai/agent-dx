@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> | <strong>中文</strong></p>
 
-Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，Agent 层提供 Template 与 AgentBinding 管理，由无状态 Activator 按需启动用户 Harness，支持 HTTP、WebSocket 和 SSH 访问。同时提供公开 Environment API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。
+Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，Agent 层提供 Template 与 AgentBinding 管理，由无状态 Activator 按需启动用户 Harness，支持 HTTP、WebSocket 和 SSH 访问。同时提供公开 Environment API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。 
 
 <p align="center">
   <a href="#-快速开始">🚀 快速开始</a> ·
